@@ -21,7 +21,7 @@ All models are served via vLLM as OpenAI-compatible APIs, on the same GPU across
 
 Run ./setup.sh after every pod migration/restart, then cp .env.example .env and fill in your real Qdrant credentials.
 
-## Starting the services
+## Starting The Services
 
 Embedding (needed for both ingestion and query):
 
@@ -31,11 +31,11 @@ GraniteDocling — only during ingestion (the untied revision is MANDATORY):
 
     nohup vllm serve ibm-granite/granite-docling-258M --revision untied --port 8003 --gpu-memory-utilization 0.3 > granite.log 2>&1 &
 
-LLM — during query (16K context is enough for the KV cache):
+LLM — During Query (16K context is enough for the KV cache):
 
     nohup vllm serve Qwen/Qwen3-14B --gpu-memory-utilization 0.85 --max-model-len 16384 --port 8000 > llm.log 2>&1 &
 
-Reranker — during query:
+Reranker — During Query:
 
     nohup vllm serve BAAI/bge-reranker-v2-m3 --task score --gpu-memory-utilization 0.05 --port 8002 > rerank.log 2>&1 &
 
