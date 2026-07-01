@@ -58,7 +58,7 @@ Using GraniteDocling via vLLM with Docling requires several critical settings th
 
 Related open GitHub issues: docling #3403, #2925, #2398; HF discussion #20.
 
-## Page-by-page ingestion strategy
+## Page-by-Page Ingestion Strategy
 
 GraniteDocling produces malformed bounding-box coordinates on some complex pages (ValueError: Coordinate 'right' is less than 'left'). If the whole PDF is processed at once, a single bad page empties the entire document with raises_on_error=False (0 chunks).
 
