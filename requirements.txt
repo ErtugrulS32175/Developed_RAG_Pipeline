@@ -1,0 +1,11 @@
+docling
+docling-core
+transformers
+torch
+torchvision
+torchaudio
+qdrant-client
+fastembed
+python-dotenv
+requests
+vllm
