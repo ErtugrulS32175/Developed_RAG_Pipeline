@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from paddleocr import PaddleOCR
 
 app = FastAPI()
-ocr = PaddleOCR(use_textline_orientation=True, lang="tr", device="cpu")
+ocr = PaddleOCR(use_textline_orientation=True, lang="tr", device="gpu")
 
 class OCRRequest(BaseModel):
     image_path: str

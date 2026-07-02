@@ -22,10 +22,8 @@ COLLECTION_NAME  = "rag_router_test"
 EMBED_API_URL    = os.getenv("EMBED_API_URL", "http://localhost:8011/v1/embeddings")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-m3")
 
-tokenizer = HuggingFaceTokenizer(
-    tokenizer=AutoTokenizer.from_pretrained("BAAI/bge-m3"),
-    max_tokens=512
-)
+hf_tok = AutoTokenizer.from_pretrained("BAAI/bge-m3")
+tokenizer = HuggingFaceTokenizer(tokenizer=hf_tok, max_tokens=512)
 chunker = HybridChunker(tokenizer=tokenizer)
 sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
 
@@ -38,33 +36,49 @@ def embed_sparse(text):
     res = list(sparse_model.embed([text]))[0]
     return SparseVector(indices=res.indices.tolist(), values=res.values.tolist())
 
-def main(path):
-    # 1) Router ile parse et (native -> TableFormer, scanned/image -> OCR'li Docling)
-    docs = route_and_parse(path)
-    print(f"\n[INGEST] {len(docs)} belge parse edildi, chunk'laniyor...")
+def chunk_plain_text(text, source_tag, max_tokens=480):
+    """Split plain OCR text into token-bounded chunks by paragraphs."""
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks, current, cur_len = [], [], 0
+    for p in paragraphs:
+        p_len = len(hf_tok.encode(p, add_special_tokens=False))
+        if cur_len + p_len > max_tokens and current:
+            chunks.append(" ".join(current))
+            current, cur_len = [], 0
+        current.append(p)
+        cur_len += p_len
+    if current:
+        chunks.append(" ".join(current))
+    return [{"type": "text", "text": c, "source_tag": source_tag, "page": 0, "headings": []} for c in chunks]
 
-    # 2) Her belgeyi chunk'la
+def main(path):
+    parts = route_and_parse(path)
+    print(f"\n[INGEST] {len(parts)} parca parse edildi, chunk'laniyor...")
+
     all_chunks = []
-    for source_tag, doc in docs:
-        for chunk in chunker.chunk(doc):
-            ctype = "text"
-            page_no = 0
-            if chunk.meta.doc_items:
-                for item in chunk.meta.doc_items:
-                    if "table" in str(item.label).lower():
-                        ctype = "table"
-                if chunk.meta.doc_items[0].prov:
-                    page_no = chunk.meta.doc_items[0].prov[0].page_no
-            all_chunks.append({
-                "type": ctype,
-                "text": chunk.text,
-                "source_tag": source_tag,
-                "page": page_no,
-                "headings": chunk.meta.headings or [],
-            })
+    for source_tag, (content_type, content) in parts:
+        if content_type == "docling":
+            for chunk in chunker.chunk(content):
+                ctype = "text"
+                page_no = 0
+                if chunk.meta.doc_items:
+                    for item in chunk.meta.doc_items:
+                        if "table" in str(item.label).lower():
+                            ctype = "table"
+                    if chunk.meta.doc_items[0].prov:
+                        page_no = chunk.meta.doc_items[0].prov[0].page_no
+                all_chunks.append({
+                    "type": ctype,
+                    "text": chunk.text,
+                    "source_tag": source_tag,
+                    "page": page_no,
+                    "headings": chunk.meta.headings or [],
+                })
+        elif content_type == "text":
+            all_chunks.extend(chunk_plain_text(content, source_tag))
+
     print(f"[INGEST] Toplam {len(all_chunks)} chunk")
 
-    # 3) Qdrant collection
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     if client.collection_exists(COLLECTION_NAME):
         client.delete_collection(COLLECTION_NAME)
@@ -75,7 +89,6 @@ def main(path):
     )
     print(f"[INGEST] Collection hazir: {COLLECTION_NAME}")
 
-    # 4) Embed + upsert
     batch = []
     for i, c in enumerate(all_chunks):
         if not c["text"].strip():
