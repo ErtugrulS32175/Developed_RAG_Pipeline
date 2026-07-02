@@ -96,3 +96,38 @@ This is currently a working prototype. Planned improvements:
 5. Hide the thinking block: Qwen3 emits a think block; suppress it in query.py so users only see the final answer.
 
 6. Ingestion performance: explore batching multiple single-page requests concurrently against the GraniteDocling endpoint.
+
+## Update — Router Architecture & Multi-format Ingestion (Session 2)
+
+The pipeline was extended with a format-aware router that directs each input to the right parser, keeping the rest of the pipeline (chunking, embedding, Qdrant) unchanged.
+
+### Router design (router.py)
+- Input classification by file type: image (jpg/png/etc.) vs pdf.
+- For PDFs, per-page native-vs-scanned detection via pypdfium2 text-layer check (empty text layer = scanned page).
+- Native pages: Docling with TableFormer (ACCURATE), OCR disabled — deterministic, best for financial tables.
+- Scanned pages / images: Docling with OCR enabled (TableFormer preserves table structure + OCR reads text).
+- Page-by-page processing with per-page error isolation.
+
+### ingest_router.py
+Connects the router output to the existing embedding + Qdrant layer: parse -> HybridChunker -> bge-m3 (dense) + BM25 (sparse) -> Qdrant (collection: rag_router_test). Verified end-to-end on a single page (6 chunks, 6 vectors).
+
+### PaddleOCR as an isolated service (paddle_service.py + setup_paddle.sh)
+PaddleOCR gives noticeably better Turkish OCR than Docling's built-in RapidOCR (e.g. RapidOCR reads "HEKTAŞ" as "HEKTA$"; PaddleOCR reads it correctly). However:
+
+- PaddlePaddle (PaddleOCR's framework) and PyTorch (vLLM/Docling's framework) CANNOT coexist in the same Python environment — installing PaddlePaddle broke PyTorch's NCCL (undefined symbol: ncclCommWindowRegister). Fix: run PaddleOCR in a separate venv (paddle_env) exposed as an HTTP service on localhost:8100, called by the router. This is localhost-only (not internet) and fully on-prem compatible.
+- Version matrix that works: PaddlePaddle-GPU 3.0.0 + PaddleOCR 3.3.1. Newer PaddleOCR (3.7) fails with "strides attribute" / "set_optimization_level" errors against PaddlePaddle 3.0.0.
+- PP-StructureV3 (table structure from scanned pages) needs paddlex[ocr] and fails on PaddlePaddle 3.0.0 with "cannot import name 'fused_rms_norm_ext'" — needs a newer PaddlePaddle. Deferred.
+
+### CRITICAL FINDING — Blackwell GPU incompatibility
+The RTX PRO 6000 (Blackwell architecture) is too new for the installed frameworks:
+- PaddleOCR on GPU: text detection silently returns 0 regions (dt_polys: 0). Works perfectly on CPU.
+- TableFormer on GPU (via router): nvrtc error "invalid value for --gpu-architecture (-arch)" — the CUDA compiler doesn't recognize the Blackwell architecture.
+- Everything works on CPU (verified: router + parse + chunk + embed + Qdrant = 6 vectors).
+- Root cause: frameworks (PaddlePaddle 3.0, PyTorch/nvrtc build) predate Blackwell and lack its compute kernels.
+- Recommendation: use a mature-architecture GPU. Ampere (A40/A100) worked flawlessly in Session 1. Hopper (H100/H200) also fine. GPT-OSS-120B specifically needs Hopper+ (FP8/MXFP4 kernels), so reserve a short H200 session for that (Phase 4).
+
+### Current status
+Architecture is fully functional end-to-end on CPU. The only blocker is Blackwell GPU support — a hardware selection issue, not a code issue. Next session: rerun on an Ampere (A100) or Hopper GPU to validate GPU execution, then decide device (GPU vs CPU) for the PaddleOCR service based on whether PaddleOCR runs on that GPU.
+
+### Turkish personal-data note
+Target production data will include scanned tables with personal data (names, ID numbers, salaries). This is out of scope for the current architecture work (built entirely on the public OYAK report) and will require a dedicated security layer (access control, audit logging, data isolation, KVKK compliance) added later on the organization's own secure infrastructure. No personal data is used in development.
