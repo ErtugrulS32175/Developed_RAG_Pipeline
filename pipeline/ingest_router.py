@@ -6,10 +6,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-import db
-from router import route_and_parse
-from table_export import table_to_markdown, save_table_xlsx, save_table_csv
-from embeddings import embed_dense, embed_sparse
+from pipeline import db
+from pipeline.router import route_and_parse
+from pipeline.table_export import table_to_markdown, save_table_xlsx, save_table_csv
+from pipeline.embeddings import embed_dense, embed_sparse
 from docling.chunking import HybridChunker
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from transformers import AutoTokenizer

@@ -3,6 +3,7 @@
 # No Visual Studio toolchain needed -- pgvector has no official Windows build,
 # so this runs Postgres in the official pgvector/pgvector Linux image instead
 # of the native Windows Postgres service (which stays untouched on port 5432).
+# Run from the repo root: ./scripts/setup_postgres.sh
 set -e
 
 CONTAINER_NAME="ragtest-pgvector"
@@ -33,7 +34,7 @@ done
 
 echo "Enabling pgvector extension and creating schema..."
 docker exec "${CONTAINER_NAME}" psql -U rag -d ragdb -c "CREATE EXTENSION IF NOT EXISTS vector;"
-docker exec -i "${CONTAINER_NAME}" psql -U rag -d ragdb < schema.sql
+docker exec -i "${CONTAINER_NAME}" psql -U rag -d ragdb < pipeline/schema.sql
 
 echo "Done."
 echo "Connection string: postgresql://rag:CHANGE_ME@localhost:${HOST_PORT}/ragdb"

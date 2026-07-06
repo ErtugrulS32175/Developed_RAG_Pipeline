@@ -27,6 +27,12 @@ A format-aware router directs each input to the appropriate parser:
 
 Every input is normalized into a unified document representation, so the downstream chunking, embedding, and retrieval layers are identical regardless of source format. New input formats only require a new branch in the router.
 
+## Layout
+
+    pipeline/   core RAG code: router, ingest, query, db, embeddings, table export, schema
+    services/   isolated microservices (own venvs): PaddleOCR, Gemma table extraction
+    scripts/    setup scripts
+
 ## Retrieval
 
 Hybrid search combines dense embeddings (bge-m3, pgvector `vector` column) for semantic matching with sparse BM25 (fastembed `Qdrant/bm25`, pgvector `sparsevec` column) for exact terms (proper nouns, codes, tickers), fused with Reciprocal Rank Fusion computed in Python (`db.hybrid_search`). A reranker (bge-reranker-v2-m3) reorders candidates before the LLM answers in Turkish and cites source pages.
@@ -35,19 +41,23 @@ BM25's token hashing produces indices beyond pgvector's `sparsevec` dimension ca
 
 ## Setup
 
-    ./setup.sh
-    ./setup_paddle.sh
-    ./setup_gemma.sh
-    ./setup_postgres.sh
+Run from the repo root:
+
+    ./scripts/setup.sh
+    ./scripts/setup_paddle.sh
+    ./scripts/setup_gemma.sh
+    ./scripts/setup_postgres.sh
     cp .env.example .env
 
 The OCR and table-extraction services each run in their own isolated environment, exposed over localhost, keeping their dependencies (and Transformers version) separate from the main pipeline and from each other. PostgreSQL + pgvector runs in Docker (official `pgvector/pgvector` image) rather than the native Windows PostgreSQL service, since pgvector has no official Windows build.
 
 ## Usage
 
+Run from the repo root:
+
     nohup vllm serve BAAI/bge-m3 --task embed --gpu-memory-utilization 0.1 --port 8011 > embed.log 2>&1 &
-    python3 ingest_router.py ./data/yourfile.pdf
-    python3 query.py
+    python3 -m pipeline.ingest_router ./data/yourfile.pdf
+    python3 -m pipeline.query
 
 ## Stack
 

@@ -3,8 +3,8 @@ import os
 import requests
 from dotenv import load_dotenv
 
-import db
-from embeddings import embed_dense, embed_sparse
+from pipeline import db
+from pipeline.embeddings import embed_dense, embed_sparse
 
 load_dotenv()
 

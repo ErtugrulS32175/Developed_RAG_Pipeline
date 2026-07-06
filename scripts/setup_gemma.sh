@@ -2,7 +2,7 @@
 # Gemma 4 E4B isolated service setup (separate venv, same rationale as
 # setup_paddle.sh: keeps its Transformers version away from vLLM's pin
 # in the main env).
-# Run after ./setup.sh on a fresh pod.
+# Run from the repo root, after ./scripts/setup.sh, on a fresh pod.
 
 set -e
 
@@ -25,5 +25,5 @@ echo "Done."
 echo "Model weights (~16GB) download on first request via from_pretrained."
 echo "If google/gemma-4-E4B-it turns out to be gated, run first:"
 echo "  export HF_TOKEN=your_token"
-echo "Start the service with:"
-echo "  nohup gemma_env/bin/uvicorn gemma_service:app --host 127.0.0.1 --port 8101 > gemma_service.log 2>&1 &"
+echo "Start the service with (from repo root):"
+echo "  nohup gemma_env/bin/uvicorn gemma_service:app --app-dir services --host 127.0.0.1 --port 8101 > gemma_service.log 2>&1 &"
