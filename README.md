@@ -16,13 +16,14 @@ Models are served via vLLM as OpenAI-compatible APIs on separate ports:
 | Reranker | BAAI/bge-reranker-v2-m3 | 8002 |
 | Embedding | BAAI/bge-m3 | 8011 |
 | OCR (isolated service) | PaddleOCR PP-OCRv5 | 8100 |
+| Table extraction (isolated service) | google/gemma-4-E4B-it | 8101 |
 
 ## Router
 
 A format-aware router directs each input to the appropriate parser:
 
-- Images go to the OCR pipeline.
-- PDFs are analyzed per page: pages with a text layer (native) go to Docling with TableFormer for deterministic, high-fidelity table extraction; scanned pages go to the OCR pipeline.
+- Images go to the OCR pipeline for plain text; table detection on the same image is handled by the Gemma table service, since PaddleOCR's table-structure model misaligns cells on spreadsheet-style screenshots (extra phantom rows/columns, drifting column assignment).
+- PDFs are analyzed per page: pages with a text layer (native) go to Docling with TableFormer for deterministic, high-fidelity table extraction; scanned pages go to the OCR pipeline for text plus the Gemma table service for tables.
 
 Every input is normalized into a unified document representation, so the downstream chunking, embedding, and retrieval layers are identical regardless of source format. New input formats only require a new branch in the router.
 
@@ -34,9 +35,10 @@ Hybrid search combines dense embeddings (bge-m3) for semantic matching with spar
 
     ./setup.sh
     ./setup_paddle.sh
+    ./setup_gemma.sh
     cp .env.example .env
 
-The OCR service runs in its own isolated environment, exposed over localhost, keeping its dependencies separate from the main pipeline.
+The OCR and table-extraction services each run in their own isolated environment, exposed over localhost, keeping their dependencies (and Transformers version) separate from the main pipeline and from each other.
 
 ## Usage
 
@@ -46,11 +48,11 @@ The OCR service runs in its own isolated environment, exposed over localhost, ke
 
 ## Stack
 
-Docling (parsing, TableFormer), PaddleOCR (OCR), bge-m3 (embeddings), BM25 (sparse), Qdrant (vector store), bge-reranker-v2-m3 (reranking), Qwen3-14B (LLM), all served with vLLM. Every component is open-source and can run fully on-premise.
+Docling (parsing, TableFormer), PaddleOCR (OCR), Gemma 4 E4B (table extraction on scanned/image tables), bge-m3 (embeddings), BM25 (sparse), Qdrant (vector store), bge-reranker-v2-m3 (reranking), Qwen3-14B (LLM), all served with vLLM. Every component is open-source and can run fully on-premise.
 
 ## Future Work
 
-- Preserve table structure on scanned pages.
+- Validate the Gemma table service against PaddleOCR's table output on real GPU hardware (untested as of writing — built without GPU access to avoid rental cost).
 - Evaluation harness (retrieval recall, answer accuracy, faithfulness).
 - Move from Qdrant Cloud to a self-hosted Qdrant instance for a fully on-prem deployment.
 - Optional LLM upgrade.

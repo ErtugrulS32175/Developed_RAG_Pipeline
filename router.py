@@ -10,7 +10,7 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMo
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
 PDF_EXTS = {".pdf"}
 PADDLE_OCR_URL = "http://127.0.0.1:8100/ocr"
-PADDLE_TABLE_URL = "http://127.0.0.1:8100/table"
+GEMMA_TABLE_URL = "http://127.0.0.1:8101/table"
 
 def classify_input(path):
     ext = Path(path).suffix.lower()
@@ -59,9 +59,9 @@ def ocr_via_paddle(image_path):
     r.raise_for_status()
     return r.json()["text"]
 
-def tables_via_paddle(image_path):
+def tables_via_gemma(image_path):
     abs_path = str(Path(image_path).resolve())
-    r = requests.post(PADDLE_TABLE_URL, json={"image_path": abs_path}, timeout=120)
+    r = requests.post(GEMMA_TABLE_URL, json={"image_path": abs_path}, timeout=120)
     r.raise_for_status()
     return r.json()["tables"]
 
@@ -78,7 +78,7 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
         text = ocr_via_paddle(path)
         results.append(("image:ocr", ("text", text)))
         try:
-            tables = tables_via_paddle(path)
+            tables = tables_via_gemma(path)
             if tables:
                 results.append(("image:tables", ("tables", tables)))
                 print("  ", len(tables), "tablo bulundu")
@@ -106,7 +106,7 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
                     text = ocr_via_paddle(tmp_img)
                     results.append(("page" + str(page_no) + ":scanned", ("text", text)))
                     try:
-                        tables = tables_via_paddle(tmp_img)
+                        tables = tables_via_gemma(tmp_img)
                         if tables:
                             results.append(("page" + str(page_no) + ":tables", ("tables", tables)))
                             print("  sayfa", page_no, ":", len(tables), "tablo bulundu")
