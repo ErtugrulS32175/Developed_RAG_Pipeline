@@ -4,42 +4,23 @@ import sys
 import uuid
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 
+import db
 from router import route_and_parse
 from table_export import table_to_markdown, save_table_xlsx, save_table_csv
+from embeddings import embed_dense, embed_sparse
 from docling.chunking import HybridChunker
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from transformers import AutoTokenizer
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, SparseVectorParams, SparseIndexParams
-from qdrant_client.http.models import SparseVector
-from fastembed import SparseTextEmbedding
-
 load_dotenv()
 
-QDRANT_URL       = os.getenv("QDRANT_URL")
-QDRANT_API_KEY   = os.getenv("QDRANT_API_KEY")
-COLLECTION_NAME  = "rag_router_test"
-EMBED_API_URL    = os.getenv("EMBED_API_URL", "http://localhost:8011/v1/embeddings")
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-m3")
-OUTPUT_DIR       = Path(os.getenv("OUTPUT_DIR", "./output"))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./output"))
 
 hf_tok = AutoTokenizer.from_pretrained("BAAI/bge-m3")
 tokenizer = HuggingFaceTokenizer(tokenizer=hf_tok, max_tokens=512)
 chunker = HybridChunker(tokenizer=tokenizer)
-sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
-
-def embed_dense(text):
-    r = requests.post(EMBED_API_URL, json={"model": EMBED_MODEL_NAME, "input": text[:2000]}, timeout=60)
-    r.raise_for_status()
-    return r.json()["data"][0]["embedding"]
-
-def embed_sparse(text):
-    res = list(sparse_model.embed([text]))[0]
-    return SparseVector(indices=res.indices.tolist(), values=res.values.tolist())
 
 def chunk_plain_text(text, source_tag, max_tokens=480):
     """Split plain OCR text into token-bounded chunks by paragraphs."""
@@ -108,34 +89,38 @@ def main(path):
 
     print(f"[INGEST] Toplam {len(all_chunks)} chunk")
 
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-    if client.collection_exists(COLLECTION_NAME):
-        client.delete_collection(COLLECTION_NAME)
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config={"dense": VectorParams(size=1024, distance=Distance.COSINE)},
-        sparse_vectors_config={"sparse": SparseVectorParams(index=SparseIndexParams(on_disk=False))}
-    )
-    print(f"[INGEST] Collection hazir: {COLLECTION_NAME}")
+    conn = db.get_conn()
+    db.init_schema(conn)
+    db.clear_chunks(conn)
+    print("[INGEST] Tablo hazir: chunks")
 
     batch = []
     for i, c in enumerate(all_chunks):
         if not c["text"].strip():
             continue
-        batch.append(PointStruct(
-            id=str(uuid.uuid4()),
-            vector={"dense": embed_dense(c["text"]), "sparse": embed_sparse(c["text"])},
-            payload=c,
-        ))
+        sparse_indices, sparse_values = embed_sparse(c["text"])
+        batch.append({
+            "id": str(uuid.uuid4()),
+            "type": c["type"],
+            "text": c["text"],
+            "source_tag": c["source_tag"],
+            "page": c["page"],
+            "headings": c["headings"],
+            "table_data": c.get("table_data"),
+            "dense": embed_dense(c["text"]),
+            "sparse": db.sparse_to_literal(sparse_indices, sparse_values),
+        })
         if len(batch) >= 32:
-            client.upsert(collection_name=COLLECTION_NAME, points=batch)
+            db.upsert_chunks(conn, batch)
             batch = []
             print(f"  {i+1}/{len(all_chunks)} yazildi...")
     if batch:
-        client.upsert(collection_name=COLLECTION_NAME, points=batch)
+        db.upsert_chunks(conn, batch)
 
-    info = client.get_collection(COLLECTION_NAME)
-    print(f"\n[INGEST] Tamamlandi. Toplam vektor: {info.points_count}")
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM chunks")
+        count = cur.fetchone()[0]
+    print(f"\n[INGEST] Tamamlandi. Toplam vektor: {count}")
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "./data/sample.pdf"

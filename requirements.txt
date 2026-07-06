@@ -4,7 +4,8 @@ transformers
 torch
 torchvision
 torchaudio
-qdrant-client
+psycopg[binary]
+pgvector
 fastembed
 python-dotenv
 requests

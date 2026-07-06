@@ -1,10 +1,10 @@
-# Cloud RAG Pipeline — Docling + vLLM + Qdrant
+# Self-Hosted RAG Pipeline — Docling + vLLM + PostgreSQL/pgvector
 
-A self-hosted RAG pipeline for Turkish PDF and image documents, built entirely on open-source components. All models run locally via vLLM. The current setup uses Qdrant Cloud as the vector store, but every component — including Qdrant — can be run fully on-premise, so the architecture has no hard dependency on external services.
+A self-hosted RAG pipeline for Turkish PDF and image documents, built entirely on open-source components. All models run locally via vLLM, and the vector store is a self-hosted PostgreSQL + pgvector instance (via Docker) — no third-party managed service is required anywhere in the pipeline, which matters given the target documents contain confidential/personal data.
 
 ## Architecture
 
-Ingestion: input -> format router -> parser -> chunker -> embeddings -> Qdrant
+Ingestion: input -> format router -> parser -> chunker -> embeddings -> PostgreSQL (pgvector)
 
 Query: question -> hybrid search (RRF) -> reranker -> LLM -> answer with source pages
 
@@ -29,16 +29,19 @@ Every input is normalized into a unified document representation, so the downstr
 
 ## Retrieval
 
-Hybrid search combines dense embeddings (bge-m3) for semantic matching with sparse BM25 for exact terms (proper nouns, codes, tickers), fused with Reciprocal Rank Fusion. A reranker (bge-reranker-v2-m3) reorders candidates before the LLM answers in Turkish and cites source pages.
+Hybrid search combines dense embeddings (bge-m3, pgvector `vector` column) for semantic matching with sparse BM25 (fastembed `Qdrant/bm25`, pgvector `sparsevec` column) for exact terms (proper nouns, codes, tickers), fused with Reciprocal Rank Fusion computed in Python (`db.hybrid_search`). A reranker (bge-reranker-v2-m3) reorders candidates before the LLM answers in Turkish and cites source pages.
+
+BM25's token hashing produces indices beyond pgvector's `sparsevec` dimension cap, so every sparse index is remapped modulo a fixed `SPARSE_DIM` before storage/query (see `db.py`) — collisions are statistically negligible at this corpus size.
 
 ## Setup
 
     ./setup.sh
     ./setup_paddle.sh
     ./setup_gemma.sh
+    ./setup_postgres.sh
     cp .env.example .env
 
-The OCR and table-extraction services each run in their own isolated environment, exposed over localhost, keeping their dependencies (and Transformers version) separate from the main pipeline and from each other.
+The OCR and table-extraction services each run in their own isolated environment, exposed over localhost, keeping their dependencies (and Transformers version) separate from the main pipeline and from each other. PostgreSQL + pgvector runs in Docker (official `pgvector/pgvector` image) rather than the native Windows PostgreSQL service, since pgvector has no official Windows build.
 
 ## Usage
 
@@ -48,11 +51,11 @@ The OCR and table-extraction services each run in their own isolated environment
 
 ## Stack
 
-Docling (parsing, TableFormer), PaddleOCR (OCR), Gemma 4 E4B (table extraction on scanned/image tables), bge-m3 (embeddings), BM25 (sparse), Qdrant (vector store), bge-reranker-v2-m3 (reranking), Qwen3-14B (LLM), all served with vLLM. Every component is open-source and can run fully on-premise.
+Docling (parsing, TableFormer), PaddleOCR (OCR), Gemma 4 E4B (table extraction on scanned/image tables), bge-m3 (embeddings), BM25 (sparse), PostgreSQL + pgvector (vector store, self-hosted via Docker), bge-reranker-v2-m3 (reranking), Qwen3-14B (LLM), all served with vLLM. Every component is open-source and runs fully on-premise.
 
 ## Future Work
 
 - Validate the Gemma table service against PaddleOCR's table output on real GPU hardware (untested as of writing — built without GPU access to avoid rental cost).
 - Evaluation harness (retrieval recall, answer accuracy, faithfulness).
-- Move from Qdrant Cloud to a self-hosted Qdrant instance for a fully on-prem deployment.
+- Add an HNSW index on `chunks.dense`/`chunks.sparse` once the corpus grows past a small demo dataset.
 - Optional LLM upgrade.
