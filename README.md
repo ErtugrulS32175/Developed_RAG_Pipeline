@@ -1,6 +1,6 @@
 # Self-Hosted RAG Pipeline — Docling + vLLM + PostgreSQL/pgvector
 
-A self-hosted RAG pipeline for Turkish PDF and image documents, built entirely on open-source components. All models run locally via vLLM, and the vector store is a self-hosted PostgreSQL + pgvector instance (via Docker) — no third-party managed service is required anywhere in the pipeline, which matters given the target documents contain confidential/personal data.
+A self-hosted RAG pipeline for Turkish PDF and image documents, built entirely on open-source components. All models run locally via vLLM, and the vector store is a self-hosted PostgreSQL + pgvector instance (via Docker) — no third-party managed service is required anywhere in the pipeline.
 
 ## Architecture
 
