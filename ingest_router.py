@@ -1,10 +1,14 @@
 import os
+import re
 import sys
 import uuid
+from pathlib import Path
+
 import requests
 from dotenv import load_dotenv
 
 from router import route_and_parse
+from table_export import table_to_markdown, save_table_xlsx, save_table_csv
 from docling.chunking import HybridChunker
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from transformers import AutoTokenizer
@@ -21,6 +25,7 @@ QDRANT_API_KEY   = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME  = "rag_router_test"
 EMBED_API_URL    = os.getenv("EMBED_API_URL", "http://localhost:8011/v1/embeddings")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "BAAI/bge-m3")
+OUTPUT_DIR       = Path(os.getenv("OUTPUT_DIR", "./output"))
 
 hf_tok = AutoTokenizer.from_pretrained("BAAI/bge-m3")
 tokenizer = HuggingFaceTokenizer(tokenizer=hf_tok, max_tokens=512)
@@ -51,6 +56,28 @@ def chunk_plain_text(text, source_tag, max_tokens=480):
         chunks.append(" ".join(current))
     return [{"type": "text", "text": c, "source_tag": source_tag, "page": 0, "headings": []} for c in chunks]
 
+def chunks_from_tables(tables, source_tag, doc_stem):
+    """Turn structured table results into RAG chunks and write xlsx/csv exports."""
+    m = re.match(r"page(\d+)", source_tag)
+    page_no = int(m.group(1)) if m else 0
+
+    chunks = []
+    tables_dir = OUTPUT_DIR / "tables"
+    for i, table in enumerate(tables):
+        headers, rows = table["headers"], table["rows"]
+        base_name = f"{doc_stem}_{source_tag.replace(':', '_')}_{i}"
+        save_table_xlsx(headers, rows, tables_dir / f"{base_name}.xlsx")
+        save_table_csv(headers, rows, tables_dir / f"{base_name}.csv")
+        chunks.append({
+            "type": "table",
+            "text": table_to_markdown(headers, rows),
+            "source_tag": source_tag,
+            "page": page_no,
+            "headings": [],
+            "table_data": table,
+        })
+    return chunks
+
 def main(path):
     parts = route_and_parse(path)
     print(f"\n[INGEST] {len(parts)} parca parse edildi, chunk'laniyor...")
@@ -76,6 +103,8 @@ def main(path):
                 })
         elif content_type == "text":
             all_chunks.extend(chunk_plain_text(content, source_tag))
+        elif content_type == "tables":
+            all_chunks.extend(chunks_from_tables(content, source_tag, Path(path).stem))
 
     print(f"[INGEST] Toplam {len(all_chunks)} chunk")
 

@@ -9,3 +9,4 @@ fastembed
 python-dotenv
 requests
 vllm
+openpyxl

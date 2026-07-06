@@ -10,6 +10,7 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMo
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
 PDF_EXTS = {".pdf"}
 PADDLE_OCR_URL = "http://127.0.0.1:8100/ocr"
+PADDLE_TABLE_URL = "http://127.0.0.1:8100/table"
 
 def classify_input(path):
     ext = Path(path).suffix.lower()
@@ -58,6 +59,12 @@ def ocr_via_paddle(image_path):
     r.raise_for_status()
     return r.json()["text"]
 
+def tables_via_paddle(image_path):
+    abs_path = str(Path(image_path).resolve())
+    r = requests.post(PADDLE_TABLE_URL, json={"image_path": abs_path}, timeout=120)
+    r.raise_for_status()
+    return r.json()["tables"]
+
 def route_and_parse(path, tmp_dir="./output/router_tmp"):
     kind = classify_input(path)
     print("[ROUTER] Girdi:", path, "-> tip:", kind)
@@ -70,6 +77,13 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
         print("[ROUTER] Goruntu yolu -> PaddleOCR servisi")
         text = ocr_via_paddle(path)
         results.append(("image:ocr", ("text", text)))
+        try:
+            tables = tables_via_paddle(path)
+            if tables:
+                results.append(("image:tables", ("tables", tables)))
+                print("  ", len(tables), "tablo bulundu")
+        except Exception as e:
+            print("  tablo tespiti -> HATA:", str(e)[:80])
 
     elif kind == "pdf":
         page_types = analyze_pdf_pages(path)
@@ -91,6 +105,13 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
                     render_page_to_image(path, idx, tmp_img)
                     text = ocr_via_paddle(tmp_img)
                     results.append(("page" + str(page_no) + ":scanned", ("text", text)))
+                    try:
+                        tables = tables_via_paddle(tmp_img)
+                        if tables:
+                            results.append(("page" + str(page_no) + ":tables", ("tables", tables)))
+                            print("  sayfa", page_no, ":", len(tables), "tablo bulundu")
+                    except Exception as e:
+                        print("  sayfa", page_no, ": tablo tespiti -> HATA:", str(e)[:80])
                     Path(tmp_img).unlink(missing_ok=True)
                     print("  sayfa", page_no, ": scanned -> OCR OK")
             except Exception as e:
