@@ -10,11 +10,15 @@ echo "[1/4] Creating isolated venv: gemma_env"
 python3 -m venv gemma_env
 gemma_env/bin/pip install --upgrade pip
 
-echo "[2/4] Installing PyTorch (CUDA 12.6 build)"
-gemma_env/bin/pip install torch --index-url https://download.pytorch.org/whl/cu126
+echo "[2/4] Installing PyTorch + torchvision (CUDA 12.6 build)"
+# torchvision is required even for text-only chat: transformers' Gemma4Processor
+# unconditionally imports its image_processing_gemma4 module, which imports
+# torchvision.transforms.v2 -- omitting it fails AutoProcessor.from_pretrained
+# with a misleading "Could not import module 'Gemma4Processor'" error.
+gemma_env/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 
 echo "[3/4] Installing latest Transformers (Gemma4ForConditionalGeneration needs a recent release) + service deps"
-gemma_env/bin/pip install -U transformers accelerate pillow fastapi uvicorn python-multipart huggingface_hub hf_transfer
+gemma_env/bin/pip install -U transformers accelerate pillow bitsandbytes fastapi uvicorn python-multipart huggingface_hub hf_transfer
 
 echo "[4/4] Verifying isolation (main env torch must stay intact)"
 python3 -c "import torch; print('main env torch ok:', torch.cuda.is_available())"

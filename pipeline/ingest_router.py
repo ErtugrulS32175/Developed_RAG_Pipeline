@@ -8,7 +8,13 @@ from dotenv import load_dotenv
 
 from pipeline import db
 from pipeline.router import route_and_parse
-from pipeline.table_export import table_to_markdown, save_table_xlsx, save_table_csv
+from pipeline.table_export import (
+    table_to_markdown,
+    save_table_xlsx,
+    save_table_csv,
+    save_table_json,
+    estimate_table_confidence,
+)
 from pipeline.embeddings import embed_dense, embed_sparse
 from docling.chunking import HybridChunker
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
@@ -37,8 +43,8 @@ def chunk_plain_text(text, source_tag, max_tokens=480):
         chunks.append(" ".join(current))
     return [{"type": "text", "text": c, "source_tag": source_tag, "page": 0, "headings": []} for c in chunks]
 
-def chunks_from_tables(tables, source_tag, doc_stem):
-    """Turn structured table results into RAG chunks and write xlsx/csv exports."""
+def chunks_from_tables(tables, source_tag, doc_stem, filename):
+    """Turn structured table results into RAG chunks and write xlsx/csv/json exports."""
     m = re.match(r"page(\d+)", source_tag)
     page_no = int(m.group(1)) if m else 0
 
@@ -46,20 +52,32 @@ def chunks_from_tables(tables, source_tag, doc_stem):
     tables_dir = OUTPUT_DIR / "tables"
     for i, table in enumerate(tables):
         headers, rows = table["headers"], table["rows"]
-        base_name = f"{doc_stem}_{source_tag.replace(':', '_')}_{i}"
-        save_table_xlsx(headers, rows, tables_dir / f"{base_name}.xlsx")
-        save_table_csv(headers, rows, tables_dir / f"{base_name}.csv")
+        table_id = f"{doc_stem}_{source_tag.replace(':', '_')}_{i}"
+        confidence = estimate_table_confidence(headers, rows)
+        save_table_xlsx(headers, rows, tables_dir / f"{table_id}.xlsx")
+        save_table_csv(headers, rows, tables_dir / f"{table_id}.csv")
+        save_table_json(table_id, page_no, headers, rows, confidence, tables_dir / f"{table_id}.json")
         chunks.append({
             "type": "table",
-            "text": table_to_markdown(headers, rows),
+            "text": table_to_markdown(
+                headers, rows,
+                filename=filename, page=page_no, table_id=table_id, confidence=confidence,
+            ),
             "source_tag": source_tag,
             "page": page_no,
             "headings": [],
-            "table_data": table,
+            "table_data": {
+                "table_id": table_id,
+                "page": page_no,
+                "headers": headers,
+                "rows": rows,
+                "confidence": confidence,
+            },
         })
     return chunks
 
 def main(path):
+    filename = Path(path).name
     parts = route_and_parse(path)
     print(f"\n[INGEST] {len(parts)} parca parse edildi, chunk'laniyor...")
 
@@ -85,42 +103,50 @@ def main(path):
         elif content_type == "text":
             all_chunks.extend(chunk_plain_text(content, source_tag))
         elif content_type == "tables":
-            all_chunks.extend(chunks_from_tables(content, source_tag, Path(path).stem))
+            all_chunks.extend(chunks_from_tables(content, source_tag, Path(path).stem, filename))
 
     print(f"[INGEST] Toplam {len(all_chunks)} chunk")
 
     conn = db.get_conn()
     db.init_schema(conn)
-    db.clear_chunks(conn)
-    print("[INGEST] Tablo hazir: chunks")
+    document_id = db.upsert_document(conn, filename, Path(path).suffix.lower().lstrip("."))
+    db.clear_chunks_for_document(conn, document_id)
+    print(f"[INGEST] Belge: {filename} ({document_id})")
 
-    batch = []
-    for i, c in enumerate(all_chunks):
-        if not c["text"].strip():
-            continue
-        sparse_indices, sparse_values = embed_sparse(c["text"])
-        batch.append({
-            "id": str(uuid.uuid4()),
-            "type": c["type"],
-            "text": c["text"],
-            "source_tag": c["source_tag"],
-            "page": c["page"],
-            "headings": c["headings"],
-            "table_data": c.get("table_data"),
-            "dense": embed_dense(c["text"]),
-            "sparse": db.sparse_to_literal(sparse_indices, sparse_values),
-        })
-        if len(batch) >= 32:
+    try:
+        batch = []
+        for i, c in enumerate(all_chunks):
+            if not c["text"].strip():
+                continue
+            sparse_indices, sparse_values = embed_sparse(c["text"])
+            batch.append({
+                "id": str(uuid.uuid4()),
+                "document_id": document_id,
+                "type": c["type"],
+                "text": c["text"],
+                "source_tag": c["source_tag"],
+                "page": c["page"],
+                "headings": c["headings"],
+                "table_data": c.get("table_data"),
+                "dense": embed_dense(c["text"]),
+                "sparse": db.sparse_to_literal(sparse_indices, sparse_values),
+            })
+            if len(batch) >= 32:
+                db.upsert_chunks(conn, batch)
+                batch = []
+                print(f"  {i+1}/{len(all_chunks)} yazildi...")
+        if batch:
             db.upsert_chunks(conn, batch)
-            batch = []
-            print(f"  {i+1}/{len(all_chunks)} yazildi...")
-    if batch:
-        db.upsert_chunks(conn, batch)
+    except Exception:
+        db.set_document_status(conn, document_id, "error")
+        raise
+
+    db.set_document_status(conn, document_id, "done")
 
     with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM chunks")
+        cur.execute("SELECT count(*) FROM chunks WHERE document_id = %s", (document_id,))
         count = cur.fetchone()[0]
-    print(f"\n[INGEST] Tamamlandi. Toplam vektor: {count}")
+    print(f"\n[INGEST] Tamamlandi. Bu belge icin vektor sayisi: {count}")
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "./data/sample.pdf"

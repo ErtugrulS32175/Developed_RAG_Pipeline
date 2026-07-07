@@ -5,5 +5,7 @@ output/
 __pycache__/
 *.pyc
 paddle_env/
-test_*.py
+gemma_env/
+/test_*.py
+.pytest_cache/
 .vscode/

@@ -53,9 +53,15 @@ def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict
 def build_context(chunks: list[dict]) -> str:
     parts = []
     for chunk in chunks:
-        page = chunk.get("page", "?")
         text = chunk.get("text", "")
-        parts.append(f"[Sayfa {page}]\n{text}")
+        if chunk.get("type") == "table":
+            # table_to_markdown already prepends a Belge/Sayfa/Tablo/Güven
+            # citation header, so this is already fully self-describing.
+            parts.append(text)
+        else:
+            filename = chunk.get("filename") or "?"
+            page = chunk.get("page", "?")
+            parts.append(f"[{filename} - Sayfa {page}]\n{text}")
     return "\n\n---\n\n".join(parts)
 
 

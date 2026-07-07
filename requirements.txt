@@ -11,3 +11,6 @@ python-dotenv
 requests
 vllm
 openpyxl
+fastapi
+uvicorn
+python-multipart

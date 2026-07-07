@@ -1,4 +1,5 @@
 import json
+import os
 import re
 
 from fastapi import FastAPI
@@ -8,7 +9,10 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 
 app = FastAPI()
 
-MODEL_ID = "google/gemma-4-E4B-it"
+# Configurable so the table-extraction model can be swapped independently of
+# the chat/LLM role's model (services/llm_service.py) -- they're separate
+# services on purpose, even when they happen to both be Gemma today.
+MODEL_ID = os.getenv("GEMMA_TABLE_MODEL", "google/gemma-4-E4B-it")
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype="auto", device_map="auto")
 
