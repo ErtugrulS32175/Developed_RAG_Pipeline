@@ -1,16 +1,27 @@
+import os
 import sys
 import requests
 from pathlib import Path
 import pypdfium2 as pdfium
 
+from dotenv import load_dotenv
+
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
 
+# router is imported by ingest_router before *it* calls load_dotenv(), so read
+# the env here on our own import or the URLs below would be frozen to defaults.
+load_dotenv()
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
 PDF_EXTS = {".pdf"}
-PADDLE_OCR_URL = "http://127.0.0.1:8100/ocr"
-GEMMA_TABLE_URL = "http://127.0.0.1:8101/table"
+# Overridable so paddle/gemma can be hosted off-box (RunPod, another dev's
+# machine, a container) without touching code -- see .env.example.
+PADDLE_OCR_URL = os.getenv("PADDLE_OCR_URL", "http://127.0.0.1:8100/ocr")
+GEMMA_TABLE_URL = os.getenv("GEMMA_TABLE_URL", "http://127.0.0.1:8101/table")
+# Remote services over a tunnel can be far slower than local; make it tunable.
+SERVICE_TIMEOUT = float(os.getenv("SERVICE_TIMEOUT", "120"))
 
 def classify_input(path):
     ext = Path(path).suffix.lower()
@@ -53,15 +64,36 @@ def render_page_to_image(src_path, page_idx, out_path, scale=2.0):
     img.save(out_path)
     pdf.close()
 
+def _describe_service_error(e):
+    """Turn a requests exception into a message that says *why* it failed, so a
+    down service (ConnectionError) reads differently from a model crash (500)."""
+    if isinstance(e, requests.ConnectionError):
+        return "baglanti kurulamadi (servis calisiyor mu / URL dogru mu?)"
+    if isinstance(e, requests.Timeout):
+        return "zaman asimi (SERVICE_TIMEOUT'u artirmayi dene)"
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"servis hatasi HTTP {e.response.status_code}"
+    return str(e)[:80]
+
 def ocr_via_paddle(image_path):
-    abs_path = str(Path(image_path).resolve())
-    r = requests.post(PADDLE_OCR_URL, json={"image_path": abs_path}, timeout=120)
+    # Upload the file itself, not a path -- a path is meaningless to a service
+    # on a different machine/filesystem (RunPod, container, another host).
+    with open(image_path, "rb") as f:
+        r = requests.post(
+            PADDLE_OCR_URL,
+            files={"file": (Path(image_path).name, f, "application/octet-stream")},
+            timeout=SERVICE_TIMEOUT,
+        )
     r.raise_for_status()
     return r.json()["text"]
 
 def tables_via_gemma(image_path):
-    abs_path = str(Path(image_path).resolve())
-    r = requests.post(GEMMA_TABLE_URL, json={"image_path": abs_path}, timeout=120)
+    with open(image_path, "rb") as f:
+        r = requests.post(
+            GEMMA_TABLE_URL,
+            files={"file": (Path(image_path).name, f, "application/octet-stream")},
+            timeout=SERVICE_TIMEOUT,
+        )
     r.raise_for_status()
     return r.json()["tables"]
 
@@ -83,7 +115,7 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
                 results.append(("image:tables", ("tables", tables)))
                 print("  ", len(tables), "tablo bulundu")
         except Exception as e:
-            print("  tablo tespiti -> HATA:", str(e)[:80])
+            print("  tablo tespiti -> HATA:", _describe_service_error(e))
 
     elif kind == "pdf":
         page_types = analyze_pdf_pages(path)
@@ -111,11 +143,11 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
                             results.append(("page" + str(page_no) + ":tables", ("tables", tables)))
                             print("  sayfa", page_no, ":", len(tables), "tablo bulundu")
                     except Exception as e:
-                        print("  sayfa", page_no, ": tablo tespiti -> HATA:", str(e)[:80])
+                        print("  sayfa", page_no, ": tablo tespiti -> HATA:", _describe_service_error(e))
                     Path(tmp_img).unlink(missing_ok=True)
                     print("  sayfa", page_no, ": scanned -> OCR OK")
             except Exception as e:
-                print("  sayfa", page_no, ":", ptype, "-> HATA:", str(e)[:80])
+                print("  sayfa", page_no, ":", ptype, "-> HATA:", _describe_service_error(e))
     else:
         print("[ROUTER] Desteklenmeyen tip:", path)
 

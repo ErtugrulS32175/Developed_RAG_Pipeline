@@ -1,16 +1,26 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+import os
+import tempfile
+
+from fastapi import FastAPI, File, UploadFile
 from paddleocr import PaddleOCR
 
 app = FastAPI()
 ocr = PaddleOCR(use_textline_orientation=True, lang="tr", device="gpu")
 
-class OCRRequest(BaseModel):
-    image_path: str
-
 @app.post("/ocr")
-def run_ocr(req: OCRRequest):
-    result = ocr.predict(req.image_path)
+async def run_ocr(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    # Buffer the upload to a temp file and hand PaddleOCR a path: predict() is
+    # happiest with a path and this avoids the RGB/BGR ambiguity of feeding it
+    # a raw ndarray. Accepting the file (not a path) lets router run off-box.
+    suffix = os.path.splitext(file.filename or "")[1] or ".png"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(image_bytes)
+        tmp_path = tmp.name
+    try:
+        result = ocr.predict(tmp_path)
+    finally:
+        os.unlink(tmp_path)
     lines = []
     for res in result:
         texts = res["rec_texts"]

@@ -13,7 +13,7 @@ RERANK_API_URL     = os.getenv("RERANK_API_URL", "http://localhost:8002/v1/score
 RERANK_MODEL_NAME  = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
 
 LLM_API_URL        = os.getenv("LLM_API_URL", "http://localhost:8000/v1/chat/completions")
-LLM_MODEL_NAME     = os.getenv("LLM_MODEL_NAME", "Qwen/Qwen3-14B-Instruct")
+LLM_MODEL_NAME     = os.getenv("LLM_MODEL_NAME", "google/gemma-4-12B-it")
 
 TOP_K      = 15
 TOP_RERANK = 10

@@ -1,10 +1,10 @@
+import io
 import json
 import os
 import re
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from PIL import Image
-from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoProcessor
 
 app = FastAPI()
@@ -28,10 +28,6 @@ TABLE_PROMPT = (
 )
 
 
-class ImageRequest(BaseModel):
-    image_path: str
-
-
 def _extract_table_json(text: str):
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
@@ -44,8 +40,9 @@ def _extract_table_json(text: str):
 
 
 @app.post("/table")
-def run_table(req: ImageRequest):
-    image = Image.open(req.image_path).convert("RGB")
+async def run_table(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     messages = [
         {
             "role": "user",
