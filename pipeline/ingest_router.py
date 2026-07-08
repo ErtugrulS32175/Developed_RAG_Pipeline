@@ -23,6 +23,9 @@ from transformers import AutoTokenizer
 load_dotenv()
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./output"))
+# Tables at or below this confidence, or with any validation issue, are copied
+# to output/tables/_review/ and marked needs_review so a human checks them.
+REVIEW_THRESHOLD = float(os.getenv("TABLE_REVIEW_THRESHOLD", "0.9"))
 
 hf_tok = AutoTokenizer.from_pretrained("BAAI/bge-m3")
 tokenizer = HuggingFaceTokenizer(tokenizer=hf_tok, max_tokens=512)
@@ -43,6 +46,17 @@ def chunk_plain_text(text, source_tag, max_tokens=480):
         chunks.append(" ".join(current))
     return [{"type": "text", "text": c, "source_tag": source_tag, "page": 0, "headings": []} for c in chunks]
 
+def _write_review_report(path, table_id, confidence, issues):
+    """Human-readable note dropped next to a flagged table's copy in _review/."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"Tablo: {table_id}", f"Guven: {confidence:.2f}", ""]
+    if issues:
+        lines.append("Sorunlar:")
+        lines.extend(f"  - {x}" for x in issues)
+    else:
+        lines.append("Guven esigin altinda (issue listelenmedi).")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 def chunks_from_tables(tables, source_tag, doc_stem, filename):
     """Turn structured table results into RAG chunks and write xlsx/csv/json exports."""
     m = re.match(r"page(\d+)", source_tag)
@@ -50,13 +64,27 @@ def chunks_from_tables(tables, source_tag, doc_stem, filename):
 
     chunks = []
     tables_dir = OUTPUT_DIR / "tables"
+    review_dir = tables_dir / "_review"
     for i, table in enumerate(tables):
         headers, rows = table["headers"], table["rows"]
         table_id = f"{doc_stem}_{source_tag.replace(':', '_')}_{i}"
-        confidence = estimate_table_confidence(headers, rows)
+        # router already computed confidence + issues (cross-checked against the
+        # page OCR); fall back to the shape-only proxy for tables from elsewhere.
+        confidence = table.get("confidence")
+        if confidence is None:
+            confidence = estimate_table_confidence(headers, rows)
+        issues = table.get("issues", [])
+        needs_review = confidence < REVIEW_THRESHOLD or bool(issues)
+
         save_table_xlsx(headers, rows, tables_dir / f"{table_id}.xlsx")
         save_table_csv(headers, rows, tables_dir / f"{table_id}.csv")
         save_table_json(table_id, page_no, headers, rows, confidence, tables_dir / f"{table_id}.json")
+
+        if needs_review:
+            save_table_xlsx(headers, rows, review_dir / f"{table_id}.xlsx")
+            _write_review_report(review_dir / f"{table_id}.issues.txt", table_id, confidence, issues)
+            print(f"  [REVIEW] {table_id}: guven {confidence:.2f}, {len(issues)} sorun -> {review_dir}")
+
         chunks.append({
             "type": "table",
             "text": table_to_markdown(
@@ -72,6 +100,8 @@ def chunks_from_tables(tables, source_tag, doc_stem, filename):
                 "headers": headers,
                 "rows": rows,
                 "confidence": confidence,
+                "needs_review": needs_review,
+                "issues": issues,
             },
         })
     return chunks

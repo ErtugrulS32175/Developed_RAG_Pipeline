@@ -24,6 +24,8 @@ TABLE_PROMPT = (
     "Extract every table in this image as a single JSON object of the form "
     '{"headers": [...], "rows": [[...], ...]}. '
     "Preserve every row and column exactly as shown, keep empty cells as \"\". "
+    "Preserve Turkish characters exactly (ğ Ğ ş Ş ı İ ç Ç ö Ö ü Ü); never split "
+    "a letter into a base character plus a separate accent mark. "
     "Return only the JSON, no other text."
 )
 

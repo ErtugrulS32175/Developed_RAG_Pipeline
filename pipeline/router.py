@@ -6,6 +6,9 @@ import pypdfium2 as pdfium
 
 from dotenv import load_dotenv
 
+from pipeline.text_normalize import normalize_tr
+from pipeline.table_export import validate_table
+
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
@@ -97,6 +100,16 @@ def tables_via_gemma(image_path):
     r.raise_for_status()
     return r.json()["tables"]
 
+def _finalize_table(table, ocr_text):
+    """Normalize Turkish characters in every cell, then validate the table
+    against the same page's OCR text. Attaches confidence + issues so ingest
+    can route low-confidence tables to human review. Corrects mechanically but
+    only *flags* content problems -- nothing is dropped."""
+    headers = [normalize_tr(h) for h in table.get("headers", [])]
+    rows = [[normalize_tr(c) for c in row] for row in table.get("rows", [])]
+    confidence, issues = validate_table(headers, rows, ocr_text=ocr_text)
+    return {"headers": headers, "rows": rows, "confidence": confidence, "issues": issues}
+
 def route_and_parse(path, tmp_dir="./output/router_tmp"):
     kind = classify_input(path)
     print("[ROUTER] Girdi:", path, "-> tip:", kind)
@@ -107,10 +120,10 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
 
     if kind == "image":
         print("[ROUTER] Goruntu yolu -> PaddleOCR servisi")
-        text = ocr_via_paddle(path)
+        text = normalize_tr(ocr_via_paddle(path))
         results.append(("image:ocr", ("text", text)))
         try:
-            tables = tables_via_gemma(path)
+            tables = [_finalize_table(t, text) for t in tables_via_gemma(path)]
             if tables:
                 results.append(("image:tables", ("tables", tables)))
                 print("  ", len(tables), "tablo bulundu")
@@ -135,10 +148,10 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
                 else:
                     tmp_img = tmp_dir + "/page_" + str(page_no) + ".png"
                     render_page_to_image(path, idx, tmp_img)
-                    text = ocr_via_paddle(tmp_img)
+                    text = normalize_tr(ocr_via_paddle(tmp_img))
                     results.append(("page" + str(page_no) + ":scanned", ("text", text)))
                     try:
-                        tables = tables_via_gemma(tmp_img)
+                        tables = [_finalize_table(t, text) for t in tables_via_gemma(tmp_img)]
                         if tables:
                             results.append(("page" + str(page_no) + ":tables", ("tables", tables)))
                             print("  sayfa", page_no, ":", len(tables), "tablo bulundu")
