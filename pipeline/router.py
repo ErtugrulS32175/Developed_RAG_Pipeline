@@ -7,7 +7,7 @@ import pypdfium2 as pdfium
 from dotenv import load_dotenv
 
 from pipeline.text_normalize import normalize_tr
-from pipeline.table_export import validate_table
+from pipeline.table_export import validate_table, parse_table_json
 
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
@@ -98,7 +98,15 @@ def tables_via_gemma(image_path):
             timeout=SERVICE_TIMEOUT,
         )
     r.raise_for_status()
-    return r.json()["tables"]
+    data = r.json()
+    # Parse the raw model text client-side (robust to VLM JSON quirks like fenced
+    # output and botched trailing brackets) so parser fixes never require a
+    # redeploy of the GPU table service. Fall back to the service's own parse
+    # for older services that don't return "raw".
+    raw = data.get("raw")
+    if raw is not None:
+        return [parse_table_json(raw)]
+    return data.get("tables", [])
 
 def _finalize_table(table, ocr_text):
     """Normalize Turkish characters in every cell, then validate the table

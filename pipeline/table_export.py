@@ -8,6 +8,82 @@ from openpyxl import Workbook
 from pipeline.text_normalize import has_residual_marks
 
 
+def _extract_balanced(text, start):
+    """Return the balanced bracket substring starting at text[start] (a '[' or
+    '{'), string-aware so brackets inside quoted values don't count."""
+    open_ch = text[start]
+    close_ch = "]" if open_ch == "[" else "}"
+    depth = 0
+    in_str = esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def parse_table_json(raw):
+    """Parse a VLM's table output into {headers, rows}, tolerant of the mess
+    VLMs produce: ``` fences and botched trailing brackets (e.g. ']}]' instead
+    of ']]}') that make a strict json.loads return nothing. Strategy: strip
+    fences, try strict parse, else pull the headers array and each row array
+    out individually, skipping stray braces. Lives client-side on purpose so
+    parser fixes don't need a redeploy of the GPU table service."""
+    if not raw:
+        return {"headers": [], "rows": []}
+    text = re.sub(r"```$", "", re.sub(r"^```(?:json)?", "", raw.strip())).strip()
+
+    try:
+        data = json.loads(text)
+        return {"headers": data.get("headers", []), "rows": data.get("rows", [])}
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    headers = []
+    hm = re.search(r'"headers"\s*:\s*\[', text)
+    if hm:
+        h = _extract_balanced(text, hm.end() - 1)
+        if h:
+            try:
+                headers = json.loads(h)
+            except json.JSONDecodeError:
+                headers = []
+
+    rows = []
+    rm = re.search(r'"rows"\s*:\s*\[', text)
+    if rm:
+        i, depth = rm.end(), 1
+        while i < len(text) and depth > 0:
+            c = text[i]
+            if c == "[":
+                row = _extract_balanced(text, i)
+                if row is None:
+                    break
+                try:
+                    rows.append(json.loads(row))
+                except json.JSONDecodeError:
+                    pass
+                i += len(row)
+                continue
+            if c == "]":
+                depth -= 1
+            i += 1
+    return {"headers": headers, "rows": rows}
+
+
 def _squash(s) -> str:
     """Lowercase and strip whitespace/punctuation for tolerant matching, so
     formatting differences (e.g. 1.000,50 vs 1000.50, spacing) don't trigger
