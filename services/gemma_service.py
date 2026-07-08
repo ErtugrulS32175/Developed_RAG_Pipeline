@@ -59,11 +59,16 @@ async def run_table(file: UploadFile = File(...)):
     )
     inputs = processor(text=text, images=image, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[-1]
-    outputs = model.generate(
-        **inputs, max_new_tokens=2048, do_sample=True, temperature=1.0, top_p=0.95, top_k=64
-    )
+    # Greedy + higher token budget: table extraction is a structured task, not
+    # creative chat -- sampling (temp 1.0) invites malformed JSON, and a 20-row
+    # table can exceed 2048 tokens and get truncated (empty parse).
+    outputs = model.generate(**inputs, max_new_tokens=4096, do_sample=False)
     response = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
-    return {"tables": [_extract_table_json(response)]}
+    # TEMP DEBUG: surface the raw model text so we can diagnose empty parses.
+    # Prints to the RunPod service log AND returns under "raw"; remove once the
+    # extraction is confirmed working.
+    print("[GEMMA RAW]", repr(response[:3000]), flush=True)
+    return {"tables": [_extract_table_json(response)], "raw": response}
 
 
 @app.get("/health")
