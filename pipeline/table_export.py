@@ -84,11 +84,23 @@ def parse_table_json(raw):
     return {"headers": headers, "rows": rows}
 
 
+# Fold Turkish letters to an ASCII base so the OCR cross-check tolerates the
+# expected ı/i, ş/s, ğ/g ... disagreement between two OCR engines: text cells
+# come from EasyOCR-tr ("Yıldız") but the page cross-check text comes from the
+# latin PaddleOCR recognizer ("Yildiz"). Without this, correct Turkish names get
+# falsely flagged as hallucination candidates.
+_TR_FOLD = str.maketrans({
+    "ı": "i", "İ": "i", "I": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g",
+    "ç": "c", "Ç": "c", "ö": "o", "Ö": "o", "ü": "u", "Ü": "u",
+})
+
+
 def _squash(s) -> str:
-    """Lowercase and strip whitespace/punctuation for tolerant matching, so
-    formatting differences (e.g. 1.000,50 vs 1000.50, spacing) don't trigger
-    false hallucination flags in the OCR cross-check."""
-    return re.sub(r"[\s\W_]+", "", str(s).lower())
+    """Lowercase, fold Turkish diacritics, and strip whitespace/punctuation for
+    tolerant matching, so neither formatting differences (1.000,50 vs 1000.50,
+    spacing) nor cross-engine Turkish-char disagreement trigger false
+    hallucination flags in the OCR cross-check."""
+    return re.sub(r"[\s\W_]+", "", str(s).translate(_TR_FOLD).lower())
 
 
 def validate_table(headers, rows, ocr_text=None):
