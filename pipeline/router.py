@@ -23,6 +23,10 @@ PDF_EXTS = {".pdf"}
 # machine, a container) without touching code -- see .env.example.
 PADDLE_OCR_URL = os.getenv("PADDLE_OCR_URL", "http://127.0.0.1:8100/ocr")
 GEMMA_TABLE_URL = os.getenv("GEMMA_TABLE_URL", "http://127.0.0.1:8101/table")
+TATR_TABLE_URL = os.getenv("TATR_TABLE_URL", "http://127.0.0.1:8102/table")
+# Which table engine to use: "tatr" = deterministic TATR+OCR (no hallucination,
+# best for financial tables), "gemma" = VLM. Default tatr.
+TABLE_BACKEND = os.getenv("TABLE_BACKEND", "tatr").lower()
 # Remote services over a tunnel can be far slower than local; make it tunable.
 SERVICE_TIMEOUT = float(os.getenv("SERVICE_TIMEOUT", "120"))
 
@@ -108,6 +112,25 @@ def tables_via_gemma(image_path):
         return [parse_table_json(raw)]
     return data.get("tables", [])
 
+def tables_via_tatr(image_path):
+    """Deterministic backend: TATR detects + crops the table, paddle_service OCRs
+    it, and tatr_service rebuilds the grid. Returns [{headers, rows}] already
+    structured (no client-side JSON parsing needed, unlike the VLM path)."""
+    with open(image_path, "rb") as f:
+        r = requests.post(
+            TATR_TABLE_URL,
+            files={"file": (Path(image_path).name, f, "application/octet-stream")},
+            timeout=SERVICE_TIMEOUT,
+        )
+    r.raise_for_status()
+    return r.json().get("tables", [])
+
+def tables_from_image(image_path):
+    """Dispatch to the configured table backend (TABLE_BACKEND)."""
+    if TABLE_BACKEND == "gemma":
+        return tables_via_gemma(image_path)
+    return tables_via_tatr(image_path)
+
 def _finalize_table(table, ocr_text):
     """Normalize Turkish characters in every cell, then validate the table
     against the same page's OCR text. Attaches confidence + issues so ingest
@@ -131,7 +154,7 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
         text = normalize_tr(ocr_via_paddle(path))
         results.append(("image:ocr", ("text", text)))
         try:
-            tables = [_finalize_table(t, text) for t in tables_via_gemma(path)]
+            tables = [_finalize_table(t, text) for t in tables_from_image(path)]
             if tables:
                 results.append(("image:tables", ("tables", tables)))
                 print("  ", len(tables), "tablo bulundu")
@@ -159,7 +182,7 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
                     text = normalize_tr(ocr_via_paddle(tmp_img))
                     results.append(("page" + str(page_no) + ":scanned", ("text", text)))
                     try:
-                        tables = [_finalize_table(t, text) for t in tables_via_gemma(tmp_img)]
+                        tables = [_finalize_table(t, text) for t in tables_from_image(tmp_img)]
                         if tables:
                             results.append(("page" + str(page_no) + ":tables", ("tables", tables)))
                             print("  sayfa", page_no, ":", len(tables), "tablo bulundu")

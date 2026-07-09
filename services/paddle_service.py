@@ -25,11 +25,20 @@ async def run_ocr(file: UploadFile = File(...)):
     for res in result:
         texts = res["rec_texts"]
         scores = res.get("rec_scores", [None] * len(texts))
-        for text, score in zip(texts, scores):
-            lines.append({"text": text, "confidence": score})
+        # Polygons give each line's pixel box; the TATR table path needs these to
+        # assign words to columns and cluster them into rows. Fall back to None
+        # when a detector variant doesn't return polygons.
+        polys = res.get("rec_polys", res.get("dt_polys")) or [None] * len(texts)
+        for text, score, poly in zip(texts, scores, polys):
+            box = None
+            if poly is not None:
+                xs = [float(pt[0]) for pt in poly]
+                ys = [float(pt[1]) for pt in poly]
+                box = [min(xs), min(ys), max(xs), max(ys)]
+            lines.append({"text": text, "confidence": score, "box": box})
     # "text" kept as a single joined string for backward compatibility with
-    # router.ocr_via_paddle; "lines" carries the per-line confidence
-    # PaddleOCR already computes, previously discarded here.
+    # router.ocr_via_paddle; "lines" carries the per-line confidence + box
+    # (previously discarded here).
     return {
         "text": "\n".join(line["text"] for line in lines),
         "lines": lines,
