@@ -16,10 +16,10 @@ echo "[2/5] Installing PyTorch (CUDA 12.4 build)"
 tatr_env/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 echo "[3/5] Installing TATR + text deps"
-# transformers>=5 for TableTransformer config; timm for the DETR backbone;
-# pymupdf (fitz.Rect) for the vendored TATR post-processing geometry; easyocr
-# for Turkish text cells (reads ı/İ/ş/ğ/ç/ö/ü correctly, no master list needed).
-tatr_env/bin/pip install "transformers>=5.0.0" timm pymupdf easyocr huggingface_hub pillow numpy
+# transformers>=5 for TableTransformer config; timm for the DETR backbone; opencv
+# for the image-preprocessing layer; easyocr for Turkish text cells (reads
+# ı/İ/ş/ğ/ç/ö/ü correctly, no master list needed).
+tatr_env/bin/pip install "transformers>=5.0.0" timm opencv-python easyocr huggingface_hub pillow numpy
 
 echo "[4/5] Installing service deps"
 tatr_env/bin/pip install fastapi uvicorn python-multipart requests

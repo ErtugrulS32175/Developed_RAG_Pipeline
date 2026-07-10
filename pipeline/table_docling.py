@@ -88,16 +88,21 @@ def correct(crop, headers, rows, word_boxes, *, text_cols=(1,), fix_headers=True
         return headers, rows, ["sutun geometrisi cikarilamadi (yetersiz OCR kutusu)"]
 
     flags = []
+    # Granite's column count and the PaddleOCR-derived band count can disagree on
+    # dense/ragged tables; only touch cells that exist in both (never crash).
     if fix_headers:
         hy = _header_y_range(word_boxes)
         if hy is not None:
             for i, val in enumerate(_read_header_row(crop, bands, hy)):
-                if val:
+                if val and i < len(headers):
                     headers[i] = val
 
     ndata = len(rows)
     for ci in text_cols:
         if ci >= len(bands):
+            continue
+        if bands[ci][1] - bands[ci][0] < 6:  # masked/empty column -> no text to read
+            flags.append(f"sutun {ci}: bant cok dar/bos, EasyOCR atlandi")
             continue
         col = {"bbox": [bands[ci][0], 0, bands[ci][1], 0]}
         trows = [(cy, t) for cy, t in tt._read_text_column(crop, col, 0, crop.height) if t]
@@ -105,7 +110,8 @@ def correct(crop, headers, rows, word_boxes, *, text_cols=(1,), fix_headers=True
             trows = trows[1:]
         if len(trows) == ndata:
             for j, (_, t) in enumerate(trows):
-                rows[j][ci] = t
+                if ci < len(rows[j]):
+                    rows[j][ci] = t
         else:
             flags.append(f"sutun {ci}: {len(trows)} metin satiri != {ndata} veri satiri, atlandi")
 
@@ -115,6 +121,8 @@ def correct(crop, headers, rows, word_boxes, *, text_cols=(1,), fix_headers=True
             if ci >= ncol:
                 continue
             for r, row in enumerate(rows):
+                if ci >= len(row):
+                    continue
                 corrected, matched = mm.correct_value(row[ci], index)
                 row[ci] = corrected
                 if not matched:

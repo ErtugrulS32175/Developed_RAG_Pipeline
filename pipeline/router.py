@@ -22,13 +22,28 @@ PDF_EXTS = {".pdf"}
 # Overridable so paddle/gemma can be hosted off-box (RunPod, another dev's
 # machine, a container) without touching code -- see .env.example.
 PADDLE_OCR_URL = os.getenv("PADDLE_OCR_URL", "http://127.0.0.1:8100/ocr")
-GEMMA_TABLE_URL = os.getenv("GEMMA_TABLE_URL", "http://127.0.0.1:8101/table")
-TATR_TABLE_URL = os.getenv("TATR_TABLE_URL", "http://127.0.0.1:8102/table")
-# Which table engine to use: "tatr" = deterministic TATR+OCR (no hallucination,
-# best for financial tables), "gemma" = VLM. Default tatr.
-TABLE_BACKEND = os.getenv("TABLE_BACKEND", "tatr").lower()
 # Remote services over a tunnel can be far slower than local; make it tunable.
 SERVICE_TIMEOUT = float(os.getenv("SERVICE_TIMEOUT", "120"))
+
+# --- Pluggable table backends -------------------------------------------------
+# Each backend is a microservice with the same contract: POST an image file ->
+# JSON {"tables": [{"headers", "rows"}], ...}. VLM backends that emit raw model
+# text set needs_raw=True so we parse it client-side (parser fixes never need a
+# GPU-service redeploy). Point each URL wherever the service runs -- local or a
+# RunPod/H200 tunnel -- and switch engines with TABLE_BACKEND; no code change.
+#   tatr         = deterministic TATR + OCR (no hallucination, frugal, flat tables)
+#   docling      = Granite-Docling VLM + EasyOCR
+#   gemma        = Gemma-4 VLM
+#   paddleocr_vl = PaddleOCR-VL 0.9B doc-parsing VLM (Turkish-proven)
+#   hunyuan      = HunyuanOCR-1.5 1B OCR VLM
+TABLE_BACKENDS = {
+    "tatr":         (os.getenv("TATR_TABLE_URL",    "http://127.0.0.1:8102/table"),    False),
+    "docling":      (os.getenv("DOCLING_TABLE_URL", "http://127.0.0.1:8103/table_tr"), False),
+    "gemma":        (os.getenv("GEMMA_TABLE_URL",   "http://127.0.0.1:8101/table"),    True),
+    "paddleocr_vl": (os.getenv("PADDLEOCR_VL_URL",  "http://127.0.0.1:8104/table"),    False),
+    "hunyuan":      (os.getenv("HUNYUAN_TABLE_URL", "http://127.0.0.1:8105/table"),    False),
+}
+TABLE_BACKEND = os.getenv("TABLE_BACKEND", "tatr").lower()
 
 def classify_input(path):
     ext = Path(path).suffix.lower()
@@ -94,42 +109,29 @@ def ocr_via_paddle(image_path):
     r.raise_for_status()
     return r.json()["text"]
 
-def tables_via_gemma(image_path):
+def _post_image(url, image_path):
     with open(image_path, "rb") as f:
         r = requests.post(
-            GEMMA_TABLE_URL,
+            url,
             files={"file": (Path(image_path).name, f, "application/octet-stream")},
             timeout=SERVICE_TIMEOUT,
         )
     r.raise_for_status()
-    data = r.json()
-    # Parse the raw model text client-side (robust to VLM JSON quirks like fenced
-    # output and botched trailing brackets) so parser fixes never require a
-    # redeploy of the GPU table service. Fall back to the service's own parse
-    # for older services that don't return "raw".
-    raw = data.get("raw")
-    if raw is not None:
-        return [parse_table_json(raw)]
+    return r.json()
+
+def tables_from_image(image_path, backend=None):
+    """Dispatch to a pluggable table backend (TABLE_BACKENDS). Backends that emit
+    raw model text are parsed client-side. Every backend returns the same shape:
+    a list of {headers, rows}. Swap engines via TABLE_BACKEND or the `backend`
+    arg -- the rest of the pipeline (verify/validate/export) is backend-agnostic."""
+    backend = (backend or TABLE_BACKEND).lower()
+    if backend not in TABLE_BACKENDS:
+        raise ValueError(f"bilinmeyen TABLE_BACKEND '{backend}' (secenekler: {list(TABLE_BACKENDS)})")
+    url, needs_raw = TABLE_BACKENDS[backend]
+    data = _post_image(url, image_path)
+    if needs_raw and data.get("raw") is not None:
+        return [parse_table_json(data["raw"])]
     return data.get("tables", [])
-
-def tables_via_tatr(image_path):
-    """Deterministic backend: TATR detects + crops the table, paddle_service OCRs
-    it, and tatr_service rebuilds the grid. Returns [{headers, rows}] already
-    structured (no client-side JSON parsing needed, unlike the VLM path)."""
-    with open(image_path, "rb") as f:
-        r = requests.post(
-            TATR_TABLE_URL,
-            files={"file": (Path(image_path).name, f, "application/octet-stream")},
-            timeout=SERVICE_TIMEOUT,
-        )
-    r.raise_for_status()
-    return r.json().get("tables", [])
-
-def tables_from_image(image_path):
-    """Dispatch to the configured table backend (TABLE_BACKEND)."""
-    if TABLE_BACKEND == "gemma":
-        return tables_via_gemma(image_path)
-    return tables_via_tatr(image_path)
 
 def _finalize_table(table, ocr_text):
     """Normalize Turkish characters in every cell, then validate the table

@@ -23,6 +23,7 @@ from fastapi import FastAPI, File, UploadFile
 from PIL import Image
 
 from pipeline import table_docling as td
+from pipeline import image_preprocess as ip
 
 app = FastAPI()
 
@@ -37,6 +38,8 @@ PADDLE_TIMEOUT = float(os.getenv("SERVICE_TIMEOUT", "120"))
 TEXT_COLS = tuple(int(c) for c in os.getenv("DOCLING_TEXT_COLS", "1").split(",") if c.strip() != "")
 # Optional master list (one name per line): snaps text columns to canonical
 # spellings and flags unknowns for review. Off unless DOCLING_MASTER_FILE is set.
+# OCR image-enhancement layer (deskew + denoise + CLAHE + 2x upscale). Default on.
+PREPROCESS = os.getenv("PREPROCESS", "1").lower() not in ("0", "false", "no")
 _MASTER_FILE = os.getenv("DOCLING_MASTER_FILE")
 MASTER_NAMES = None
 if _MASTER_FILE and os.path.exists(_MASTER_FILE):
@@ -125,6 +128,8 @@ def _split_header(headers, rows):
 @app.post("/docling")
 async def run_docling(file: UploadFile = File(...)):
     image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    if PREPROCESS:
+        image = ip.enhance(image)
     doctags, gen_tokens, elapsed = _generate(image)
     doc = _doctags_to_doc(doctags, image)
     markdown = doc.export_to_markdown() if doc is not None else None
@@ -146,6 +151,8 @@ async def table_tr(file: UploadFile = File(...)):
     (column geometry from paddle_service). Returns {headers, rows} like the other
     table backends. Independent of the router pipeline -- inspect it directly."""
     image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    if PREPROCESS:
+        image = ip.enhance(image)
     doctags, gen_tokens, elapsed = _generate(image)
     doc = _doctags_to_doc(doctags, image)
     tables = _tables_from_doc(doc) if doc is not None else []

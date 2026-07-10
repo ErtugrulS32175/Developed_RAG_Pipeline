@@ -1,11 +1,63 @@
 import csv
 import json
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 from openpyxl import Workbook
 
 from pipeline.text_normalize import has_residual_marks
+
+
+class _HTMLTableExtractor(HTMLParser):
+    """Pull <table>s out of a VLM's markdown/HTML output into rows of cell text.
+    Tolerant of the messy HTML doc-parsing VLMs (PaddleOCR-VL, HunyuanOCR) emit:
+    ignores unknown tags, treats <th>/<td> as cells, <tr> as rows. Cell spans
+    (colspan/rowspan) are NOT expanded -- flagged upstream as a structure issue."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables, self._rows, self._cell = [], None, None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._rows = []
+        elif tag == "tr" and self._rows is not None:
+            self._rows.append([])
+        elif tag in ("td", "th") and self._rows:
+            self._cell = []
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None:
+            self._rows[-1].append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "table" and self._rows is not None:
+            if any(self._rows):
+                self.tables.append([r for r in self._rows if r])
+            self._rows = None
+
+
+def parse_html_tables(text):
+    """VLM markdown/HTML -> [{headers, rows}]. First row becomes the header, the
+    rest are data (VLMs put column labels in the first <tr>). Returns [] if no
+    <table> is present."""
+    p = _HTMLTableExtractor()
+    try:
+        p.feed(text or "")
+    except Exception:
+        pass
+    out = []
+    for grid in p.tables:
+        if not grid:
+            continue
+        headers = grid[0]
+        rows = grid[1:] if len(grid) > 1 else []
+        out.append({"headers": headers, "rows": rows})
+    return out
 
 
 def _extract_balanced(text, start):

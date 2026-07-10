@@ -19,11 +19,16 @@ from fastapi import FastAPI, File, UploadFile
 from PIL import Image
 
 from pipeline import table_tatr as tt
+from pipeline import image_preprocess as ip
 
 app = FastAPI()
 
 PADDLE_OCR_URL = os.getenv("PADDLE_OCR_URL", "http://127.0.0.1:8100/ocr")
 PADDLE_TIMEOUT = float(os.getenv("SERVICE_TIMEOUT", "120"))
+# OCR image-enhancement layer (deskew + denoise + CLAHE + 2x upscale). Helps
+# hard scans (low-contrast/shaded/dense) without regressing clean ones, and is
+# safe for TATR detection (hard binarization is NOT -- kept off). Default on.
+PREPROCESS = os.getenv("PREPROCESS", "1").lower() not in ("0", "false", "no")
 # Columns whose data cells are read by EasyOCR-tr (names / Turkish text) rather
 # than PaddleOCR. Default: column 1 (customer name). Comma-separated indices.
 TEXT_COLS = tuple(int(c) for c in os.getenv("TATR_TEXT_COLS", "1").split(",") if c.strip() != "")
@@ -46,6 +51,8 @@ def _paddle_boxes(crop):
 @app.post("/table")
 async def extract_table(file: UploadFile = File(...)):
     image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    if PREPROCESS:
+        image = ip.enhance(image)
     crop, box = tt.detect_and_crop(image)
     if crop is None:
         return {"tables": [], "detected": False}

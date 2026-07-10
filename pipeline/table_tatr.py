@@ -24,9 +24,38 @@ from huggingface_hub import hf_hub_download
 from transformers import (AutoImageProcessor, TableTransformerForObjectDetection,
                           TableTransformerConfig)
 
-from pipeline import tatr_extract as te
 from pipeline import master_match as mm
 from pipeline.text_normalize import normalize_tr
+
+
+# --- DETR output -> objects (vendored from microsoft/table-transformer, MIT) ---
+def _box_cxcywh_to_xyxy(x):
+    x_c, y_c, w, h = x.unbind(-1)
+    b = [(x_c - 0.5 * w), (y_c - 0.5 * h), (x_c + 0.5 * w), (y_c + 0.5 * h)]
+    return torch.stack(b, dim=1)
+
+
+def _rescale_bboxes(out_bbox, size):
+    img_w, img_h = size
+    b = _box_cxcywh_to_xyxy(out_bbox) * torch.tensor([img_w, img_h, img_w, img_h],
+                                                     dtype=torch.float32)
+    return b
+
+
+def outputs_to_objects(outputs, img_size, class_idx2name):
+    """TATR raw logits/boxes -> [{label, score, bbox}] in pixel coords."""
+    m = outputs["pred_logits"].softmax(-1).max(-1)
+    labels = list(m.indices.detach().cpu().numpy())[0]
+    scores = list(m.values.detach().cpu().numpy())[0]
+    boxes = [elem.tolist() for elem in _rescale_bboxes(outputs["pred_boxes"].detach().cpu()[0], img_size)]
+    objects = []
+    for label, score, bbox in zip(labels, scores, boxes):
+        name = class_idx2name[int(label)]
+        if name != "no object":
+            objects.append({"label": name, "score": float(score),
+                            "bbox": [float(e) for e in bbox]})
+    return objects
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DET_REPO = "microsoft/table-transformer-detection"
@@ -91,7 +120,7 @@ def _structure(table_img):
     proc, model = _model(STRUCT_REPO)
     with torch.no_grad():
         sout = model(**proc(images=table_img, return_tensors="pt", size=STRUCT_SIZE).to(DEVICE))
-    objects = te.outputs_to_objects(
+    objects = outputs_to_objects(
         {"pred_logits": sout.logits, "pred_boxes": sout.pred_boxes}, table_img.size, ID2NAME)
     cols = sorted([o for o in objects if o["label"] == "table column" and o["score"] >= 0.5],
                   key=lambda o: o["bbox"][0])
@@ -128,6 +157,8 @@ def _read_text_column(table_img, col, y0, y1, inset=2, scale=2, row_gap=22):
     clustering detections on y. Returns [(y_center_in_crop, text), ...]."""
     nx0 = col["bbox"][0] + inset
     nx1 = col["bbox"][2] - inset
+    if nx1 - nx0 < 2:  # degenerate/empty column strip -> nothing to read
+        return []
     ny0 = max(0, int(y0 - 3)); ny1 = min(table_img.height, int(y1 + 3))
     strip = table_img.crop((nx0, ny0, nx1, ny1))
     strip = strip.resize((strip.width * scale, strip.height * scale), Image.LANCZOS)
@@ -246,8 +277,3 @@ def assemble(table_img, ocr_words, *, text_cols=(1,), master_names=None, row_gap
                     flags.append(f"satir {r + 1} sutun {ci}: master listede yok ({corrected!r})")
 
     return {"headers": headers, "rows": rows, "flags": flags}
-
-
-def extract_from_crop(table_img, ocr_words, **kw):
-    """Convenience: assemble from an already-detected crop + its word boxes."""
-    return assemble(table_img, ocr_words, **kw)
