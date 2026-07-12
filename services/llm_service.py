@@ -12,7 +12,7 @@ app = FastAPI()
 # Kept independent from services/gemma_service.py (the table/image-extraction
 # role) on purpose: LLM_SERVICE_MODEL can be swapped to a different model
 # later without touching the table-extraction service, and vice versa.
-MODEL_ID = os.getenv("LLM_SERVICE_MODEL", "google/gemma-4-E2B-it")
+MODEL_ID = os.getenv("LLM_SERVICE_MODEL", "google/gemma-4-E4B-it")
 
 # device_map="auto" + 4-bit was tried first: accelerate's planner sizes the
 # offload plan off the *unquantized* footprint, decided some modules (Gemma
