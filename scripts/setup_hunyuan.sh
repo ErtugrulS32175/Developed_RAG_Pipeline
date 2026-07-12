@@ -19,7 +19,7 @@ hunyuan_env/bin/pip install torch torchvision --index-url https://download.pytor
 
 echo "[3/4] Installing Transformers (>=5.13 for HunYuanVLForConditionalGeneration) + service deps"
 hunyuan_env/bin/pip install -U "transformers>=5.13" accelerate pillow \
-  fastapi uvicorn python-multipart huggingface_hub hf_transfer
+  openpyxl fastapi uvicorn python-multipart huggingface_hub hf_transfer
 
 echo "[4/4] Verifying isolation + import"
 python3 -c "import torch; print('main env torch ok:', torch.cuda.is_available())" || true
