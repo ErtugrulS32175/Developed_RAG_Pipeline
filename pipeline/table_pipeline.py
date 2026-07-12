@@ -34,11 +34,17 @@ from pipeline.text_normalize import normalize_tr
 from pipeline.table_export import validate_table
 
 REVIEW_THRESHOLD = float(os.getenv("TABLE_REVIEW_THRESHOLD", "0.9"))
-# Preprocessing profile per backend: the deterministic engine (small models) needs
-# the deskew+contrast+2x-upscale to resolve dense/faint cells; VLM backends handle
-# resolution internally and an upscaled image can HURT them (Granite misclassifies
-# a large table as a picture -> empty). So VLMs get the raw image by default.
+# Preprocessing profile per backend: the deterministic engine (small models) gets
+# deskew+contrast to resolve faint/skewed cells; VLM backends handle resolution
+# internally and an enhanced image can HURT them (Granite misclassifies a large
+# table as a picture -> empty), so VLMs get the raw image by default.
 _DETERMINISTIC = {"tatr"}
+# Upscale is OFF by default (scale=1.0): it breaks TATR structure detection --
+# even 1.25x merges sample1's narrow first column into the second (cell_acc
+# accuracy drops). Upscale was only ever needed to spread rows for the
+# y-clustering step on tiny/dense scans, NOT for TATR; set PREPROCESS_SCALE>1
+# there. deskew+denoise+CLAHE stay on (geometry-safe, lift faint text).
+PREPROCESS_SCALE = float(os.getenv("PREPROCESS_SCALE", "1.0"))
 
 
 def _finalize(table, ocr_text, backend, review_threshold):
@@ -80,7 +86,7 @@ def run(image_path, backend=None, preprocess=None, review_threshold=REVIEW_THRES
     work = image_path
     tmp = None
     if preprocess:
-        enhanced = ip.enhance(Image.open(image_path).convert("RGB"))
+        enhanced = ip.enhance(Image.open(image_path).convert("RGB"), scale=PREPROCESS_SCALE)
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         tmp.close()
         enhanced.save(tmp.name)
