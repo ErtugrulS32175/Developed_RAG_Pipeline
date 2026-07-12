@@ -39,7 +39,7 @@ SERVICE_TIMEOUT = float(os.getenv("SERVICE_TIMEOUT", "120"))
 TABLE_BACKENDS = {
     "tatr":         (os.getenv("TATR_TABLE_URL",    "http://127.0.0.1:8102/table"),    False),
     "docling":      (os.getenv("DOCLING_TABLE_URL", "http://127.0.0.1:8103/table_tr"), False),
-    "gemma":        (os.getenv("GEMMA_TABLE_URL",   "http://127.0.0.1:8101/table"),    True),
+    "gemma":        (os.getenv("GEMMA_TABLE_URL",   "http://127.0.0.1:8101/table"),    False),
     "paddleocr_vl": (os.getenv("PADDLEOCR_VL_URL",  "http://127.0.0.1:8104/table"),    False),
     "hunyuan":      (os.getenv("HUNYUAN_TABLE_URL", "http://127.0.0.1:8105/table"),    False),
 }

@@ -1,11 +1,12 @@
 #!/bin/bash
-# vLLM setup for the FAST A/B path: PaddleOCR-VL + HunyuanOCR served through
-# vLLM's OpenAI API (batched attention/paged KV -> same greedy output as the
-# transformers wrappers, far faster). Consumed by services/vllm_table_service.py.
+# vLLM setup for the FAST path: ALL VLM backends (gemma-4-E4B, PaddleOCR-VL,
+# HunyuanOCR) served through vLLM's OpenAI API (batched attention/paged KV ->
+# same greedy output as the transformers wrappers, far faster). Consumed by
+# services/vllm_table_service.py.
 #
 # Two constraints drive the choices below:
 #  * PaddleOCR-VL needs a vLLM NIGHTLY (until 0.11.1 releases); nightly also
-#    serves HunyuanOCR, so one env covers both.
+#    serves HunyuanOCR and gemma-4, so one env covers all three.
 #  * vLLM + torch is big and the container disk (/) is nearly full, so the env
 #    lives on the /workspace volume (huge, network-backed).
 # Run from repo root on the pod, after the other setup scripts.
