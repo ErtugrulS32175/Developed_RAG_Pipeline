@@ -42,5 +42,6 @@ VLLM_BASE_URL="http://127.0.0.1:8113/v1" VLLM_MODEL="$MODEL" PYTHONPATH="$REPO" 
 sleep 6
 printf "Health :8101 -> "; curl -s "localhost:8101/health"; echo
 echo
-echo "Done. Locally: tunnel 8201->8101 and run:"
-echo "  GEMMA_TABLE_URL=http://127.0.0.1:8201/table python -m eval.run_eval --backends gemma --images sample1"
+echo "Done. Score everything ON THIS POD (no tunnel, no paddle) with:"
+echo "  gemma_env/bin/python -m eval.pod_eval"
+echo "Then copy output/eval/pod_results.json off the pod (raw outputs included)."
