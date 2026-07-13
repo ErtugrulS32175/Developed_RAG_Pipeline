@@ -17,7 +17,7 @@ pip install -q uv
 uv venv /workspace/vllm_env
 uv pip install --python /workspace/vllm_env/bin/python -U vllm --pre \
   --extra-index-url https://wheels.vllm.ai/nightly \
-  --extra-index-url https://download.pytorch.org/whl/cu129 \
+  --extra-index-url https://download.pytorch.org/whl/cu130 \
   --index-strategy unsafe-best-match
 
 echo "[2/3] Wrapper deps into gemma_env (runs services/vllm_table_service.py)"

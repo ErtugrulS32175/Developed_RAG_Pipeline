@@ -15,6 +15,11 @@ VLLM=/workspace/vllm_env/bin/vllm
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
+# HF weights must land on the big /workspace volume -- the container disk (/) is
+# nearly full and a default ~/.cache/huggingface download dies with
+# "Disk quota exceeded (os error 122)" partway through gemma's weights.
+export HF_HOME="${HF_HOME:-/workspace/hf}"
+
 echo "Starting vLLM OpenAI server for gemma-4-E4B (weights download on first run)..."
 nohup $VLLM serve google/gemma-4-E4B-it \
   --max-model-len 8192 --no-enable-prefix-caching --mm-processor-cache-gb 0 \
