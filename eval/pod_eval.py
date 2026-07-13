@@ -15,8 +15,9 @@ output/eval/pod_results.json (raw text + every parsed table + scores + timing).
     gemma_env/bin/python -m eval.pod_eval
     ADAPTER_URL=http://127.0.0.1:8101/table gemma_env/bin/python -m eval.pod_eval
 
-sample1 has ground truth -> scored (TEDS / number_fid / cell_acc, vs TATR=1.0).
-example + example have no GT yet -> dumped for offline scoring once GT exists.
+Images that have a GT are scored (TEDS / number_fid / cell_acc); images without a
+GT yet are dumped (raw + parsed) for offline scoring later -- pass those via the
+POD_EVAL_RAW env var so no dataset filenames live in the repo.
 """
 import glob
 import json
@@ -31,8 +32,9 @@ ADAPTER_URL = os.getenv("ADAPTER_URL", "http://127.0.0.1:8101/table")
 GT_DIR = "data/gt"
 OUT_DIR = "output/eval"
 OUT = os.path.join(OUT_DIR, "pod_results.json")
-# GT-less images: predictions dumped (raw + parsed) for later offline scoring.
-RAW_IMAGES = ["data/example.jpg.jpeg", "data/example.jpeg"]
+# GT-less images to dump (raw + parsed) for later offline scoring. Kept OUT of the
+# repo: set POD_EVAL_RAW="data/a.jpeg,data/b.jpeg" (comma-separated) at run time.
+RAW_IMAGES = [p.strip() for p in os.getenv("POD_EVAL_RAW", "").split(",") if p.strip()]
 TIMEOUT = float(os.getenv("EVAL_TIMEOUT", "900"))
 
 
