@@ -26,8 +26,13 @@ GPU_FRAC="${GPU_FRAC:-0.90}"
 export HF_HOME="${HF_HOME:-/workspace/hf}"
 
 echo "Starting vLLM OpenAI server for $MODEL (weights download on first run)..."
+# --safetensors-load-strategy=prefetch: /workspace is a FUSE (MooseFS) mount, which
+# vLLM doesn't auto-recognize as a network FS, so it loads shards serially and a
+# 58GB checkpoint can stall for tens of minutes. Forcing prefetch parallelizes the
+# reads and makes the load actually progress.
 nohup $VLLM serve "$MODEL" \
   --max-model-len 8192 --no-enable-prefix-caching --mm-processor-cache-gb 0 \
+  --safetensors-load-strategy=prefetch \
   --gpu-memory-utilization "$GPU_FRAC" --port 8113 > vllm_gemma.log 2>&1 &
 
 echo "Waiting for vLLM (31B load + download can take a while)..."
