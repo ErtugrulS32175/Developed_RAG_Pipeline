@@ -26,7 +26,10 @@ app = FastAPI()
 
 BASE_URL = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
 MODEL = os.getenv("VLLM_MODEL", "")
-MAX_TOKENS = int(os.getenv("VLLM_MAX_TOKENS", "4096"))
+# Big tables (50+ rows / many cols) blow past 4096 output tokens -> the HTML gets
+# cut off before </table> and parse_html_tables finds nothing. Default high; vLLM
+# caps it to whatever fits max-model-len minus the image+prompt tokens.
+MAX_TOKENS = int(os.getenv("VLLM_MAX_TOKENS", "7000"))
 TIMEOUT = float(os.getenv("VLLM_TIMEOUT", "600"))
 # Doc-parse prompt: markdown with tables as HTML (parse_html_tables consumes the
 # <table> markup). Turkish preservation is spelled out -- both models can drop
