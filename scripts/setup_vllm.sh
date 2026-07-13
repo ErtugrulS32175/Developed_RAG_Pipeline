@@ -20,6 +20,13 @@ uv pip install --python /workspace/vllm_env/bin/python -U vllm --pre \
   --extra-index-url https://download.pytorch.org/whl/cu130 \
   --index-strategy unsafe-best-match
 
+# flashinfer JIT-compiles some sampling kernels at startup and shells out to
+# `ninja`; without it the engine dies late with FileNotFoundError: 'ninja'. The
+# pip `ninja` lands in the venv bin (not on PATH when vllm is called directly), so
+# install the system one to be safe.
+echo "[1.5/3] ninja (flashinfer JIT build tool)"
+apt-get install -y -qq ninja-build 2>/dev/null || pip install -q ninja
+
 echo "[2/3] Wrapper deps into gemma_env (runs services/vllm_table_service.py)"
 # The adapter only needs a web stack + requests + table_export's openpyxl; reuse
 # the existing gemma_env rather than build another venv.
