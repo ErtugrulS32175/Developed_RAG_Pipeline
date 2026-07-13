@@ -1,6 +1,6 @@
 """Deterministic scanned-table -> {headers, rows} extraction, no VLM.
 
-Consolidates the four engines proven on sample1.jpeg into one path:
+Consolidates the four engines proven on a sample table into one path:
   * TATR detection        -> find the table on the page, crop it
   * TATR structure (v1.1) -> column boundaries + the column-header band
   * PaddleOCR word boxes  -> numeric cells (pixel-faithful, best on digits)

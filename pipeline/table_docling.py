@@ -8,9 +8,9 @@ boxes (per-word, they separate adjacent columns cleanly, unlike EasyOCR's
 full-crop detections which merge neighbours). Cuts fall on the gutter midpoint so
 a band never catches a neighbouring column's edge digit.
 
-Validated on sample1: headers exact, names near-exact without a master list (only a name→
-a name, ş→s residual) — matching the standalone TATR path. Pair with master_match
-for the last polish. Reuses the EasyOCR helpers in pipeline.table_tatr.
+Validated on a sample table: headers exact, names near-exact without a master list
+(only a Turkish ş→s folding residual) — matching the standalone TATR path. Pair
+with master_match for the last polish. Reuses the EasyOCR helpers in table_tatr.
 """
 import re
 

@@ -4,8 +4,8 @@ General-purpose VLM prompted to emit a table as JSON directly from the image,
 bypassing grid-cell regression. Registered as router.TABLE_BACKEND=gemma
 (needs_raw=True): this service returns the model's raw text under `raw` and the
 router parses it client-side with table_export.parse_table_json, so parser fixes
-never require a service redeploy. Validated on a RunPod A40 (sample1: lower on the
-full scan, much higher cropped to the table region -- cropping is the pipeline's job).
+never require a service redeploy. Validated on a RunPod A40 (a sample table: lower
+on the full scan, much higher cropped to the table region -- cropping is the job).
 
 Isolated `gemma_env` venv (transformers kept off the main env's vLLM pin); see
 scripts/setup_gemma.sh. Weights are heavy for an 8GB laptop -- an A40/H200 service.

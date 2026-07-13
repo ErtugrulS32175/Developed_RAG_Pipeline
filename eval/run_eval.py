@@ -103,7 +103,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--backends", nargs="+", default=DEFAULT_BACKENDS)
     ap.add_argument("--images", nargs="+", default=None,
-                    help="GT stem'leri (or. sample1 sample2); vermezsen hepsi")
+                    help="GT stem adlari; vermezsen hepsi")
     ap.add_argument("--raw", nargs="+", default=None,
                     help="GT'siz gorsel yollari: koss + tahmini kaydet (skorlama yok), "
                          "GT sonra hazir olunca offline skorlanir")
