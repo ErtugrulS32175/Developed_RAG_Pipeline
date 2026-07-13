@@ -10,20 +10,29 @@ from pipeline.text_normalize import has_residual_marks
 
 
 class _HTMLTableExtractor(HTMLParser):
-    """Pull <table>s out of a VLM's markdown/HTML output into rows of cell text.
-    Tolerant of the messy HTML doc-parsing VLMs (PaddleOCR-VL, HunyuanOCR) emit:
-    ignores unknown tags, treats <th>/<td> as cells, <tr> as rows. Cell spans
-    (colspan/rowspan) are NOT expanded -- flagged upstream as a structure issue."""
+    """Pull <table>s out of a VLM's markdown/HTML output into rows of cell text,
+    remembering which rows sit inside <thead>. Tolerant of the messy HTML
+    doc-parsing VLMs emit: ignores unknown tags, treats <th>/<td> as cells, <tr>
+    as rows. Cell spans (colspan/rowspan) are NOT expanded -- but a full-width
+    spanning TITLE row (e.g. <th colspan=14>REPORT TITLE</th>) lands in
+    <thead> with few cells, so parse_html_tables can skip it via the head flags."""
 
     def __init__(self):
         super().__init__()
-        self.tables, self._rows, self._cell = [], None, None
+        self.tables = []                       # list of (rows, head_flags)
+        self._rows = self._flags = self._cell = None
+        self._in_thead = False
 
     def handle_starttag(self, tag, attrs):
         if tag == "table":
-            self._rows = []
+            self._rows, self._flags, self._in_thead = [], [], False
+        elif tag == "thead" and self._rows is not None:
+            self._in_thead = True
+        elif tag == "tbody" and self._rows is not None:
+            self._in_thead = False
         elif tag == "tr" and self._rows is not None:
             self._rows.append([])
+            self._flags.append(self._in_thead)
         elif tag in ("td", "th") and self._rows:
             self._cell = []
 
@@ -36,27 +45,36 @@ class _HTMLTableExtractor(HTMLParser):
             self._rows[-1].append(" ".join("".join(self._cell).split()))
             self._cell = None
         elif tag == "table" and self._rows is not None:
-            if any(self._rows):
-                self.tables.append([r for r in self._rows if r])
-            self._rows = None
+            rows = [(r, f) for r, f in zip(self._rows, self._flags) if r]
+            if rows:
+                self.tables.append(([r for r, _ in rows], [f for _, f in rows]))
+            self._rows = self._flags = None
 
 
 def parse_html_tables(text):
-    """VLM markdown/HTML -> [{headers, rows}]. First row becomes the header, the
-    rest are data (VLMs put column labels in the first <tr>). Returns [] if no
-    <table> is present."""
+    """VLM markdown/HTML -> [{headers, rows}]. The column header is the WIDEST
+    <thead> row (skips a spanning title row above it) when <thead> is present,
+    else the first <tr>; body = the tbody rows (or everything after row 0). This
+    keeps a title like "<th colspan=14>REPORT TITLE</th>" from being
+    mistaken for a 1-column header. Returns [] if no <table> is present."""
     p = _HTMLTableExtractor()
     try:
         p.feed(text or "")
     except Exception:
         pass
     out = []
-    for grid in p.tables:
-        if not grid:
+    for rows, flags in p.tables:
+        if not rows:
             continue
-        headers = grid[0]
-        rows = grid[1:] if len(grid) > 1 else []
-        out.append({"headers": headers, "rows": rows})
+        head_idx = [i for i, f in enumerate(flags) if f]
+        if head_idx:
+            hi = max(head_idx, key=lambda i: (len(rows[i]), i))   # widest thead row
+            headers = rows[hi]
+            body = [r for i, r in enumerate(rows) if not flags[i]]
+        else:
+            headers = rows[0]
+            body = rows[1:]
+        out.append({"headers": headers, "rows": body})
     return out
 
 
