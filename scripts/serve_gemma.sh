@@ -20,6 +20,11 @@ cd "$REPO"
 MODEL="${GEMMA_MODEL:-google/gemma-4-31B-it}"
 GPU_FRAC="${GPU_FRAC:-0.90}"
 
+# flashinfer JIT-compiles a sampling kernel at startup by shelling out to `ninja`.
+# The pip `ninja` lives in the venv bin, which isn't on PATH when we call the vllm
+# binary directly -> engine dies late with FileNotFoundError: 'ninja'. Put it on PATH.
+export PATH="$(dirname "$VLLM"):$PATH"
+
 # HF weights must land on the big /workspace volume -- a default ~/.cache download
 # hits the near-full container disk and dies with "Disk quota exceeded (os error
 # 122)". Keep HF_HUB_DISABLE_XET=1 in the environment too (xet ~doubles peak disk).
