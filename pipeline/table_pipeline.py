@@ -32,7 +32,7 @@ from pipeline import image_preprocess as ip
 from pipeline import number_verify
 from pipeline import router
 from pipeline.text_normalize import normalize_tr
-from pipeline.table_export import validate_table
+from pipeline.table_export import export_result_xlsx, validate_table
 
 # Two small VLMs, cross-checked: same image through both, agree -> auto-accept,
 # disagree -> that cell to human review (see pipeline/consensus.py).
@@ -207,7 +207,17 @@ if __name__ == "__main__":
     be = sys.argv[2] if len(sys.argv) > 2 else None
     if be == "consensus":
         print(f"[PIPELINE] {img} | consensus={'+'.join(CONSENSUS_BACKENDS)}")
-        _print_report(run_consensus(img))
+        results = run_consensus(img)
     else:
         print(f"[PIPELINE] {img} | backend={be or router.TABLE_BACKEND}")
-        _print_report(run(img, backend=be))
+        results = run(img, backend=be)
+    _print_report(results)
+
+    # TABLE_XLSX=out.xlsx -> write the deliverable (one file per detected table)
+    xlsx = os.getenv("TABLE_XLSX")
+    if xlsx and results:
+        base = xlsx[:-5] if xlsx.lower().endswith(".xlsx") else xlsx
+        for i, t in enumerate(results):
+            path = f"{base}.xlsx" if len(results) == 1 else f"{base}_{i}.xlsx"
+            export_result_xlsx(t, path)
+            print(f"  -> {path}")
