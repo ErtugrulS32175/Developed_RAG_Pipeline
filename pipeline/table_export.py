@@ -44,11 +44,21 @@ class _HTMLTableExtractor(HTMLParser):
         if tag in ("td", "th") and self._cell is not None:
             self._rows[-1].append(" ".join("".join(self._cell).split()))
             self._cell = None
-        elif tag == "table" and self._rows is not None:
+        elif tag == "table":
+            self._commit()
+
+    def _commit(self):
+        """Emit the current table's non-empty rows. Called on </table> AND at
+        end-of-feed, so a VLM output truncated at its token cap (rows present but
+        no closing </table>) still yields the rows it managed to produce."""
+        if self._cell is not None:            # truncated mid-cell: flush partial
+            self._rows[-1].append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        if self._rows:
             rows = [(r, f) for r, f in zip(self._rows, self._flags) if r]
             if rows:
                 self.tables.append(([r for r, _ in rows], [f for _, f in rows]))
-            self._rows = self._flags = None
+        self._rows = self._flags = None
 
 
 def parse_html_tables(text):
@@ -62,6 +72,7 @@ def parse_html_tables(text):
         p.feed(text or "")
     except Exception:
         pass
+    p._commit()          # flush a table left open by truncated (token-capped) output
     out = []
     for rows, flags in p.tables:
         if not rows:

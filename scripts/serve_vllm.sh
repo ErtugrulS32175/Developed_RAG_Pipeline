@@ -24,8 +24,11 @@ nohup $VLLM serve google/gemma-4-E4B-it \
 nohup $VLLM serve PaddlePaddle/PaddleOCR-VL --trust-remote-code \
   --max-num-batched-tokens 16384 --max-model-len 8192 --no-enable-prefix-caching \
   --mm-processor-cache-gb 0 --gpu-memory-utilization 0.2 --port 8114 > vllm_vl.log 2>&1 &
+# HunyuanOCR handles up to 4K images (many vision tokens); 8192 truncates them ->
+# garbage. The official recipe leaves max-model-len at the model default; 32768 is
+# plenty for our tables and fits the 0.2 cap. Flags match the official serve.
 nohup $VLLM serve tencent/HunyuanOCR \
-  --max-model-len 8192 --no-enable-prefix-caching --mm-processor-cache-gb 0 \
+  --max-model-len 32768 --no-enable-prefix-caching --mm-processor-cache-gb 0 \
   --gpu-memory-utilization 0.2 --port 8115 > vllm_hy.log 2>&1 &
 
 echo "Waiting for vLLM servers (model load can take a few minutes)..."
@@ -35,14 +38,15 @@ for p in 8113 8114 8115; do
 done
 
 echo "Starting adapter services (our contract ports)..."
-start_adapter () {  # $1=vllm_port  $2=model  $3=adapter_port  $4=log
-  VLLM_BASE_URL="http://127.0.0.1:$1/v1" VLLM_MODEL="$2" PYTHONPATH="$REPO" \
+start_adapter () {  # $1=vllm_port  $2=model  $3=adapter_port  $4=log  $5=extra_env
+  env $5 VLLM_BASE_URL="http://127.0.0.1:$1/v1" VLLM_MODEL="$2" PYTHONPATH="$REPO" \
     nohup gemma_env/bin/uvicorn vllm_table_service:app --app-dir services \
     --host 127.0.0.1 --port "$3" > "$4" 2>&1 &
 }
 start_adapter 8113 google/gemma-4-E4B-it   8101 wrap_gemma.log
 start_adapter 8114 PaddlePaddle/PaddleOCR-VL 8104 wrap_vl.log
-start_adapter 8115 tencent/HunyuanOCR      8105 wrap_hy.log
+# HunyuanOCR REQUIRES an (empty) system turn -- see vllm_table_service.py.
+start_adapter 8115 tencent/HunyuanOCR      8105 wrap_hy.log 'VLLM_SYSTEM_PROMPT='
 
 sleep 6
 echo "Health:"

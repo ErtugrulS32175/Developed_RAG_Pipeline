@@ -31,6 +31,10 @@ MODEL = os.getenv("VLLM_MODEL", "")
 # caps it to whatever fits max-model-len minus the image+prompt tokens.
 MAX_TOKENS = int(os.getenv("VLLM_MAX_TOKENS", "7000"))
 TIMEOUT = float(os.getenv("VLLM_TIMEOUT", "600"))
+# Some models (HunyuanOCR) require an explicit system turn in the chat -- their
+# template builds a malformed prompt without it -> scrambled output. Set
+# VLLM_SYSTEM_PROMPT="" (present but empty) to prepend one; leave it unset to omit.
+SYSTEM_PROMPT = os.getenv("VLLM_SYSTEM_PROMPT")  # None => no system turn
 # Doc-parse prompt: markdown with tables as HTML (parse_html_tables consumes the
 # <table> markup). Turkish preservation is spelled out -- both models can drop
 # diacritics otherwise. Override per model with VLLM_PROMPT if needed.
@@ -51,12 +55,16 @@ def _data_url(data: bytes, filename: str) -> str:
 @app.post("/table")
 async def extract_table(file: UploadFile = File(...)):
     data = await file.read()
+    messages = []
+    if SYSTEM_PROMPT is not None:
+        messages.append({"role": "system", "content": SYSTEM_PROMPT})
+    messages.append({"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": _data_url(data, file.filename)}},
+        {"type": "text", "text": PROMPT},
+    ]})
     payload = {
         "model": MODEL,
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": _data_url(data, file.filename)}},
-            {"type": "text", "text": PROMPT},
-        ]}],
+        "messages": messages,
         "temperature": 0.0,          # greedy: reproducible, best for OCR
         "top_k": 1,
         "repetition_penalty": 1.0,

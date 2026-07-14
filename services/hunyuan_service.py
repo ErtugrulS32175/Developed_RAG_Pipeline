@@ -22,7 +22,9 @@ PROMPT = os.getenv(
     "提取文档图片中正文的所有信息用markdown格式表示，其中页眉、页脚部分忽略，"
     "表格用html格式表达，文档中公式用latex格式表示，按照阅读顺序组织进行解析。",
 )
-MAX_NEW = int(os.getenv("HUNYUAN_MAX_NEW_TOKENS", "3000"))
+# Long/dense tables as HTML need many output tokens; a low cap truncates mid-table
+# so </table> never arrives and the parser gets nothing. The model handles 128K ctx.
+MAX_NEW = int(os.getenv("HUNYUAN_MAX_NEW_TOKENS", "8000"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _STATE = {}
 
@@ -30,7 +32,11 @@ _STATE = {}
 def _load():
     if not _STATE:
         from transformers import AutoProcessor, HunYuanVLForConditionalGeneration
-        _STATE["proc"] = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+        # use_fast=False -> PIL-backed image processor, which supports the model's
+        # native LANCZOS resample. The fast (torchvision) path silently downgrades
+        # to BICUBIC on torchvision<0.27, degrading OCR fidelity vs the original.
+        _STATE["proc"] = AutoProcessor.from_pretrained(
+            MODEL_ID, trust_remote_code=True, use_fast=False)
         _STATE["model"] = HunYuanVLForConditionalGeneration.from_pretrained(
             MODEL_ID, dtype="bfloat16", device_map="auto", trust_remote_code=True).eval()
     return _STATE["proc"], _STATE["model"]
@@ -40,14 +46,27 @@ def _load():
 async def extract_table(file: UploadFile = File(...)):
     image = Image.open(io.BytesIO(await file.read())).convert("RGB")
     proc, model = _load()
-    messages = [{"role": "user", "content": [
-        {"type": "image", "image": image}, {"type": "text", "text": PROMPT}]}]
+    # The chat template expects a system turn; the official client sends an empty
+    # one. Omitting it builds a malformed prompt -> scrambled output (Tencent's
+    # 2025-11-28 "system prompt config" fix). Sampling stays greedy per the recipe.
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": [
+            {"type": "image", "image": image}, {"type": "text", "text": PROMPT}]}]
     inputs = proc.apply_chat_template(messages, add_generation_prompt=True, tokenize=True,
                                       return_dict=True, return_tensors="pt").to(model.device)
     with torch.inference_mode():
         out = model.generate(**inputs, max_new_tokens=MAX_NEW, do_sample=False,
                              repetition_penalty=1.08)
-    text = proc.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+    # clean_up_tokenization_spaces defaults True but is destructive for BPE (strips
+    # spaces before punctuation) -> corrupts OCR text; the processor itself warns.
+    text = proc.batch_decode(out[:, inputs["input_ids"].shape[1]:],
+                             skip_special_tokens=True,
+                             clean_up_tokenization_spaces=False)[0]
+    dbg = os.getenv("HUNYUAN_DEBUG_DIR")
+    if dbg:
+        with open(os.path.join(dbg, "hy_last_raw.txt"), "w", encoding="utf-8") as fh:
+            fh.write(text)
     return {"tables": parse_html_tables(text), "raw": text}
 
 
