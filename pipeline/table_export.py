@@ -5,8 +5,13 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 from pipeline.text_normalize import has_residual_marks
+
+# Highlight for cells a reviewer should check (consensus disagreements): light amber.
+_REVIEW_FILL = PatternFill("solid", fgColor="FFE699")
 
 
 class _HTMLTableExtractor(HTMLParser):
@@ -280,6 +285,92 @@ def save_table_xlsx(headers, rows, path):
     for row in rows:
         ws.append(row)
     wb.save(path)
+
+
+def export_result_xlsx(result, path):
+    """Write a pipeline result dict (from table_pipeline.run or run_consensus) to
+    an .xlsx the reviewer can act on:
+
+      * "Tablo" sheet -- bold + frozen header, auto-ish column widths, and any
+        cell the models disagreed on highlighted amber (from `disagreements`).
+      * "Rapor" sheet -- backend(s), confidence breakdown, issues, and each
+        disagreement with BOTH candidate values so a human can pick.
+
+    Works for a single-backend result (no disagreements -> nothing highlighted)
+    and a consensus result alike. Values are written verbatim (no number coercion)
+    to preserve OCR fidelity."""
+    headers = result.get("headers", [])
+    rows = result.get("rows", [])
+    disagreements = result.get("disagreements", [])
+    review_cells = {d["pos"] for d in disagreements if d.get("kind") == "cell"}
+    review_headers = {d["pos"] for d in disagreements if d.get("kind") == "header"}
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Tablo"
+
+    if headers:
+        ws.append(list(headers))
+        for j, cell in enumerate(ws[1]):
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            if j in review_headers:
+                cell.fill = _REVIEW_FILL
+        ws.freeze_panes = "A2"
+
+    for i, row in enumerate(rows):
+        ws.append(list(row))
+        excel_row = i + 2 if headers else i + 1
+        for j in range(len(row)):
+            if (i, j) in review_cells:
+                ws.cell(row=excel_row, column=j + 1).fill = _REVIEW_FILL
+
+    # rough column widths from the longest value seen per column
+    for j in range(len(headers) or (len(rows[0]) if rows else 0)):
+        longest = len(str(headers[j])) if j < len(headers) else 0
+        for row in rows:
+            if j < len(row):
+                longest = max(longest, len(str(row[j])))
+        ws.column_dimensions[get_column_letter(j + 1)].width = min(max(longest + 2, 8), 40)
+
+    _write_report_sheet(wb.create_sheet("Rapor"), result)
+    wb.save(path)
+
+
+def _write_report_sheet(ws, result):
+    backends = result.get("backends") or ([result["backend"]] if result.get("backend") else [])
+    ws.append(["Backend", " + ".join(backends)])
+    ws.append(["Guven (confidence)", result.get("confidence")])
+    ws.append(["  yapisal", result.get("structural_confidence")])
+    ws.append(["  sayisal (number fidelity)", result.get("number_fidelity")])
+    if "agreement" in result:
+        ws.append(["  model uyumu (agreement)", result.get("agreement")])
+    ws.append(["Gozden gecirme gerekli", "EVET" if result.get("needs_review") else "hayir"])
+    ws.append([])
+
+    issues = result.get("issues") or []
+    ws.append(["Sorunlar", f"{len(issues)} adet"])
+    for msg in issues:
+        ws.append(["", msg])
+
+    disagreements = result.get("disagreements") or []
+    if disagreements:
+        ws.append([])
+        ws.append(["Ayrisan hucreler", f"{len(disagreements)} adet"])
+        ws.append(["konum", "aday 1", "aday 2"])
+        for cell in ws[ws.max_row]:
+            cell.font = Font(bold=True)
+        for d in disagreements:
+            keys = [k for k in d if k not in ("kind", "pos")]
+            pos = d.get("pos")
+            loc = (f"satir {pos[0]+1}, sutun {pos[1]+1}" if isinstance(pos, tuple)
+                   else f"baslik {pos+1}" if isinstance(pos, int)
+                   else d.get("kind", ""))
+            ws.append([loc] + [str(d.get(k)) for k in keys])
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 40
+    ws.column_dimensions["C"].width = 40
 
 
 def save_table_csv(headers, rows, path):
