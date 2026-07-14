@@ -27,11 +27,17 @@ import tempfile
 
 from PIL import Image
 
+from pipeline import consensus
 from pipeline import image_preprocess as ip
 from pipeline import number_verify
 from pipeline import router
 from pipeline.text_normalize import normalize_tr
 from pipeline.table_export import validate_table
+
+# Two small VLMs, cross-checked: same image through both, agree -> auto-accept,
+# disagree -> that cell to human review (see pipeline/consensus.py).
+CONSENSUS_BACKENDS = tuple(
+    os.getenv("CONSENSUS_BACKENDS", "paddleocr_vl,hunyuan").split(","))
 
 REVIEW_THRESHOLD = float(os.getenv("TABLE_REVIEW_THRESHOLD", "0.9"))
 # Preprocessing profile per backend: the deterministic engine (small models) gets
@@ -102,15 +108,91 @@ def run(image_path, backend=None, preprocess=None, review_threshold=REVIEW_THRES
             os.unlink(tmp.name)
 
 
+def _normalize_table(table):
+    """normalize_tr every cell so the two backends are compared on clean Turkish
+    text (residual-mark differences shouldn't register as disagreement)."""
+    return {
+        "headers": [normalize_tr(h) for h in table.get("headers", [])],
+        "rows": [[normalize_tr(c) for c in row] for row in table.get("rows", [])],
+    }
+
+
+def _finalize_consensus(rec, ocr_text, backends, review_threshold):
+    """Stages 3-5 on a reconciled (two-backend) table. Confidence is the weakest
+    of {structural, numeric fidelity, model agreement}; ANY disagreement or shape
+    mismatch forces review -- nothing is auto-accepted where the models differ."""
+    headers, rows = rec["headers"], rec["rows"]
+    struct_conf, issues = validate_table(headers, rows)
+    num_fidelity, num_flags = number_verify.verify(headers, rows, ocr_text)
+    issues = list(issues) + number_verify.flags_to_messages(num_flags, headers)
+
+    if not rec["shape_match"]:
+        issues.append(f"modeller farkli sekil verdi: {rec['shape_primary']} vs "
+                      f"{rec['shape_secondary']} (yapisal ayrisma)")
+    elif rec["disagreements"]:
+        issues.append(f"{len(rec['disagreements'])} hucrede modeller ayristi "
+                      f"(insan gozden gecirmeli)")
+
+    confidence = round(min(struct_conf, num_fidelity, rec["agreement"]), 3)
+    needs_review = (confidence < review_threshold or bool(issues)
+                    or not rec["shape_match"])
+    return {
+        "mode": "consensus",
+        "backends": list(backends),
+        "headers": headers,
+        "rows": rows,
+        "confidence": confidence,
+        "agreement": rec["agreement"],
+        "structural_confidence": struct_conf,
+        "number_fidelity": num_fidelity,
+        "shape_match": rec["shape_match"],
+        "disagreements": rec["disagreements"],
+        "issues": issues,
+        "needs_review": needs_review,
+    }
+
+
+def run_consensus(image_path, backends=CONSENSUS_BACKENDS, preprocess=False,
+                  review_threshold=REVIEW_THRESHOLD):
+    """Cross-check two backends on one image. backends[0] is primary (its value
+    wins where they agree). Both are VLMs -> no preprocessing by default. Returns
+    a list of consensus table dicts (one per detected table)."""
+    prim_be, sec_be = backends[0], backends[1]
+    work = image_path
+    tmp = None
+    if preprocess:
+        enhanced = ip.enhance(Image.open(image_path).convert("RGB"), scale=PREPROCESS_SCALE)
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        enhanced.save(tmp.name)
+        work = tmp.name
+    try:
+        ocr_text = router.ocr_via_paddle(work)
+        prim = [_normalize_table(t) for t in router.tables_from_image(work, prim_be)]
+        sec = [_normalize_table(t) for t in router.tables_from_image(work, sec_be)]
+        results = []
+        for i in range(max(len(prim), len(sec))):
+            a = prim[i] if i < len(prim) else {"headers": [], "rows": []}
+            b = sec[i] if i < len(sec) else {"headers": [], "rows": []}
+            rec = consensus.reconcile(a, b, prim_be, sec_be)
+            results.append(_finalize_consensus(rec, ocr_text, backends, review_threshold))
+        return results
+    finally:
+        if tmp is not None:
+            os.unlink(tmp.name)
+
+
 def _print_report(results):
     if not results:
         print("[PIPELINE] tablo bulunamadi")
         return
     for i, t in enumerate(results):
         flag = "REVIEW" if t["needs_review"] else "OK"
-        print(f"\n[{flag}] tablo {i} | backend={t['backend']} | "
+        engine = "+".join(t["backends"]) if t.get("mode") == "consensus" else t["backend"]
+        extra = f", uyum={t['agreement']}" if t.get("mode") == "consensus" else ""
+        print(f"\n[{flag}] tablo {i} | backend={engine} | "
               f"guven={t['confidence']} (yapi={t['structural_confidence']}, "
-              f"sayi={t['number_fidelity']}) | {len(t['rows'])}x{len(t['headers'])}")
+              f"sayi={t['number_fidelity']}{extra}) | {len(t['rows'])}x{len(t['headers'])}")
         if t["issues"]:
             print("  sorunlar:")
             for x in t["issues"][:8]:
@@ -123,5 +205,9 @@ if __name__ == "__main__":
         sys.exit(1)
     img = sys.argv[1]
     be = sys.argv[2] if len(sys.argv) > 2 else None
-    print(f"[PIPELINE] {img} | backend={be or router.TABLE_BACKEND}")
-    _print_report(run(img, backend=be))
+    if be == "consensus":
+        print(f"[PIPELINE] {img} | consensus={'+'.join(CONSENSUS_BACKENDS)}")
+        _print_report(run_consensus(img))
+    else:
+        print(f"[PIPELINE] {img} | backend={be or router.TABLE_BACKEND}")
+        _print_report(run(img, backend=be))
