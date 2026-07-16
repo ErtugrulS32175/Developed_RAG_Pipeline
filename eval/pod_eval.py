@@ -31,7 +31,9 @@ from eval import table_eval
 ADAPTER_URL = os.getenv("ADAPTER_URL", "http://127.0.0.1:8101/table")
 GT_DIR = "data/gt"
 OUT_DIR = "output/eval"
-OUT = os.path.join(OUT_DIR, "pod_results.json")
+# Override per backend so a two-model A/B (run once per adapter) doesn't clobber
+# itself: POD_EVAL_OUT=output/eval/vl.json / .../hy.json
+OUT = os.getenv("POD_EVAL_OUT", os.path.join(OUT_DIR, "pod_results.json"))
 # GT-less images to dump (raw + parsed) for later offline scoring. Kept OUT of the
 # repo: set POD_EVAL_RAW="data/a.jpeg,data/b.jpeg" (comma-separated) at run time.
 RAW_IMAGES = [p.strip() for p in os.getenv("POD_EVAL_RAW", "").split(",") if p.strip()]

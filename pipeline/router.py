@@ -9,9 +9,9 @@ from dotenv import load_dotenv
 from pipeline.text_normalize import normalize_tr
 from pipeline.table_export import validate_table, parse_table_json
 
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+# docling is imported lazily inside build_native_converter (PDF-native path only):
+# it pulls torch and is heavy, and the table-backend / consensus path never needs
+# it -- so the orchestrator can run on a pod/box without docling installed.
 
 # router is imported by ingest_router before *it* calls load_dotenv(), so read
 # the env here on our own import or the URLs below would be frozen to defaults.
@@ -63,6 +63,10 @@ def analyze_pdf_pages(path, min_chars=10):
     return page_types
 
 def build_native_converter():
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+
     opts = PdfPipelineOptions()
     opts.do_ocr = False
     opts.do_table_structure = True
