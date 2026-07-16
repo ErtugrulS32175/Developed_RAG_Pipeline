@@ -26,10 +26,16 @@ def _by_stem(path):
 
 
 def _table_from_row(row):
-    """Re-parse the model's raw text (so the latest parser applies), normalize
-    Turkish, and return the first table."""
-    tabs = parse_html_tables(row.get("raw") or "")
-    t = tabs[0] if tabs else {"headers": [], "rows": []}
+    """Return the first table, normalized. Prefer re-parsing raw (so the latest
+    parser applies), but fall back to the parsed table pod_eval stored when a
+    backend returns no raw (PaddleOCR-VL's service emits tables only)."""
+    raw = (row.get("raw") or "").strip()
+    if raw:
+        tabs = parse_html_tables(raw)
+        t = tabs[0] if tabs else {"headers": [], "rows": []}
+    else:
+        stored = row.get("tables") or []
+        t = stored[0] if stored else {"headers": [], "rows": []}
     return {
         "headers": [normalize_tr(h) for h in t.get("headers", [])],
         "rows": [[normalize_tr(c) for c in r] for r in t.get("rows", [])],
