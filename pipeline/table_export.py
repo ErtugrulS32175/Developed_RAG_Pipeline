@@ -1,6 +1,7 @@
 import csv
 import json
 import re
+from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -68,10 +69,11 @@ class _HTMLTableExtractor(HTMLParser):
 
 def parse_html_tables(text):
     """VLM markdown/HTML -> [{headers, rows}]. The column header is the WIDEST
-    <thead> row (skips a spanning title row above it) when <thead> is present,
-    else the first <tr>; body = the tbody rows (or everything after row 0). This
-    keeps a title like "<th colspan=14>REPORT TITLE</th>" from being
-    mistaken for a 1-column header. Returns [] if no <table> is present."""
+    <thead> row when <thead> is present; without <thead> it's the first row that
+    spans the full grid (leading spanning TITLE rows, which collapse to fewer
+    cells, are skipped). Body = the remaining rows. This keeps a title like
+    "<th colspan=N>REPORT TITLE</th>" from being mistaken for the header, with or
+    without <thead>. Returns [] if no <table> is present."""
     p = _HTMLTableExtractor()
     try:
         p.feed(text or "")
@@ -88,8 +90,15 @@ def parse_html_tables(text):
             headers = rows[hi]
             body = [r for i, r in enumerate(rows) if not flags[i]]
         else:
-            headers = rows[0]
-            body = rows[1:]
+            # No <thead>: the header is the first row that spans the full grid. A
+            # spanning TITLE/caption row above it collapses to fewer cells (often
+            # one), so skip leading rows narrower than the table's dominant width.
+            width = Counter(len(r) for r in rows).most_common(1)[0][0]
+            start = 0
+            while start < len(rows) - 1 and len(rows[start]) < width:
+                start += 1
+            headers = rows[start]
+            body = rows[start + 1:]
         out.append({"headers": headers, "rows": body})
     return out
 

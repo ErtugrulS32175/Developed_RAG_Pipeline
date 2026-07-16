@@ -3,6 +3,7 @@ from openpyxl import load_workbook
 from pipeline.table_export import (
     estimate_table_confidence,
     export_result_xlsx,
+    parse_html_tables,
     table_to_markdown,
 )
 
@@ -39,6 +40,46 @@ def test_markdown_without_citation_args_stays_plain():
     md = table_to_markdown(["Product"], [["Pen"]])
     assert "Belge:" not in md
     assert md.startswith("| Product |")
+
+
+def test_parse_skips_spanning_title_row_without_thead():
+    html = ("<table>"
+            "<tr><td>REPORT TITLE</td></tr>"
+            "<tr><td>Product</td><td>Qty</td><td>Total</td></tr>"
+            "<tr><td>Pen</td><td>5</td><td>100</td></tr>"
+            "</table>")
+    t = parse_html_tables(html)[0]
+    assert t["headers"] == ["Product", "Qty", "Total"]
+    assert t["rows"] == [["Pen", "5", "100"]]
+
+
+def test_parse_first_row_is_header_when_no_title():
+    html = ("<table>"
+            "<tr><td>Product</td><td>Qty</td></tr>"
+            "<tr><td>Pen</td><td>5</td></tr>"
+            "</table>")
+    t = parse_html_tables(html)[0]
+    assert t["headers"] == ["Product", "Qty"]
+    assert t["rows"] == [["Pen", "5"]]
+
+
+def test_parse_widest_thead_row_is_header():
+    html = ("<table><thead>"
+            "<tr><th>REPORT TITLE</th></tr>"
+            "<tr><th>Product</th><th>Qty</th></tr>"
+            "</thead><tbody>"
+            "<tr><td>Pen</td><td>5</td></tr>"
+            "</tbody></table>")
+    t = parse_html_tables(html)[0]
+    assert t["headers"] == ["Product", "Qty"]
+    assert t["rows"] == [["Pen", "5"]]
+
+
+def test_parse_recovers_table_truncated_before_close_tag():
+    html = "<table><tr><td>Product</td><td>Qty</td></tr><tr><td>Pen</td><td>5</td>"
+    t = parse_html_tables(html)[0]
+    assert t["headers"] == ["Product", "Qty"]
+    assert t["rows"] == [["Pen", "5"]]
 
 
 def _consensus_result():
