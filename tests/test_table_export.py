@@ -82,6 +82,43 @@ def test_parse_recovers_table_truncated_before_close_tag():
     assert t["rows"] == [["Pen", "5"]]
 
 
+def test_parse_colspan_title_without_rowspan_stays_flat():
+    # A spanning TITLE row (colspan only, no rowspan) must NOT trigger the
+    # grouped-header path: title skipped, the wide row is the flat header.
+    html = ("<table>"
+            "<tr><td colspan='3'>REPORT TITLE</td></tr>"
+            "<tr><td>Product</td><td>Qty</td><td>Total</td></tr>"
+            "<tr><td>Pen</td><td>5</td><td>100</td></tr>"
+            "</table>")
+    t = parse_html_tables(html)[0]
+    assert t["headers"] == ["Product", "Qty", "Total"]
+    assert t["rows"] == [["Pen", "5", "100"]]
+    assert "header_merges" not in t
+
+
+def test_parse_two_level_grouped_header():
+    # rowspan present -> grouped-header path. Group row spans, sub-row labels it.
+    #   ColA(cs2,rs2) | ColB(rs2) | GroupC(cs2)
+    #                              | Sub1 | Sub2
+    html = ("<table>"
+            "<tr><td colspan='2' rowspan='2'>ColA</td>"
+            "<td rowspan='2'>ColB</td>"
+            "<td colspan='2'>GroupC</td></tr>"
+            "<tr><td>Sub1</td><td>Sub2</td></tr>"
+            "<tr><td>a1</td><td></td><td>b1</td><td>c1</td><td>c2</td></tr>"
+            "</table>")
+    t = parse_html_tables(html)[0]
+    # flat header: group label folded into each sub-column
+    assert t["headers"] == ["ColA", "ColA", "ColB", "GroupC - Sub1", "GroupC - Sub2"]
+    # the data row is no longer mistaken for the header
+    assert t["rows"] == [["a1", "", "b1", "c1", "c2"]]
+    # merges are reported (row, col, rowspan, colspan) relative to the header block
+    merges = {(m[0], m[1]): (m[2], m[3]) for m in t["header_merges"]}
+    assert merges[(0, 0)] == (2, 2)      # ColA: 2 rows x 2 cols
+    assert merges[(0, 2)] == (2, 1)      # ColB: 2 rows x 1 col
+    assert merges[(0, 3)] == (1, 2)      # GroupC: 1 row x 2 cols
+
+
 def _consensus_result():
     return {
         "mode": "consensus",
@@ -125,6 +162,58 @@ def test_export_report_lists_both_candidates(tmp_path):
     flat = [str(c) for r in rows for c in r if c is not None]
     assert "vl + hy" in flat
     assert "3" in flat and "8" in flat                 # both candidates present
+
+
+def _grouped_result():
+    return {
+        "backend": "b1",
+        "headers": ["ColA", "ColA", "ColB", "GroupC - Sub1", "GroupC - Sub2"],
+        "header_rows": [
+            ["ColA", "", "ColB", "GroupC", ""],
+            ["", "", "", "Sub1", "Sub2"],
+        ],
+        "header_merges": [(0, 0, 2, 2), (0, 2, 2, 1), (0, 3, 1, 2)],
+        "rows": [["a1", "", "b1", "c1", "c2"]],
+        "confidence": 1.0,
+        "needs_review": False,
+        "issues": [],
+    }
+
+
+def test_export_grouped_header_writes_merged_two_level_header(tmp_path):
+    out = tmp_path / "g.xlsx"
+    export_result_xlsx(_grouped_result(), str(out))
+    ws = load_workbook(out)["Tablo"]
+    merged = {str(r) for r in ws.merged_cells.ranges}
+    assert "A1:B2" in merged          # ColA: 2 rows x 2 cols
+    assert "C1:C2" in merged          # ColB: 2 rows x 1 col
+    assert "D1:E1" in merged          # GroupC: 1 row x 2 cols
+    assert ws["A1"].value == "ColA"
+    assert ws["C1"].value == "ColB"
+    assert ws["D1"].value == "GroupC"
+    assert ws["D2"].value == "Sub1" and ws["E2"].value == "Sub2"
+    assert ws["A1"].font.bold is True
+
+
+def test_export_grouped_header_offsets_data_below_header(tmp_path):
+    out = tmp_path / "g.xlsx"
+    export_result_xlsx(_grouped_result(), str(out))
+    ws = load_workbook(out)["Tablo"]
+    # two header rows -> data starts at Excel row 3, and the pane freezes there
+    assert ws["A3"].value == "a1"
+    assert ws["C3"].value == "b1"
+    assert ws.freeze_panes == "A3"
+
+
+def test_export_grouped_header_highlights_data_disagreement_at_right_offset(tmp_path):
+    result = _grouped_result()
+    result["disagreements"] = [{"kind": "cell", "pos": (0, 4), "b1": "c2", "b2": "c9"}]
+    out = tmp_path / "g.xlsx"
+    export_result_xlsx(result, str(out))
+    ws = load_workbook(out)["Tablo"]
+    # data row 0, col 4 -> Excel E3 (below the 2-row header)
+    assert ws["E3"].fill.patternType == "solid"
+    assert ws["D3"].fill.patternType is None
 
 
 def test_export_single_backend_result_has_no_highlights(tmp_path):

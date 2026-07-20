@@ -15,6 +15,20 @@ from pipeline.text_normalize import has_residual_marks
 _REVIEW_FILL = PatternFill("solid", fgColor="FFE699")
 
 
+def _int_attr(attrs, name, default=1):
+    """Parse an HTML integer attribute (colspan/rowspan) tolerantly; VLM OCR
+    sometimes emits stray/non-numeric values, so fall back to `default` (1) and
+    clamp to [1, 1000] -- a garbled span like rowspan="8000" would otherwise
+    balloon the grid's occupied-cell set. No real table span approaches 1000."""
+    for k, v in attrs:
+        if k == name:
+            try:
+                return min(1000, max(1, int(str(v).strip())))
+            except (TypeError, ValueError):
+                return default
+    return default
+
+
 class _HTMLTableExtractor(HTMLParser):
     """Pull <table>s out of a VLM's markdown/HTML output into rows of cell text,
     remembering which rows sit inside <thead>. Tolerant of the messy HTML
@@ -25,22 +39,26 @@ class _HTMLTableExtractor(HTMLParser):
 
     def __init__(self):
         super().__init__()
-        self.tables = []                       # list of (rows, head_flags)
-        self._rows = self._flags = self._cell = None
+        self.tables = []                       # list of (rows, head_flags, spans)
+        self._rows = self._flags = self._spans = self._cell = None
+        self._span = (1, 1)
         self._in_thead = False
 
     def handle_starttag(self, tag, attrs):
         if tag == "table":
-            self._rows, self._flags, self._in_thead = [], [], False
+            self._rows, self._flags, self._spans = [], [], []
+            self._in_thead = False
         elif tag == "thead" and self._rows is not None:
             self._in_thead = True
         elif tag == "tbody" and self._rows is not None:
             self._in_thead = False
         elif tag == "tr" and self._rows is not None:
             self._rows.append([])
+            self._spans.append([])
             self._flags.append(self._in_thead)
         elif tag in ("td", "th") and self._rows:
             self._cell = []
+            self._span = (_int_attr(attrs, "colspan"), _int_attr(attrs, "rowspan"))
 
     def handle_data(self, data):
         if self._cell is not None:
@@ -49,6 +67,7 @@ class _HTMLTableExtractor(HTMLParser):
     def handle_endtag(self, tag):
         if tag in ("td", "th") and self._cell is not None:
             self._rows[-1].append(" ".join("".join(self._cell).split()))
+            self._spans[-1].append(self._span)
             self._cell = None
         elif tag == "table":
             self._commit()
@@ -59,21 +78,30 @@ class _HTMLTableExtractor(HTMLParser):
         no closing </table>) still yields the rows it managed to produce."""
         if self._cell is not None:            # truncated mid-cell: flush partial
             self._rows[-1].append(" ".join("".join(self._cell).split()))
+            self._spans[-1].append(self._span)
             self._cell = None
         if self._rows:
-            rows = [(r, f) for r, f in zip(self._rows, self._flags) if r]
-            if rows:
-                self.tables.append(([r for r, _ in rows], [f for _, f in rows]))
-        self._rows = self._flags = None
+            keep = [(r, f, s) for r, f, s in zip(self._rows, self._flags, self._spans) if r]
+            if keep:
+                self.tables.append(
+                    ([r for r, _, _ in keep], [f for _, f, _ in keep], [s for _, _, s in keep])
+                )
+        self._rows = self._flags = self._spans = None
 
 
 def parse_html_tables(text):
-    """VLM markdown/HTML -> [{headers, rows}]. The column header is the WIDEST
-    <thead> row when <thead> is present; without <thead> it's the first row that
-    spans the full grid (leading spanning TITLE rows, which collapse to fewer
-    cells, are skipped). Body = the remaining rows. This keeps a title like
-    "<th colspan=N>REPORT TITLE</th>" from being mistaken for the header, with or
-    without <thead>. Returns [] if no <table> is present."""
+    """VLM markdown/HTML -> [{headers, rows, ...}]. Routes each table by shape:
+
+      * flat (single-row header) -> _parse_flat: header is the widest <thead>
+        row, or without <thead> the first full-grid row (leading spanning TITLE
+        rows are skipped). This covers the common case and title-only colspans.
+      * grouped (a rowspan>1 is present) -> _parse_grouped: a real two-level
+        header. Spans are expanded, the header band folded into flat "Group -
+        Sub" column names, and the result also carries `header_rows` /
+        `header_merges` so the Excel exporter can rebuild the merged header.
+
+    Every result has `headers` and `rows`; grouped ones add the two extra keys.
+    Returns [] if no <table> is present."""
     p = _HTMLTableExtractor()
     try:
         p.feed(text or "")
@@ -81,26 +109,116 @@ def parse_html_tables(text):
         pass
     p._commit()          # flush a table left open by truncated (token-capped) output
     out = []
-    for rows, flags in p.tables:
+    for rows, flags, spans in p.tables:
         if not rows:
             continue
-        head_idx = [i for i, f in enumerate(flags) if f]
-        if head_idx:
-            hi = max(head_idx, key=lambda i: (len(rows[i]), i))   # widest thead row
-            headers = rows[hi]
-            body = [r for i, r in enumerate(rows) if not flags[i]]
+        # A rowspan>1 anywhere is the signal for a genuine multi-row (grouped)
+        # header -- a group label sits above sub-columns and spans down into the
+        # sub-label row. Colspan alone (a full-width TITLE row) does NOT count;
+        # that stays on the flat path so title-only tables keep working.
+        if any(rs > 1 for row in spans for _, rs in row):
+            out.append(_parse_grouped(rows, spans))
         else:
-            # No <thead>: the header is the first row that spans the full grid. A
-            # spanning TITLE/caption row above it collapses to fewer cells (often
-            # one), so skip leading rows narrower than the table's dominant width.
-            width = Counter(len(r) for r in rows).most_common(1)[0][0]
-            start = 0
-            while start < len(rows) - 1 and len(rows[start]) < width:
-                start += 1
-            headers = rows[start]
-            body = rows[start + 1:]
-        out.append({"headers": headers, "rows": body})
+            out.append(_parse_flat(rows, flags))
     return out
+
+
+def _parse_flat(rows, flags):
+    """Single-row-header parse (no grouped header). The column header is the
+    WIDEST <thead> row when <thead> is present; without <thead> it's the first
+    row that spans the full grid (leading spanning TITLE rows, which collapse to
+    fewer cells, are skipped)."""
+    head_idx = [i for i, f in enumerate(flags) if f]
+    if head_idx:
+        hi = max(head_idx, key=lambda i: (len(rows[i]), i))   # widest thead row
+        headers = rows[hi]
+        body = [r for i, r in enumerate(rows) if not flags[i]]
+    else:
+        # No <thead>: the header is the first row that spans the full grid. A
+        # spanning TITLE/caption row above it collapses to fewer cells (often
+        # one), so skip leading rows narrower than the table's dominant width.
+        width = Counter(len(r) for r in rows).most_common(1)[0][0]
+        start = 0
+        while start < len(rows) - 1 and len(rows[start]) < width:
+            start += 1
+        headers = rows[start]
+        body = rows[start + 1:]
+    return {"headers": headers, "rows": body}
+
+
+def _build_grid(rows, spans):
+    """Expand colspan/rowspan into a rectangular grid using the HTML table
+    layout algorithm. Returns (grid, labels, merges, width): `grid` places each
+    cell's text at its top-left and blanks the covered cells (what Excel shows
+    under a merge); `labels` fills EVERY covered cell with the text (used to fold
+    a grouped header into flat column names); `merges` lists (r, c, rowspan,
+    colspan) for every spanning cell."""
+    grid, labels, merges, occupied = {}, {}, [], set()
+    width = 0
+    for r, (cells, cellspans) in enumerate(zip(rows, spans)):
+        c = 0
+        for text, (cs, rs) in zip(cells, cellspans):
+            while (r, c) in occupied:
+                c += 1
+            for dr in range(rs):
+                for dc in range(cs):
+                    occupied.add((r + dr, c + dc))
+                    grid[(r + dr, c + dc)] = text if (dr == 0 and dc == 0) else ""
+                    labels[(r + dr, c + dc)] = text
+            if cs > 1 or rs > 1:
+                merges.append((r, c, rs, cs))
+            c += cs
+            width = max(width, c)
+    return grid, labels, merges, width
+
+
+def _parse_grouped(rows, spans):
+    """Parse a table with a genuine multi-row grouped header (rowspan present).
+    Expands spans to a grid, skips a leading full-width TITLE row, detects how
+    many rows the header band covers (from the rowspan reach of its first row),
+    folds the band into flat "Group - Sub" column names, and returns the data
+    rows below it. Extra keys `header_rows` (the raw header grid) and
+    `header_merges` (spans relative to the header block) let the Excel exporter
+    reproduce the two-level merged header faithfully."""
+    grid, labels, merges, width = _build_grid(rows, spans)
+    nrows = len(rows)
+
+    def row_cells(g, r):
+        return [g.get((r, c), "") for c in range(width)]
+
+    # Skip a leading TITLE row: a single cell spanning the full width.
+    h0 = 0
+    while h0 < nrows - 1:
+        row_merges = [m for m in merges if m[0] == h0]
+        if len(row_merges) == 1 and row_merges[0][1] == 0 and row_merges[0][3] == width:
+            h0 += 1
+        else:
+            break
+
+    # Header band height = how far the first header row's cells span downward.
+    band = max((rs for (r, _, rs, _) in merges if r == h0), default=1)
+    band = min(band, nrows - h0)                     # never swallow all rows
+    header_end = h0 + band
+
+    # Fold the band into one flat name per column: distinct labels top->bottom.
+    headers = []
+    for c in range(width):
+        seen = []
+        for r in range(h0, header_end):
+            lab = labels.get((r, c), "")
+            if lab and (not seen or seen[-1] != lab):
+                seen.append(lab)
+        headers.append(" - ".join(seen))
+
+    header_rows = [row_cells(grid, r) for r in range(h0, header_end)]
+    header_merges = [(r - h0, c, rs, cs) for (r, c, rs, cs) in merges if h0 <= r < header_end]
+    body = [row_cells(grid, r) for r in range(header_end, nrows)]
+    return {
+        "headers": headers,
+        "rows": body,
+        "header_rows": header_rows,
+        "header_merges": header_merges,
+    }
 
 
 def _extract_balanced(text, start):
@@ -296,12 +414,57 @@ def save_table_xlsx(headers, rows, path):
     wb.save(path)
 
 
+def _write_header(ws, result, review_headers):
+    """Write the header into the "Tablo" sheet and return how many Excel rows it
+    occupies (0 if there is no header). A grouped result (from _parse_grouped)
+    carries `header_rows` + `header_merges`, which are rendered as a faithful
+    two-level MERGED header; otherwise a single bold header row is written.
+    `review_headers` is the set of column indices to highlight amber."""
+    header_rows = result.get("header_rows")
+    headers = result.get("headers", [])
+
+    if header_rows:
+        merges = result.get("header_merges", [])
+        n = len(header_rows)
+        width = max((len(hr) for hr in header_rows), default=0)
+        for hr in header_rows:
+            ws.append(list(hr))
+        for (r, c, rs, cs) in merges:
+            # clamp inside the header block so a stray rowspan can't spill into
+            # (and later crash `ws.append` on) the data rows below
+            end_row = min(r + rs, n)
+            end_col = min(c + cs, width)
+            if end_row > r + 1 or end_col > c + 1:
+                ws.merge_cells(start_row=r + 1, start_column=c + 1,
+                               end_row=end_row, end_column=end_col)
+        for r in range(1, len(header_rows) + 1):
+            for cell in ws[r]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        # header disagreements are per flat column -> mark the bottom (leaf) row
+        for j in review_headers:
+            ws.cell(row=len(header_rows), column=j + 1).fill = _REVIEW_FILL
+        return len(header_rows)
+
+    if headers:
+        ws.append(list(headers))
+        for j, cell in enumerate(ws[1]):
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            if j in review_headers:
+                cell.fill = _REVIEW_FILL
+        return 1
+
+    return 0
+
+
 def export_result_xlsx(result, path):
     """Write a pipeline result dict (from table_pipeline.run or run_consensus) to
     an .xlsx the reviewer can act on:
 
-      * "Tablo" sheet -- bold + frozen header, auto-ish column widths, and any
-        cell the models disagreed on highlighted amber (from `disagreements`).
+      * "Tablo" sheet -- bold + frozen header (a two-level MERGED header when the
+        result carries header_rows/header_merges from a grouped table), auto-ish
+        column widths, and any cell the models disagreed on highlighted amber.
       * "Rapor" sheet -- backend(s), confidence breakdown, issues, and each
         disagreement with BOTH candidate values so a human can pick.
 
@@ -319,18 +482,13 @@ def export_result_xlsx(result, path):
     ws = wb.active
     ws.title = "Tablo"
 
-    if headers:
-        ws.append(list(headers))
-        for j, cell in enumerate(ws[1]):
-            cell.font = Font(bold=True)
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            if j in review_headers:
-                cell.fill = _REVIEW_FILL
-        ws.freeze_panes = "A2"
+    n_header = _write_header(ws, result, review_headers)
+    if n_header:
+        ws.freeze_panes = f"A{n_header + 1}"
 
     for i, row in enumerate(rows):
         ws.append(list(row))
-        excel_row = i + 2 if headers else i + 1
+        excel_row = i + 1 + n_header
         for j in range(len(row)):
             if (i, j) in review_cells:
                 ws.cell(row=excel_row, column=j + 1).fill = _REVIEW_FILL
