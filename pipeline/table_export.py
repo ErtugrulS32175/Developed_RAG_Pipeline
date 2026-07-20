@@ -172,6 +172,37 @@ def _build_grid(rows, spans):
     return grid, labels, merges, width
 
 
+def flatten_header(header_rows, header_merges):
+    """Fold a two-level header (a display grid where merged cells hold their text
+    at the top-left and blanks elsewhere, plus the merge spans) into one flat
+    "Group - Sub" name per column. Used both by the grouped parser and by the
+    template stamper so both produce identical flat column names."""
+    if not header_rows:
+        return []
+    n = len(header_rows)
+    width = max(len(r) for r in header_rows)
+    # rebuild the full label coverage: every covered cell carries its span's text
+    label = {}
+    for r in range(n):
+        for c in range(len(header_rows[r])):
+            if str(header_rows[r][c]).strip():
+                label[(r, c)] = header_rows[r][c]
+    for (r, c, rs, cs) in header_merges:
+        text = header_rows[r][c] if c < len(header_rows[r]) else ""
+        for dr in range(rs):
+            for dc in range(cs):
+                label[(r + dr, c + dc)] = text
+    out = []
+    for c in range(width):
+        seen = []
+        for r in range(n):
+            lab = label.get((r, c), "")
+            if str(lab).strip() and (not seen or seen[-1] != lab):
+                seen.append(str(lab))
+        out.append(" - ".join(seen))
+    return out
+
+
 def _parse_grouped(rows, spans):
     """Parse a table with a genuine multi-row grouped header (rowspan present).
     Expands spans to a grid, skips a leading full-width TITLE row, detects how
@@ -180,7 +211,7 @@ def _parse_grouped(rows, spans):
     rows below it. Extra keys `header_rows` (the raw header grid) and
     `header_merges` (spans relative to the header block) let the Excel exporter
     reproduce the two-level merged header faithfully."""
-    grid, labels, merges, width = _build_grid(rows, spans)
+    grid, _labels, merges, width = _build_grid(rows, spans)
     nrows = len(rows)
 
     def row_cells(g, r):
@@ -200,21 +231,11 @@ def _parse_grouped(rows, spans):
     band = min(band, nrows - h0)                     # never swallow all rows
     header_end = h0 + band
 
-    # Fold the band into one flat name per column: distinct labels top->bottom.
-    headers = []
-    for c in range(width):
-        seen = []
-        for r in range(h0, header_end):
-            lab = labels.get((r, c), "")
-            if lab and (not seen or seen[-1] != lab):
-                seen.append(lab)
-        headers.append(" - ".join(seen))
-
     header_rows = [row_cells(grid, r) for r in range(h0, header_end)]
     header_merges = [(r - h0, c, rs, cs) for (r, c, rs, cs) in merges if h0 <= r < header_end]
     body = [row_cells(grid, r) for r in range(header_end, nrows)]
     return {
-        "headers": headers,
+        "headers": flatten_header(header_rows, header_merges),
         "rows": body,
         "header_rows": header_rows,
         "header_merges": header_merges,
