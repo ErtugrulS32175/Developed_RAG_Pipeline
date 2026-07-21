@@ -197,34 +197,39 @@ def cell_accuracy(pred, gt, fold_text=True):
     return round(correct / total, 4) if total else None
 
 
-def consensus_metrics(vl, hy, gt, fold_text=True):
+def consensus_metrics(primary, secondary, gt, fold_text=True):
     """Three cell-level rates for a two-model consensus vs ground truth (over
-    headers + data), computed only when all three shapes match (else None):
+    headers + data), computed only when all three shapes match (else None).
+    Columns the GT lists in `exclude_cols` (e.g. a redacted column no backend can
+    read) are dropped first, so trivially-empty cells don't inflate the rates:
 
-      * agreement    -- both models read the SAME value (VL == HY). Needs no GT;
-                        the fraction the pipeline auto-accepts without review.
-      * primary_acc  -- the PRIMARY model (VL, the value we output) matches GT.
+      * agreement    -- both models read the SAME value. Needs no GT; the fraction
+                        the pipeline auto-accepts without review.
+      * primary_acc  -- the PRIMARY model (the value we output) matches GT.
       * total_acc    -- AT LEAST ONE model matches GT: the ceiling a human can
                         reach by picking the right candidate on each disagreement.
 
-    total_acc - primary_acc is exactly what human review of the amber-flagged
-    disagreements recovers (cells where VL is wrong but HY is right)."""
+    total_acc - primary_acc is what human review of the amber-flagged
+    disagreements recovers (cells where primary is wrong but secondary is right)."""
+    cols = gt.get("exclude_cols") or []
+    P, S, G = _drop_cols(primary, cols), _drop_cols(secondary, cols), _drop_cols(gt, cols)
+
     def cells(t):
         return [list(t.get("headers", []))] + [list(r) for r in t.get("rows", [])]
-    V, H, G = cells(vl), cells(hy), cells(gt)
-    if not (len(V) == len(H) == len(G)):
+    Pc, Sc, Gc = cells(P), cells(S), cells(G)
+    if not (len(Pc) == len(Sc) == len(Gc)):
         return None
-    if any(not (len(a) == len(b) == len(c)) for a, b, c in zip(V, H, G)):
+    if any(not (len(a) == len(b) == len(c)) for a, b, c in zip(Pc, Sc, Gc)):
         return None
     norm = fold if fold_text else (lambda x: str(x).strip())
     n = agree = prim = total = 0
-    for rv, rh, rg in zip(V, H, G):
-        for v, h, g in zip(rv, rh, rg):
+    for rp, rs, rg in zip(Pc, Sc, Gc):
+        for p, s, g in zip(rp, rs, rg):
             n += 1
-            nv, nh, ng = norm(v), norm(h), norm(g)
-            agree += (nv == nh)
-            prim += (nv == ng)
-            total += (nv == ng or nh == ng)
+            np_, ns_, ng_ = norm(p), norm(s), norm(g)
+            agree += (np_ == ns_)
+            prim += (np_ == ng_)
+            total += (np_ == ng_ or ns_ == ng_)
     if not n:
         return None
     return {

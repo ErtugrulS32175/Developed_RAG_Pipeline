@@ -142,10 +142,23 @@ def test_finalize_consensus_no_candidates_when_template_arbitrates():
 
 def test_consensus_metrics_agreement_primary_total():
     from eval.table_eval import consensus_metrics
-    vl = {"headers": ["A", "B"], "rows": [["1", "2"], ["3", "4"]]}
-    hy = {"headers": ["A", "B"], "rows": [["1", "2"], ["9", "4"]]}   # differs at (1,0)
-    gt = {"headers": ["A", "B"], "rows": [["1", "2"], ["9", "4"]]}   # hy right, vl wrong there
-    m = consensus_metrics(vl, hy, gt)
+    primary = {"headers": ["A", "B"], "rows": [["1", "2"], ["3", "4"]]}
+    secondary = {"headers": ["A", "B"], "rows": [["1", "2"], ["9", "4"]]}  # differs at (1,0)
+    gt = {"headers": ["A", "B"], "rows": [["1", "2"], ["9", "4"]]}   # secondary right there
+    m = consensus_metrics(primary, secondary, gt)
     assert m["agreement"] == round(5 / 6, 4)      # 1 of 6 cells disagree
-    assert m["primary_acc"] == round(5 / 6, 4)    # VL wrong on (1,0)
-    assert m["total_acc"] == 1.0                  # HY recovers it -> at least one right
+    assert m["primary_acc"] == round(5 / 6, 4)    # primary wrong on (1,0)
+    assert m["total_acc"] == 1.0                  # secondary recovers it
+
+
+def test_consensus_metrics_respects_exclude_cols():
+    from eval.table_eval import consensus_metrics
+    # col 1 is a redacted (empty) column marked excluded -> dropped, so the real
+    # disagreement in col 0 isn't diluted by trivial empty-cell matches
+    primary = {"headers": ["A", "B"], "rows": [["1", ""], ["3", ""]]}
+    secondary = {"headers": ["A", "B"], "rows": [["9", ""], ["3", ""]]}
+    gt = {"headers": ["A", "B"], "rows": [["1", ""], ["3", ""]], "exclude_cols": [1]}
+    m = consensus_metrics(primary, secondary, gt)
+    assert m["n_cells"] == 3                       # header A + 2 data in col 0 (B dropped)
+    assert m["agreement"] == round(2 / 3, 4)       # (0,0) disagrees
+    assert m["primary_acc"] == 1.0                 # primary right on the kept cells
