@@ -484,31 +484,14 @@ def _write_header(ws, result, review_headers):
     return 0
 
 
-def export_result_xlsx(result, path):
-    """Write a pipeline result dict (from table_pipeline.run or run_consensus) to
-    an .xlsx the reviewer can act on:
+def _write_table_sheet(ws, table, review_cells=frozenset(), review_headers=frozenset()):
+    """Render one table (flat or two-level grouped header + data) into a sheet:
+    bold/frozen/merged header, auto-ish column widths, and any cell in
+    `review_cells` / column in `review_headers` highlighted amber."""
+    headers = table.get("headers", [])
+    rows = table.get("rows", [])
 
-      * "Tablo" sheet -- bold + frozen header (a two-level MERGED header when the
-        result carries header_rows/header_merges from a grouped table), auto-ish
-        column widths, and any cell the models disagreed on highlighted amber.
-      * "Rapor" sheet -- backend(s), confidence breakdown, issues, and each
-        disagreement with BOTH candidate values so a human can pick.
-
-    Works for a single-backend result (no disagreements -> nothing highlighted)
-    and a consensus result alike. Values are written verbatim (no number coercion)
-    to preserve OCR fidelity."""
-    headers = result.get("headers", [])
-    rows = result.get("rows", [])
-    disagreements = result.get("disagreements", [])
-    review_cells = {d["pos"] for d in disagreements if d.get("kind") == "cell"}
-    review_headers = {d["pos"] for d in disagreements if d.get("kind") == "header"}
-
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Tablo"
-
-    n_header = _write_header(ws, result, review_headers)
+    n_header = _write_header(ws, table, review_headers)
     if n_header:
         ws.freeze_panes = f"A{n_header + 1}"
 
@@ -526,6 +509,88 @@ def export_result_xlsx(result, path):
             if j < len(row):
                 longest = max(longest, len(str(row[j])))
         ws.column_dimensions[get_column_letter(j + 1)].width = min(max(longest + 2, 8), 40)
+
+
+def _candidate_sheet_title(cand, k):
+    """Excel-safe sheet title for one show-both candidate (<=31 chars, no []:*?/\\)."""
+    label = cand.get("backend") or f"model{k + 1}"
+    title = f"Model {chr(65 + k)} - {label}"
+    for ch in r'[]:*?/\ ':
+        title = title.replace(ch, "_")
+    return title[:31]
+
+
+def _candidate_width(cand):
+    """Column count of a candidate reading (grouped header width if present)."""
+    hr = cand.get("header_rows")
+    if hr:
+        return max((len(r) for r in hr), default=0)
+    rows = cand.get("rows", [])
+    return len(cand.get("headers", [])) or (len(rows[0]) if rows else 0)
+
+
+def _write_comparison_sheet(ws, candidates):
+    """Decision dashboard for a show-both result: one column per model with its
+    shape, header type, and quality signal. Deliberately NOT a cross-model header
+    alignment -- the models disagree on column count, so pairing their headers
+    cell-by-cell would misalign; each model's full header lives on its own sheet.
+    Here we only report per-model summary values (nothing to shift)."""
+    labels = [c.get("backend") or f"model{k + 1}" for k, c in enumerate(candidates)]
+    rows = [
+        ["Karsilastirma", *labels],
+        ["Sutun sayisi", *[_candidate_width(c) for c in candidates]],
+        ["Satir sayisi", *[len(c.get("rows", [])) for c in candidates]],
+        ["Baslik tipi", *["gruplu" if c.get("header_rows") else "duz" for c in candidates]],
+        ["Supheli sayi (OCR'da yok)", *[c.get("suspect_count", 0) for c in candidates]],
+        ["Sayi guveni", *[c.get("number_fidelity", "") for c in candidates]],
+    ]
+    for r in rows:
+        ws.append(r)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    ws.column_dimensions["A"].width = 26
+    for k in range(len(candidates)):
+        ws.column_dimensions[get_column_letter(k + 2)].width = 22
+
+
+def export_result_xlsx(result, path):
+    """Write a pipeline result dict (from table_pipeline.run or run_consensus) to
+    an .xlsx the reviewer can act on:
+
+      * "Tablo" sheet -- bold + frozen header (a two-level MERGED header when the
+        result carries header_rows/header_merges from a grouped table), auto-ish
+        column widths, and any cell the models disagreed on highlighted amber.
+      * BUT when the result carries `candidates` (models disagreed on STRUCTURE and
+        no template could arbitrate), a "Karsilastirma" dashboard (per-model shape
+        + quality) leads, then each candidate reading is written to its own
+        "Model A/B - <backend>" sheet (with that model's suspect cells highlighted)
+        so a human can compare and pick.
+      * "Rapor" sheet -- backend(s), confidence breakdown, issues, and each
+        disagreement with BOTH candidate values so a human can pick.
+
+    Works for a single-backend result (no disagreements -> nothing highlighted)
+    and a consensus result alike. Values are written verbatim (no number coercion)
+    to preserve OCR fidelity."""
+    disagreements = result.get("disagreements", [])
+    review_cells = {d["pos"] for d in disagreements if d.get("kind") == "cell"}
+    review_headers = {d["pos"] for d in disagreements if d.get("kind") == "header"}
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+
+    candidates = result.get("candidates")
+    if candidates:
+        # decision dashboard first, then each model's faithful reading on its own
+        # sheet with that model's suspect numeric cells highlighted
+        _write_comparison_sheet(wb.active, candidates)
+        wb.active.title = "Karsilastirma"
+        for k, cand in enumerate(candidates):
+            ws = wb.create_sheet(_candidate_sheet_title(cand, k))
+            _write_table_sheet(ws, cand, review_cells=set(cand.get("review_cells", ())))
+    else:
+        ws = wb.active
+        ws.title = "Tablo"
+        _write_table_sheet(ws, result, review_cells, review_headers)
 
     _write_report_sheet(wb.create_sheet("Rapor"), result)
     wb.save(path)

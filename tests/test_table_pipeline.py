@@ -96,3 +96,45 @@ def test_finalize_consensus_flat_passes_through():
     assert "header_rows" not in r
     assert r.get("review_all_headers") is None
     assert r["headers"] == ["A", "B"]
+
+
+def test_finalize_consensus_shows_both_on_unresolved_shape_mismatch():
+    rec = _rec(["A", "B", "C"], [["1", "2", "3"]],
+               shape_match=False, shape_primary=(1, 3), shape_secondary=(1, 4),
+               disagreements=[{"kind": "shape"}], agreement=0.0)
+    cands = [{"backend": "b1", "headers": ["A", "B", "C"], "rows": [["1", "2", "3"]]},
+             {"backend": "b2", "headers": ["A", "B", "C", "D"], "rows": [["1", "2", "3", "4"]]}]
+    r = _finalize_consensus(rec, "", ["b1", "b2"], 0.9, templates=[], candidates=cands)
+    assert r["needs_review"] is True
+    assert len(r["candidates"]) == 2
+    assert [c["backend"] for c in r["candidates"]] == ["b1", "b2"]
+
+
+def test_finalize_consensus_scores_candidate_quality_from_ocr():
+    rec = _rec(["A", "B"], [["10", "20"]],
+               shape_match=False, shape_primary=(1, 2), shape_secondary=(1, 3),
+               disagreements=[{"kind": "shape"}], agreement=0.0)
+    # ocr_text has 10 and 20 but NOT 99 -> b2's "99" is a suspect number
+    cands = [{"backend": "b1", "headers": ["A", "B"], "rows": [["10", "20"]]},
+             {"backend": "b2", "headers": ["A", "B", "C"], "rows": [["10", "20", "99"]]}]
+    r = _finalize_consensus(rec, "10 20", ["b1", "b2"], 0.9, templates=[], candidates=cands)
+    a, b = r["candidates"]
+    assert a["suspect_count"] == 0
+    assert b["suspect_count"] == 1 and (0, 2) in b["review_cells"]
+
+
+def test_finalize_consensus_no_candidates_when_template_arbitrates():
+    # shape mismatch, but a template recognizes the form and stamps it (data
+    # width matches) -> we have the answer, so DON'T dump both candidates
+    rec = _rec(["x", "x", "x", "x"], [["aa", "bb", "cc", "dd"]],
+               shape_match=False, shape_primary=(1, 4), shape_secondary=(1, 5),
+               disagreements=[{"kind": "shape"}], agreement=0.0,
+               header_rows=[["C0l4", "Grup8", "", "ColC"], ["", "Sub1", "Sub2", ""]],
+               header_merges=[[0, 0, 2, 1]])
+    cands = [{"backend": "b1", "headers": ["x"] * 4, "rows": [["aa", "bb", "cc", "dd"]]},
+             {"backend": "b2", "headers": ["y"] * 5, "rows": [["a", "b", "c", "d", "e"]]}]
+    r = _finalize_consensus(rec, "", ["b1", "b2"], 0.9,
+                            templates=[_matching_template()], candidates=cands)
+    assert r.get("template") == "form_x"
+    assert "candidates" not in r          # arbitrated -> no need to show both
+    assert r["headers"] == ["ColA", "GroupB - Sub1", "GroupB - Sub2", "ColC"]

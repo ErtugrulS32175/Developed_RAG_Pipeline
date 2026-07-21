@@ -142,17 +142,29 @@ def _normalize_table(table):
     return out
 
 
-def _finalize_consensus(rec, ocr_text, backends, review_threshold, templates=()):
+def _finalize_consensus(rec, ocr_text, backends, review_threshold, templates=(),
+                        candidates=None):
     """Stages 3-5 on a reconciled (two-backend) table. Confidence is the weakest
     of {structural, numeric fidelity, model agreement}; ANY disagreement or shape
     mismatch forces review -- nothing is auto-accepted where the models differ.
     A grouped header is run through the form-template stage first (recognized ->
-    stamp canonical header; unrecognized -> flag for human header review)."""
-    table = {"headers": rec["headers"], "rows": rec["rows"]}
-    if rec.get("header_rows"):
-        table["header_rows"] = rec["header_rows"]
-        table["header_merges"] = rec.get("header_merges", [])
-    table, hdr = header_templates.resolve_header(table, templates)
+    stamp canonical header; unrecognized -> flag for human header review). When
+    the two models disagree on STRUCTURE and no template can arbitrate, both
+    readings are attached as `candidates` so the exporter can show both for the
+    human to pick."""
+    # Prefer cross-model arbitration (recognize the form from whichever model has
+    # a header structure, stamp onto the model whose width matches the template,
+    # keeping its full data). Fall back to resolving the reconciled table.
+    stamped = header_templates.arbitrate(candidates, templates) if candidates else None
+    if stamped is not None:
+        table = stamped
+        hdr = {"template": stamped["template"], "undefined_form": False, "match_score": 1.0}
+    else:
+        table = {"headers": rec["headers"], "rows": rec["rows"]}
+        if rec.get("header_rows"):
+            table["header_rows"] = rec["header_rows"]
+            table["header_merges"] = rec.get("header_merges", [])
+        table, hdr = header_templates.resolve_header(table, templates)
     headers, rows = table["headers"], table["rows"]
 
     struct_conf, issues = validate_table(headers, rows)
@@ -193,7 +205,22 @@ def _finalize_consensus(rec, ocr_text, backends, review_threshold, templates=())
         result["header_merges"] = table.get("header_merges", [])
     if hdr["template"]:
         result["template"] = hdr["template"]
-    if hdr["undefined_form"]:
+
+    stamped = bool(hdr["template"]) and not hdr["undefined_form"]
+    if not rec["shape_match"] and not stamped and candidates:
+        # structural disagreement the template couldn't arbitrate -> hand the
+        # human BOTH readings to choose from (don't silently pick one). Attach a
+        # per-model quality signal (numeric cells absent from the OCR reading) so
+        # the reviewer can tell which reading is cleaner -- highlighted on each
+        # model's own sheet, counted on the comparison sheet.
+        for cand in candidates:
+            fid, flags = number_verify.verify(
+                cand.get("headers", []), cand.get("rows", []), ocr_text)
+            cand["review_cells"] = {(ri, ci) for ri, ci, _ in flags}
+            cand["suspect_count"] = len(flags)
+            cand["number_fidelity"] = fid
+        result["candidates"] = candidates
+    elif hdr["undefined_form"]:
         issues = list(issues) + ["tanimlanmamis form - basliklari kontrol edin"]
         result["review_all_headers"] = True
         needs_review = True
@@ -233,8 +260,11 @@ def run_consensus(image_path, backends=CONSENSUS_BACKENDS, preprocess=False,
             if src is not None:
                 rec["header_rows"] = src["header_rows"]
                 rec["header_merges"] = src.get("header_merges", [])
-            results.append(
-                _finalize_consensus(rec, ocr_text, backends, review_threshold, templates))
+            # both full readings, in case the structures disagree and no template
+            # can arbitrate -> exporter shows both for the human to choose
+            cands = [{"backend": prim_be, **a}, {"backend": sec_be, **b}]
+            results.append(_finalize_consensus(
+                rec, ocr_text, backends, review_threshold, templates, candidates=cands))
         return results
     finally:
         if tmp is not None:
