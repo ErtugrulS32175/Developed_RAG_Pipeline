@@ -28,6 +28,7 @@ import tempfile
 from PIL import Image
 
 from pipeline import consensus
+from pipeline import header_templates
 from pipeline import image_preprocess as ip
 from pipeline import number_verify
 from pipeline import router
@@ -53,8 +54,12 @@ _DETERMINISTIC = {"tatr"}
 PREPROCESS_SCALE = float(os.getenv("PREPROCESS_SCALE", "1.0"))
 
 
-def _finalize(table, ocr_text, backend, review_threshold):
-    """Stages 3-5 on one raw {headers, rows} from a backend."""
+def _finalize(table, ocr_text, backend, review_threshold, templates=()):
+    """Stages 3-5 on one raw {headers, rows} from a backend. If the table has a
+    grouped header, first try to recognize the form and stamp its canonical
+    header (base-layer safety net); an unrecognized grouped header is flagged for
+    human header review rather than trusted."""
+    table, hdr = header_templates.resolve_header(table, templates)
     headers = [normalize_tr(h) for h in table.get("headers", [])]
     rows = [[normalize_tr(c) for c in row] for row in table.get("rows", [])]
 
@@ -70,16 +75,28 @@ def _finalize(table, ocr_text, backend, review_threshold):
     confidence = round(min(struct_conf, num_fidelity), 3)
     needs_review = confidence < review_threshold or bool(issues)
 
-    return {
+    result = {
         "backend": backend,
         "headers": headers,
         "rows": rows,
         "confidence": confidence,
         "structural_confidence": struct_conf,
         "number_fidelity": num_fidelity,
-        "issues": issues,
-        "needs_review": needs_review,
     }
+    # keep the two-level structure so the exporter can rebuild a merged header
+    if table.get("header_rows"):
+        result["header_rows"] = [[normalize_tr(c) for c in r] for r in table["header_rows"]]
+        result["header_merges"] = table.get("header_merges", [])
+    if hdr["template"]:
+        result["template"] = hdr["template"]
+    if hdr["undefined_form"]:
+        issues = list(issues) + ["tanimlanmamis form - basliklari kontrol edin"]
+        result["review_all_headers"] = True
+        needs_review = True
+
+    result["issues"] = issues
+    result["needs_review"] = needs_review
+    return result
 
 
 def run(image_path, backend=None, preprocess=None, review_threshold=REVIEW_THRESHOLD):
@@ -102,7 +119,9 @@ def run(image_path, backend=None, preprocess=None, review_threshold=REVIEW_THRES
         # + OCR cross-check both rely on this being pixel-faithful on digits)
         ocr_text = router.ocr_via_paddle(work)
         raw_tables = router.tables_from_image(work, backend)
-        return [_finalize(t, ocr_text, backend, review_threshold) for t in raw_tables]
+        templates = header_templates.load_templates()
+        return [_finalize(t, ocr_text, backend, review_threshold, templates)
+                for t in raw_tables]
     finally:
         if tmp is not None:
             os.unlink(tmp.name)
@@ -110,18 +129,32 @@ def run(image_path, backend=None, preprocess=None, review_threshold=REVIEW_THRES
 
 def _normalize_table(table):
     """normalize_tr every cell so the two backends are compared on clean Turkish
-    text (residual-mark differences shouldn't register as disagreement)."""
-    return {
+    text (residual-mark differences shouldn't register as disagreement). A
+    grouped header's structure (header_rows/header_merges) is carried through for
+    template matching + faithful merged export."""
+    out = {
         "headers": [normalize_tr(h) for h in table.get("headers", [])],
         "rows": [[normalize_tr(c) for c in row] for row in table.get("rows", [])],
     }
+    if table.get("header_rows"):
+        out["header_rows"] = [[normalize_tr(c) for c in r] for r in table["header_rows"]]
+        out["header_merges"] = table.get("header_merges", [])
+    return out
 
 
-def _finalize_consensus(rec, ocr_text, backends, review_threshold):
+def _finalize_consensus(rec, ocr_text, backends, review_threshold, templates=()):
     """Stages 3-5 on a reconciled (two-backend) table. Confidence is the weakest
     of {structural, numeric fidelity, model agreement}; ANY disagreement or shape
-    mismatch forces review -- nothing is auto-accepted where the models differ."""
-    headers, rows = rec["headers"], rec["rows"]
+    mismatch forces review -- nothing is auto-accepted where the models differ.
+    A grouped header is run through the form-template stage first (recognized ->
+    stamp canonical header; unrecognized -> flag for human header review)."""
+    table = {"headers": rec["headers"], "rows": rec["rows"]}
+    if rec.get("header_rows"):
+        table["header_rows"] = rec["header_rows"]
+        table["header_merges"] = rec.get("header_merges", [])
+    table, hdr = header_templates.resolve_header(table, templates)
+    headers, rows = table["headers"], table["rows"]
+
     struct_conf, issues = validate_table(headers, rows)
     num_fidelity, num_flags = number_verify.verify(headers, rows, ocr_text)
     issues = list(issues) + number_verify.flags_to_messages(num_flags, headers)
@@ -136,7 +169,14 @@ def _finalize_consensus(rec, ocr_text, backends, review_threshold):
     confidence = round(min(struct_conf, num_fidelity, rec["agreement"]), 3)
     needs_review = (confidence < review_threshold or bool(issues)
                     or not rec["shape_match"])
-    return {
+
+    # a recognized (stamped) header is trusted, so its per-column disagreements
+    # are moot -- drop them so the correct header isn't flagged
+    disagreements = rec["disagreements"]
+    if hdr["template"] and not hdr["undefined_form"]:
+        disagreements = [d for d in disagreements if d.get("kind") != "header"]
+
+    result = {
         "mode": "consensus",
         "backends": list(backends),
         "headers": headers,
@@ -146,10 +186,21 @@ def _finalize_consensus(rec, ocr_text, backends, review_threshold):
         "structural_confidence": struct_conf,
         "number_fidelity": num_fidelity,
         "shape_match": rec["shape_match"],
-        "disagreements": rec["disagreements"],
-        "issues": issues,
-        "needs_review": needs_review,
+        "disagreements": disagreements,
     }
+    if table.get("header_rows"):
+        result["header_rows"] = table["header_rows"]
+        result["header_merges"] = table.get("header_merges", [])
+    if hdr["template"]:
+        result["template"] = hdr["template"]
+    if hdr["undefined_form"]:
+        issues = list(issues) + ["tanimlanmamis form - basliklari kontrol edin"]
+        result["review_all_headers"] = True
+        needs_review = True
+
+    result["issues"] = issues
+    result["needs_review"] = needs_review
+    return result
 
 
 def run_consensus(image_path, backends=CONSENSUS_BACKENDS, preprocess=False,
@@ -170,12 +221,20 @@ def run_consensus(image_path, backends=CONSENSUS_BACKENDS, preprocess=False,
         ocr_text = router.ocr_via_paddle(work)
         prim = [_normalize_table(t) for t in router.tables_from_image(work, prim_be)]
         sec = [_normalize_table(t) for t in router.tables_from_image(work, sec_be)]
+        templates = header_templates.load_templates()
         results = []
         for i in range(max(len(prim), len(sec))):
             a = prim[i] if i < len(prim) else {"headers": [], "rows": []}
             b = sec[i] if i < len(sec) else {"headers": [], "rows": []}
             rec = consensus.reconcile(a, b, prim_be, sec_be)
-            results.append(_finalize_consensus(rec, ocr_text, backends, review_threshold))
+            # carry a grouped header (whichever model produced one) so the
+            # template stage can recognize the form
+            src = a if a.get("header_rows") else (b if b.get("header_rows") else None)
+            if src is not None:
+                rec["header_rows"] = src["header_rows"]
+                rec["header_merges"] = src.get("header_merges", [])
+            results.append(
+                _finalize_consensus(rec, ocr_text, backends, review_threshold, templates))
         return results
     finally:
         if tmp is not None:

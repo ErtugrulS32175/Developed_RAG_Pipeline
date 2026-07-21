@@ -440,9 +440,12 @@ def _write_header(ws, result, review_headers):
     occupies (0 if there is no header). A grouped result (from _parse_grouped)
     carries `header_rows` + `header_merges`, which are rendered as a faithful
     two-level MERGED header; otherwise a single bold header row is written.
-    `review_headers` is the set of column indices to highlight amber."""
+    `review_headers` is the set of column indices to highlight amber.
+    `review_all_headers` on the result highlights the WHOLE header -- used when a
+    grouped header could not be mapped to a known form ("undefined form")."""
     header_rows = result.get("header_rows")
     headers = result.get("headers", [])
+    review_all = bool(result.get("review_all_headers"))
 
     if header_rows:
         merges = result.get("header_merges", [])
@@ -458,21 +461,23 @@ def _write_header(ws, result, review_headers):
             if end_row > r + 1 or end_col > c + 1:
                 ws.merge_cells(start_row=r + 1, start_column=c + 1,
                                end_row=end_row, end_column=end_col)
-        for r in range(1, len(header_rows) + 1):
+        for r in range(1, n + 1):
             for cell in ws[r]:
                 cell.font = Font(bold=True)
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                if review_all:
+                    cell.fill = _REVIEW_FILL
         # header disagreements are per flat column -> mark the bottom (leaf) row
         for j in review_headers:
-            ws.cell(row=len(header_rows), column=j + 1).fill = _REVIEW_FILL
-        return len(header_rows)
+            ws.cell(row=n, column=j + 1).fill = _REVIEW_FILL
+        return n
 
     if headers:
         ws.append(list(headers))
         for j, cell in enumerate(ws[1]):
             cell.font = Font(bold=True)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-            if j in review_headers:
+            if review_all or j in review_headers:
                 cell.fill = _REVIEW_FILL
         return 1
 

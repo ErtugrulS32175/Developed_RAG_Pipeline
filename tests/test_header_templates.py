@@ -4,6 +4,7 @@ from pipeline.header_templates import (
     apply_template,
     load_templates,
     match_template,
+    resolve_header,
 )
 
 
@@ -82,3 +83,36 @@ def test_apply_stamps_canonical_header_and_keeps_data():
 def test_apply_returns_none_on_column_count_mismatch():
     parsed = {"rows": [["1", "2", "3", "4", "5"]]}   # 5 data cols, template is 4
     assert apply_template(parsed, _template()) is None
+
+
+def test_resolve_stamps_when_form_recognized():
+    parsed = {
+        "header_rows": [["C0l4", "Grup8", "", "ColC"], ["", "Sub1", "Sub2", ""]],
+        "header_merges": [[0, 0, 2, 1]],
+        "rows": [["a", "b", "c", "d"]],
+    }
+    out, info = resolve_header(parsed, [_template()])
+    assert info["template"] == "form_x" and info["undefined_form"] is False
+    assert out["headers"] == ["ColA", "GroupB - Sub1", "GroupB - Sub2", "ColC"]
+
+
+def test_resolve_flags_unrecognized_grouped_header():
+    parsed = {"header_rows": [["Zzz", "Qqq", "Www", "Rrr"]], "rows": [["a", "b", "c", "d"]]}
+    out, info = resolve_header(parsed, [_template()])
+    assert info["undefined_form"] is True and info["template"] is None
+    assert out is parsed          # unchanged, nothing stamped
+
+
+def test_resolve_flags_recognized_but_column_mismatch():
+    parsed = {
+        "header_rows": [["C0l4", "Grup8", "", "ColC"], ["", "Sub1", "Sub2", ""]],
+        "rows": [["a", "b", "c", "d", "e"]],       # 5 data cols, template is 4
+    }
+    out, info = resolve_header(parsed, [_template()])
+    assert info["template"] == "form_x" and info["undefined_form"] is True
+
+
+def test_resolve_passes_flat_header_through():
+    parsed = {"headers": ["A", "B"], "rows": [["1", "2"]]}
+    out, info = resolve_header(parsed, [_template()])
+    assert out is parsed and info["undefined_form"] is False

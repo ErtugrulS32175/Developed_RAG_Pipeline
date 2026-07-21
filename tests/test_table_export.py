@@ -216,6 +216,17 @@ def test_export_grouped_header_highlights_data_disagreement_at_right_offset(tmp_
     assert ws["D3"].fill.patternType is None
 
 
+def test_export_review_all_headers_highlights_whole_grouped_header(tmp_path):
+    result = _grouped_result()
+    result["review_all_headers"] = True          # undefined form -> flag whole header
+    out = tmp_path / "g.xlsx"
+    export_result_xlsx(result, str(out))
+    ws = load_workbook(out)["Tablo"]
+    assert ws["A1"].fill.patternType == "solid"       # top-level cell flagged
+    assert ws["D2"].fill.patternType == "solid"       # sub cell flagged
+    assert ws["A3"].fill.patternType is None          # data row not flagged
+
+
 def test_export_single_backend_result_has_no_highlights(tmp_path):
     out = tmp_path / "t.xlsx"
     result = {

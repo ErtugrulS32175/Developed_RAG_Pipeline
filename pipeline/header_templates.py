@@ -78,6 +78,39 @@ def match_template(header_rows, templates, *, token_thresh=0.6, min_score=0.5):
     return None, round(best_score, 2)
 
 
+def resolve_header(table, templates):
+    """Base-layer header resolution for one extracted table.
+
+    If the table has a grouped (multi-row) header, try to recognize the form and
+    stamp its canonical header on top; otherwise pass the table through untouched.
+    Returns (table, info) where info = {template, undefined_form, match_score}:
+
+      * recognized + stamped   -> corrected table,  undefined_form=False
+      * recognized but columns don't line up (can't safely stamp) -> original
+        table, undefined_form=True (flag the header for a human)
+      * not recognized (grouped header, no template match) -> original table,
+        undefined_form=True
+      * flat header (no grouped structure) -> passes through, undefined_form=False
+
+    This is the always-works safety net: a grouped header we can't map to a known
+    form is never silently trusted -- it's marked for human header review.
+    """
+    header_rows = table.get("header_rows")
+    if not header_rows:
+        return table, {"template": None, "undefined_form": False, "match_score": 0.0}
+    tpl, score = match_template(header_rows, templates)
+    if tpl is not None:
+        stamped = apply_template(table, tpl)
+        if stamped is not None:
+            return stamped, {"template": tpl["name"], "undefined_form": False,
+                             "match_score": score}
+        # recognized the form but the extraction's column count disagrees with
+        # the template -> don't force a wrong alignment, hand it to a human
+        return table, {"template": tpl["name"], "undefined_form": True,
+                       "match_score": score}
+    return table, {"template": None, "undefined_form": True, "match_score": score}
+
+
 def apply_template(parsed, template):
     """Stamp a matched template's canonical header onto a parsed table: swap in
     the template's correct header_rows/header_merges (fixing garbled text AND any
