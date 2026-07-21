@@ -197,6 +197,44 @@ def cell_accuracy(pred, gt, fold_text=True):
     return round(correct / total, 4) if total else None
 
 
+def consensus_metrics(vl, hy, gt, fold_text=True):
+    """Three cell-level rates for a two-model consensus vs ground truth (over
+    headers + data), computed only when all three shapes match (else None):
+
+      * agreement    -- both models read the SAME value (VL == HY). Needs no GT;
+                        the fraction the pipeline auto-accepts without review.
+      * primary_acc  -- the PRIMARY model (VL, the value we output) matches GT.
+      * total_acc    -- AT LEAST ONE model matches GT: the ceiling a human can
+                        reach by picking the right candidate on each disagreement.
+
+    total_acc - primary_acc is exactly what human review of the amber-flagged
+    disagreements recovers (cells where VL is wrong but HY is right)."""
+    def cells(t):
+        return [list(t.get("headers", []))] + [list(r) for r in t.get("rows", [])]
+    V, H, G = cells(vl), cells(hy), cells(gt)
+    if not (len(V) == len(H) == len(G)):
+        return None
+    if any(not (len(a) == len(b) == len(c)) for a, b, c in zip(V, H, G)):
+        return None
+    norm = fold if fold_text else (lambda x: str(x).strip())
+    n = agree = prim = total = 0
+    for rv, rh, rg in zip(V, H, G):
+        for v, h, g in zip(rv, rh, rg):
+            n += 1
+            nv, nh, ng = norm(v), norm(h), norm(g)
+            agree += (nv == nh)
+            prim += (nv == ng)
+            total += (nv == ng or nh == ng)
+    if not n:
+        return None
+    return {
+        "agreement": round(agree / n, 4),
+        "primary_acc": round(prim / n, 4),
+        "total_acc": round(total / n, 4),
+        "n_cells": n,
+    }
+
+
 def _drop_cols(table, cols):
     if not cols:
         return table

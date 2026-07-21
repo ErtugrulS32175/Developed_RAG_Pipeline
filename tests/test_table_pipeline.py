@@ -138,3 +138,14 @@ def test_finalize_consensus_no_candidates_when_template_arbitrates():
     assert r.get("template") == "form_x"
     assert "candidates" not in r          # arbitrated -> no need to show both
     assert r["headers"] == ["ColA", "GroupB - Sub1", "GroupB - Sub2", "ColC"]
+
+
+def test_consensus_metrics_agreement_primary_total():
+    from eval.table_eval import consensus_metrics
+    vl = {"headers": ["A", "B"], "rows": [["1", "2"], ["3", "4"]]}
+    hy = {"headers": ["A", "B"], "rows": [["1", "2"], ["9", "4"]]}   # differs at (1,0)
+    gt = {"headers": ["A", "B"], "rows": [["1", "2"], ["9", "4"]]}   # hy right, vl wrong there
+    m = consensus_metrics(vl, hy, gt)
+    assert m["agreement"] == round(5 / 6, 4)      # 1 of 6 cells disagree
+    assert m["primary_acc"] == round(5 / 6, 4)    # VL wrong on (1,0)
+    assert m["total_acc"] == 1.0                  # HY recovers it -> at least one right
