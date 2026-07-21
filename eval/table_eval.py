@@ -13,7 +13,7 @@ of the same shape. Three complementary numbers because one lies:
   * cell_acc     -- positional exact-match ratio, only when shapes match. Human-
                     readable ("17/20 wrong") for debugging; N/A on shape mismatch.
 
-Ground truth may set "exclude_cols" (e.g. a masked column no backend can read);
+Ground truth may set "exclude_cols" (e.g. a redacted column no backend can read);
 those columns are dropped from both pred and GT before scoring.
 """
 import re
