@@ -101,7 +101,8 @@ def parse_html_tables(text):
         `header_merges` so the Excel exporter can rebuild the merged header.
 
     Every result has `headers` and `rows`; grouped ones add the two extra keys.
-    Returns [] if no <table> is present."""
+    Falls back to markdown pipe-tables when no <table> is present (some VLMs emit
+    a table as markdown instead of HTML). Returns [] if neither is found."""
     p = _HTMLTableExtractor()
     try:
         p.feed(text or "")
@@ -120,6 +121,44 @@ def parse_html_tables(text):
             out.append(_parse_grouped(rows, spans))
         else:
             out.append(_parse_flat(rows, flags))
+    if not out:
+        out = parse_markdown_tables(text)
+    return out
+
+
+# A markdown table separator row: |---|:--:|---| (dashes, optional : alignment).
+_MD_SEP_RE = re.compile(r"^\s*\|?(\s*:?-{1,}:?\s*\|)+\s*:?-{1,}:?\s*\|?\s*$")
+
+
+def _split_md_row(line):
+    """Split one markdown table row on its pipes, dropping the outer border
+    pipes so `| a | b |` -> ['a', 'b']."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def parse_markdown_tables(text):
+    """Parse GitHub-style markdown pipe tables (a header row, a |---| separator
+    row, then body rows) into [{headers, rows}]. Some VLMs emit a table as
+    markdown rather than HTML, so this is the fallback for parse_html_tables.
+    A table ends at the first following line without a pipe."""
+    lines = (text or "").splitlines()
+    out, i, n = [], 0, len((text or "").splitlines())
+    while i < n - 1:
+        if "|" in lines[i] and _MD_SEP_RE.match(lines[i + 1]):
+            headers = _split_md_row(lines[i])
+            rows, j = [], i + 2
+            while j < n and lines[j].strip() and "|" in lines[j]:
+                rows.append(_split_md_row(lines[j]))
+                j += 1
+            out.append({"headers": headers, "rows": rows})
+            i = j
+        else:
+            i += 1
     return out
 
 

@@ -119,6 +119,46 @@ def test_parse_two_level_grouped_header():
     assert merges[(0, 3)] == (1, 2)      # GroupC: 1 row x 2 cols
 
 
+def test_parse_markdown_table_via_fallback():
+    # no HTML <table> -> parse_html_tables falls back to markdown pipe table
+    md = (
+        "# SOME TITLE\n"
+        "| Product | Qty | Note |\n"
+        "|---|---|---|\n"
+        "| Pen | 5 |  |\n"
+        "| Book | 3 | x |\n"
+    )
+    t = parse_html_tables(md)[0]
+    assert t["headers"] == ["Product", "Qty", "Note"]
+    assert t["rows"] == [["Pen", "5", ""], ["Book", "3", "x"]]
+    assert "header_rows" not in t          # markdown tables are flat
+
+
+def test_parse_markdown_stops_at_non_table_line():
+    md = (
+        "| A | B |\n"
+        "| :-: | :-: |\n"
+        "| 1 | 2 |\n"
+        "\n"
+        "## TOTALS\n"
+        "99  0\n"
+    )
+    t = parse_html_tables(md)[0]
+    assert t["headers"] == ["A", "B"]
+    assert t["rows"] == [["1", "2"]]       # totals section not swallowed
+
+
+def test_html_table_still_preferred_over_markdown_text():
+    # when a real <table> is present, the markdown fallback must NOT run
+    html = "<table><tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></table>"
+    t = parse_html_tables(html)[0]
+    assert t["headers"] == ["A", "B"] and t["rows"] == [["1", "2"]]
+
+
+def test_parse_markdown_no_table_returns_empty():
+    assert parse_html_tables("just some text, no table here") == []
+
+
 def _consensus_result():
     return {
         "mode": "consensus",
