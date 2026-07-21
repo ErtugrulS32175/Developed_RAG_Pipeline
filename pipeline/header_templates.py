@@ -78,6 +78,51 @@ def match_template(header_rows, templates, *, token_thresh=0.6, min_score=0.5):
     return None, round(best_score, 2)
 
 
+def _full_data(cand):
+    """The complete data body of one candidate reading. A grouped reading has its
+    header separated already (data = rows). A FLAT reading has no real header --
+    the model put the first data row into `headers` -- so that row is data too and
+    must be kept (this is what fixes the dropped first row when stamping)."""
+    rows = cand.get("rows", [])
+    if cand.get("header_rows"):
+        return rows
+    headers = cand.get("headers", [])
+    return ([list(headers)] + rows) if headers else rows
+
+
+def arbitrate(candidates, templates):
+    """Resolve a set of candidate readings (same table, different models) with a
+    template. Recognize the form from whichever candidate carries a header
+    structure, then stamp the template's canonical header onto the candidate
+    whose column count matches the template -- using that candidate's FULL data
+    (a flat reading's misclassified 'header' row is kept). Returns a stamped table
+    dict or None if no template recognizes the form and fits a candidate's width.
+    """
+    tpl = None
+    for c in candidates:
+        hr = c.get("header_rows")
+        if hr:
+            t, _ = match_template(hr, templates)
+            if t is not None:
+                tpl = t
+                break
+    if tpl is None:
+        return None
+    width = max(len(r) for r in tpl["header_rows"])
+    for c in candidates:
+        data = _full_data(c)
+        if max((len(r) for r in data), default=0) == width:
+            merges = [tuple(m) for m in tpl.get("header_merges", [])]
+            return {
+                "headers": flatten_header(tpl["header_rows"], merges),
+                "header_rows": tpl["header_rows"],
+                "header_merges": merges,
+                "rows": data,
+                "template": tpl["name"],
+            }
+    return None
+
+
 def resolve_header(table, templates):
     """Base-layer header resolution for one extracted table.
 

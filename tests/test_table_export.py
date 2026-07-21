@@ -227,6 +227,52 @@ def test_export_review_all_headers_highlights_whole_grouped_header(tmp_path):
     assert ws["A3"].fill.patternType is None          # data row not flagged
 
 
+def _candidates_result():
+    return {
+        "mode": "consensus",
+        "backends": ["b1", "b2"],
+        "headers": [], "rows": [],
+        "shape_match": False,
+        "disagreements": [{"kind": "shape", "b1": (1, 3), "b2": (1, 4)}],
+        "needs_review": True,
+        "issues": ["modeller farkli sekil verdi"],
+        "candidates": [
+            {"backend": "b1", "headers": ["A", "B", "C"], "rows": [["1", "2", "3"]],
+             "review_cells": {(0, 2)}, "suspect_count": 1, "number_fidelity": 0.67},
+            {"backend": "b2", "headers": ["A", "B", "C", "D"], "rows": [["1", "2", "3", "4"]],
+             "review_cells": set(), "suspect_count": 0, "number_fidelity": 1.0},
+        ],
+    }
+
+
+def test_export_candidates_writes_comparison_and_per_model_sheets(tmp_path):
+    out = tmp_path / "c.xlsx"
+    export_result_xlsx(_candidates_result(), str(out))
+    wb = load_workbook(out)
+    assert wb.sheetnames == ["Karsilastirma", "Model_A_-_b1", "Model_B_-_b2", "Rapor"]
+    assert [c.value for c in wb["Model_A_-_b1"][1]] == ["A", "B", "C"]
+    assert [c.value for c in wb["Model_B_-_b2"][1]] == ["A", "B", "C", "D"]
+    assert wb["Model_B_-_b2"]["D2"].value == "4"
+
+
+def test_export_comparison_sheet_reports_per_model_summary(tmp_path):
+    out = tmp_path / "c.xlsx"
+    export_result_xlsx(_candidates_result(), str(out))
+    ws = load_workbook(out)["Karsilastirma"]
+    rows = {r[0].value: [c.value for c in r[1:]] for r in ws.iter_rows()}
+    assert rows["Sutun sayisi"][:2] == [3, 4]
+    assert rows["Supheli sayi (OCR'da yok)"][:2] == [1, 0]
+
+
+def test_export_candidate_suspect_cell_highlighted_on_its_sheet(tmp_path):
+    out = tmp_path / "c.xlsx"
+    export_result_xlsx(_candidates_result(), str(out))
+    wb = load_workbook(out)
+    # b1's cell (0,2) flagged -> C2 amber; b2 has no suspects
+    assert wb["Model_A_-_b1"]["C2"].fill.patternType == "solid"
+    assert wb["Model_B_-_b2"]["D2"].fill.patternType is None
+
+
 def test_export_single_backend_result_has_no_highlights(tmp_path):
     out = tmp_path / "t.xlsx"
     result = {
