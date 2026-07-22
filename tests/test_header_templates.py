@@ -112,6 +112,19 @@ def test_resolve_flags_recognized_but_column_mismatch():
     assert info["template"] == "form_x" and info["undefined_form"] is True
 
 
+def test_arbitrate_prefers_more_complete_candidate():
+    from pipeline.header_templates import arbitrate
+    # c1 matches width 4 but zeroed two cells; c2 is 6-wide with 2 blank
+    # (spurious) columns that drop to width 4 and keeps real values -> pick c2.
+    c1 = {"header_rows": [["C0l4", "Grup8", "", "ColC"], ["", "Sub1", "Sub2", ""]],
+          "rows": [["1", "0,00", "0,00", "4"]]}
+    c2 = {"rows": [["1", "", "9", "9", "4", ""]]}
+    out = arbitrate([c1, c2], [_template()])
+    assert out is not None and out["template"] == "form_x"
+    assert out["rows"] == [["1", "9", "9", "4"]]        # c2's complete data, empties dropped
+    assert out["headers"] == ["ColA", "GroupB - Sub1", "GroupB - Sub2", "ColC"]
+
+
 def test_resolve_passes_flat_header_through():
     parsed = {"headers": ["A", "B"], "rows": [["1", "2"]]}
     out, info = resolve_header(parsed, [_template()])

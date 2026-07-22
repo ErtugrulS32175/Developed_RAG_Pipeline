@@ -90,14 +90,34 @@ def _full_data(cand):
     return ([list(headers)] + rows) if headers else rows
 
 
+def _drop_empty_cols(rows):
+    """Drop columns that are blank in EVERY row -- spurious columns a model emits
+    (e.g. from an over-wide colspan that overshoots the real column count).
+    Returns (aligned_rows, kept_width). A plain "0,00" is NOT blank, so only truly
+    empty columns go."""
+    if not rows:
+        return [], 0
+    w = max(len(r) for r in rows)
+    kept = [c for c in range(w) if any(c < len(r) and str(r[c]).strip() for r in rows)]
+    return [[(r[c] if c < len(r) else "") for c in kept] for r in rows], len(kept)
+
+
+def _completeness(rows):
+    """How many 'real' values a reading carries -- non-blank and not a plain zero.
+    A model that dropped values to 0,00 (or blanks) scores lower than one that
+    kept them, so arbitration can prefer the more complete reading."""
+    return sum(1 for r in rows for c in r if str(c).strip() not in ("", "0", "0,00", "0.00", "-"))
+
+
 def arbitrate(candidates, templates):
     """Resolve a set of candidate readings (same table, different models) with a
     template. Recognize the form from whichever candidate carries a header
-    structure, then stamp the template's canonical header onto the candidate
-    whose column count matches the template -- using that candidate's FULL data
-    (a flat reading's misclassified 'header' row is kept). Returns a stamped table
-    dict or None if no template recognizes the form and fits a candidate's width.
-    """
+    structure, align each candidate to the template width by dropping its blank
+    (spurious) columns, and stamp the template onto the MOST COMPLETE aligned
+    candidate -- the one that dropped the fewest real values. This picks the model
+    that actually captured a column's values over one that matched the width but
+    zeroed those cells out. Returns a stamped table dict, or None if no template
+    recognizes/fits any candidate."""
     tpl = None
     for c in candidates:
         hr = c.get("header_rows")
@@ -109,18 +129,24 @@ def arbitrate(candidates, templates):
     if tpl is None:
         return None
     width = max(len(r) for r in tpl["header_rows"])
+    best = None                                   # (completeness, aligned_rows)
     for c in candidates:
-        data = _full_data(c)
-        if max((len(r) for r in data), default=0) == width:
-            merges = [tuple(m) for m in tpl.get("header_merges", [])]
-            return {
-                "headers": flatten_header(tpl["header_rows"], merges),
-                "header_rows": tpl["header_rows"],
-                "header_merges": merges,
-                "rows": data,
-                "template": tpl["name"],
-            }
-    return None
+        aligned, w = _drop_empty_cols(_full_data(c))
+        if w != width:
+            continue
+        comp = _completeness(aligned)
+        if best is None or comp > best[0]:
+            best = (comp, aligned)
+    if best is None:
+        return None
+    merges = [tuple(m) for m in tpl.get("header_merges", [])]
+    return {
+        "headers": flatten_header(tpl["header_rows"], merges),
+        "header_rows": tpl["header_rows"],
+        "header_merges": merges,
+        "rows": best[1],
+        "template": tpl["name"],
+    }
 
 
 def resolve_header(table, templates):
