@@ -111,13 +111,13 @@ def test_finalize_consensus_shows_both_on_unresolved_shape_mismatch():
 
 
 def test_finalize_consensus_scores_candidate_quality_from_ocr():
-    rec = _rec(["A", "B"], [["10", "20"]],
+    rec = _rec(["A", "B"], [["10,00", "20,00"]],
                shape_match=False, shape_primary=(1, 2), shape_secondary=(1, 3),
                disagreements=[{"kind": "shape"}], agreement=0.0)
-    # ocr_text has 10 and 20 but NOT 99 -> b2's "99" is a suspect number
-    cands = [{"backend": "b1", "headers": ["A", "B"], "rows": [["10", "20"]]},
-             {"backend": "b2", "headers": ["A", "B", "C"], "rows": [["10", "20", "99"]]}]
-    r = _finalize_consensus(rec, "10 20", ["b1", "b2"], 0.9, templates=[], candidates=cands)
+    # OCR has 10,00 and 20,00 but NOT 99,99 -> b2's "99,99" is a suspect (financial)
+    cands = [{"backend": "b1", "headers": ["A", "B"], "rows": [["10,00", "20,00"]]},
+             {"backend": "b2", "headers": ["A", "B", "C"], "rows": [["10,00", "20,00", "99,99"]]}]
+    r = _finalize_consensus(rec, "10,00 20,00", ["b1", "b2"], 0.9, templates=[], candidates=cands)
     a, b = r["candidates"]
     assert a["suspect_count"] == 0
     assert b["suspect_count"] == 1 and (0, 2) in b["review_cells"]

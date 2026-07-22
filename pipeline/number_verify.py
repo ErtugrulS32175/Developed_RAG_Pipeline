@@ -24,6 +24,20 @@ def is_numeric(cell) -> bool:
     return bool(re.fullmatch(r"[-+()%.,\s\d]+", s))
 
 
+# a monetary value: digits (with optional . thousands) and a , decimal part
+_FINANCIAL_RE = re.compile(r"[-+(]?\d[\d.]*,\d{1,2}\)?%?")
+
+
+def is_financial(cell) -> bool:
+    """True only for a monetary/decimal value -- a number with a comma decimal
+    part (12,34 / 1.234,56 / 0,00 / -7,89). Fidelity-checking is scoped to these:
+    they are the values that matter and that a VLM might silently alter. Bare
+    integers used as row indices / years / months, and ISO year-month dates, are
+    NOT financial -- and the deterministic OCR often can't read them from narrow
+    columns -- so verifying them only produces false hallucination flags."""
+    return bool(_FINANCIAL_RE.fullmatch(str(cell).strip()))
+
+
 def _digits(s) -> str:
     """Digits only -- drop thousands/decimal separators, sign, spaces -- so
     1.373,66 / 1373,66 / 1,373.66 all compare equal. We verify the DIGITS were
@@ -42,11 +56,15 @@ def numeric_token_set(ocr_text) -> set:
 
 
 def verify(headers, rows, ocr_text):
-    """Cross-check numeric cells against the deterministic OCR reading.
+    """Cross-check FINANCIAL cells against the deterministic OCR reading.
+
+    Only monetary/decimal cells (is_financial) are checked -- row indices, years,
+    months and dates are skipped, since the deterministic OCR frequently can't
+    read those narrow/small columns and would false-flag correct values.
 
     Returns (fidelity, flags):
-      fidelity = matched_numeric / total_numeric  (1.0 when there are no numbers)
-      flags    = [(row_idx, col_idx, value), ...] for numeric cells whose digits
+      fidelity = matched / total financial cells  (1.0 when there are none)
+      flags    = [(row_idx, col_idx, value), ...] for financial cells whose digits
                  never appear in the OCR text (hallucination candidates).
     """
     ocr_keys = numeric_token_set(ocr_text)
@@ -54,7 +72,7 @@ def verify(headers, rows, ocr_text):
     flags = []
     for ri, row in enumerate(rows):
         for ci, cell in enumerate(row):
-            if not is_numeric(cell):
+            if not is_financial(cell):
                 continue
             total += 1
             key = _digits(cell)
