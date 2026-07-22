@@ -125,6 +125,28 @@ def test_arbitrate_prefers_more_complete_candidate():
     assert out["headers"] == ["ColA", "GroupB - Sub1", "GroupB - Sub2", "ColC"]
 
 
+def test_arbitrate_backfills_garbage_cell_from_other_model():
+    from pipeline.header_templates import arbitrate
+    # winner (c1) leaked text "X" into a numeric slot; the other reading (c2) has
+    # a number there and agrees on the rest of the row -> backfill "X" -> "2".
+    c1 = {"header_rows": [["C0l4", "Grup8", "", "ColC"], ["", "Sub1", "Sub2", ""]],
+          "rows": [["1", "X", "99", "44"]]}
+    c2 = {"rows": [["1", "2", "99", "44"]]}
+    out = arbitrate([c1, c2], [_template()])
+    assert out["rows"] == [["1", "2", "99", "44"]]     # garbage replaced, rest kept
+
+
+def test_arbitrate_does_not_backfill_across_misaligned_rows():
+    from pipeline.header_templates import arbitrate
+    # c2's row is a DIFFERENT record (agrees on nothing) -> guard blocks backfill,
+    # the garbage stays rather than importing a wrong value.
+    c1 = {"header_rows": [["C0l4", "Grup8", "", "ColC"], ["", "Sub1", "Sub2", ""]],
+          "rows": [["1", "X", "99", "44"]]}
+    c2 = {"rows": [["7", "8", "55", "66"]]}
+    out = arbitrate([c1, c2], [_template()])
+    assert out["rows"] == [["1", "X", "99", "44"]]     # unchanged, no wrong import
+
+
 def test_resolve_passes_flat_header_through():
     parsed = {"headers": ["A", "B"], "rows": [["1", "2"]]}
     out, info = resolve_header(parsed, [_template()])
