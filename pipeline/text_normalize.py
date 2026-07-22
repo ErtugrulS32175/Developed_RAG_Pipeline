@@ -48,6 +48,38 @@ def normalize_tr(text):
     return s
 
 
+_NUM_RE = re.compile(r"-?\d[\d.,]*")
+
+
+def normalize_number(text):
+    """Canonicalize a numeric cell to Turkish format (comma decimal, dot
+    thousands) by SWAPPING separators only -- never regrouping -- so a plain
+    integer like a 4-digit year or code is left untouched. Non-numeric text
+    (an ISO date, a percentage, anything with no separator) passes through
+    unchanged.
+
+    Fixes the common VLM slip of emitting an English decimal ('12.34') for a
+    Turkish table ('12,34'), and a fully English number ('9,876.54' ->
+    '9.876,54'). A dot before a 3-digit group is read as a thousands separator and
+    kept as-is."""
+    s = str(text).strip()
+    if not _NUM_RE.fullmatch(s) or ("." not in s and "," not in s):
+        return text
+    neg, body = s.startswith("-"), s.lstrip("-")
+    dot, comma = body.rfind("."), body.rfind(",")
+    if dot >= 0 and comma >= 0:
+        if dot > comma:                     # English (dot=decimal, comma=thousands) -> swap
+            body = body.replace(",", "\0").replace(".", ",").replace("\0", ".")
+        # else already Turkish -> leave
+    elif dot >= 0:
+        parts = body.split(".")
+        if len(parts) == 2 and len(parts[1]) in (1, 2):
+            body = body.replace(".", ",")   # a lone decimal dot -> comma
+        # else 3-digit group / multiple dots = thousands -> leave
+    # comma-only is already Turkish decimal (or rare English thousands) -> leave
+    return ("-" if neg else "") + body
+
+
 def has_residual_marks(text):
     """True if, after normalization, stray accent/modifier marks remain -- a
     signal that normalize_tr hit a sequence it doesn't know about."""

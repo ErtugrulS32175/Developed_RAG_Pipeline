@@ -32,8 +32,13 @@ from pipeline import header_templates
 from pipeline import image_preprocess as ip
 from pipeline import number_verify
 from pipeline import router
-from pipeline.text_normalize import normalize_tr
+from pipeline.text_normalize import normalize_number, normalize_tr
 from pipeline.table_export import export_result_xlsx, validate_table
+
+
+def _ncell(c):
+    """Normalize a data cell: Turkish-character repair + Turkish number format."""
+    return normalize_number(normalize_tr(c))
 
 # Two small VLMs, cross-checked: same image through both, agree -> auto-accept,
 # disagree -> that cell to human review (see pipeline/consensus.py).
@@ -61,7 +66,7 @@ def _finalize(table, ocr_text, backend, review_threshold, templates=()):
     human header review rather than trusted."""
     table, hdr = header_templates.resolve_header(table, templates)
     headers = [normalize_tr(h) for h in table.get("headers", [])]
-    rows = [[normalize_tr(c) for c in row] for row in table.get("rows", [])]
+    rows = [[_ncell(c) for c in row] for row in table.get("rows", [])]
 
     # validate_table does STRUCTURAL checks only here (width, empty rows, residual
     # Turkish marks) -- NOT the general OCR cross-check, which false-positives on
@@ -134,7 +139,7 @@ def _normalize_table(table):
     template matching + faithful merged export."""
     out = {
         "headers": [normalize_tr(h) for h in table.get("headers", [])],
-        "rows": [[normalize_tr(c) for c in row] for row in table.get("rows", [])],
+        "rows": [[_ncell(c) for c in row] for row in table.get("rows", [])],
     }
     if table.get("header_rows"):
         out["header_rows"] = [[normalize_tr(c) for c in r] for r in table["header_rows"]]

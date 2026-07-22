@@ -140,6 +140,25 @@ def test_finalize_consensus_no_candidates_when_template_arbitrates():
     assert r["headers"] == ["ColA", "GroupB - Sub1", "GroupB - Sub2", "ColC"]
 
 
+def test_normalize_number_turkish_format():
+    from pipeline.text_normalize import normalize_number as nn
+    # English decimal -> Turkish comma; fully-English -> Turkish (invented values)
+    assert nn("12.34") == "12,34"
+    assert nn("0.50") == "0,50"
+    assert nn("-8.52") == "-8,52"
+    assert nn("9,876.54") == "9.876,54"
+    # already Turkish -> unchanged
+    assert nn("9.876,54") == "9.876,54"
+    assert nn("42,10") == "42,10"
+    # integers / years / dates / percent -> NEVER regrouped or touched
+    assert nn("3000") == "3000"
+    assert nn("8888") == "8888"
+    assert nn("2000-11") == "2000-11"
+    assert nn("%15") == "%15"
+    assert nn("7.500") == "7.500"          # 3-digit group = thousands, kept
+    assert nn("abc.de") == "abc.de"        # text untouched
+
+
 def test_consensus_metrics_agreement_primary_total():
     from eval.table_eval import consensus_metrics
     primary = {"headers": ["A", "B"], "rows": [["1", "2"], ["3", "4"]]}
