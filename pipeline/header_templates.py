@@ -19,10 +19,13 @@ template's, otherwise the caller flags it for a human instead of forcing a wrong
 alignment.
 """
 import json
+import re
 from difflib import SequenceMatcher
 from pathlib import Path
 
 from pipeline.table_export import _squash, flatten_header
+
+_NUM = re.compile(r"-?\d[\d.,]*")
 
 DEFAULT_TEMPLATE_DIR = Path("data/header_templates")
 
@@ -109,6 +112,37 @@ def _completeness(rows):
     return sum(1 for r in rows for c in r if str(c).strip() not in ("", "0", "0,00", "0.00", "-"))
 
 
+def _is_number(s):
+    s = str(s).strip()
+    return bool(_NUM.fullmatch(s)) and any(ch.isdigit() for ch in s)
+
+
+def _rows_same_record(a, b, thresh=0.5):
+    """Do two aligned rows refer to the SAME record? True when they agree (folded)
+    on at least `thresh` of their cells -- a guard so backfilling never pulls a
+    value from a mis-aligned row when the two readings have different row counts."""
+    pairs = list(zip(a, b))
+    if not pairs:
+        return False
+    return sum(1 for x, y in pairs if _squash(x) == _squash(y)) / len(pairs) >= thresh
+
+
+def _plausibility_backfill(winner, other):
+    """Replace GARBAGE cells in `winner` -- non-numeric text where the other
+    reading has a real number (e.g. a header label that leaked into a numeric
+    column) -- with `other`'s value, but only within rows that clearly refer to
+    the same record. Leaves everything else untouched. Two-model tiebreak: with no
+    third model to vote, a numeric reading beats a text one in a numeric slot."""
+    out = [list(r) for r in winner]
+    for i, wr in enumerate(out):
+        if i >= len(other) or not _rows_same_record(wr, other[i]):
+            continue
+        for j in range(min(len(wr), len(other[i]))):
+            if wr[j] and not _is_number(wr[j]) and _is_number(other[i][j]):
+                out[i][j] = other[i][j]
+    return out
+
+
 def arbitrate(candidates, templates):
     """Resolve a set of candidate readings (same table, different models) with a
     template. Recognize the form from whichever candidate carries a header
@@ -116,8 +150,9 @@ def arbitrate(candidates, templates):
     (spurious) columns, and stamp the template onto the MOST COMPLETE aligned
     candidate -- the one that dropped the fewest real values. This picks the model
     that actually captured a column's values over one that matched the width but
-    zeroed those cells out. Returns a stamped table dict, or None if no template
-    recognizes/fits any candidate."""
+    zeroed those cells out. The winner's garbage cells (text leaked into a numeric
+    column) are then backfilled from the next-best reading. Returns a stamped
+    table dict, or None if no template recognizes/fits any candidate."""
     tpl = None
     for c in candidates:
         hr = c.get("header_rows")
@@ -129,22 +164,20 @@ def arbitrate(candidates, templates):
     if tpl is None:
         return None
     width = max(len(r) for r in tpl["header_rows"])
-    best = None                                   # (completeness, aligned_rows)
-    for c in candidates:
-        aligned, w = _drop_empty_cols(_full_data(c))
-        if w != width:
-            continue
-        comp = _completeness(aligned)
-        if best is None or comp > best[0]:
-            best = (comp, aligned)
-    if best is None:
+    aligned = [rows for rows, w in (_drop_empty_cols(_full_data(c)) for c in candidates)
+               if w == width]
+    if not aligned:
         return None
+    aligned.sort(key=_completeness, reverse=True)
+    winner = aligned[0]
+    for other in aligned[1:]:              # backfill garbage from each next-best reading
+        winner = _plausibility_backfill(winner, other)
     merges = [tuple(m) for m in tpl.get("header_merges", [])]
     return {
         "headers": flatten_header(tpl["header_rows"], merges),
         "header_rows": tpl["header_rows"],
         "header_merges": merges,
-        "rows": best[1],
+        "rows": winner,
         "template": tpl["name"],
     }
 
