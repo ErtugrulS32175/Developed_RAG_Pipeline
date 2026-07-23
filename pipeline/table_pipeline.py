@@ -21,6 +21,7 @@ tail to a human. Swap the table engine with TABLE_BACKEND -- every downstream
 stage is engine-agnostic. Preprocessing is owned HERE (run backend services with
 PREPROCESS=0) so the VLM and the verification OCR read the exact same image.
 """
+import json
 import os
 import sys
 import tempfile
@@ -230,6 +231,16 @@ def _finalize_consensus(rec, ocr_text, backends, review_threshold, templates=(),
         result["review_all_headers"] = True
         needs_review = True
 
+    # Persist BOTH raw model readings on every consensus result (not just the
+    # show-both case) so a per-model reading is never lost -- e.g. rebuilding a
+    # model's own sheet or scoring the total/agreement metrics offline later.
+    # Separate from `candidates` (which drives show-both export) so attaching it
+    # never changes export behaviour.
+    if candidates:
+        result["model_readings"] = [
+            {"backend": c.get("backend"), "headers": c.get("headers", []),
+             "rows": c.get("rows", [])} for c in candidates]
+
     result["issues"] = issues
     result["needs_review"] = needs_review
     return result
@@ -307,7 +318,10 @@ if __name__ == "__main__":
         results = run(img, backend=be)
     _print_report(results)
 
-    # TABLE_XLSX=out.xlsx -> write the deliverable (one file per detected table)
+    # TABLE_XLSX=out.xlsx -> write the deliverable (one file per detected table).
+    # Alongside it, dump both raw model readings to <base>_readings.json so a
+    # per-model reading is always retained (consensus keeps only the reconciled
+    # result in the xlsx otherwise).
     xlsx = os.getenv("TABLE_XLSX")
     if xlsx and results:
         base = xlsx[:-5] if xlsx.lower().endswith(".xlsx") else xlsx
@@ -315,3 +329,8 @@ if __name__ == "__main__":
             path = f"{base}.xlsx" if len(results) == 1 else f"{base}_{i}.xlsx"
             export_result_xlsx(t, path)
             print(f"  -> {path}")
+            if t.get("model_readings"):
+                rpath = f"{base}_readings.json" if len(results) == 1 else f"{base}_{i}_readings.json"
+                with open(rpath, "w", encoding="utf-8") as fh:
+                    json.dump(t["model_readings"], fh, ensure_ascii=False, indent=1)
+                print(f"  -> {rpath}")
