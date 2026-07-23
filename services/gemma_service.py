@@ -21,7 +21,7 @@ from PIL import Image
 app = FastAPI()
 
 # Configurable so the table-extraction model can be swapped independently of the
-# chat/LLM role's model (services/llm_service.py) -- separate services on purpose,
+# chat/LLM role's model (services/local_llm_service.py) -- separate services on purpose,
 # even when they both happen to be Gemma today. E4B = 8B params (~16GB BF16).
 MODEL_ID = os.getenv("GEMMA_TABLE_MODEL", "google/gemma-4-E4B-it")
 MAX_NEW = int(os.getenv("GEMMA_MAX_NEW_TOKENS", "4096"))
