@@ -42,6 +42,37 @@ def test_markdown_without_citation_args_stays_plain():
     assert md.startswith("| Product |")
 
 
+def test_data_area_rowspan_does_not_make_a_flat_table_grouped():
+    """Some backends encode a repeated cell as a vertical merge. That is a data
+    merge, not a two-level header -- treating it as one made the template stage
+    report a plain table as an unrecognized form and flag its whole header."""
+    html = ('<table>'
+            '<tr><td>A</td><td>B</td><td>C</td></tr>'
+            '<tr><td>1</td><td rowspan="2">x</td><td>p</td></tr>'
+            '<tr><td>2</td><td>q</td></tr>'
+            '</table>')
+    t = parse_html_tables(html)[0]
+
+    assert t["headers"] == ["A", "B", "C"]
+    assert "header_rows" not in t
+    assert "header_merges" not in t
+    # the merge is still expanded, so the covered cell stays blank in its row
+    assert t["rows"] == [["1", "x", "p"], ["2", "", "q"]]
+
+
+def test_real_two_row_header_still_reports_grouped_structure():
+    html = ('<table>'
+            '<tr><th rowspan="2">ColA</th><th colspan="2">GroupB</th></tr>'
+            '<tr><th>Sub1</th><th>Sub2</th></tr>'
+            '<tr><td>aa</td><td>bb</td><td>cc</td></tr>'
+            '</table>')
+    t = parse_html_tables(html)[0]
+
+    assert t["headers"] == ["ColA", "GroupB - Sub1", "GroupB - Sub2"]
+    assert len(t["header_rows"]) == 2
+    assert t["rows"] == [["aa", "bb", "cc"]]
+
+
 def test_parse_skips_spanning_title_row_without_thead():
     html = ("<table>"
             "<tr><td>REPORT TITLE</td></tr>"

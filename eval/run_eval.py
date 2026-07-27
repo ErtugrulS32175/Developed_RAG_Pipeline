@@ -17,6 +17,7 @@ import time
 
 from eval import table_eval
 from pipeline import table_pipeline
+from pipeline.table_export import export_result_xlsx
 
 GT_DIR = "data/gt"
 OUT = "output/eval"
@@ -39,7 +40,20 @@ def _load_gts(only=None):
     return gts
 
 
-def run(backends, images=None, raw_images=None):
+def _write_xlsx(tables, xlsx_dir, stem, backend):
+    """One reviewable workbook per detected table, named <stem>_<backend>.xlsx so
+    several backends' outputs can sit side by side in the same folder."""
+    os.makedirs(xlsx_dir, exist_ok=True)
+    written = []
+    for i, t in enumerate(tables):
+        suffix = "" if len(tables) == 1 else f"_{i}"
+        path = os.path.join(xlsx_dir, f"{stem}_{backend}{suffix}.xlsx")
+        export_result_xlsx(t, path)
+        written.append(path)
+    return written
+
+
+def run(backends, images=None, raw_images=None, xlsx_dir=None):
     # GT-backed jobs (scored) + raw image paths (predictions dumped, not scored --
     # for harvesting a RunPod session's VLM outputs on images not yet labeled, so
     # we can score them offline later without renting the GPU again).
@@ -68,6 +82,8 @@ def run(backends, images=None, raw_images=None):
                 row["needs_review"] = pred.get("needs_review")
                 # keep the prediction so a bad score is debuggable without re-running
                 row["pred"] = {"headers": pred.get("headers", []), "rows": pred.get("rows", [])}
+                if xlsx_dir and tables:
+                    row["xlsx"] = _write_xlsx(tables, xlsx_dir, stem, be)
             except Exception as e:
                 row["error"] = f"{type(e).__name__}: {e}"
             results.append(row)
@@ -107,6 +123,9 @@ if __name__ == "__main__":
     ap.add_argument("--raw", nargs="+", default=None,
                     help="GT'siz gorsel yollari: koss + tahmini kaydet (skorlama yok), "
                          "GT sonra hazir olunca offline skorlanir")
+    ap.add_argument("--xlsx-dir", default=None,
+                    help="her tahmini bu klasore xlsx olarak da yaz "
+                         "(<gorsel>_<backend>.xlsx)")
     a = ap.parse_args()
     print(f"backends={a.backends}  images={a.images or 'hepsi'}  raw={a.raw or '-'}\n")
-    run(a.backends, a.images, a.raw)
+    run(a.backends, a.images, a.raw, a.xlsx_dir)

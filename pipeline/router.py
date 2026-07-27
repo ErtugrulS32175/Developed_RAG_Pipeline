@@ -7,7 +7,7 @@ import pypdfium2 as pdfium
 from dotenv import load_dotenv
 
 from pipeline.text_normalize import normalize_tr
-from pipeline.table_export import validate_table, parse_table_json
+from pipeline.table_export import parse_table_json
 
 # docling is imported lazily inside build_native_converter (PDF-native path only):
 # it pulls torch and is heavy, and the table-backend / consensus path never needs
@@ -36,14 +36,22 @@ SERVICE_TIMEOUT = float(os.getenv("SERVICE_TIMEOUT", "120"))
 #   gemma        = Gemma-4 VLM
 #   paddleocr_vl = PaddleOCR-VL 0.9B doc-parsing VLM (Turkish-proven)
 #   hunyuan      = HunyuanOCR-1.5 1B OCR VLM
+#   mineru       = MinerU2.5 1.2B doc-parsing VLM (own layout pass; trial)
 TABLE_BACKENDS = {
     "tatr":         (os.getenv("TATR_TABLE_URL",    "http://127.0.0.1:8102/table"),    False),
     "docling":      (os.getenv("DOCLING_TABLE_URL", "http://127.0.0.1:8103/table_tr"), False),
     "gemma":        (os.getenv("GEMMA_TABLE_URL",   "http://127.0.0.1:8101/table"),    False),
     "paddleocr_vl": (os.getenv("PADDLEOCR_VL_URL",  "http://127.0.0.1:8104/table"),    False),
     "hunyuan":      (os.getenv("HUNYUAN_TABLE_URL", "http://127.0.0.1:8105/table"),    False),
+    "mineru":       (os.getenv("MINERU_TABLE_URL",  "http://127.0.0.1:8106/table"),    False),
 }
 TABLE_BACKEND = os.getenv("TABLE_BACKEND", "tatr").lower()
+# How ingest extracts tables: consensus (two models cross-checked, same flow the
+# table deliverable uses) or single (one TABLE_BACKEND, when only one service is
+# up). Ingest used to call a backend raw, which skipped number verification and
+# the whole cross-check layer -- tables reaching RAG were the least verified data
+# in the system.
+INGEST_TABLE_MODE = os.getenv("INGEST_TABLE_MODE", "consensus").lower()
 
 def classify_input(path):
     ext = Path(path).suffix.lower()
@@ -137,15 +145,19 @@ def tables_from_image(image_path, backend=None):
         return [parse_table_json(data["raw"])]
     return data.get("tables", [])
 
-def _finalize_table(table, ocr_text):
-    """Normalize Turkish characters in every cell, then validate the table
-    against the same page's OCR text. Attaches confidence + issues so ingest
-    can route low-confidence tables to human review. Corrects mechanically but
-    only *flags* content problems -- nothing is dropped."""
-    headers = [normalize_tr(h) for h in table.get("headers", [])]
-    rows = [[normalize_tr(c) for c in row] for row in table.get("rows", [])]
-    confidence, issues = validate_table(headers, rows, ocr_text=ocr_text)
-    return {"headers": headers, "rows": rows, "confidence": confidence, "issues": issues}
+def tables_from_image_verified(image_path, ocr_text=None):
+    """Extract tables through the full production pipeline (number verify,
+    template stage, confidence + human-review flags) rather than calling a
+    backend raw. INGEST_TABLE_MODE=consensus (default) cross-checks two models;
+    `single` runs one TABLE_BACKEND, for a box where only one service is up.
+
+    table_pipeline imports this module, so the import has to happen at call time
+    -- same reason docling is imported lazily above."""
+    from pipeline import table_pipeline
+
+    if INGEST_TABLE_MODE == "single":
+        return table_pipeline.run(image_path, ocr_text=ocr_text)
+    return table_pipeline.run_consensus(image_path, ocr_text=ocr_text)
 
 def route_and_parse(path, tmp_dir="./output/router_tmp"):
     kind = classify_input(path)
@@ -157,10 +169,13 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
 
     if kind == "image":
         print("[ROUTER] Goruntu yolu -> PaddleOCR servisi")
-        text = normalize_tr(ocr_via_paddle(path))
+        raw_text = ocr_via_paddle(path)
+        text = normalize_tr(raw_text)
         results.append(("image:ocr", ("text", text)))
         try:
-            tables = [_finalize_table(t, text) for t in tables_from_image(path)]
+            # hand over the reading we already have -- the pipeline would
+            # otherwise call the same OCR service a second time
+            tables = tables_from_image_verified(path, ocr_text=raw_text)
             if tables:
                 results.append(("image:tables", ("tables", tables)))
                 print("  ", len(tables), "tablo bulundu")
@@ -185,10 +200,11 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
                 else:
                     tmp_img = tmp_dir + "/page_" + str(page_no) + ".png"
                     render_page_to_image(path, idx, tmp_img)
-                    text = normalize_tr(ocr_via_paddle(tmp_img))
+                    raw_text = ocr_via_paddle(tmp_img)
+                    text = normalize_tr(raw_text)
                     results.append(("page" + str(page_no) + ":scanned", ("text", text)))
                     try:
-                        tables = [_finalize_table(t, text) for t in tables_from_image(tmp_img)]
+                        tables = tables_from_image_verified(tmp_img, ocr_text=raw_text)
                         if tables:
                             results.append(("page" + str(page_no) + ":tables", ("tables", tables)))
                             print("  sayfa", page_no, ":", len(tables), "tablo bulundu")

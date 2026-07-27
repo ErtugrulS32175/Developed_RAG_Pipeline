@@ -95,10 +95,12 @@ def parse_html_tables(text):
       * flat (single-row header) -> _parse_flat: header is the widest <thead>
         row, or without <thead> the first full-grid row (leading spanning TITLE
         rows are skipped). This covers the common case and title-only colspans.
-      * grouped (a rowspan>1 is present) -> _parse_grouped: a real two-level
-        header. Spans are expanded, the header band folded into flat "Group -
-        Sub" column names, and the result also carries `header_rows` /
-        `header_merges` so the Excel exporter can rebuild the merged header.
+      * grouped (a rowspan>1 is present) -> _parse_grouped: spans are expanded
+        to a grid. Only when the header band really covers more than one row is
+        it a two-level header -- then the band is folded into flat "Group - Sub"
+        column names and the result also carries `header_rows` /
+        `header_merges` so the Excel exporter can rebuild the merged header. A
+        rowspan that turns out to be a data-area merge yields a flat result.
 
     Every result has `headers` and `rows`; grouped ones add the two extra keys.
     Falls back to markdown pipe-tables when no <table> is present (some VLMs emit
@@ -273,12 +275,17 @@ def _parse_grouped(rows, spans):
     header_rows = [row_cells(grid, r) for r in range(h0, header_end)]
     header_merges = [(r - h0, c, rs, cs) for (r, c, rs, cs) in merges if h0 <= r < header_end]
     body = [row_cells(grid, r) for r in range(header_end, nrows)]
-    return {
-        "headers": flatten_header(header_rows, header_merges),
-        "rows": body,
-        "header_rows": header_rows,
-        "header_merges": header_merges,
-    }
+    result = {"headers": flatten_header(header_rows, header_merges), "rows": body}
+    # A one-row header band is NOT a grouped header: the rowspan that routed us
+    # here was a merge in the DATA area (some backends encode a repeated cell as
+    # a vertical merge). Carrying header_rows for it would make the template
+    # stage read a plain flat table as an unrecognized *form* and flag its whole
+    # header for review. The grid expansion above still applies, which is the
+    # part that actually matters for those merges.
+    if band > 1:
+        result["header_rows"] = header_rows
+        result["header_merges"] = header_merges
+    return result
 
 
 def _extract_balanced(text, start):
@@ -359,9 +366,9 @@ def parse_table_json(raw):
 
 # Fold Turkish letters to an ASCII base so the OCR cross-check tolerates the
 # expected ı/i, ş/s, ğ/g ... disagreement between two OCR engines: text cells
-# come from EasyOCR-tr ("Sirket-A") but the page cross-check text comes from the
-# latin PaddleOCR recognizer ("Sirket-A"). Without this, correct Turkish names get
-# falsely flagged as hallucination candidates.
+# come from EasyOCR-tr ("Şirket-A") but the page cross-check text comes from the
+# latin PaddleOCR recognizer ("Sirket-A"). Without this, correct Turkish text
+# gets falsely flagged as a hallucination candidate.
 _TR_FOLD = str.maketrans({
     "ı": "i", "İ": "i", "I": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g",
     "ç": "c", "Ç": "c", "ö": "o", "Ö": "o", "ü": "u", "Ü": "u",

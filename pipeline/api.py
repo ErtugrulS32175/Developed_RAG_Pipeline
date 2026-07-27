@@ -1,20 +1,18 @@
-import base64
 import os
-import re
 import time
 import uuid
 from pathlib import Path
 from typing import Union
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from pipeline import db
 from pipeline import ingest_router
+from pipeline import owui_chat
 from pipeline.query import ask
-from pipeline.table_pipeline import run_consensus
-from pipeline.table_export import table_to_markdown
 
 load_dotenv()
 
@@ -43,79 +41,9 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
-
-
-_DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTALL)
-_MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp"}
-
-
-def _message_text(content) -> str:
-    """The user's typed text, whether the turn is a plain string or a
-    multimodal content-part list."""
-    if isinstance(content, str):
-        return content
-    return "\n".join(
-        p.get("text", "") for p in content
-        if isinstance(p, dict) and p.get("type") == "text"
-    ).strip()
-
-
-def _message_image_urls(content) -> list:
-    """Every image_url attached to a multimodal turn, in order."""
-    if isinstance(content, str):
-        return []
-    urls = []
-    for p in content:
-        if isinstance(p, dict) and p.get("type") == "image_url":
-            url = (p.get("image_url") or {}).get("url", "")
-            if url:
-                urls.append(url)
-    return urls
-
-
-def _save_data_url_image(data_url: str):
-    """Decode a base64 data: URL (what OpenWebUI embeds) to a file on disk so the
-    consensus pipeline, which works from a path, can read it. Returns None for a
-    plain http(s) url, which we don't fetch."""
-    m = _DATA_URL_RE.match(data_url)
-    if not m:
-        return None
-    ext = _MIME_EXT.get(m.group("mime"), "png")
-    dest = UPLOAD_DIR / f"owui-{uuid.uuid4().hex[:12]}.{ext}"
-    dest.write_bytes(base64.b64decode(m.group("data")))
-    return dest
-
-
-def _extract_tables_reply(messages) -> str:
-    """Run the two-VLM consensus on the image in the latest turn and render the
-    result(s) as markdown OpenWebUI can display inline."""
-    images = _message_image_urls(messages[-1].content)
-    if not images:
-        return ("Tablo çıkarımı için bir tablo görüntüsü yükleyin: sohbet "
-                "kutusundaki + ile bir PNG/JPG ekleyip gönderin.")
-
-    dest = _save_data_url_image(images[-1])
-    if dest is None:
-        return "Görüntü çözülemedi (yalnızca gömülü base64 görüntüler destekleniyor)."
-
-    try:
-        results = run_consensus(str(dest))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"tablo cikarimi basarisiz: {e}")
-
-    if not results:
-        return "Görüntüde tablo bulunamadı."
-
-    blocks = []
-    for i, r in enumerate(results, 1):
-        md = table_to_markdown(r["headers"], r["rows"])
-        note = f"_Güven: {r['confidence']:.2f}_"
-        if r.get("needs_review"):
-            n = len(r.get("disagreements", []))
-            note += (f" — ⚠️ {n} hücrede modeller uyuşmuyor, gözden geçirin"
-                     if n else " — ⚠️ gözden geçirilmeli")
-        blocks.append(f"**Tablo {i}**\n\n{md}\n\n{note}")
-    return "\n\n---\n\n".join(blocks)
+    # OpenWebUI streams by default; without this the flag would be silently
+    # dropped and every reply would arrive as one lump after minutes of silence.
+    stream: bool = False
 
 
 @app.get("/v1/models")
@@ -139,10 +67,21 @@ def chat_completions(req: ChatRequest):
     image->consensus->table flow; anything else falls through to the existing
     retrieve/rerank/generate RAG pipeline. OpenWebUI does not know or care which
     happens underneath."""
-    if req.model == TABLE_MODEL_ID:
-        answer = _extract_tables_reply(req.messages)
+    is_table = req.model == TABLE_MODEL_ID
+    if req.stream:
+        gen = (owui_chat.stream_tables(req.messages, req.model) if is_table
+               else owui_chat.stream_text(
+                   ask(owui_chat.message_text(req.messages[-1].content)), req.model))
+        return StreamingResponse(gen, media_type="text/event-stream")
+
+    if is_table:
+        try:
+            answer = owui_chat.tables_reply(req.messages)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"tablo cikarimi basarisiz: {e}")
     else:
-        answer = ask(_message_text(req.messages[-1].content))
+        answer = ask(owui_chat.message_text(req.messages[-1].content))
+
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:10]}",
         "object": "chat.completion",
@@ -152,6 +91,22 @@ def chat_completions(req: ChatRequest):
             {"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}
         ],
     }
+
+
+@app.get("/files/{name}")
+def download_export(name: str):
+    """Serve a generated xlsx. Linked from the chat reply, so this is opened by
+    the user's browser rather than by OpenWebUI itself."""
+    if not owui_chat.EXPORT_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="gecersiz dosya adi")
+    path = owui_chat.EXPORT_DIR / name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="dosya bulunamadi")
+    return FileResponse(
+        path,
+        filename=name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.post("/documents/upload")

@@ -105,10 +105,13 @@ def _finalize(table, ocr_text, backend, review_threshold, templates=()):
     return result
 
 
-def run(image_path, backend=None, preprocess=None, review_threshold=REVIEW_THRESHOLD):
+def run(image_path, backend=None, preprocess=None, review_threshold=REVIEW_THRESHOLD,
+        ocr_text=None):
     """Run the full flow on one image. `backend` overrides TABLE_BACKEND.
     `preprocess=None` auto-selects by backend (deterministic=on, VLM=off).
-    Returns a list of finalized table dicts (one per detected table)."""
+    `ocr_text` lets a caller that already OCR'd this image pass its reading in
+    instead of paying for a second call. Returns a list of finalized table dicts
+    (one per detected table)."""
     backend = (backend or router.TABLE_BACKEND).lower()
     if preprocess is None:
         preprocess = backend in _DETERMINISTIC
@@ -122,8 +125,10 @@ def run(image_path, backend=None, preprocess=None, review_threshold=REVIEW_THRES
         work = tmp.name
     try:
         # deterministic reading of the SAME image the backend sees (number verify
-        # + OCR cross-check both rely on this being pixel-faithful on digits)
-        ocr_text = router.ocr_via_paddle(work)
+        # + OCR cross-check both rely on this being pixel-faithful on digits) --
+        # so a caller's reading is only reusable when we didn't enhance the image
+        if ocr_text is None or preprocess:
+            ocr_text = router.ocr_via_paddle(work)
         raw_tables = router.tables_from_image(work, backend)
         templates = header_templates.load_templates()
         return [_finalize(t, ocr_text, backend, review_threshold, templates)
@@ -247,10 +252,12 @@ def _finalize_consensus(rec, ocr_text, backends, review_threshold, templates=(),
 
 
 def run_consensus(image_path, backends=CONSENSUS_BACKENDS, preprocess=False,
-                  review_threshold=REVIEW_THRESHOLD):
+                  review_threshold=REVIEW_THRESHOLD, ocr_text=None):
     """Cross-check two backends on one image. backends[0] is primary (its value
-    wins where they agree). Both are VLMs -> no preprocessing by default. Returns
-    a list of consensus table dicts (one per detected table)."""
+    wins where they agree). Both are VLMs -> no preprocessing by default.
+    `ocr_text` lets a caller that already OCR'd this image pass its reading in
+    instead of paying for a second call. Returns a list of consensus table dicts
+    (one per detected table)."""
     prim_be, sec_be = backends[0], backends[1]
     work = image_path
     tmp = None
@@ -261,7 +268,9 @@ def run_consensus(image_path, backends=CONSENSUS_BACKENDS, preprocess=False,
         enhanced.save(tmp.name)
         work = tmp.name
     try:
-        ocr_text = router.ocr_via_paddle(work)
+        # see run(): a caller's reading is only reusable when we didn't enhance
+        if ocr_text is None or preprocess:
+            ocr_text = router.ocr_via_paddle(work)
         prim = [_normalize_table(t) for t in router.tables_from_image(work, prim_be)]
         sec = [_normalize_table(t) for t in router.tables_from_image(work, sec_be)]
         templates = header_templates.load_templates()

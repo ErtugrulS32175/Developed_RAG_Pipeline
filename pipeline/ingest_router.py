@@ -14,6 +14,7 @@ from pipeline.table_export import (
     save_table_csv,
     save_table_json,
     estimate_table_confidence,
+    export_result_xlsx,
 )
 from pipeline.embeddings import embed_dense, embed_sparse
 from docling.chunking import HybridChunker
@@ -46,16 +47,31 @@ def chunk_plain_text(text, source_tag, max_tokens=480):
         chunks.append(" ".join(current))
     return [{"type": "text", "text": c, "source_tag": source_tag, "page": 0, "headings": []} for c in chunks]
 
-def _write_review_report(path, table_id, confidence, issues):
+def _write_review_report(path, table_id, confidence, issues, table=None):
     """Human-readable note dropped next to a flagged table's copy in _review/."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"Tablo: {table_id}", f"Guven: {confidence:.2f}", ""]
+    lines = [f"Tablo: {table_id}", f"Guven: {confidence:.2f}"]
+    if table and table.get("mode") == "consensus":
+        lines.append(f"Modeller: {'+'.join(table.get('backends', []))}")
+        lines.append(f"Uyum: {table.get('agreement')}"
+                     f" ({len(table.get('disagreements', []))} hucrede ayrisma)")
+    lines.append("")
     if issues:
         lines.append("Sorunlar:")
         lines.extend(f"  - {x}" for x in issues)
     else:
         lines.append("Guven esigin altinda (issue listelenmedi).")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _save_xlsx(table, headers, rows, path):
+    """Pipeline results carry disagreement/review metadata, so they get the rich
+    export (amber-highlighted cells + Rapor sheet). Anything else falls back to a
+    plain sheet."""
+    if "needs_review" in table:
+        export_result_xlsx(table, str(path))
+    else:
+        save_table_xlsx(headers, rows, path)
 
 def chunks_from_tables(tables, source_tag, doc_stem, filename):
     """Turn structured table results into RAG chunks and write xlsx/csv/json exports."""
@@ -68,22 +84,43 @@ def chunks_from_tables(tables, source_tag, doc_stem, filename):
     for i, table in enumerate(tables):
         headers, rows = table["headers"], table["rows"]
         table_id = f"{doc_stem}_{source_tag.replace(':', '_')}_{i}"
-        # router already computed confidence + issues (cross-checked against the
-        # page OCR); fall back to the shape-only proxy for tables from elsewhere.
+        # the table pipeline already scored this table (number verification,
+        # model agreement, template stage) and decided whether it needs review;
+        # fall back to the shape-only proxy for tables from elsewhere.
         confidence = table.get("confidence")
         if confidence is None:
             confidence = estimate_table_confidence(headers, rows)
         issues = table.get("issues", [])
-        needs_review = confidence < REVIEW_THRESHOLD or bool(issues)
+        needs_review = table.get("needs_review")
+        if needs_review is None:
+            needs_review = confidence < REVIEW_THRESHOLD or bool(issues)
 
-        save_table_xlsx(headers, rows, tables_dir / f"{table_id}.xlsx")
+        _save_xlsx(table, headers, rows, tables_dir / f"{table_id}.xlsx")
         save_table_csv(headers, rows, tables_dir / f"{table_id}.csv")
         save_table_json(table_id, page_no, headers, rows, confidence, tables_dir / f"{table_id}.json")
 
         if needs_review:
-            save_table_xlsx(headers, rows, review_dir / f"{table_id}.xlsx")
-            _write_review_report(review_dir / f"{table_id}.issues.txt", table_id, confidence, issues)
+            _save_xlsx(table, headers, rows, review_dir / f"{table_id}.xlsx")
+            _write_review_report(review_dir / f"{table_id}.issues.txt", table_id,
+                                 confidence, issues, table)
             print(f"  [REVIEW] {table_id}: guven {confidence:.2f}, {len(issues)} sorun -> {review_dir}")
+
+        # Carry the trust signals into the chunk, not just the values: a later
+        # consumer (retrieval, an analytics layer, a reviewer UI) needs to know
+        # which cells the two models disagreed on, not only what was extracted.
+        table_data = {
+            "table_id": table_id,
+            "page": page_no,
+            "headers": headers,
+            "rows": rows,
+            "confidence": confidence,
+            "needs_review": needs_review,
+            "issues": issues,
+        }
+        for key in ("mode", "backends", "agreement", "disagreements",
+                    "structural_confidence", "number_fidelity", "template"):
+            if key in table:
+                table_data[key] = table[key]
 
         chunks.append({
             "type": "table",
@@ -94,15 +131,7 @@ def chunks_from_tables(tables, source_tag, doc_stem, filename):
             "source_tag": source_tag,
             "page": page_no,
             "headings": [],
-            "table_data": {
-                "table_id": table_id,
-                "page": page_no,
-                "headers": headers,
-                "rows": rows,
-                "confidence": confidence,
-                "needs_review": needs_review,
-                "issues": issues,
-            },
+            "table_data": table_data,
         })
     return chunks
 

@@ -1,6 +1,6 @@
 """Snap OCR'd values to a known master list, tolerant of the Turkish-character
 confusions latin OCR makes (ı/i, ş/s, ğ/g, ç/c, ö/o, ü/u). Both a *correction*
-(OCR "Sirket-A" -> canonical "Sirket-A") and a *validation* signal (no match =>
+(OCR "Sirket-A" -> canonical "Şirket-A") and a *validation* signal (no match =>
 flag for review). Deterministic: only snaps on an unambiguous match, never
 invents. Feed it a customer/product master list for the real pipeline.
 """
