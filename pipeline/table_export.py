@@ -620,6 +620,10 @@ def export_result_xlsx(result, path):
     disagreements = result.get("disagreements", [])
     review_cells = {d["pos"] for d in disagreements if d.get("kind") == "cell"}
     review_headers = {d["pos"] for d in disagreements if d.get("kind") == "header"}
+    # cells a deterministic check flagged on its own (e.g. a serial column that
+    # contradicts the row count) -- highlighted the same way as a disagreement,
+    # since to a reviewer both mean "look here"
+    review_cells |= {tuple(p) for p in result.get("review_cells", ())}
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()

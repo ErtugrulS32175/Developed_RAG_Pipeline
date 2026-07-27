@@ -32,6 +32,7 @@ from pipeline import consensus
 from pipeline import header_templates
 from pipeline import image_preprocess as ip
 from pipeline import number_verify
+from pipeline import row_sequence
 from pipeline import router
 from pipeline.text_normalize import normalize_number, normalize_tr
 from pipeline.table_export import export_result_xlsx, validate_table
@@ -75,6 +76,10 @@ def _finalize(table, ocr_text, backend, review_threshold, templates=()):
     struct_conf, issues = validate_table(headers, rows)
     num_fidelity, num_flags = number_verify.verify(headers, rows, ocr_text)
     issues = list(issues) + number_verify.flags_to_messages(num_flags, headers)
+    # the table's own serial column, where it has one, states how many rows it
+    # should have -- a miscount is invisible to every other check here
+    seq_issues, seq_cells = row_sequence.check(rows)
+    issues += seq_issues
 
     # weakest-link: a table is only as trustworthy as its shakiest signal. For
     # financial data we'd rather over-flag than pass a bad number silently.
@@ -89,6 +94,8 @@ def _finalize(table, ocr_text, backend, review_threshold, templates=()):
         "structural_confidence": struct_conf,
         "number_fidelity": num_fidelity,
     }
+    if seq_cells:
+        result["review_cells"] = seq_cells
     # keep the two-level structure so the exporter can rebuild a merged header
     if table.get("header_rows"):
         result["header_rows"] = [[normalize_tr(c) for c in r] for r in table["header_rows"]]
@@ -181,6 +188,10 @@ def _finalize_consensus(rec, ocr_text, backends, review_threshold, templates=(),
     struct_conf, issues = validate_table(headers, rows)
     num_fidelity, num_flags = number_verify.verify(headers, rows, ocr_text)
     issues = list(issues) + number_verify.flags_to_messages(num_flags, headers)
+    # see run()'s finalize: a serial column contradicting its own row count is a
+    # miscount both models can share, so consensus alone would not surface it
+    seq_issues, seq_cells = row_sequence.check(rows)
+    issues += seq_issues
 
     if not rec["shape_match"]:
         issues.append(f"modeller farkli sekil verdi: {rec['shape_primary']} vs "
@@ -211,6 +222,8 @@ def _finalize_consensus(rec, ocr_text, backends, review_threshold, templates=(),
         "shape_match": rec["shape_match"],
         "disagreements": disagreements,
     }
+    if seq_cells:
+        result["review_cells"] = seq_cells
     if table.get("header_rows"):
         result["header_rows"] = table["header_rows"]
         result["header_merges"] = table.get("header_merges", [])
