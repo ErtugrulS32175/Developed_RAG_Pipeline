@@ -19,14 +19,24 @@ TOP_K      = 15
 TOP_RERANK = 10
 
 # --- Init ---
-conn = db.get_conn()
+_conn = None
+
+
+def get_conn():
+    """Connect on first use rather than at import, so importing this module (for
+    build_context, for a test, for anything that isn't a query) doesn't require a
+    running database."""
+    global _conn
+    if _conn is None:
+        _conn = db.get_conn()
+    return _conn
 
 
 def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
     """Hybrid search in Postgres (pgvector) combining dense and sparse vectors via RRF."""
     dense_vector = embed_dense(query)
     sparse_indices, sparse_values = embed_sparse(query)
-    return db.hybrid_search(conn, dense_vector, sparse_indices, sparse_values, top_k=top_k)
+    return db.hybrid_search(get_conn(), dense_vector, sparse_indices, sparse_values, top_k=top_k)
 
 
 def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict]:
@@ -50,19 +60,39 @@ def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict
     return [chunk for _, chunk in scored[:top_n]]
 
 
+def citation(chunk: dict) -> str:
+    """Source line for one passage, built from its stored metadata.
+
+    Every passage gets one, whatever produced it -- the old version only added a
+    citation for non-table chunks, on the assumption that table text already
+    carried its own header. That held for tables from the verified image
+    pipeline but NOT for tables parsed out of a native PDF, which reached the
+    model with no source at all.
+
+    The section path is included because it is the strongest disambiguator in a
+    long report, where similar tables and figures repeat across sections.
+    """
+    parts = [str(chunk.get("filename") or "?"), f"Sayfa {chunk.get('page', 0)}"]
+
+    headings = chunk.get("headings") or []
+    if headings:
+        parts.append(" > ".join(str(h) for h in headings))
+
+    table_data = chunk.get("table_data") or {}
+    confidence = table_data.get("confidence")
+    if confidence is not None:
+        # a verified table: tell the model how much to trust the numbers
+        parts.append(f"tablo, guven {confidence:.2f}")
+    elif chunk.get("type") == "table":
+        parts.append("tablo")
+
+    return "[" + " | ".join(parts) + "]"
+
+
 def build_context(chunks: list[dict]) -> str:
-    parts = []
-    for chunk in chunks:
-        text = chunk.get("text", "")
-        if chunk.get("type") == "table":
-            # table_to_markdown already prepends a Belge/Sayfa/Tablo/Güven
-            # citation header, so this is already fully self-describing.
-            parts.append(text)
-        else:
-            filename = chunk.get("filename") or "?"
-            page = chunk.get("page", "?")
-            parts.append(f"[{filename} - Sayfa {page}]\n{text}")
-    return "\n\n---\n\n".join(parts)
+    return "\n\n---\n\n".join(
+        f"{citation(chunk)}\n{chunk.get('text', '')}" for chunk in chunks
+    )
 
 
 def generate(question: str, context: str) -> str:

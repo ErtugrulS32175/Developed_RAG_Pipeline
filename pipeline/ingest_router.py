@@ -32,6 +32,21 @@ hf_tok = AutoTokenizer.from_pretrained("BAAI/bge-m3")
 tokenizer = HuggingFaceTokenizer(tokenizer=hf_tok, max_tokens=512)
 chunker = HybridChunker(tokenizer=tokenizer)
 
+_PAGE_TAG_RE = re.compile(r"page(\d+)")
+
+
+def page_from_tag(source_tag):
+    """Page number carried by the router's source tag ("page26:native" -> 26).
+
+    The router hands the converter ONE single-page PDF per page, so the parsed
+    document's own provenance always reports page 1 no matter which page it is
+    -- the tag is the only place the real page number survives. Tags without a
+    page (a standalone image) are page 0.
+    """
+    m = _PAGE_TAG_RE.match(source_tag or "")
+    return int(m.group(1)) if m else 0
+
+
 def chunk_plain_text(text, source_tag, max_tokens=480):
     """Split plain OCR text into token-bounded chunks by paragraphs."""
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
@@ -45,7 +60,8 @@ def chunk_plain_text(text, source_tag, max_tokens=480):
         cur_len += p_len
     if current:
         chunks.append(" ".join(current))
-    return [{"type": "text", "text": c, "source_tag": source_tag, "page": 0, "headings": []} for c in chunks]
+    page = page_from_tag(source_tag)
+    return [{"type": "text", "text": c, "source_tag": source_tag, "page": page, "headings": []} for c in chunks]
 
 def _write_review_report(path, table_id, confidence, issues, table=None):
     """Human-readable note dropped next to a flagged table's copy in _review/."""
@@ -73,10 +89,9 @@ def _save_xlsx(table, headers, rows, path):
     else:
         save_table_xlsx(headers, rows, path)
 
-def chunks_from_tables(tables, source_tag, doc_stem, filename):
+def chunks_from_tables(tables, source_tag, doc_stem):
     """Turn structured table results into RAG chunks and write xlsx/csv/json exports."""
-    m = re.match(r"page(\d+)", source_tag)
-    page_no = int(m.group(1)) if m else 0
+    page_no = page_from_tag(source_tag)
 
     chunks = []
     tables_dir = OUTPUT_DIR / "tables"
@@ -124,10 +139,10 @@ def chunks_from_tables(tables, source_tag, doc_stem, filename):
 
         chunks.append({
             "type": "table",
-            "text": table_to_markdown(
-                headers, rows,
-                filename=filename, page=page_no, table_id=table_id, confidence=confidence,
-            ),
+            # No citation header inside the text: query.build_context builds one
+            # for EVERY chunk from its stored metadata, so embedding it here
+            # would both duplicate it and pollute the indexed tokens.
+            "text": table_to_markdown(headers, rows),
             "source_tag": source_tag,
             "page": page_no,
             "headings": [],
@@ -145,24 +160,21 @@ def main(path):
         if content_type == "docling":
             for chunk in chunker.chunk(content):
                 ctype = "text"
-                page_no = 0
                 if chunk.meta.doc_items:
                     for item in chunk.meta.doc_items:
                         if "table" in str(item.label).lower():
                             ctype = "table"
-                    if chunk.meta.doc_items[0].prov:
-                        page_no = chunk.meta.doc_items[0].prov[0].page_no
                 all_chunks.append({
                     "type": ctype,
                     "text": chunk.text,
                     "source_tag": source_tag,
-                    "page": page_no,
+                    "page": page_from_tag(source_tag),
                     "headings": chunk.meta.headings or [],
                 })
         elif content_type == "text":
             all_chunks.extend(chunk_plain_text(content, source_tag))
         elif content_type == "tables":
-            all_chunks.extend(chunks_from_tables(content, source_tag, Path(path).stem, filename))
+            all_chunks.extend(chunks_from_tables(content, source_tag, Path(path).stem))
 
     print(f"[INGEST] Toplam {len(all_chunks)} chunk")
 

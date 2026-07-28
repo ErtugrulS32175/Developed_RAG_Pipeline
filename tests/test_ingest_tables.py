@@ -24,9 +24,9 @@ def _consensus_table():
     }
 
 
-def _chunks(table, tmp_path, monkeypatch):
+def _chunks(table, tmp_path, monkeypatch, source_tag="image:tables"):
     monkeypatch.setattr(ingest_router, "OUTPUT_DIR", tmp_path)
-    return ingest_router.chunks_from_tables([table], "image:tables", "doc", "doc.png")
+    return ingest_router.chunks_from_tables([table], source_tag, "doc")
 
 
 # --- trust signals reach the chunk ---
@@ -68,6 +68,41 @@ def test_falls_back_to_shape_confidence_for_a_plain_table(tmp_path, monkeypatch)
     assert data["confidence"] == 1.0
     assert data["needs_review"] is False
     assert "mode" not in data
+
+
+# --- page numbering ---
+
+def test_page_comes_from_the_source_tag():
+    """The router converts ONE single-page PDF per page, so the parsed
+    document always claims to be on page 1 -- the tag is the only place the real
+    page number survives."""
+    assert ingest_router.page_from_tag("page26:native") == 26
+    assert ingest_router.page_from_tag("page7:scanned") == 7
+    assert ingest_router.page_from_tag("page250:native") == 250
+
+
+def test_page_is_zero_when_the_tag_carries_none():
+    for tag in ("image:ocr", "image:tables", "", None):
+        assert ingest_router.page_from_tag(tag) == 0
+
+
+def test_table_chunk_takes_the_page_from_its_tag(tmp_path, monkeypatch):
+    chunks = _chunks(_consensus_table(), tmp_path, monkeypatch, source_tag="page42:tables")
+    assert chunks[0]["page"] == 42
+    assert chunks[0]["table_data"]["page"] == 42
+
+
+def test_plain_text_chunks_take_the_page_from_their_tag():
+    chunks = ingest_router.chunk_plain_text("bir paragraf", "page9:scanned")
+    assert chunks and all(c["page"] == 9 for c in chunks)
+
+
+def test_table_text_has_no_embedded_citation_header(tmp_path, monkeypatch):
+    """build_context adds a citation to every chunk from its metadata, so a
+    header baked into the text would duplicate it and pollute the index."""
+    text = _chunks(_consensus_table(), tmp_path, monkeypatch)[0]["text"]
+    assert not text.startswith("Belge:")
+    assert text.startswith("|")
 
 
 # --- exports ---

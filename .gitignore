@@ -6,6 +6,9 @@ __pycache__/
 *.pyc
 paddle_env/
 gemma_env/
+hunyuan_env/
+mineru_env/
+paddleocrvl_env/
 /test_*.py
 .pytest_cache/
 .vscode/
