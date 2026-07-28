@@ -54,3 +54,11 @@ def test_passages_stay_separated():
 
 def test_empty_context_is_empty_not_an_error():
     assert build_context([]) == ""
+
+
+def test_reranking_never_shrinks_the_context():
+    """The reranker orders passages; discarding some of them silently removes
+    content that retrieval had already found. Measured: cutting the list made a
+    question unanswerable while every page-level metric still read 1.0."""
+    from pipeline import query
+    assert query.TOP_RERANK >= query.TOP_K

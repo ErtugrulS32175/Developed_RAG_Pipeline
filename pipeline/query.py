@@ -15,8 +15,16 @@ RERANK_MODEL_NAME  = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
 LLM_API_URL        = os.getenv("LLM_API_URL", "http://localhost:8000/v1/chat/completions")
 LLM_MODEL_NAME     = os.getenv("LLM_MODEL_NAME", "google/gemma-4-12B-it")
 
-TOP_K      = 15
-TOP_RERANK = 10
+TOP_K      = int(os.getenv("RAG_TOP_K", "15"))
+# The reranker's job is to ORDER the retrieved passages, not to throw any away.
+# Measured on the eval set: keeping only 10 of them dropped a passage that held
+# the answer -- reproducibly, in both a 15- and a 50-candidate pool -- which
+# makes that question unanswerable no matter which model generates from it.
+# Page-level scoring hid this completely, because a different passage from the
+# same page kept coming back. Ordering still earns its keep: it is what puts the
+# right passage first. Defaults to TOP_K so the ranking stage cannot silently
+# shrink the context again.
+TOP_RERANK = int(os.getenv("RAG_TOP_RERANK", str(TOP_K)))
 
 # --- Init ---
 _conn = None
