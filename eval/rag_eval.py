@@ -224,8 +224,17 @@ def bootstrap_questions(conn, n, seed=0, terms_per_query=6):
 
 # --- retrieval ----------------------------------------------------------------
 
-def retrieve_chunks(conn, question, *, top_k, rrf_k, rerank_to=None):
-    """The chunks production would put in front of the model, best first."""
+def retrieve_chunks(conn, question, *, top_k, rrf_k, rerank_to=None, backend="native"):
+    """The chunks a backend would put in front of the model, best first.
+
+    An alternative engine is measured on the same questions, by the same
+    metrics, over the same documents. That is the whole reason to keep more than
+    one: which is better stops being a matter of opinion.
+    """
+    if backend != "native":
+        from pipeline import rag_backends
+        return rag_backends.retrieve(question, top_k, backend=backend)
+
     from pipeline import db
     from pipeline.embeddings import embed_dense, embed_sparse
 
@@ -268,10 +277,11 @@ def rerank(question, chunks, top_n):
     return [chunks[i] for _, i in ranked[:top_n]]
 
 
-def run(conn, questions, *, top_k, rrf_k, rerank_to=None):
+def run(conn, questions, *, top_k, rrf_k, rerank_to=None, backend="native"):
     ranks, key_hits, misses, t0 = [], [], [], time.time()
     for q in questions:
-        chunks = retrieve_chunks(conn, q["q"], top_k=top_k, rrf_k=rrf_k, rerank_to=rerank_to)
+        chunks = retrieve_chunks(conn, q["q"], top_k=top_k, rrf_k=rrf_k,
+                                 rerank_to=rerank_to, backend=backend)
         ranks.append(first_hit_rank([c["page"] for c in chunks], q["pages"]))
         found = contains_key(" ".join(c.get("text", "") for c in chunks), q.get("key"))
         if found is not None:
@@ -300,6 +310,8 @@ def main():
     ap.add_argument("--rerank-to", type=int, default=10)
     ap.add_argument("--sweep-top-k", type=int, nargs="+", metavar="K")
     ap.add_argument("--sweep-rrf-k", type=int, nargs="+", metavar="K")
+    ap.add_argument("--backend", default="native",
+                    help="hangi soru-cevap motoru: native | llamaindex")
     args = ap.parse_args()
 
     from pipeline import db
@@ -321,15 +333,18 @@ def main():
     rrf_ks = args.sweep_rrf_k or [args.rrf_k]
     for tk in top_ks:
         for rk in rrf_ks:
-            label = f"top_k={tk} rrf_k={rk}" + (f" rerank->{rerank_to}" if rerank_to else "")
-            m, _ = run(conn, questions, top_k=tk, rrf_k=rk, rerank_to=rerank_to)
+            label = (f"[{args.backend}] top_k={tk} rrf_k={rk}"
+                     + (f" rerank->{rerank_to}" if rerank_to else ""))
+            m, _ = run(conn, questions, top_k=tk, rrf_k=rk,
+                       rerank_to=rerank_to, backend=args.backend)
             results[label] = m
             print(format_summary(label, m))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     # named per question set: a second run used to overwrite the first, which
     # loses exactly the detail (which questions missed) that a run is for
-    out = OUT_DIR / f"rag_eval_{args.set}.json"
+    suffix = "" if args.backend == "native" else f"_{args.backend}"
+    out = OUT_DIR / f"rag_eval_{args.set}{suffix}.json"
     out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nyazildi: {out}")
 

@@ -1,0 +1,25 @@
+# The LlamaIndex answering engine (RAG_BACKEND=llamaindex), kept out of
+# requirements.txt so the default engine never carries a dependency it does not
+# import -- and so installing this cannot disturb a working setup.
+#
+# Install it into its OWN virtualenv. This path needs neither docling nor torch,
+# so the environment stays small and cannot collide with the pins the ingest
+# side depends on:
+#
+#     python -m venv llamaindex_env
+#     llamaindex_env\Scripts\pip install -r requirements-llamaindex.txt
+#     llamaindex_env\Scripts\python -m pipeline.rag_llamaindex build
+#     llamaindex_env\Scripts\python -m eval.rag_eval --set human --backend llamaindex
+
+# what the comparison path itself needs (a subset of requirements.txt)
+psycopg[binary]
+pgvector
+fastembed
+python-dotenv
+requests
+
+# LlamaIndex
+llama-index-core
+llama-index-vector-stores-postgres
+llama-index-embeddings-openai-like
+llama-index-llms-openai-like
