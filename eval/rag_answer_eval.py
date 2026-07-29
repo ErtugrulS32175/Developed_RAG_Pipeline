@@ -133,7 +133,9 @@ def main():
     m["saniye"] = round(time.time() - t0, 1)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUT_DIR / "rag_answers.json"
+    # named per question set: a second run used to overwrite the first, and
+    # those answers cost GPU time to produce -- losing them means renting again
+    out = OUT_DIR / f"rag_answers_{args.set}.json"
     out.write_text(json.dumps({"ozet": m, "sorular": rows}, ensure_ascii=False, indent=2),
                    encoding="utf-8")
 

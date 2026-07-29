@@ -32,6 +32,7 @@ import random
 import re
 import statistics
 import time
+import unicodedata
 from collections import Counter
 from pathlib import Path
 
@@ -54,6 +55,56 @@ def first_hit_rank(ranked_pages, expected_pages):
     return None
 
 
+_MARKDOWN = re.compile(r"[*_`~#]+")
+
+
+def fold(text):
+    """Normalise for comparison: lowercase, drop markdown emphasis, strip Turkish
+    diacritics.
+
+    Both halves are needed and both were learned the hard way. A model bolds the
+    salient words, which breaks a contiguous match on the plain phrase; and it
+    drops the circumflex that a source carries, because models normalise it
+    away. Neither is a wrong answer, but both scored as one. The cost is that
+    comparison becomes diacritic-blind -- fine here, where we are asking whether
+    the model conveyed the fact, not how it spelled it.
+    """
+    # DELETED, not replaced with a space: a model bolds the STEM of a word and
+    # leaves the suffix outside the emphasis. In an agglutinative language that
+    # is the normal case, so substituting a space would split the word in two.
+    s = _MARKDOWN.sub("", str(text).lower()).replace("ı", "i")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return " ".join(s.split())
+
+
+_MAGNITUDE = {"bin": 1e3, "milyon": 1e6, "milyar": 1e9, "trilyon": 1e12}
+# a dot/space between digit groups is a THOUSANDS separator only when exactly
+# three digits follow; otherwise it is a decimal point (512.7 stays 512.7)
+_THOUSANDS = re.compile(r"(?<=\d)[ .](?=\d{3}(?!\d))")
+_NUMBER = re.compile(r"(\d+(?:[.,]\d{1,2})?)\s*(bin|milyon|milyar|trilyon)?")
+
+
+def numbers(text):
+    """Every figure in `text` as a plain value, with Turkish magnitude words
+    expanded, so a figure written with a magnitude word, with a dot separator or
+    with a space separator all compare equal.
+
+    A source writes the magnitude as a word and a model answers in digits. Same
+    figure, and scoring that as a wrong answer is simply wrong. Financial
+    Turkish leans on bin/milyon/milyar constantly, so comparing digits alone
+    silently fails a large share of correct answers.
+    """
+    s = _THOUSANDS.sub("", fold(text))
+    out = set()
+    for digits, magnitude in _NUMBER.findall(s):
+        value = float(digits.replace(",", "."))
+        if magnitude:
+            value *= _MAGNITUDE[magnitude]
+        out.add(round(value, 4))
+    return out
+
+
 def contains_key(text, key):
     """Is the expected answer actually present in this text?
 
@@ -63,19 +114,33 @@ def contains_key(text, key):
     stricter question, and it is the real ceiling on answer quality -- if the
     key is absent from the context, no generator can answer correctly.
 
-    Falls back to digit-only comparison against numeric TOKENS (not against the
-    whole string, which would splice adjacent numbers together and match things
-    that are not there) so 8.765 / 8765 / 8,765 count as the same figure.
+    Three ways to match, loosening in order:
+      1. the key as a contiguous phrase
+      2. every word of the key present somewhere -- survives a gloss inserted
+         mid-phrase, without accepting a paraphrase that drops a key word, which
+         SHOULD still be flagged for a human
+      3. by VALUE -- every figure of the key present as a number, and every
+         non-numeric word of the key present too, so a magnitude word and its
+         digit form match while a bare figure on its own does not
     """
     if not key:
         return None
-    hay = " ".join(str(text).lower().split())
-    if " ".join(str(key).lower().split()) in hay:
+    hay, k = fold(text), fold(key)
+    if k in hay:
         return True
-    digits = re.sub(r"\D", "", str(key))
-    if len(digits) >= 3:
-        from pipeline.number_verify import numeric_token_set
-        return digits in numeric_token_set(text)
+    words = k.split()
+    hay_words = set(hay.split())
+    if len(words) > 1 and all(w in hay_words for w in words):
+        return True
+
+    key_numbers = numbers(key)
+    if key_numbers and key_numbers <= numbers(text):
+        # the words that carry meaning, once figures and their magnitude words
+        # are accounted for: the unit must still be present, the magnitude word
+        # need not, since its value is already folded into the figure
+        rest = [w for w in words
+                if w not in _MAGNITUDE and not re.fullmatch(r"[%\d.,]+", w)]
+        return all(w in hay_words for w in rest)
     return False
 
 

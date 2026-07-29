@@ -41,6 +41,59 @@ def test_absent_key_is_false_and_missing_key_is_none():
     assert contains_key("herhangi bir metin", None) is None
 
 
+# --- matching a real model's phrasing (each case cost a false failure once) ---
+
+def test_markdown_emphasis_does_not_break_a_phrase():
+    """Models bold the salient words, which splits the phrase being matched."""
+    assert contains_key("**zeta** ve **gamma** bulunur", "zeta ve gamma") is True
+
+
+def test_diacritics_are_folded():
+    """Models normalise the circumflex away that the source text carries."""
+    assert contains_key("lale zeta uretimi", "lâle zeta üretimi") is True
+    assert contains_key("LÂLE ZETA", "lale zeta") is True
+
+
+def test_an_inserted_gloss_still_counts():
+    """'zeta (greek) gamma' conveys the same fact as 'zeta gamma'."""
+    assert contains_key("zeta (greek) gamma modeli", "zeta gamma") is True
+
+
+def test_a_paraphrase_that_drops_a_key_word_is_still_flagged():
+    """Loosening must not go so far that a genuinely different answer passes --
+    that case needs a human, and silently scoring it correct hides it."""
+    assert contains_key("zeta gamma urunu", "zeta delta urunu") is False
+
+
+def test_single_word_key_is_not_loosened():
+    assert contains_key("gamma delta", "zeta") is False
+
+
+# --- Turkish magnitude words are a notation, not a different figure ---
+
+def test_bin_milyon_milyar_expand_to_their_value():
+    assert contains_key("kapasite 6 000 zeta", "6 bin zeta") is True
+    assert contains_key("kapasite 4 500 zeta", "4,5 bin zeta") is True
+    assert contains_key("tutar 8.765.000 zeta", "8.765 bin zeta") is True
+
+
+def test_decimal_is_not_mistaken_for_a_thousands_separator():
+    """512.7 is a decimal; 4.321 is four thousand three hundred twenty-one."""
+    from eval.rag_eval import numbers
+    assert 512.7 in numbers("512.7 zeta")
+    assert 4321 in numbers("4.321 zeta")
+    assert 8765 in numbers("8 765 zeta")
+
+
+def test_the_unit_still_has_to_match():
+    """Value-level matching must not let any '6' anywhere count as the answer."""
+    assert contains_key("6 000 gamma uretildi", "6 bin zeta") is False
+
+
+def test_a_different_figure_is_still_wrong():
+    assert contains_key("kapasite 9 876 zeta", "6 bin zeta") is False
+
+
 # --- citation parsing ---
 
 def test_reads_the_page_the_prompt_asks_for():
