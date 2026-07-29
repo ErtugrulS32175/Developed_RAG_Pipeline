@@ -105,6 +105,29 @@ def test_table_text_has_no_embedded_citation_header(tmp_path, monkeypatch):
     assert text.startswith("|")
 
 
+# --- headings have to reach the index, not just the metadata ---
+
+def test_headings_without_a_body_are_still_emitted():
+    """A masthead is a run of headings with no text under it. Left at the
+    default the chunker discards those entirely, so a document's own number and
+    date -- among the most asked-about facts it has -- never reach the index."""
+    assert ingest_router.chunker.always_emit_headings is True
+
+
+def test_indexed_text_carries_the_heading_path(monkeypatch):
+    """chunk.text drops headings, so anything that lives in one is unsearchable
+    and a heading-only chunk indexes as an empty string."""
+    class _Chunk:
+        text = "govde"
+
+    class _Chunker:
+        def contextualize(self, chunk):
+            return f"Baslik\n{chunk.text}"
+
+    monkeypatch.setattr(ingest_router, "chunker", _Chunker())
+    assert ingest_router.chunk_text(_Chunk()) == "Baslik\ngovde"
+
+
 # --- fragments get folded back into their context ---
 
 def _c(text, tag="page1:native", ctype="text", headings=None):

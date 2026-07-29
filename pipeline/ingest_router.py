@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -30,7 +31,22 @@ REVIEW_THRESHOLD = float(os.getenv("TABLE_REVIEW_THRESHOLD", "0.9"))
 
 hf_tok = AutoTokenizer.from_pretrained("BAAI/bge-m3")
 tokenizer = HuggingFaceTokenizer(tokenizer=hf_tok, max_tokens=512)
-chunker = HybridChunker(tokenizer=tokenizer)
+# always_emit_headings: by default a heading with no body under it is dropped
+# entirely -- not in any chunk's text, not in any chunk's metadata. A document's
+# masthead is exactly that shape, so the facts printed there (a law's number and
+# date, a report's period) were absent from the index and unanswerable.
+chunker = HybridChunker(tokenizer=tokenizer, always_emit_headings=True)
+
+
+def chunk_text(chunk):
+    """The text to index for a chunk: its body with its heading path prepended.
+
+    `chunk.text` alone drops headings -- the chunker keeps them as metadata, so
+    nothing that lives in a heading is searchable, and a heading-only chunk has
+    no text at all. Contextualising also gives every ordinary chunk the section
+    it belongs to, which is what tells two similarly-worded passages apart.
+    """
+    return chunker.contextualize(chunk)
 
 _PAGE_TAG_RE = re.compile(r"page(\d+)")
 
@@ -112,6 +128,43 @@ def chunk_plain_text(text, source_tag, max_tokens=480):
         chunks.append(" ".join(current))
     page = page_from_tag(source_tag)
     return [{"type": "text", "text": c, "source_tag": source_tag, "page": page, "headings": []} for c in chunks]
+
+# A chunk's id is derived from what it is, not generated fresh each run. That
+# single choice is what makes an interrupted ingest resumable: re-running
+# produces the same ids, already-stored rows are recognised and skipped, and the
+# embedding calls -- the slow, costly part -- are not repeated.
+_CHUNK_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
+
+RETRY_ATTEMPTS = int(os.getenv("INGEST_RETRY_ATTEMPTS", "4"))
+RETRY_BACKOFF = float(os.getenv("INGEST_RETRY_BACKOFF", "2.0"))
+
+
+def _chunk_id(document_id, chunk, index):
+    key = f"{document_id}|{chunk['source_tag']}|{index}|{chunk['text']}"
+    return str(uuid.uuid5(_CHUNK_NS, key))
+
+
+def _retry(fn, attempts=None, backoff=None):
+    """Retry a call that goes over the network, backing off between tries.
+
+    A whole ingest used to die on one hiccup from the embedding service -- a
+    restart, a timeout, a moment of load -- after minutes of work. Most such
+    failures pass within seconds, so the fix is to wait rather than to abandon
+    the run. The last failure is re-raised so a genuine outage still stops us.
+    """
+    attempts = RETRY_ATTEMPTS if attempts is None else attempts
+    backoff = RETRY_BACKOFF if backoff is None else backoff
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == attempts:
+                raise
+            wait = backoff ** (attempt - 1)
+            print(f"  [RETRY] {type(e).__name__}: {str(e)[:60]} "
+                  f"-- {wait:.0f}s sonra tekrar ({attempt}/{attempts - 1})")
+            time.sleep(wait)
+
 
 def _write_review_report(path, table_id, confidence, issues, table=None):
     """Human-readable note dropped next to a flagged table's copy in _review/."""
@@ -218,7 +271,7 @@ def main(path):
                             ctype = "table"
                 part.append({
                     "type": ctype,
-                    "text": chunk.text,
+                    "text": chunk_text(chunk),
                     "source_tag": source_tag,
                     "page": page_from_tag(source_tag),
                     "headings": chunk.meta.headings or [],
@@ -243,17 +296,31 @@ def main(path):
     conn = db.get_conn()
     db.init_schema(conn)
     document_id = db.upsert_document(conn, filename, Path(path).suffix.lower().lstrip("."))
-    db.clear_chunks_for_document(conn, document_id)
     print(f"[INGEST] Belge: {filename} ({document_id})")
 
+    # Chunks already stored from an earlier, interrupted run. Their ids are
+    # derived from the content, so anything unchanged is skipped rather than
+    # embedded a second time -- the embedding call is the expensive part.
+    already = db.existing_chunk_ids(conn, document_id)
+    if already:
+        # how many of these get reused is not known yet: an id changes whenever
+        # the text does, so a re-chunked document matches none of them
+        print(f"[INGEST] bu belgeden {len(already)} chunk zaten var, "
+              f"degismeyenler tekrar gomulmeyecek")
+
     try:
-        batch = []
+        batch, written_ids, skipped = [], set(), 0
         for i, c in enumerate(all_chunks):
             if not c["text"].strip():
                 continue
-            sparse_indices, sparse_values = embed_sparse(c["text"])
+            chunk_id = _chunk_id(document_id, c, i)
+            written_ids.add(chunk_id)
+            if chunk_id in already:
+                skipped += 1
+                continue
+            sparse_indices, sparse_values = _retry(lambda: embed_sparse(c["text"]))
             batch.append({
-                "id": str(uuid.uuid4()),
+                "id": chunk_id,
                 "document_id": document_id,
                 "type": c["type"],
                 "text": c["text"],
@@ -261,7 +328,7 @@ def main(path):
                 "page": c["page"],
                 "headings": c["headings"],
                 "table_data": c.get("table_data"),
-                "dense": embed_dense(c["text"]),
+                "dense": _retry(lambda: embed_dense(c["text"])),
                 "sparse": db.sparse_to_literal(sparse_indices, sparse_values),
             })
             if len(batch) >= 32:
@@ -272,14 +339,27 @@ def main(path):
             db.upsert_chunks(conn, batch)
     except Exception:
         db.set_document_status(conn, document_id, "error")
+        # what has been written stays: ids are content-derived, so re-running
+        # this command picks up from here instead of starting over
+        print(f"[INGEST] HATA -- yazilanlar korundu, ayni komutu tekrar "
+              f"calistirarak kaldigi yerden devam edebilirsin")
         raise
 
+    # only now that everything is stored: drop rows from an older version of
+    # this file that the current run did not produce
+    stale = db.delete_stale_chunks(conn, document_id, written_ids)
     db.set_document_status(conn, document_id, "done")
 
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM chunks WHERE document_id = %s", (document_id,))
         count = cur.fetchone()[0]
-    print(f"\n[INGEST] Tamamlandi. Bu belge icin vektor sayisi: {count}")
+    extra = []
+    if skipped:
+        extra.append(f"{skipped} atlandi")
+    if stale:
+        extra.append(f"{stale} eskimis chunk silindi")
+    suffix = f" ({', '.join(extra)})" if extra else ""
+    print(f"\n[INGEST] Tamamlandi. Bu belge icin vektor sayisi: {count}{suffix}")
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "./data/sample.pdf"

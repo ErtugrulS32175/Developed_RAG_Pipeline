@@ -82,6 +82,12 @@ def sparse_to_literal(indices, values) -> str:
 
 
 def upsert_chunks(conn, rows: list[dict]) -> None:
+    """Insert chunks, skipping any that are already stored.
+
+    `ON CONFLICT DO NOTHING` is what makes an interrupted ingest resumable: ids
+    are derived from the content, so re-running writes only what is missing
+    instead of failing on the rows that already landed.
+    """
     prepared = [
         {**r, "headings": Json(r["headings"]), "table_data": Json(r["table_data"]) if r["table_data"] else None}
         for r in rows
@@ -90,10 +96,37 @@ def upsert_chunks(conn, rows: list[dict]) -> None:
         cur.executemany(
             "INSERT INTO chunks (id, document_id, type, text, source_tag, page, headings, table_data, dense, sparse) "
             "VALUES (%(id)s, %(document_id)s, %(type)s, %(text)s, %(source_tag)s, %(page)s, %(headings)s, "
-            "%(table_data)s, %(dense)s, %(sparse)s::sparsevec)",
+            "%(table_data)s, %(dense)s, %(sparse)s::sparsevec) "
+            "ON CONFLICT (id) DO NOTHING",
             prepared,
         )
     conn.commit()
+
+
+def existing_chunk_ids(conn, document_id: str) -> set:
+    """Ids already stored for this document -- what a resumed run can skip."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM chunks WHERE document_id = %s", (document_id,))
+        return {str(row[0]) for row in cur.fetchall()}
+
+
+def delete_stale_chunks(conn, document_id: str, keep_ids) -> int:
+    """Drop chunks of this document that the current run did not produce.
+
+    Re-ingesting an edited file leaves rows behind whose text no longer exists.
+    Clearing everything up front would be simpler but throws away the work that
+    makes a crashed run resumable, so the cleanup happens at the end instead.
+    """
+    keep = list(keep_ids)
+    with conn.cursor() as cur:
+        if keep:
+            cur.execute("DELETE FROM chunks WHERE document_id = %s AND NOT (id = ANY(%s::uuid[]))",
+                        (document_id, keep))
+        else:
+            cur.execute("DELETE FROM chunks WHERE document_id = %s", (document_id,))
+        removed = cur.rowcount
+    conn.commit()
+    return removed
 
 
 def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15, rrf_k=1) -> list[dict]:
