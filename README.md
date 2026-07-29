@@ -32,13 +32,45 @@ swappable with one setting; every downstream step is engine-agnostic.
 
 ## Setup
 
+The Python pipeline is not containerised: it runs on the host and reaches every
+model over HTTP. That is deliberate — the models can sit on a different machine,
+which is how a workstation without a GPU runs the whole system.
+
+### Containers
+
+Set the database password in your shell first (it is never stored in the repo),
+then bring up the containers:
+
+    export DB_PASSWORD=...              # PowerShell: $env:DB_PASSWORD = "..."
+    docker compose up -d                # PostgreSQL + Open WebUI
+    docker compose --profile gpu up -d  # ...plus embeddings (8011) + reranker (8002)
+
+The database creates its schema on first start. Leave out `--profile gpu` on a
+machine with no GPU and point `EMBED_API_URL` / `RERANK_API_URL` at the host that
+does have one.
+
+### Model services
+
 Each model runs in its own isolated environment. Table extraction needs a GPU
-(CUDA 12.6):
+(CUDA 12.6) and a Linux host — the CUDA stack these use is broken on Windows:
 
     ./scripts/setup_paddle.sh        # PaddleOCR OCR service      -> port 8100
     ./scripts/setup_paddleocrvl.sh   # PaddleOCR-VL table service -> port 8104
     ./scripts/setup_hunyuan.sh       # HunyuanOCR table service   -> port 8105
     cp .env.example .env
+
+### Split across two machines
+
+Every service address is an environment variable, so nothing in the code changes.
+On the machine running the pipeline, point each URL at the GPU host in `.env`:
+`EMBED_API_URL`, `RERANK_API_URL`, `LLM_API_URL`, `PADDLE_OCR_URL` and the
+`*_TABLE_URL` entries. Reaching them over an SSH tunnel keeps the model ports off
+the network:
+
+    ssh -N -L 8011:127.0.0.1:8011 -L 8002:127.0.0.1:8002 user@gpu-host
+
+Note that `data/` is deliberately untracked, so documents, ground truth and
+evaluation question sets do not travel with a clone — copy them separately.
 
 Start the services (each downloads its model weights on the first request):
 
@@ -56,9 +88,12 @@ in Turkish with source-page citations: inputs are normalized into chunks stored 
 PostgreSQL + pgvector, and queries use hybrid search (dense + BM25) with a reranker
 before an LLM answers.
 
-    ./scripts/setup_postgres.sh
     python -m pipeline.ingest_router path/to/file.pdf
     python -m pipeline.query
+
+Retrieval and answer quality are measured by `eval/rag_eval.py` (does the answer
+reach the context, and at what rank) and `eval/rag_answer_eval.py` (is the answer
+right, is the cited page right, and which stage is at fault when it is not).
 
 ## Stack
 

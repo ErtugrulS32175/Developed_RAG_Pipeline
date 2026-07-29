@@ -1,0 +1,107 @@
+# Containers this project needs. The Python pipeline itself is NOT containerised
+# -- it runs on the host in a venv and reaches every model over HTTP, which is
+# why the services below can sit on a different machine entirely.
+#
+# Two profiles, because the GPU services usually live on another host:
+#
+#   docker compose up -d                  # postgres + open-webui   (no GPU)
+#   docker compose --profile gpu up -d    # ...plus embed + reranker (needs GPU)
+#
+# The password is never stored here. Set it in the shell first:
+#   PowerShell:  $env:DB_PASSWORD = "..."
+#   bash:        export DB_PASSWORD=...
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ragtest-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_DB: ragdb
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in your shell before running compose}
+    ports:
+      # bound to loopback on purpose: the database must not be reachable from
+      # the network just because the container is running
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+      # applied once, on an empty data directory -- it creates the vector
+      # extension and every table, so no separate schema step is needed
+      - ./pipeline/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d ragdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      # the one service deliberately reachable from the network: it is the web
+      # UI people open in a browser, and it has its own login. Everything else
+      # here stays on loopback.
+      - "3000:8080"
+    volumes:
+      - openwebui:/app/backend/data
+    extra_hosts:
+      # Open WebUI calls pipeline/api.py, which runs on the HOST, not in a
+      # container. On Linux this mapping does not exist unless it is declared.
+      - "host.docker.internal:host-gateway"
+
+  embed:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:latest
+    container_name: bge-m3-embed
+    restart: unless-stopped
+    command: ["--model", "BAAI/bge-m3", "--runner", "pooling", "--gpu-memory-utilization", "0.2"]
+    ports:
+      # loopback only. vLLM has no authentication, so a published port hands the
+      # model to anyone who can reach the host. Reach it from another machine
+      # over an SSH tunnel; drop the 127.0.0.1 prefix only if you have decided
+      # to expose it and put access control in front of it.
+      - "127.0.0.1:8011:8000"
+    volumes:
+      # without this the weights live in the container layer and are downloaded
+      # again every time the container is recreated
+      - hf_cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  reranker:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:latest
+    container_name: bge-reranker
+    restart: unless-stopped
+    command: ["--model", "BAAI/bge-reranker-v2-m3", "--runner", "pooling", "--gpu-memory-utilization", "0.15"]
+    ports:
+      # loopback only -- see the note on the embed service above
+      - "127.0.0.1:8002:8000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  # named explicitly so an existing install keeps its data instead of compose
+  # creating a second, empty volume under a project-prefixed name
+  pgvector_data:
+    name: ragtest_pgvector_data
+  openwebui:
+    name: openwebui
+  hf_cache:
+    name: ragtest_hf_cache
