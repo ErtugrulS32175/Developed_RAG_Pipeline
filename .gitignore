@@ -9,6 +9,8 @@ gemma_env/
 hunyuan_env/
 mineru_env/
 paddleocrvl_env/
+llamaindex_env/
 /test_*.py
+ci-requirements.txt
 .pytest_cache/
 .vscode/

@@ -1,0 +1,27 @@
+# Mirror of .gitlab-ci.yml -- the repo is pushed to both remotes, so both need
+# to run the suite or one of them silently stops checking.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        # vLLM is a serving dependency, not an orchestration one: multiple GB,
+        # expects CUDA, and nothing under test imports it.
+        run: |
+          grep -v '^vllm$' requirements.txt > ci-requirements.txt
+          pip install -r ci-requirements.txt
+          pip install pytest httpx
+      - name: Run tests
+        run: python -m pytest tests/ -q

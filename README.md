@@ -59,6 +59,22 @@ Each model runs in its own isolated environment. Table extraction needs a GPU
     ./scripts/setup_hunyuan.sh       # HunyuanOCR table service   -> port 8105
     cp .env.example .env
 
+### Authentication
+
+`pipeline/api.py` is protected by a shared secret. Set `API_KEY` in `.env` and
+enter the same value as the API key on the OpenWebUI connection. Every endpoint
+that reads or adds documents then requires `Authorization: Bearer <key>`.
+
+Left empty, the API runs unauthenticated and warns about it at startup — fine
+bound to localhost, never acceptable beyond it. Two endpoints stay open by
+design: `/health` and `/ready`, so monitoring can reach them without a
+credential, and the generated-xlsx link, whose filename is a content hash so
+that knowing the URL is the authorisation.
+
+`/health` answers "is the process alive", `/ready` answers "can it serve" by
+checking the database and the embedding service, returning 503 when either is
+down.
+
 ### Split across two machines
 
 Every service address is an environment variable, so nothing in the code changes.
@@ -94,6 +110,22 @@ before an LLM answers.
 Retrieval and answer quality are measured by `eval/rag_eval.py` (does the answer
 reach the context, and at what rank) and `eval/rag_answer_eval.py` (is the answer
 right, is the cited page right, and which stage is at fault when it is not).
+
+### Two engines, one measurement
+
+The answering engine is pluggable, like the table engine. `native` is the
+pipeline described above; `llamaindex` is LlamaIndex retrieving over the same
+chunks, kept as a second opinion rather than a replacement.
+
+    pip install -r requirements-llamaindex.txt
+    python -m pipeline.rag_llamaindex build       # copy chunks into its own table
+    python -m eval.rag_eval --set human --backend llamaindex
+
+Pick one with `RAG_BACKEND`, or per conversation in OpenWebUI by choosing the
+`ragtest-rag-llamaindex` model. The source chunks, the embedding model, the LLM
+and the answer prompt are identical for both — only the retrieval strategy
+differs, so a difference in the numbers is attributable to the thing being
+compared.
 
 ## Stack
 

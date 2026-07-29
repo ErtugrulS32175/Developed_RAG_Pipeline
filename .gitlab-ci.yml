@@ -1,0 +1,25 @@
+# Runs the test suite on every push. No GPU, no database and no model services
+# are needed: the suite covers the logic that decides things -- scoring,
+# chunking, merging, table parsing, auth -- and the pieces that talk to a
+# service are exercised through fakes.
+stages: [test]
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths: [.pip-cache]
+
+test:
+  stage: test
+  image: python:3.12
+  before_script:
+    # vLLM is a serving dependency, not an orchestration one: it is multiple GB,
+    # expects CUDA, and nothing under test imports it. Everything else installs
+    # exactly as it does locally, so CI is not testing a different tree.
+    - grep -v '^vllm$' requirements.txt > ci-requirements.txt
+    - pip install -r ci-requirements.txt
+    - pip install pytest httpx
+  script:
+    - python -m pytest tests/ -q
