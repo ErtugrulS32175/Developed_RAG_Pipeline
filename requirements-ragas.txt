@@ -1,0 +1,31 @@
+# Ragas, used to cross-check the deterministic scoring with an LLM judge and to
+# measure the two things key-matching cannot see: whether an answer's claims are
+# actually supported by the context, and how much of the retrieved context was
+# useless. Kept out of requirements.txt and installed into its OWN virtualenv --
+# it pulls the LangChain tree, which must not touch the pins the ingest side
+# depends on:
+#
+#     python -m venv ragas_env
+#     ragas_env\Scripts\pip install -r requirements-ragas.txt
+#     ragas_env\Scripts\python -m eval.ragas_check --set human
+#
+# The judge is OUR own model (LLM_API_URL); nothing is sent anywhere else.
+
+ragas
+litellm
+
+# Ragas 0.4.x still imports langchain_community.chat_models.vertexai at module
+# level, which the LangChain 1.x line moved out. Without these pins the import
+# fails outright -- documentation saying LangChain is no longer required does
+# not match the installed package.
+langchain<1.0
+langchain-core<1.0
+langchain-community<0.4
+langchain-openai<1.0
+
+# what the cross-check itself reads (a subset of requirements.txt)
+psycopg[binary]
+pgvector
+fastembed
+python-dotenv
+requests

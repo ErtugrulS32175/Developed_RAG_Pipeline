@@ -111,6 +111,30 @@ Retrieval and answer quality are measured by `eval/rag_eval.py` (does the answer
 reach the context, and at what rank) and `eval/rag_answer_eval.py` (is the answer
 right, is the cited page right, and which stage is at fault when it is not).
 
+### Checking the checker
+
+Scoring here is deterministic: an expected answer is present in the text or it
+is not. That is cheap and repeatable, but blind to two things — whether the
+claims *around* a correct figure are supported by the context, and how much of
+the retrieved context was useless.
+
+Ragas measures both, using an LLM as judge. Whether an LLM judges Turkish
+reliably is not something to assume, so the same run also scores
+`FactualCorrectness` against the hand-written reference answers and reports how
+often the judge and the deterministic verdict agree — and in which direction
+they differ when they do not.
+
+    python -m venv ragas_env
+    ragas_env\Scripts\pip install -r requirements-ragas.txt
+    ragas_env\Scripts\python -m eval.ragas_check --set human
+
+The judge is whatever `LLM_API_URL` points at — the same self-hosted model the
+pipeline answers with, so nothing leaves the machines it already runs on.
+Judgements are cached on disk, so re-scoring after a change costs nothing.
+
+Each question costs several LLM calls, and context precision costs one per
+retrieved chunk, so start with `--limit` before running a whole set.
+
 ### Two engines, one measurement
 
 The answering engine is pluggable, like the table engine. `native` is the

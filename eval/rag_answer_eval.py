@@ -63,6 +63,10 @@ def score_one(question, answer, context):
         "soru": question["q"],
         "tip": question.get("type", "?"),
         "cevap": answer,
+        # kept so the run can be re-scored later without re-retrieving: the
+        # index changes between runs, so a context fetched afterwards would not
+        # be the one this answer was actually produced from
+        "baglam": context,
         "ctx_var": in_ctx,
         "cevap_dogru": bool(in_ans),
         "sayfa_dogru": bool(cites & set(question["pages"])),

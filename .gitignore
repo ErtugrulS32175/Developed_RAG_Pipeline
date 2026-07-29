@@ -10,6 +10,7 @@ hunyuan_env/
 mineru_env/
 paddleocrvl_env/
 llamaindex_env/
+ragas_env/
 /test_*.py
 ci-requirements.txt
 .pytest_cache/
