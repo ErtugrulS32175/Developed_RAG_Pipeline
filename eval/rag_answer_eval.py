@@ -61,6 +61,7 @@ def score_one(question, answer, context):
 
     return {
         "soru": question["q"],
+        "tip": question.get("type", "?"),
         "cevap": answer,
         "ctx_var": in_ctx,
         "cevap_dogru": bool(in_ans),
@@ -72,12 +73,12 @@ def score_one(question, answer, context):
     }
 
 
-def summarize(rows):
+def summarize(rows, split_by_type=True):
     n = len(rows)
     if not n:
         return {"n": 0}
     faults = [r["hata"] for r in rows if r["hata"]]
-    return {
+    out = {
         "n": n,
         "ctx_recall": round(sum(1 for r in rows if r["ctx_var"]) / n, 4),
         "cevap_dogrulugu": round(sum(1 for r in rows if r["cevap_dogru"]) / n, 4),
@@ -87,6 +88,16 @@ def summarize(rows):
         "sayfa_verdi": round(sum(1 for r in rows if r["sayfa_verdi"]) / n, 4),
         "hata_dagilimi": {f: faults.count(f) for f in sorted(set(faults))},
     }
+    # Figures and prose fail differently: a figure is copied or it is not, while
+    # a prose answer can be fluent and still miss the point. Reporting one number
+    # over both hides whichever is the weaker half.
+    types = {r.get("tip", "?") for r in rows}
+    if split_by_type and len(types) > 1:
+        out["tipe_gore"] = {
+            t: summarize([r for r in rows if r.get("tip") == t], split_by_type=False)
+            for t in sorted(types)
+        }
+    return out
 
 
 def main():
@@ -132,6 +143,9 @@ def main():
     print(f"  cevap dogrulugu  : {m['cevap_dogrulugu']:.3f}")
     print(f"  sayfa dogrulugu  : {m['sayfa_dogrulugu']:.3f}   (sayfa verdi: {m['sayfa_verdi']:.3f})")
     print(f"  hata dagilimi    : {m['hata_dagilimi']}")
+    for tip, tm in m.get("tipe_gore", {}).items():
+        print(f"    {tip:8s} n={tm['n']:3d}  ctx={tm['ctx_recall']:.3f}  "
+              f"cevap={tm['cevap_dogrulugu']:.3f}  sayfa={tm['sayfa_dogrulugu']:.3f}")
     print(f"\nham cevaplar: {out}")
 
 

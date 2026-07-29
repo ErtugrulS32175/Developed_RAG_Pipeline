@@ -106,3 +106,22 @@ def test_summary_counts_each_dimension_separately():
 
 def test_empty_run_does_not_divide_by_zero():
     assert summarize([]) == {"n": 0}
+
+
+def test_figures_and_prose_are_reported_separately():
+    """One number over both hides whichever half is weaker -- a figure is copied
+    or it is not, while prose can be fluent and still miss."""
+    rows = [
+        score_one(_q(type="sayisal"), "Sayfa 42: 555 birim", "555 birim"),
+        score_one(_q(type="sayisal"), "bulunamadı", "555 birim"),
+        score_one(_q(type="metin"), "Sayfa 42: 555 birim", "555 birim"),
+    ]
+    m = summarize(rows)
+    assert m["tipe_gore"]["sayisal"]["cevap_dogrulugu"] == 0.5
+    assert m["tipe_gore"]["metin"]["cevap_dogrulugu"] == 1.0
+    assert "tipe_gore" not in m["tipe_gore"]["metin"]      # no infinite nesting
+
+
+def test_no_type_split_when_every_question_is_one_type():
+    rows = [score_one(_q(type="sayisal"), "Sayfa 42: 555 birim", "555 birim")]
+    assert "tipe_gore" not in summarize(rows)
