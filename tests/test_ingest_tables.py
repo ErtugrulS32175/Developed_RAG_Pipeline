@@ -105,6 +105,73 @@ def test_table_text_has_no_embedded_citation_header(tmp_path, monkeypatch):
     assert text.startswith("|")
 
 
+# --- fragments get folded back into their context ---
+
+def _c(text, tag="page1:native", ctype="text", headings=None):
+    return {"type": ctype, "text": text, "source_tag": tag, "page": 1,
+            "headings": headings or []}
+
+
+def test_a_fragment_joins_the_chunk_before_it():
+    """The measured failure: a label/value fragment split away from the subject
+    it describes, leaving nothing for a query to match on."""
+    out = ingest_router.merge_small_chunks([_c("a" * 400), _c("b" * 40)], min_chars=150)
+    assert len(out) == 1
+    assert out[0]["text"] == "a" * 400 + "\n" + "b" * 40
+
+
+def test_a_fragment_at_the_start_absorbs_the_next_chunk():
+    """Merging only backwards would strand a fragment that comes first."""
+    out = ingest_router.merge_small_chunks([_c("a" * 40), _c("b" * 400)], min_chars=150)
+    assert len(out) == 1
+
+
+def test_consecutive_fragments_fold_together():
+    out = ingest_router.merge_small_chunks(
+        [_c("a" * 40), _c("b" * 40), _c("c" * 40)], min_chars=150)
+    assert len(out) == 1
+
+
+def test_page_boundary_is_never_crossed():
+    """A merge across pages would file text under the wrong page number, which
+    is exactly the citation error this pipeline just finished fixing."""
+    out = ingest_router.merge_small_chunks(
+        [_c("a" * 400, tag="page1:native"), _c("b" * 40, tag="page2:native")],
+        min_chars=150)
+    assert len(out) == 2
+
+
+def test_a_table_fragment_is_not_folded_into_prose():
+    out = ingest_router.merge_small_chunks(
+        [_c("a" * 400, ctype="text"), _c("b" * 40, ctype="table")], min_chars=150)
+    assert len(out) == 2
+
+
+def test_merging_stops_at_the_length_ceiling():
+    out = ingest_router.merge_small_chunks(
+        [_c("a" * 400), _c("b" * 40)], min_chars=150, max_chars=300)
+    assert len(out) == 2
+
+
+def test_normal_sized_chunks_are_left_alone():
+    out = ingest_router.merge_small_chunks([_c("a" * 400), _c("b" * 400)], min_chars=150)
+    assert len(out) == 2
+
+
+def test_the_survivor_inherits_headings_when_it_has_none():
+    out = ingest_router.merge_small_chunks(
+        [_c("a" * 400), _c("b" * 40, headings=["Bolum"])], min_chars=150)
+    assert out[0]["headings"] == ["Bolum"]
+
+
+def test_input_chunks_are_not_mutated():
+    """main() reuses the list it passes in; silently editing it would make the
+    merge count wrong and the behaviour order-dependent."""
+    original = [_c("a" * 400), _c("b" * 40)]
+    ingest_router.merge_small_chunks(original, min_chars=150)
+    assert original[0]["text"] == "a" * 400
+
+
 # --- exports ---
 
 def test_flagged_table_is_copied_to_review_with_a_report(tmp_path, monkeypatch):

@@ -327,7 +327,9 @@ def main():
             print(format_summary(label, m))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUT_DIR / "rag_eval.json"
+    # named per question set: a second run used to overwrite the first, which
+    # loses exactly the detail (which questions missed) that a run is for
+    out = OUT_DIR / f"rag_eval_{args.set}.json"
     out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nyazildi: {out}")
 

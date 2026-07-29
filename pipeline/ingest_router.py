@@ -47,6 +47,56 @@ def page_from_tag(source_tag):
     return int(m.group(1)) if m else 0
 
 
+# A chunk this short is usually a fragment of a label/value block that the
+# chunker split away from its subject -- measured case: a 45-character piece
+# holding a company's founding year, with the company's name in a different
+# chunk. Nothing in it matches a question about that company, so neither dense
+# nor sparse search can reach it, and the fact is effectively lost.
+#
+# The threshold is measured, not guessed. At 150 a legitimate ~146-character
+# passage was merged into its neighbour, and the combined chunk's embedding was
+# diluted enough to drop it out of the results -- trading one lost answer for
+# another. Fragments cluster well below 100; real short passages sit above it.
+MIN_CHUNK_CHARS = int(os.getenv("MIN_CHUNK_CHARS", "100"))
+# ...but never grow a chunk without limit: an over-long passage dilutes its own
+# embedding, which is the problem chunking exists to avoid.
+MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "2500"))
+
+
+def merge_small_chunks(chunks, min_chars=None, max_chars=None):
+    """Fold undersized chunks into an adjacent one so no fragment is left
+    without the context that makes it findable.
+
+    Merges in either direction -- a short chunk joins the one before it, and a
+    short chunk at the START of a part absorbs the one after it, which it could
+    not do if merging only ever looked backwards.
+
+    Two boundaries are never crossed: `source_tag` (so a merge cannot move text
+    onto the wrong page) and `type` (so a table fragment is never folded into
+    narrative prose). Table chunks built by `chunks_from_tables` are whole units
+    and are not passed through here at all.
+    """
+    min_chars = MIN_CHUNK_CHARS if min_chars is None else min_chars
+    max_chars = MAX_CHUNK_CHARS if max_chars is None else max_chars
+
+    merged = []
+    for chunk in chunks:
+        prev = merged[-1] if merged else None
+        joinable = (
+            prev is not None
+            and prev["source_tag"] == chunk["source_tag"]
+            and prev["type"] == chunk["type"]
+            and len(prev["text"]) + len(chunk["text"]) + 1 <= max_chars
+        )
+        if joinable and (len(chunk["text"]) < min_chars or len(prev["text"]) < min_chars):
+            prev["text"] = f"{prev['text']}\n{chunk['text']}"
+            if not prev.get("headings"):
+                prev["headings"] = chunk.get("headings") or []
+            continue
+        merged.append(dict(chunk))
+    return merged
+
+
 def chunk_plain_text(text, source_tag, max_tokens=480):
     """Split plain OCR text into token-bounded chunks by paragraphs."""
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
@@ -156,27 +206,39 @@ def main(path):
     print(f"\n[INGEST] {len(parts)} parca parse edildi, chunk'laniyor...")
 
     all_chunks = []
+    before_merge = 0
     for source_tag, (content_type, content) in parts:
         if content_type == "docling":
+            part = []
             for chunk in chunker.chunk(content):
                 ctype = "text"
                 if chunk.meta.doc_items:
                     for item in chunk.meta.doc_items:
                         if "table" in str(item.label).lower():
                             ctype = "table"
-                all_chunks.append({
+                part.append({
                     "type": ctype,
                     "text": chunk.text,
                     "source_tag": source_tag,
                     "page": page_from_tag(source_tag),
                     "headings": chunk.meta.headings or [],
                 })
+            before_merge += len(part)
+            all_chunks.extend(merge_small_chunks(part))
         elif content_type == "text":
-            all_chunks.extend(chunk_plain_text(content, source_tag))
+            part = chunk_plain_text(content, source_tag)
+            before_merge += len(part)
+            all_chunks.extend(merge_small_chunks(part))
         elif content_type == "tables":
-            all_chunks.extend(chunks_from_tables(content, source_tag, Path(path).stem))
+            # a table is already a unit; merging would corrupt its markdown and
+            # break the mapping to its table_data
+            part = chunks_from_tables(content, source_tag, Path(path).stem)
+            before_merge += len(part)
+            all_chunks.extend(part)
 
-    print(f"[INGEST] Toplam {len(all_chunks)} chunk")
+    folded = before_merge - len(all_chunks)
+    print(f"[INGEST] Toplam {len(all_chunks)} chunk"
+          + (f" ({folded} kirinti komsusuna katildi)" if folded else ""))
 
     conn = db.get_conn()
     db.init_schema(conn)
