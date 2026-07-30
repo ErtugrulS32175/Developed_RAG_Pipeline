@@ -1,0 +1,9 @@
+# Text files are stored and checked out with LF, everywhere.
+#
+# This is not cosmetic. requirements.txt was committed with CRLF, so on the
+# Linux CI runner the last line read `vllm\r` -- and the filter that was
+# supposed to drop it, `grep -v '^vllm$'`, matched nothing while still exiting
+# 0. CI silently installed the multi-GB CUDA serving stack the filter existed
+# to keep out, and the whole job failed before a single test ran. The shell
+# scripts under scripts/ run on Linux too, and would break the same way.
+* text=auto eol=lf

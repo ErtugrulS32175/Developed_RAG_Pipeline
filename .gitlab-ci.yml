@@ -15,11 +15,23 @@ test:
   stage: test
   image: python:3.12
   before_script:
-    # vLLM is a serving dependency, not an orchestration one: it is multiple GB,
-    # expects CUDA, and nothing under test imports it. Everything else installs
-    # exactly as it does locally, so CI is not testing a different tree.
-    - grep -v '^vllm$' requirements.txt > ci-requirements.txt
-    - pip install -r ci-requirements.txt
+    # OpenCV arrives through docling -> rapidocr and loads libGL at import time,
+    # so without these the suite dies during collection -- not in the tests that
+    # need OpenCV, but in every file that imports the pipeline.
+    - apt-get update && apt-get install -y libgl1 libglib2.0-0
+    # The packages are listed here rather than filtered out of requirements.txt.
+    # A filter fails silently when it stops matching, and this one did:
+    # `grep -v '^vllm$'` matched nothing on a Linux runner because the file was
+    # stored with CRLF, so CI installed the multi-GB CUDA serving stack the
+    # filter existed to keep out. An explicit list can drift instead, which
+    # tests/test_ci_requirements.py checks for.
+    #
+    # vLLM is a serving dependency, not an orchestration one: nothing under test
+    # imports it, and it pins an exact torch that fights this file. Torch itself
+    # comes from the CPU index -- no test touches a GPU, and the default wheels
+    # drag in several GB of CUDA libraries.
+    - pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+    - pip install docling docling-core transformers 'psycopg[binary]' pgvector fastembed python-dotenv requests openpyxl fastapi uvicorn python-multipart
     - pip install pytest httpx
   script:
     - python -m pytest tests/ -q
