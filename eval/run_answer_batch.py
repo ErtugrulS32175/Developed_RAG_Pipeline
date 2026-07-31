@@ -120,12 +120,15 @@ def preflight(sets):
     return problems, notes
 
 
-def run_set(name, rerank_to, top_k=TOP_K, backend="native", out_dir=None):
+def run_set(name, rerank_to, top_k=TOP_K, backend="native", out_dir=None,
+            structured=False):
     """One question set. Returns its summary dict, or None if the run failed."""
     out_dir = out_dir or OUT_DIR
     cmd = [sys.executable, "-m", "eval.rag_answer_eval", "--set", name,
            "--top-k", str(top_k), "--rerank", "--rerank-to", str(rerank_to),
            "--backend", backend, "--out-dir", str(out_dir)]
+    if structured:
+        cmd.append("--structured")
     print(f"\n{'=' * 68}\n{name}  ({backend}, top_k={top_k}, rerank_to={rerank_to})"
           f"\n{'=' * 68}")
     t0 = time.time()
@@ -165,6 +168,8 @@ def main():
     ap.add_argument("--sets", nargs="+", default=None,
                     help="olculecek soru setleri; vermezsen klasordeki hepsi")
     ap.add_argument("--rerank-to", type=int, default=RERANK_TO)
+    ap.add_argument("--structured", action="store_true",
+                    help="cevapla birlikte dayanak alintisi da istensin")
     ap.add_argument("--backends", nargs="+", default=["native"],
                     help="olculecek erisim motorlari (native llamaindex)")
     ap.add_argument("--run", default=None,
@@ -196,6 +201,7 @@ def main():
         results = []
         for s in sets:
             results.append((s, run_set(s, args.rerank_to, backend=backend,
+                                       structured=args.structured,
                                        out_dir=out_dir)))
 
         if args.context_ab:
@@ -205,7 +211,8 @@ def main():
             # distractors -- but also less recall. Only accuracy prices that.
             for s in sets:
                 results.append((f"{s} (10 chunk)",
-                                run_set(s, 10, backend=backend, out_dir=out_dir)))
+                                run_set(s, 10, backend=backend, out_dir=out_dir,
+                                        structured=args.structured)))
 
         table(results, title=f"motor: {backend}"
                              + (f"   klasor: {out_dir}" if out_dir else ""))
