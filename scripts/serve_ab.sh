@@ -16,16 +16,21 @@ cd "$REPO"
 export HF_HOME="${HF_HOME:-/workspace/hf}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 mkdir -p "$HF_HOME"
+# Service output goes to logs/ rather than the working directory: these scripts
+# cd to the repo root, so a bare redirect drops a .log beside the source tree
+# every time a backend starts.
+LOG_DIR="${LOG_DIR:-$REPO/logs}"
+mkdir -p "$LOG_DIR"
 
 echo "Starting PaddleOCR-VL (:8104) ..."
 PYTHONPATH="$REPO" HF_HOME="$HF_HOME" HF_HUB_DISABLE_XET="$HF_HUB_DISABLE_XET" \
   nohup paddleocrvl_env/bin/uvicorn paddleocrvl_service:app --app-dir services \
-  --host 127.0.0.1 --port 8104 > paddleocrvl_service.log 2>&1 &
+  --host 127.0.0.1 --port 8104 > "$LOG_DIR/paddleocrvl_service.log" 2>&1 &
 
 echo "Starting HunyuanOCR (:8105) ..."
 PYTHONPATH="$REPO" HF_HOME="$HF_HOME" HF_HUB_DISABLE_XET="$HF_HUB_DISABLE_XET" \
   nohup hunyuan_env/bin/uvicorn hunyuan_service:app --app-dir services \
-  --host 127.0.0.1 --port 8105 > hunyuan_service.log 2>&1 &
+  --host 127.0.0.1 --port 8105 > "$LOG_DIR/hunyuan_service.log" 2>&1 &
 
 echo "Waiting for health (first call also downloads weights -> can take minutes)..."
 for p in 8104 8105; do

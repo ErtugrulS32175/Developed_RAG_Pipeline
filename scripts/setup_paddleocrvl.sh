@@ -26,8 +26,9 @@ python3 -c "import torch; print('main env torch ok:', torch.cuda.is_available())
 paddleocrvl_env/bin/python -c "import paddle; print('paddle:', paddle.__version__, 'cuda:', paddle.device.is_compiled_with_cuda())"
 paddleocrvl_env/bin/python -c "from paddleocr import PaddleOCRVL; print('PaddleOCRVL import ok')"
 
+mkdir -p logs
 echo "Done."
 echo "Model weights download on first request via PaddleOCRVL()."
 echo "Start the service with (from repo root -- PYTHONPATH so pipeline.* imports):"
 echo "  PYTHONPATH=\$(pwd) nohup paddleocrvl_env/bin/uvicorn paddleocrvl_service:app \\"
-echo "    --app-dir services --host 127.0.0.1 --port 8104 > paddleocrvl_service.log 2>&1 &"
+echo "    --app-dir services --host 127.0.0.1 --port 8104 > logs/paddleocrvl_service.log 2>&1 &"

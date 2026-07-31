@@ -26,9 +26,10 @@ python3 -c "import torch; print('main env torch ok:', torch.cuda.is_available())
 hunyuan_env/bin/python -c "import torch; print('venv torch:', torch.__version__, torch.cuda.is_available())"
 hunyuan_env/bin/python -c "from transformers import HunYuanVLForConditionalGeneration; print('HunYuanVL import ok')"
 
+mkdir -p logs
 echo "Done."
 echo "Model weights (tencent/HunyuanOCR) download on first request via from_pretrained."
 echo "If it is gated, run first:  export HF_TOKEN=your_token"
 echo "Start the service with (from repo root -- PYTHONPATH so pipeline.* imports):"
 echo "  PYTHONPATH=\$(pwd) nohup hunyuan_env/bin/uvicorn hunyuan_service:app \\"
-echo "    --app-dir services --host 127.0.0.1 --port 8105 > hunyuan_service.log 2>&1 &"
+echo "    --app-dir services --host 127.0.0.1 --port 8105 > logs/hunyuan_service.log 2>&1 &"

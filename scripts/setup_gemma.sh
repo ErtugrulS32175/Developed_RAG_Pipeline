@@ -25,9 +25,10 @@ python3 -c "import torch; print('main env torch ok:', torch.cuda.is_available())
 gemma_env/bin/python -c "import torch; print('venv torch:', torch.__version__, torch.cuda.is_available())"
 gemma_env/bin/python -c "from transformers import AutoModelForCausalLM; print('venv transformers ok')"
 
+mkdir -p logs
 echo "Done."
 echo "Model weights (~16GB) download on first request via from_pretrained."
 echo "If google/gemma-4-E4B-it turns out to be gated, run first:"
 echo "  export HF_TOKEN=your_token"
 echo "Start the service with (from repo root):"
-echo "  nohup gemma_env/bin/uvicorn gemma_service:app --app-dir services --host 127.0.0.1 --port 8101 > gemma_service.log 2>&1 &"
+echo "  nohup gemma_env/bin/uvicorn gemma_service:app --app-dir services --host 127.0.0.1 --port 8101 > logs/gemma_service.log 2>&1 &"

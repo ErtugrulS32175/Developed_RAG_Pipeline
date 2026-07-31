@@ -29,6 +29,11 @@ export PATH="$(dirname "$VLLM"):$PATH"
 # hits the near-full container disk and dies with "Disk quota exceeded (os error
 # 122)". Keep HF_HUB_DISABLE_XET=1 in the environment too (xet ~doubles peak disk).
 export HF_HOME="${HF_HOME:-/workspace/hf}"
+# Service output goes to logs/ rather than the working directory: these scripts
+# cd to the repo root, so a bare redirect drops a .log beside the source tree
+# every time a backend starts.
+LOG_DIR="${LOG_DIR:-$REPO/logs}"
+mkdir -p "$LOG_DIR"
 
 echo "Starting vLLM OpenAI server for $MODEL (weights download on first run)..."
 # --safetensors-load-strategy=prefetch: /workspace is a FUSE (MooseFS) mount, which
@@ -38,7 +43,7 @@ echo "Starting vLLM OpenAI server for $MODEL (weights download on first run)..."
 nohup $VLLM serve "$MODEL" \
   --max-model-len 8192 --no-enable-prefix-caching --mm-processor-cache-gb 0 \
   --safetensors-load-strategy=prefetch \
-  --gpu-memory-utilization "$GPU_FRAC" --port 8113 > vllm_gemma.log 2>&1 &
+  --gpu-memory-utilization "$GPU_FRAC" --port 8113 > "$LOG_DIR/vllm_gemma.log" 2>&1 &
 
 echo "Waiting for vLLM (31B load + download can take a while)..."
 until curl -s "http://127.0.0.1:8113/health" >/dev/null 2>&1; do sleep 5; done
@@ -47,7 +52,7 @@ echo "  vLLM :8113 ready"
 echo "Starting adapter service (our contract port :8101)..."
 VLLM_BASE_URL="http://127.0.0.1:8113/v1" VLLM_MODEL="$MODEL" PYTHONPATH="$REPO" \
   nohup gemma_env/bin/uvicorn vllm_table_service:app --app-dir services \
-  --host 127.0.0.1 --port 8101 > wrap_gemma.log 2>&1 &
+  --host 127.0.0.1 --port 8101 > "$LOG_DIR/wrap_gemma.log" 2>&1 &
 
 sleep 6
 printf "Health :8101 -> "; curl -s "localhost:8101/health"; echo

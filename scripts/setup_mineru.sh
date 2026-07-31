@@ -27,11 +27,12 @@ echo "[4/4] Verifying import"
 mineru_env/bin/python -c "import torch; print('venv torch:', torch.__version__, torch.cuda.is_available())"
 mineru_env/bin/python -c "from mineru_vl_utils import MinerUClient; print('MinerUClient import ok')"
 
+mkdir -p logs
 echo "Done."
 echo "Model weights download on first request via from_pretrained."
 echo "Start the service with (from repo root -- PYTHONPATH so pipeline.* imports):"
 echo "  PYTHONPATH=\$(pwd) nohup mineru_env/bin/python -m uvicorn mineru_service:app \\"
-echo "    --app-dir services --host 127.0.0.1 --port 8106 > mineru_service.log 2>&1 &"
+echo "    --app-dir services --host 127.0.0.1 --port 8106 > logs/mineru_service.log 2>&1 &"
 echo ""
 echo "Then score it against the labeled images:"
 echo "  python -m eval.run_eval --backends mineru"

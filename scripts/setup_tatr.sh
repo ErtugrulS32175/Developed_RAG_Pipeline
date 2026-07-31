@@ -27,7 +27,8 @@ tatr_env/bin/pip install fastapi uvicorn python-multipart requests
 echo "[5/5] Verifying"
 tatr_env/bin/python -c "import torch, timm, fitz, easyocr, transformers; print('tatr_env ok | torch', torch.__version__, 'cuda', torch.cuda.is_available(), '| transformers', transformers.__version__)"
 
+mkdir -p logs
 echo "Done. Start the service with (from repo root):"
 echo "  # paddle_service must be up first (number cells); point PADDLE_OCR_URL at it."
 echo "  PADDLE_OCR_URL=http://127.0.0.1:8100/ocr KMP_DUPLICATE_LIB_OK=TRUE PYTHONPATH=. \\"
-echo "    nohup tatr_env/bin/uvicorn services.tatr_service:app --host 127.0.0.1 --port 8102 > tatr_service.log 2>&1 &"
+echo "    nohup tatr_env/bin/uvicorn services.tatr_service:app --host 127.0.0.1 --port 8102 > logs/tatr_service.log 2>&1 &"

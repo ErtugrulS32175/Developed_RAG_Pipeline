@@ -19,5 +19,6 @@ python3 -c "import torch; print('main env torch ok:', torch.cuda.is_available())
 paddle_env/bin/python -c "import paddle; print('venv paddle:', paddle.__version__, paddle.device.is_compiled_with_cuda())"
 paddle_env/bin/python -c "import paddleocr; print('venv paddleocr ok')"
 
+mkdir -p logs
 echo "Done. Start the service with (from repo root):"
-echo "  nohup paddle_env/bin/uvicorn paddle_service:app --app-dir services --host 127.0.0.1 --port 8100 > paddle_service.log 2>&1 &"
+echo "  nohup paddle_env/bin/uvicorn paddle_service:app --app-dir services --host 127.0.0.1 --port 8100 > logs/paddle_service.log 2>&1 &"
