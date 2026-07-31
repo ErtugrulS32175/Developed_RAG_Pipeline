@@ -27,6 +27,7 @@ import re
 import time
 from pathlib import Path
 
+from eval.judge import DOGRU, INCELE, YANLIS, judge
 from eval.rag_eval import QUESTION_DIR, OUT_DIR, contains_key, retrieve_chunks
 
 # "Sayfa 13'e göre" / "sayfa 58" -- the citation shape the answer prompt asks for
@@ -43,21 +44,30 @@ def abstained(answer):
     return _ABSTAIN in (answer or "").lower()
 
 
-def score_one(question, answer, context):
-    """Grade one answer and say WHERE it went wrong."""
+def score_one(question, answer, context, sim=None):
+    """Grade one answer and say WHERE it went wrong.
+
+    The verdict has three states, not two -- see eval/judge. An answer the
+    scorer cannot confirm is not therefore wrong, and counting it as wrong is
+    how one run's table score was reported at 0.588 when it was nearer 0.99.
+    `sim` lets a caller supply the similarity itself, which is what keeps this
+    callable with no embedding service running.
+    """
     key = question.get("key")
     in_ctx = contains_key(context, key)
-    in_ans = contains_key(answer, key)
+    durum, gerekce = judge(key, answer, question.get("answer"), sim=sim)
     cites = cited_pages(answer)
 
     if in_ctx is False:
         fault = "retrieval"          # the model was never given the answer
-    elif in_ans:
+    elif durum == DOGRU:
         fault = None
     elif abstained(answer):
         fault = "uretim_cekimser"    # had it, still refused
-    else:
+    elif durum == YANLIS:
         fault = "uretim_yanlis"      # had it, answered something else
+    else:
+        fault = None                 # under review: no fault attributed yet
 
     return {
         "soru": question["q"],
@@ -68,7 +78,9 @@ def score_one(question, answer, context):
         # be the one this answer was actually produced from
         "baglam": context,
         "ctx_var": in_ctx,
-        "cevap_dogru": bool(in_ans),
+        "durum": durum,
+        "gerekce": gerekce,
+        "cevap_dogru": durum == DOGRU,
         "sayfa_dogru": bool(cites & set(question["pages"])),
         "sayfa_verdi": bool(cites),
         "atif_edilen": sorted(cites),
@@ -82,10 +94,18 @@ def summarize(rows, split_by_type=True):
     if not n:
         return {"n": 0}
     faults = [r["hata"] for r in rows if r["hata"]]
+    review = sum(1 for r in rows if r.get("durum") == INCELE)
+    correct = sum(1 for r in rows if r["cevap_dogru"])
     out = {
         "n": n,
         "ctx_recall": round(sum(1 for r in rows if r["ctx_var"]) / n, 4),
-        "cevap_dogrulugu": round(sum(1 for r in rows if r["cevap_dogru"]) / n, 4),
+        # Accuracy is a BAND, not a number. The lower bound is what the scorer
+        # could confirm; the upper bound adds what it could not settle either
+        # way. Reporting only the lower bound is what made a run look far worse
+        # than it was, and reporting only the upper one would flatter it.
+        "cevap_dogrulugu": round(correct / n, 4),
+        "incele_orani": round(review / n, 4),
+        "ust_sinir": round((correct + review) / n, 4),
         # of the answers that were RIGHT, how many pointed the user at a page
         # they could actually verify -- this is what the page-number fix bought
         "sayfa_dogrulugu": round(sum(1 for r in rows if r["sayfa_dogru"]) / n, 4),
@@ -155,7 +175,8 @@ def main():
     print()
     print(f"  n                : {m['n']}")
     print(f"  ctx_recall       : {m['ctx_recall']:.3f}   (cevap modele ulasti mi)")
-    print(f"  cevap dogrulugu  : {m['cevap_dogrulugu']:.3f}")
+    print(f"  cevap dogrulugu  : {m['cevap_dogrulugu']:.3f} - {m['ust_sinir']:.3f}"
+          f"   (incelenecek: {m['incele_orani']:.3f})")
     print(f"  sayfa dogrulugu  : {m['sayfa_dogrulugu']:.3f}   (sayfa verdi: {m['sayfa_verdi']:.3f})")
     print(f"  hata dagilimi    : {m['hata_dagilimi']}")
     for tip, tm in m.get("tipe_gore", {}).items():

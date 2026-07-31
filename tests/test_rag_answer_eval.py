@@ -121,7 +121,11 @@ def test_present_in_context_but_refused_is_blamed_on_generation():
 
 
 def test_present_in_context_but_answered_wrong_is_blamed_on_generation():
-    r = score_one(_q(), "Sayfa 42'ye göre 444 birimdir.", "olcum 555 birim")
+    """Blaming the generator now needs the answer to be RULED wrong, not merely
+    unmatched -- so the question set's reference answer and a similarity are
+    both part of the verdict. See tests/test_judge.py for the three states."""
+    r = score_one(_q(answer="olcum 555 birim"), "Sayfa 42'ye göre 444 birimdir.",
+                  "olcum 555 birim", sim=0.1)
     assert r["hata"] == "uretim_yanlis"
     assert r["cevap_dogru"] is False
 
@@ -231,5 +235,5 @@ def test_a_date_written_in_another_notation_still_counts():
     """Slashes and hyphens carry figures. Excluding them from the numeric class
     made a slashed date a WORD that had to appear verbatim, so an answer giving the
     same date another way was scored wrong though every figure matched."""
-    assert contains_key("kabul tarihi 9.4.1977", "9/4/1977") is True
+    assert contains_key("olcum tarihi 9.4.1977", "9/4/1977") is True
     assert contains_key("1977 yilinda kabul edildi", "9/4/1977") is False

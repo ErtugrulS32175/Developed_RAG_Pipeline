@@ -17,6 +17,7 @@ import argparse
 import json
 from pathlib import Path
 
+from eval.judge import INCELE
 from eval.rag_answer_eval import score_one, summarize
 from eval.rag_eval import QUESTION_DIR
 
@@ -44,24 +45,28 @@ def rescore(run_dir, sets=None):
                 continue
             row = score_one(g, r["cevap"], r.get("baglam") or "")
             scored.append(row)
-            if not row["cevap_dogru"]:
-                pending.append((name, g, r["cevap"]))
+            # only what the scorer could not settle goes to a person; an answer
+            # it ruled wrong has already been judged, and queueing those too is
+            # what made the review list mostly noise
+            if row["durum"] == INCELE:
+                pending.append((name, g, r["cevap"], row["gerekce"]))
         rows_by_set[name] = (before, summarize(scored))
     return rows_by_set, pending
 
 
 def write_review(pending, path):
-    """The still-failing answers, for a human to judge. A metric cannot settle
+    """The unsettled answers, for a human to judge. A metric cannot decide
     whether a differently-phrased answer is right; only a person can, and the
     verdicts belong back in the question set."""
     lines = ["# Inceleme kuyrugu", "",
-             f"{len(pending)} cevap hala hatali sayiliyor. Her biri icin: "
-             "gercekten yanlis mi, yoksa skorlayici mi kaciriyor?", ""]
-    for i, (setname, g, answer) in enumerate(pending, 1):
+             f"{len(pending)} cevap karara baglanamadi. Her biri icin: "
+             "gercekten yanlis mi, yoksa ayni seyi baska turlu mu soyluyor?", ""]
+    for i, (setname, g, answer, why) in enumerate(pending, 1):
         lines += [f"## {i}. [{setname}] {g['q']}", "",
                   f"- **beklenen** : `{g.get('key')}`",
                   f"- **referans** : {g.get('answer')}",
-                  f"- **model**    : {answer}", ""]
+                  f"- **model**    : {answer}",
+                  f"- **gerekce**  : {why}", ""]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -78,17 +83,19 @@ def main():
     if not by_set:
         raise SystemExit(f"kayitli cevap bulunamadi: {args.run_dir}")
 
-    print(f"{'set':<12}{'n':>4}{'onceki':>9}{'simdi':>8}   hata")
-    print("-" * 58)
-    total = count = 0
+    print(f"{'set':<12}{'n':>4}{'onceki':>9}{'alt':>7}{'ust':>7}{'incele':>8}   hata")
+    print("-" * 66)
+    lower = upper = count = 0
     for name, (before, m) in sorted(by_set.items()):
-        total += m["cevap_dogrulugu"] * m["n"]
+        lower += m["cevap_dogrulugu"] * m["n"]
+        upper += m["ust_sinir"] * m["n"]
         count += m["n"]
         was = f"{before:.3f}" if before is not None else "  -  "
-        print(f"{name:<12}{m['n']:>4}{was:>9}{m['cevap_dogrulugu']:>8.3f}   "
+        print(f"{name:<12}{m['n']:>4}{was:>9}{m['cevap_dogrulugu']:>7.3f}"
+              f"{m['ust_sinir']:>7.3f}{m['incele_orani']:>8.3f}   "
               f"{m.get('hata_dagilimi') or ''}")
-    print("-" * 58)
-    print(f"{'AGIRLIKLI':<12}{count:>4}{'':>9}{total / count:>8.3f}")
+    print("-" * 66)
+    print(f"{'AGIRLIKLI':<12}{count:>4}{'':>9}{lower / count:>7.3f}{upper / count:>7.3f}")
 
     out = Path(args.review) if args.review else Path(args.run_dir) / "review.md"
     write_review(pending, out)
