@@ -78,30 +78,79 @@ def fold(text):
 
 
 _MAGNITUDE = {"bin": 1e3, "milyon": 1e6, "milyar": 1e9, "trilyon": 1e12}
-# a dot/space between digit groups is a THOUSANDS separator only when exactly
+# a separator between digit groups is a THOUSANDS separator only when exactly
 # three digits follow; otherwise it is a decimal point (512.7 stays 512.7)
-_THOUSANDS = re.compile(r"(?<=\d)[ .](?=\d{3}(?!\d))")
-_NUMBER = re.compile(r"(\d+(?:[.,]\d{1,2})?)\s*(bin|milyon|milyar|trilyon)?")
+# a space is never a decimal point, so it can be resolved before tokenising
+_THOUSANDS_SPACE = re.compile(r"(?<=\d) (?=\d{3}(?!\d))")
+_THOUSANDS_DOT = re.compile(r"(?<=\d)\.(?=\d{3}(?!\d))")
+_THOUSANDS_COMMA = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+_FIGURE = re.compile(r"(\d[\d.,]*\d|\d)\s*(bin|milyon|milyar|trilyon)?")
+
+
+def _readings(token):
+    """Every value a numeric token could denote, given that the separator
+    convention is not reliable.
+
+    Turkish writes 1.234,56 and English writes 1,234.56, and a model answering a
+    Turkish question uses either -- often both in one answer. A group of exactly
+    three digits after a separator is therefore genuinely ambiguous between a
+    thousands group and a three-place decimal, so both readings are kept and the
+    caller accepts a match on either.
+
+    Measured: reading "3,927" as 3.92 (two decimal places, comma never a
+    thousands separator) turned correct answers into failures.
+    """
+    turkish = _THOUSANDS_DOT.sub("", token).replace(",", ".")
+    english = _THOUSANDS_COMMA.sub("", token)
+    out = set()
+    for s in (turkish, english):
+        try:
+            out.add(round(float(s), 4))
+        except ValueError:
+            pass
+    return out
+
+
+def number_forms(text):
+    """Each figure in `text` as the set of values it could denote.
+
+    A figure written with a magnitude word denotes two things at once, and which
+    one an expected answer means depends on where the unit was stated. "48.213
+    milyon" is both the figure 48213 and the amount 4.8213e10; an expected
+    answer often carries the figure alone, because the unit sat in the question.
+    Expanding the magnitude word and keeping ONLY the expanded value makes those
+    two forms unable to meet.
+
+    This was measured, not theorised: five correct answers in one run scored
+    wrong for exactly this reason, moving a reported accuracy from 0.88 to 0.59
+    and sending the diagnosis off after a generation defect that did not exist.
+    """
+    out = []
+    for token, magnitude in _FIGURE.findall(_THOUSANDS_SPACE.sub("", fold(text))):
+        forms = _readings(token)
+        if not forms:
+            # not a single value under either convention -- a composite such as
+            # a date or an article number. Its PARTS are the figures; without
+            # this a dotted date contributed nothing at all.
+            for part in re.split(r"[.,]", token):
+                if part.isdigit():
+                    out.append({float(part)})
+            continue
+        if magnitude:
+            forms |= {round(v * _MAGNITUDE[magnitude], 4) for v in forms}
+        out.append(forms)
+    return out
 
 
 def numbers(text):
-    """Every figure in `text` as a plain value, with Turkish magnitude words
-    expanded, so a figure written with a magnitude word, with a dot separator or
-    with a space separator all compare equal.
+    """Every value any figure in `text` could denote, flattened.
 
     A source writes the magnitude as a word and a model answers in digits. Same
     figure, and scoring that as a wrong answer is simply wrong. Financial
     Turkish leans on bin/milyon/milyar constantly, so comparing digits alone
     silently fails a large share of correct answers.
     """
-    s = _THOUSANDS.sub("", fold(text))
-    out = set()
-    for digits, magnitude in _NUMBER.findall(s):
-        value = float(digits.replace(",", "."))
-        if magnitude:
-            value *= _MAGNITUDE[magnitude]
-        out.add(round(value, 4))
-    return out
+    return {v for forms in number_forms(text) for v in forms}
 
 
 def contains_key(text, key):
@@ -132,13 +181,21 @@ def contains_key(text, key):
     if len(words) > 1 and all(w in hay_words for w in words):
         return True
 
-    key_numbers = numbers(key)
-    if key_numbers and key_numbers <= numbers(text):
+    # per FIGURE, not as one flat set: each expected figure needs SOME form of
+    # itself present, so a bare key can meet a magnitude-worded answer and the
+    # reverse, while an unrelated figure still fails
+    key_forms = number_forms(key)
+    text_values = numbers(text)
+    if key_forms and all(forms & text_values for forms in key_forms):
         # the words that carry meaning, once figures and their magnitude words
         # are accounted for: the unit must still be present, the magnitude word
         # need not, since its value is already folded into the figure
+        # slashes and hyphens carry figures too (dates, ratios, article
+        # numbers). Leaving them out of this class made a slashed date count as a
+        # WORD that had to appear verbatim, so an answer giving the same date in
+        # another notation was scored wrong even though every figure matched.
         rest = [w for w in words
-                if w not in _MAGNITUDE and not re.fullmatch(r"[%\d.,]+", w)]
+                if w not in _MAGNITUDE and not re.fullmatch(r"[%\d.,/-]+", w)]
         return all(w in hay_words for w in rest)
     return False
 

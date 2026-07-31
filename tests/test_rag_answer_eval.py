@@ -178,3 +178,58 @@ def test_figures_and_prose_are_reported_separately():
 def test_no_type_split_when_every_question_is_one_type():
     rows = [score_one(_q(type="sayisal"), "Sayfa 42: 555 birim", "555 birim")]
     assert "tipe_gore" not in summarize(rows)
+
+
+# --- a figure and its magnitude word denote two things at once ---
+
+def test_bare_key_meets_a_magnitude_worded_answer():
+    """The regression this exists for. An expected answer carries the figure
+    alone because the unit sat in the question; the model answers with the unit
+    spelled out. Expanding the magnitude word and keeping only the expanded
+    value made these unable to meet, and five correct answers scored wrong."""
+    assert contains_key("deger 8.765 milyon zeta", "8765 zeta") is True
+    assert contains_key("deger 8765 milyon zeta", "8765 zeta") is True
+
+
+def test_magnitude_worded_key_meets_a_bare_answer():
+    """The same in reverse, so the fix is not one-directional."""
+    assert contains_key("tutar 8765 zeta", "8.765 milyon zeta") is True
+
+
+def test_a_different_figure_still_fails():
+    """Accepting both forms must not accept an unrelated number."""
+    assert contains_key("deger 9876 milyon zeta", "8765 zeta") is False
+
+
+def test_the_unit_word_is_still_required():
+    """Both forms of the figure are accepted, but the thing being measured is
+    not: a figure without its unit is not the answer."""
+    assert contains_key("deger 8.765 milyon gamma", "8765 zeta") is False
+
+
+def test_every_figure_of_a_multi_number_key_must_be_present():
+    assert contains_key("zeta 8765 ve 4321 birim", "8765 4321 birim") is True
+    assert contains_key("zeta 8765 birim", "8765 4321 birim") is False
+
+
+def test_a_three_digit_group_after_a_comma_is_ambiguous_and_both_readings_count():
+    """Turkish writes 1.234,56; English writes 1,234.56; a model answering a
+    Turkish question uses either. Reading '3,927' only as 3.92 turned correct
+    answers into failures."""
+    from eval.rag_eval import numbers
+    assert {3.927, 3927} <= numbers("3,927 zeta")
+    assert contains_key("tutar 3,927 milyon zeta", "3927 zeta") is True
+
+
+def test_a_space_separator_is_never_a_decimal_point():
+    from eval.rag_eval import numbers
+    assert 8765 in numbers("8 765 zeta")
+    assert 8765 not in numbers("8 76 zeta")
+
+
+def test_a_date_written_in_another_notation_still_counts():
+    """Slashes and hyphens carry figures. Excluding them from the numeric class
+    made a slashed date a WORD that had to appear verbatim, so an answer giving the
+    same date another way was scored wrong though every figure matched."""
+    assert contains_key("kabul tarihi 9.4.1977", "9/4/1977") is True
+    assert contains_key("1977 yilinda kabul edildi", "9/4/1977") is False
