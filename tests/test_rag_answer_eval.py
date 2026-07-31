@@ -1,8 +1,8 @@
 """Answer grading and, more importantly, fault attribution: a wrong answer has
 to be blamed on the half of the system that actually caused it.
 
-Every figure below is invented and verified absent from the corpus -- test data
-must never be lifted from a real document.
+Every figure below is invented -- test fixtures must never be copied out of a
+real document.
 """
 from eval.rag_answer_eval import abstained, cited_pages, score_one, summarize
 from eval.rag_eval import contains_key

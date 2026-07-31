@@ -10,8 +10,7 @@ the expected pages. That survives re-chunking, is what a human can actually
 label, and needs NO LLM -- retrieval quality is measurable without a generator,
 which is why this can run entirely on local services.
 
-Question sets live in a GITIGNORED directory (questions and page numbers are
-document content and never belong in the repo).
+Question sets are read from `data/rag_eval/` and supplied per deployment.
 
 Two kinds of question set, and they measure different things:
   * BOOTSTRAP (--bootstrap) -- generated from the index itself: for a sampled

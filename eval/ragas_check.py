@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -47,14 +48,18 @@ def _clients():
     vendor: the servers are the ones this project already runs. `api_key` is a
     placeholder because they require no authentication.
     """
-    from openai import OpenAI
+    from openai import AsyncOpenAI, OpenAI
 
     from pipeline import embeddings as emb
     from pipeline import query
 
-    llm_client = OpenAI(
+    # ASYNC on purpose: the metrics are awaited through `ascore`, and ragas
+    # refuses to drive an async call with a synchronous client -- it fails every
+    # metric with "Cannot use agenerate() with a synchronous client" rather than
+    # falling back, so the whole run scores None.
+    llm_client = AsyncOpenAI(
         base_url=query.LLM_API_URL.rsplit("/v1/", 1)[0] + "/v1",
-        api_key=os.getenv("LLM_API_KEY", "not-needed"),
+        api_key=os.getenv("LLM_API_KEY") or "not-needed",
     )
     embed_client = OpenAI(
         base_url=emb.EMBED_API_URL.rsplit("/v1/", 1)[0] + "/v1",
@@ -140,9 +145,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--set", default="human")
     ap.add_argument("--limit", type=int, help="ilk N soru (deneme icin)")
+    # A run's answers and its judgements live in their own folders, so scoring
+    # one run never reads or overwrites another's.
+    ap.add_argument("--in-dir", default=None, help="kayitli cevaplarin klasoru")
+    ap.add_argument("--out-dir", default=None, help="hakem sonuclarinin klasoru")
     args = ap.parse_args()
 
-    answers_path = IN_DIR / f"rag_answers_{args.set}.json"
+    in_dir = Path(args.in_dir) if args.in_dir else IN_DIR
+    out_dir = Path(args.out_dir) if args.out_dir else IN_DIR
+    answers_path = in_dir / f"rag_answers_{args.set}.json"
     if not answers_path.exists():
         raise SystemExit(
             f"kayitli cevap yok: {answers_path}\n"
@@ -165,12 +176,18 @@ def main():
         g = gt.get(row["soru"])
         if not g:
             continue
+        t0 = time.time()
         scored = asyncio.run(score_row(metrics, row, g["answer"]))
-        scored.update({"soru": row["soru"], "bizim_dogru": bool(row["cevap_dogru"])})
+        secs = round(time.time() - t0, 1)
+        scored.update({"soru": row["soru"], "bizim_dogru": bool(row["cevap_dogru"]),
+                       "saniye": secs})
         rows.append(scored)
         fc = scored.get("factual_correctness")
+        # Per-question timing is what prices the full run: ~19 LLM calls each,
+        # so five questions tell you whether 38 is worth it.
         print(f"  {i}/{len(saved)} fc={fc} faith={scored.get('faithfulness')} "
-              f"bizim={'dogru' if row['cevap_dogru'] else 'yanlis'}  {row['soru'][:45]}")
+              f"{secs}s bizim={'dogru' if row['cevap_dogru'] else 'yanlis'}  "
+              f"{row['soru'][:42]}")
 
     def mean(key):
         vals = [r[key] for r in rows if r.get(key) is not None]
@@ -183,7 +200,8 @@ def main():
         "factual_correctness": mean("factual_correctness"),
         "hakem_uyumu": agreement(rows),
     }
-    out = IN_DIR / f"ragas_{args.set}.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"ragas_{args.set}.json"
     out.write_text(json.dumps({"ozet": summary, "sorular": rows},
                               ensure_ascii=False, indent=2), encoding="utf-8")
 

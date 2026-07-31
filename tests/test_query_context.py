@@ -62,3 +62,20 @@ def test_reranking_never_shrinks_the_context():
     question unanswerable while every page-level metric still read 1.0."""
     from pipeline import query
     assert query.TOP_RERANK >= query.TOP_K
+
+
+# --- answering-endpoint auth ---
+
+def test_no_header_when_no_key_is_set(monkeypatch):
+    """The local and tunnelled cases: an unauthenticated endpoint must not be
+    sent an empty Bearer token, which some servers reject outright."""
+    import pipeline.query as q
+    monkeypatch.setattr(q, "LLM_API_KEY", "")
+    assert q.llm_headers() == {}
+
+
+def test_key_is_sent_as_bearer(monkeypatch):
+    """Needed once the endpoint is a rented GPU behind a public proxy URL."""
+    import pipeline.query as q
+    monkeypatch.setattr(q, "LLM_API_KEY", "test-api-key")
+    assert q.llm_headers() == {"Authorization": "Bearer test-api-key"}

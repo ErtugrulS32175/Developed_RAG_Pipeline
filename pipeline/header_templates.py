@@ -11,8 +11,8 @@ A template is one JSON file per form, holding that form's canonical header:
       "header_merges": [[r, c, rowspan, colspan], ...]
     }
 
-Templates are USER DATA and live under a gitignored directory -- never shipped in
-the repo (a template encodes real document headers). Matching is text-based and
+Templates are supplied per deployment and read from a configurable directory.
+Matching is text-based and
 Turkish-fold tolerant so OCR garble ("GRUP~B" vs "GroupB") still lines up with
 the right form; stamping requires the extraction's column count to equal the
 template's, otherwise the caller flags it for a human instead of forcing a wrong
@@ -31,8 +31,8 @@ DEFAULT_TEMPLATE_DIR = Path("data/header_templates")
 
 
 def load_templates(directory=DEFAULT_TEMPLATE_DIR):
-    """Load form templates from a gitignored directory of JSON files. Returns []
-    when the directory is absent (templates are user data, not shipped)."""
+    """Load form templates from a directory of JSON files. Returns [] when the
+    directory is absent, so the pipeline runs unchanged without templates."""
     d = Path(directory)
     out = []
     if not d.is_dir():

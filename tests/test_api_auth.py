@@ -83,7 +83,8 @@ def test_readiness_reports_status_without_leaking_connection_detail(monkeypatch)
     import pipeline.api as api
 
     def unreachable(*a, **k):
-        raise ConnectionError("postgresql://rag:gizli@db-host:5433/ragdb erisilemedi")
+        raise ConnectionError(
+            "postgresql://db-user:Enter_Your_Password_Here@db-host:5433/db-name erisilemedi")
 
     monkeypatch.setattr(api, "get_conn", unreachable)
     monkeypatch.setattr("requests.get", unreachable)

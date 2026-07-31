@@ -111,6 +111,10 @@ def main():
     ap.add_argument("--rrf-k", type=int, default=1)
     ap.add_argument("--rerank", action="store_true")
     ap.add_argument("--rerank-to", type=int, default=10)
+    ap.add_argument("--backend", default="native",
+                    help="cevaplari hangi erisim motoru beslesin (native/llamaindex)")
+    ap.add_argument("--out-dir", default=None,
+                    help="ciktinin yazilacagi klasor; verilmezse output/eval")
     args = ap.parse_args()
 
     from pipeline import db
@@ -123,7 +127,8 @@ def main():
     rows, t0 = [], time.time()
     for i, q in enumerate(questions, start=1):
         chunks = retrieve_chunks(conn, q["q"], top_k=args.top_k,
-                                 rrf_k=args.rrf_k, rerank_to=rerank_to)
+                                 rrf_k=args.rrf_k, rerank_to=rerank_to,
+                                 backend=args.backend)
         context = build_context(chunks)
         try:
             answer = generate(q["q"], context)
@@ -136,10 +141,14 @@ def main():
     m = summarize(rows)
     m["saniye"] = round(time.time() - t0, 1)
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    # --out-dir keeps a run's results in their own folder, so a later run of the
+    # same set cannot destroy answers that cost GPU time to produce. Falls back
+    # to the flat layout when nobody asks for one.
+    out_dir = Path(args.out_dir) if args.out_dir else OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     # named per question set: a second run used to overwrite the first, and
     # those answers cost GPU time to produce -- losing them means renting again
-    out = OUT_DIR / f"rag_answers_{args.set}.json"
+    out = out_dir / f"rag_answers_{args.set}.json"
     out.write_text(json.dumps({"ozet": m, "sorular": rows}, ensure_ascii=False, indent=2),
                    encoding="utf-8")
 

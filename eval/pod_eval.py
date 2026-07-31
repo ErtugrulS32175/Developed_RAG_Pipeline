@@ -34,8 +34,8 @@ OUT_DIR = "output/eval"
 # Override per backend so a two-model A/B (run once per adapter) doesn't clobber
 # itself: POD_EVAL_OUT=output/eval/vl.json / .../hy.json
 OUT = os.getenv("POD_EVAL_OUT", os.path.join(OUT_DIR, "pod_results.json"))
-# GT-less images to dump (raw + parsed) for later offline scoring. Kept OUT of the
-# repo: set POD_EVAL_RAW="data/a.jpeg,data/b.jpeg" (comma-separated) at run time.
+# Unlabelled images to dump (raw + parsed) for later offline scoring. Paths are
+# given at run time: POD_EVAL_RAW="path/one.jpeg,path/two.jpeg" (comma-separated).
 RAW_IMAGES = [p.strip() for p in os.getenv("POD_EVAL_RAW", "").split(",") if p.strip()]
 TIMEOUT = float(os.getenv("EVAL_TIMEOUT", "900"))
 

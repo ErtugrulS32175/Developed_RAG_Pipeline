@@ -14,6 +14,11 @@ RERANK_MODEL_NAME  = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
 
 LLM_API_URL        = os.getenv("LLM_API_URL", "http://localhost:8000/v1/chat/completions")
 LLM_MODEL_NAME     = os.getenv("LLM_MODEL_NAME", "google/gemma-4-12B-it")
+# Empty by default: reached over a tunnel or on localhost the endpoint needs no
+# credential. It matters when the server is a rented GPU behind a provider's
+# PUBLIC proxy URL -- there, vLLM's own --api-key plus this header is what stops
+# the thing from answering anyone who guesses the address.
+LLM_API_KEY        = os.getenv("LLM_API_KEY", "")
 
 TOP_K      = int(os.getenv("RAG_TOP_K", "15"))
 # The reranker's job is to ORDER the retrieved passages, not to throw any away.
@@ -103,6 +108,15 @@ def build_context(chunks: list[dict]) -> str:
     )
 
 
+def llm_headers() -> dict:
+    """Auth header for the answering endpoint, or nothing when no key is set.
+
+    Kept as a function rather than a module constant so a test (or a caller
+    that sets LLM_API_KEY late) sees the current value.
+    """
+    return {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
+
+
 def generate(question: str, context: str) -> str:
     """Call the vLLM chat completions endpoint for the final answer."""
     prompt = f"""Aşağıdaki belge pasajlarına dayanarak soruyu Türkçe olarak cevapla.
@@ -125,6 +139,7 @@ CEVAP:"""
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
         },
+        headers=llm_headers(),
         timeout=120,
     )
     response.raise_for_status()
