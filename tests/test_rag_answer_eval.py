@@ -4,8 +4,8 @@ to be blamed on the half of the system that actually caused it.
 Every figure below is invented -- test fixtures must never be copied out of a
 real document.
 """
-from eval.rag_answer_eval import abstained, cited_pages, score_one, summarize
-from eval.rag_eval import contains_key
+from eval.answer.rag_answer_eval import abstained, cited_pages, score_one, summarize
+from eval.retrieval.rag_eval import contains_key
 
 
 def _q(**kw):
@@ -79,7 +79,7 @@ def test_bin_milyon_milyar_expand_to_their_value():
 
 def test_decimal_is_not_mistaken_for_a_thousands_separator():
     """512.7 is a decimal; 4.321 is four thousand three hundred twenty-one."""
-    from eval.rag_eval import numbers
+    from eval.retrieval.rag_eval import numbers
     assert 512.7 in numbers("512.7 zeta")
     assert 4321 in numbers("4.321 zeta")
     assert 8765 in numbers("8 765 zeta")
@@ -220,13 +220,13 @@ def test_a_three_digit_group_after_a_comma_is_ambiguous_and_both_readings_count(
     """Turkish writes 1.234,56; English writes 1,234.56; a model answering a
     Turkish question uses either. Reading '3,927' only as 3.92 turned correct
     answers into failures."""
-    from eval.rag_eval import numbers
+    from eval.retrieval.rag_eval import numbers
     assert {3.927, 3927} <= numbers("3,927 zeta")
     assert contains_key("tutar 3,927 milyon zeta", "3927 zeta") is True
 
 
 def test_a_space_separator_is_never_a_decimal_point():
-    from eval.rag_eval import numbers
+    from eval.retrieval.rag_eval import numbers
     assert 8765 in numbers("8 765 zeta")
     assert 8765 not in numbers("8 76 zeta")
 

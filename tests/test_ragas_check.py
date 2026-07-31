@@ -4,7 +4,7 @@ Ragas scores with an LLM. Whether an LLM judges Turkish reliably is unknown, so
 before depending on it we compare its verdict to the deterministic one we
 already trust. These cover the comparison itself; the scoring needs a live LLM.
 """
-from eval.ragas_check import agreement
+from eval.answer.ragas_check import agreement
 
 
 def _row(fc, ours):

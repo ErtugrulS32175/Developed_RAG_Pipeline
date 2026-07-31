@@ -20,7 +20,7 @@ import os
 import requests
 from fastapi import FastAPI, File, UploadFile
 
-from pipeline.table_export import parse_html_tables
+from pipeline.extraction.table_export import parse_html_tables
 
 app = FastAPI()
 

@@ -58,5 +58,5 @@ sleep 6
 printf "Health :8101 -> "; curl -s "localhost:8101/health"; echo
 echo
 echo "Done. Score everything ON THIS POD (no tunnel, no paddle) with:"
-echo "  gemma_env/bin/python -m eval.pod_eval"
+echo "  gemma_env/bin/python -m eval.table.pod_eval"
 echo "Then copy output/eval/pod_results.json off the pod (raw outputs included)."

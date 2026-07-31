@@ -1,4 +1,4 @@
-from pipeline.table_pipeline import _finalize, _finalize_consensus
+from pipeline.extraction.table_pipeline import _finalize, _finalize_consensus
 
 
 def _grouped_table():
@@ -141,7 +141,7 @@ def test_finalize_consensus_no_candidates_when_template_arbitrates():
 
 
 def test_normalize_number_turkish_format():
-    from pipeline.text_normalize import normalize_number as nn
+    from pipeline.lang.text_normalize import normalize_number as nn
     # English decimal -> Turkish comma; fully-English -> Turkish (invented values)
     assert nn("12.34") == "12,34"
     assert nn("0.50") == "0,50"
@@ -160,7 +160,7 @@ def test_normalize_number_turkish_format():
 
 
 def test_consensus_metrics_agreement_primary_total():
-    from eval.table_eval import consensus_metrics
+    from eval.table.table_eval import consensus_metrics
     primary = {"headers": ["A", "B"], "rows": [["1", "2"], ["3", "4"]]}
     secondary = {"headers": ["A", "B"], "rows": [["1", "2"], ["9", "4"]]}  # differs at (1,0)
     gt = {"headers": ["A", "B"], "rows": [["1", "2"], ["9", "4"]]}   # secondary right there
@@ -171,7 +171,7 @@ def test_consensus_metrics_agreement_primary_total():
 
 
 def test_consensus_metrics_respects_exclude_cols():
-    from eval.table_eval import consensus_metrics
+    from eval.table.table_eval import consensus_metrics
     # col 1 is a redacted (empty) column marked excluded -> dropped, so the real
     # disagreement in col 0 isn't diluted by trivial empty-cell matches
     primary = {"headers": ["A", "B"], "rows": [["1", ""], ["3", ""]]}

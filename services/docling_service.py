@@ -22,8 +22,8 @@ import torch
 from fastapi import FastAPI, File, UploadFile
 from PIL import Image
 
-from pipeline import table_docling as td
-from pipeline import image_preprocess as ip
+from pipeline.extraction import table_docling as td
+from pipeline.extraction import image_preprocess as ip
 
 app = FastAPI()
 

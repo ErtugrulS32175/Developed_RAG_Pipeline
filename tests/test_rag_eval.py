@@ -4,7 +4,7 @@ every conclusion about retrieval quality will rest on.
 """
 from collections import Counter
 
-from eval.rag_eval import first_hit_rank, rarest_terms, summarize
+from eval.retrieval.rag_eval import first_hit_rank, rarest_terms, summarize
 
 
 # --- first_hit_rank ---

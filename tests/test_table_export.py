@@ -1,6 +1,6 @@
 from openpyxl import load_workbook
 
-from pipeline.table_export import (
+from pipeline.extraction.table_export import (
     estimate_table_confidence,
     export_result_xlsx,
     parse_html_tables,

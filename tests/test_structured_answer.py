@@ -9,9 +9,9 @@ at all, because "the figure appears somewhere in fifteen passages" is satisfied
 by almost any figure. These tests pin down what changes once the answer has to
 say WHICH passage, and which line of it.
 """
-from pipeline.answer_guard import (check_structured, parse_structured,
-                                   passages)
-from pipeline.query import build_context
+from pipeline.retrieval.query import build_context
+from pipeline.validation.rag.answer_guard import (
+    check_structured, parse_structured, passages)
 
 CHUNKS = [
     {"filename": "belge.pdf", "page": 42, "text": "Zeta uretimi 47 000 birimdir."},
@@ -91,7 +91,7 @@ def test_a_figure_from_an_uncited_passage_is_now_caught():
     not, and that is the difference between checking whether a number exists
     somewhere and checking whether it came from the record that was asked
     about."""
-    from pipeline.answer_guard import check
+    from pipeline.validation.rag.answer_guard import check
     answer = "Sayfa 42'ye gore 8 000 birim."
     assert check(answer, CONTEXT) == []                       # unscoped: clean
     reply = _reply(1, "Zeta uretimi 47 000 birimdir.", answer)
@@ -125,7 +125,8 @@ def test_the_structured_path_holds_together_end_to_end(monkeypatch):
     """Unit tests pass while the pieces are wired to each other wrongly, and
     the next run of this path costs rented GPU hours. So drive it once with the
     model faked out: retrieval, numbering, prompt, parse, check."""
-    from pipeline import query
+    from pipeline.generation import answer as gen
+    from pipeline.retrieval import query
 
     seen = {}
 
@@ -137,7 +138,7 @@ def test_the_structured_path_holds_together_end_to_end(monkeypatch):
 
     monkeypatch.setattr(query, "retrieve", lambda q, top_k=None: CHUNKS)
     monkeypatch.setattr(query, "rerank", lambda q, chunks, top_n=None: chunks)
-    monkeypatch.setattr(query, "complete", fake_complete)
+    monkeypatch.setattr(gen, "complete", fake_complete)
 
     reply = query.ask("zeta uretimi nedir?", structured=True)
 
@@ -154,12 +155,13 @@ def test_the_structured_path_holds_together_end_to_end(monkeypatch):
 def test_the_plain_path_is_untouched(monkeypatch):
     """The default must keep producing exactly what every earlier run produced,
     or nothing is comparable with anything."""
-    from pipeline import query
+    from pipeline.generation import answer as gen
+    from pipeline.retrieval import query
 
     seen = {}
     monkeypatch.setattr(query, "retrieve", lambda q, top_k=None: CHUNKS)
     monkeypatch.setattr(query, "rerank", lambda q, chunks, top_n=None: chunks)
-    monkeypatch.setattr(query, "complete",
+    monkeypatch.setattr(gen, "complete",
                         lambda p: seen.setdefault("prompt", p) and "" or "duz cevap")
 
     assert query.ask("zeta uretimi nedir?") == "duz cevap"

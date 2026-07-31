@@ -61,7 +61,7 @@ Each model runs in its own isolated environment. Table extraction needs a GPU
 
 ### Authentication
 
-`pipeline/api.py` is protected by a shared secret. Set `API_KEY` in `.env` and
+`pipeline/api/app.py` is protected by a shared secret. Set `API_KEY` in `.env` and
 enter the same value as the API key on the OpenWebUI connection. Every endpoint
 that reads or adds documents then requires `Authorization: Bearer <key>`.
 
@@ -95,7 +95,7 @@ Start the services (each downloads its model weights on the first request):
 
 Extract a table to Excel using two-model consensus:
 
-    TABLE_XLSX=out.xlsx python -m pipeline.table_pipeline path/to/image.png consensus
+    TABLE_XLSX=out.xlsx python -m pipeline.extraction.table_pipeline path/to/image.png consensus
 
 ## Document Q&A (RAG)
 
@@ -104,11 +104,11 @@ in Turkish with source-page citations: inputs are normalized into chunks stored 
 PostgreSQL + pgvector, and queries use hybrid search (dense + BM25) with a reranker
 before an LLM answers.
 
-    python -m pipeline.ingest_router path/to/file.pdf
-    python -m pipeline.query
+    python -m pipeline.index.ingest path/to/file.pdf
+    python -m pipeline.retrieval.query
 
-Retrieval and answer quality are measured by `eval/rag_eval.py` (does the answer
-reach the context, and at what rank) and `eval/rag_answer_eval.py` (is the answer
+Retrieval and answer quality are measured by `eval/retrieval/rag_eval.py` (does the answer
+reach the context, and at what rank) and `eval/answer/rag_answer_eval.py` (is the answer
 right, is the cited page right, and which stage is at fault when it is not).
 
 ### Checking the checker
@@ -126,7 +126,7 @@ they differ when they do not.
 
     python -m venv ragas_env
     ragas_env\Scripts\pip install -r requirements-ragas.txt
-    ragas_env\Scripts\python -m eval.ragas_check --set human
+    ragas_env\Scripts\python -m eval.answer.ragas_check --set human
 
 The judge is whatever `LLM_API_URL` points at — the same self-hosted model the
 pipeline answers with, so nothing leaves the machines it already runs on.
@@ -142,8 +142,8 @@ pipeline described above; `llamaindex` is LlamaIndex retrieving over the same
 chunks, kept as a second opinion rather than a replacement.
 
     pip install -r requirements-llamaindex.txt
-    python -m pipeline.rag_llamaindex build       # copy chunks into its own table
-    python -m eval.rag_eval --set human --backend llamaindex
+    python -m pipeline.retrieval.rag_llamaindex build       # copy chunks into its own table
+    python -m eval.retrieval.rag_eval --set human --backend llamaindex
 
 Pick one with `RAG_BACKEND`, or per conversation in OpenWebUI by choosing the
 `ragtest-rag-llamaindex` model. The source chunks, the embedding model, the LLM

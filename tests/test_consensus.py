@@ -1,4 +1,4 @@
-from pipeline.consensus import reconcile
+from pipeline.validation.table.consensus import reconcile
 
 
 def test_full_agreement_no_disagreements():

@@ -8,8 +8,8 @@
 #
 #     python -m venv llamaindex_env
 #     llamaindex_env\Scripts\pip install -r requirements-llamaindex.txt
-#     llamaindex_env\Scripts\python -m pipeline.rag_llamaindex build
-#     llamaindex_env\Scripts\python -m eval.rag_eval --set human --backend llamaindex
+#     llamaindex_env\Scripts\python -m pipeline.retrieval.rag_llamaindex build
+#     llamaindex_env\Scripts\python -m eval.retrieval.rag_eval --set human --backend llamaindex
 
 # what the comparison path itself needs (a subset of requirements.txt)
 psycopg[binary]

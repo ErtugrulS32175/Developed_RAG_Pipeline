@@ -1,5 +1,5 @@
 """A table that numbers its own rows can prove its row count is wrong."""
-from pipeline.row_sequence import check, find_index_column
+from pipeline.validation.table.row_sequence import check, find_index_column
 
 
 def _rows(indices, width=3):

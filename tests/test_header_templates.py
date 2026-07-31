@@ -1,6 +1,6 @@
 import json
 
-from pipeline.header_templates import (
+from pipeline.extraction.header_templates import (
     apply_template,
     load_templates,
     match_template,
@@ -113,7 +113,7 @@ def test_resolve_flags_recognized_but_column_mismatch():
 
 
 def test_arbitrate_prefers_more_complete_candidate():
-    from pipeline.header_templates import arbitrate
+    from pipeline.extraction.header_templates import arbitrate
     # c1 matches width 4 but zeroed two cells; c2 is 6-wide with 2 blank
     # (spurious) columns that drop to width 4 and keeps real values -> pick c2.
     c1 = {"header_rows": [["C0l4", "Grup8", "", "ColC"], ["", "Sub1", "Sub2", ""]],
@@ -126,7 +126,7 @@ def test_arbitrate_prefers_more_complete_candidate():
 
 
 def test_arbitrate_backfills_garbage_cell_from_other_model():
-    from pipeline.header_templates import arbitrate
+    from pipeline.extraction.header_templates import arbitrate
     # winner (c1) leaked text "X" into a numeric slot; the other reading (c2) has
     # a number there and agrees on the rest of the row -> backfill "X" -> "2".
     c1 = {"header_rows": [["C0l4", "Grup8", "", "ColC"], ["", "Sub1", "Sub2", ""]],
@@ -137,7 +137,7 @@ def test_arbitrate_backfills_garbage_cell_from_other_model():
 
 
 def test_arbitrate_does_not_backfill_across_misaligned_rows():
-    from pipeline.header_templates import arbitrate
+    from pipeline.extraction.header_templates import arbitrate
     # c2's row is a DIFFERENT record (agrees on nothing) -> guard blocks backfill,
     # the garbage stays rather than importing a wrong value.
     c1 = {"header_rows": [["C0l4", "Grup8", "", "ColC"], ["", "Sub1", "Sub2", ""]],

@@ -8,8 +8,8 @@ that the right value was chosen. The tests that matter most are the ones
 pinning down what the checks CANNOT see, because that is what decides whether
 they may ever be allowed to block an answer.
 """
-from pipeline.answer_guard import (check, context_pages, unsupported_figures,
-                                   unsupported_pages)
+from pipeline.validation.rag.answer_guard import (
+    check, context_pages, unsupported_figures, unsupported_pages)
 
 CONTEXT = (
     "[belge.pdf | Sayfa 42 | Bolum]\n"

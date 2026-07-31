@@ -6,7 +6,7 @@ message instead of breaking anything that does not use it.
 """
 import pytest
 
-from pipeline import rag_backends
+from pipeline.retrieval import rag_backends
 
 
 def test_the_default_is_the_engine_built_here():
@@ -32,7 +32,7 @@ def test_the_native_engine_resolves_without_optional_packages():
 def test_a_missing_optional_engine_says_how_to_install_it(monkeypatch):
     """Selecting an engine that is not installed should explain itself, not
     surface an ImportError from somewhere deep in a dependency."""
-    from pipeline import rag_llamaindex
+    from pipeline.retrieval import rag_llamaindex
 
     def no_package():
         raise RuntimeError(rag_llamaindex._MISSING)
@@ -56,7 +56,7 @@ def test_the_alternative_engine_reuses_this_project_s_prompt():
     and the comparison would measure the wrong thing."""
     import inspect
 
-    from pipeline import rag_llamaindex
+    from pipeline.retrieval import rag_llamaindex
 
     src = inspect.getsource(rag_llamaindex.answer)
     assert "build_context" in src and "generate" in src

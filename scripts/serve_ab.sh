@@ -37,6 +37,6 @@ for p in 8104 8105; do
   until curl -s "http://127.0.0.1:$p/health" >/dev/null 2>&1; do sleep 3; done
   printf "  :%s -> " "$p"; curl -s "http://127.0.0.1:$p/health"; echo
 done
-echo "Both up. Score with eval/pod_eval.py (once per adapter):"
-echo "  POD_EVAL_OUT=output/eval/vl.json ADAPTER_URL=http://127.0.0.1:8104/table paddle_env/bin/python -m eval.pod_eval"
-echo "  POD_EVAL_OUT=output/eval/hy.json ADAPTER_URL=http://127.0.0.1:8105/table paddle_env/bin/python -m eval.pod_eval"
+echo "Both up. Score with eval/table/pod_eval.py (once per adapter):"
+echo "  POD_EVAL_OUT=output/eval/vl.json ADAPTER_URL=http://127.0.0.1:8104/table paddle_env/bin/python -m eval.table.pod_eval"
+echo "  POD_EVAL_OUT=output/eval/hy.json ADAPTER_URL=http://127.0.0.1:8105/table paddle_env/bin/python -m eval.table.pod_eval"

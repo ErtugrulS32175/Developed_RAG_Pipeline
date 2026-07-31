@@ -5,7 +5,7 @@ already embedded hundreds of chunks, and the next attempt started from zero.
 """
 import pytest
 
-from pipeline import ingest_router as ir
+from pipeline.index import ingest as ir
 
 
 def _c(text, tag="page7:native"):

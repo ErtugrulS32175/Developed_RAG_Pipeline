@@ -29,8 +29,11 @@ def _imported_modules(path):
 
 
 def test_no_pipeline_module_imports_eval_or_tests():
+    # rglob, not glob: the validation subpackages are exactly where this is
+    # easiest to get wrong again, since their checks and the eval scorers do
+    # similar-looking work on the same kind of text
     offenders = []
-    for path in sorted(PIPELINE.glob("*.py")):
+    for path in sorted(PIPELINE.rglob("*.py")):
         for module in _imported_modules(path):
             root = module.split(".")[0]
             if root in ("eval", "tests"):

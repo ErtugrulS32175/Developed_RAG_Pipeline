@@ -18,8 +18,8 @@ import requests
 from fastapi import FastAPI, File, UploadFile
 from PIL import Image
 
-from pipeline import table_tatr as tt
-from pipeline import image_preprocess as ip
+from pipeline.extraction import table_tatr as tt
+from pipeline.extraction import image_preprocess as ip
 
 app = FastAPI()
 

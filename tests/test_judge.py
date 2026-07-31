@@ -11,7 +11,7 @@ similarity directly, so the suite stays runnable with no containers up.
 """
 import pytest
 
-from eval.judge import (DOGRU, INCELE, YANLIS, expand_cardinals, expand_months,
+from eval.answer.judge import (DOGRU, INCELE, YANLIS, expand_cardinals, expand_months,
                         judge, normalize, notation_match, stems)
 
 
@@ -176,7 +176,7 @@ def test_without_a_reference_nothing_is_called_wrong():
 
 def test_an_unreachable_embedding_service_sends_answers_to_review(monkeypatch):
     """Scoring must degrade to 'ask a person', never to 'wrong'."""
-    monkeypatch.setattr("eval.judge.similarity", lambda a, b: None)
+    monkeypatch.setattr("eval.answer.judge.similarity", lambda a, b: None)
     durum, why = judge("kirk yedi bin zeta", "Sayfa 42: 8 000 gamma.", "kirk yedi bin zeta")
     assert durum == INCELE and "servis" in why
 
@@ -191,7 +191,7 @@ def _q(**kw):
 
 
 def test_an_unsettled_answer_is_not_blamed_on_the_generator():
-    from eval.rag_answer_eval import score_one
+    from eval.answer.rag_answer_eval import score_one
     r = score_one(_q(), "Sayfa 42: en cok kirk yedi bin gamma.", "olcum kirk yedi bin zeta",
                   sim=0.9)
     assert r["durum"] == INCELE
@@ -202,7 +202,7 @@ def test_an_unsettled_answer_is_not_blamed_on_the_generator():
 def test_accuracy_is_reported_as_a_band():
     """Reporting only what the scorer could confirm made one run look far worse
     than it was; reporting the upper bound alone would flatter it."""
-    from eval.rag_answer_eval import score_one, summarize
+    from eval.answer.rag_answer_eval import score_one, summarize
     rows = [
         score_one(_q(), "Sayfa 42: 47 000 zeta", "olcum kirk yedi bin zeta"),
         score_one(_q(), "Sayfa 42: en cok kirk yedi bin gamma", "olcum kirk yedi bin zeta",

@@ -1,4 +1,4 @@
-from pipeline.number_verify import is_financial, verify
+from pipeline.validation.table.number_verify import is_financial, verify
 
 
 def test_is_financial_only_monetary_values():

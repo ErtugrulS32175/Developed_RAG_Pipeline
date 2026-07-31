@@ -35,4 +35,4 @@ echo "  PYTHONPATH=\$(pwd) nohup mineru_env/bin/python -m uvicorn mineru_service
 echo "    --app-dir services --host 127.0.0.1 --port 8106 > logs/mineru_service.log 2>&1 &"
 echo ""
 echo "Then score it against the labeled images:"
-echo "  python -m eval.run_eval --backends mineru"
+echo "  python -m eval.retrieval.run_eval --backends mineru"

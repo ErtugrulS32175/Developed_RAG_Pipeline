@@ -47,7 +47,7 @@ services:
     volumes:
       - openwebui:/app/backend/data
     extra_hosts:
-      # Open WebUI calls pipeline/api.py, which runs on the HOST, not in a
+      # Open WebUI calls pipeline/api/app.py, which runs on the HOST, not in a
       # container. On Linux this mapping does not exist unless it is declared.
       - "host.docker.internal:host-gateway"
 

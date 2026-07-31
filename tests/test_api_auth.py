@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 def _client(monkeypatch, key):
     """Reimport the module with API_KEY set, since it is read once at import."""
     monkeypatch.setenv("API_KEY", key)
-    import pipeline.api as api
+    import pipeline.api.app as api
     importlib.reload(api)
     return TestClient(api.app), api
 
@@ -80,7 +80,7 @@ def test_readiness_reports_status_without_leaking_connection_detail(monkeypatch)
 
     The dependencies are stubbed rather than contacted: a test that waits on a
     real connection timeout takes minutes and fails for reasons of its own."""
-    import pipeline.api as api
+    import pipeline.api.app as api
 
     def unreachable(*a, **k):
         raise ConnectionError(

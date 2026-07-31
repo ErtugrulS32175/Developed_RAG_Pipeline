@@ -12,7 +12,7 @@ import torch
 from fastapi import FastAPI, File, UploadFile
 from PIL import Image
 
-from pipeline.table_export import parse_html_tables
+from pipeline.extraction.table_export import parse_html_tables
 
 app = FastAPI()
 MODEL_ID = os.getenv("HUNYUAN_MODEL", "tencent/HunyuanOCR")

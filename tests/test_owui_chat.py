@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from pipeline import owui_chat
+from pipeline.api import owui_chat
 
 
 def _img_part(url):

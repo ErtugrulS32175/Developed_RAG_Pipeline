@@ -3,7 +3,8 @@ and that ingest extracts through the verified pipeline rather than a raw backend
 """
 import json
 
-from pipeline import ingest_router, router
+from pipeline.index import ingest as ingest_router
+from pipeline.extraction import router
 
 
 def _consensus_table():
@@ -235,7 +236,7 @@ def test_ingest_uses_consensus_by_default(monkeypatch):
         seen["ocr_text"] = ocr_text
         return [{"headers": ["A"], "rows": [["1"]]}]
 
-    import pipeline.table_pipeline as tp
+    import pipeline.extraction.table_pipeline as tp
     monkeypatch.setattr(tp, "run_consensus", fake_run_consensus)
     monkeypatch.setattr(router, "INGEST_TABLE_MODE", "consensus")
 
@@ -253,7 +254,7 @@ def test_ingest_single_mode_runs_one_backend(monkeypatch):
         seen["mode"] = "single"
         return []
 
-    import pipeline.table_pipeline as tp
+    import pipeline.extraction.table_pipeline as tp
     monkeypatch.setattr(tp, "run", fake_run)
     monkeypatch.setattr(router, "INGEST_TABLE_MODE", "single")
 
