@@ -113,50 +113,126 @@ def unsupported_pages(answer, context):
 _BLOCK = "\n\n---\n\n"
 
 
+def _json_containers(text):
+    """Yield complete top-level JSON containers found in model prose.
+
+    A whole container is consumed before looking for another one. This is
+    important for strictness: an otherwise valid answer object nested inside
+    an array or wrapper object must not be mistaken for the requested top-level
+    response.
+    """
+    position = 0
+    while position < len(text):
+        openings = [
+            index for index in (text.find("{", position),
+                                text.find("[", position))
+            if index != -1
+        ]
+        if not openings:
+            return
+        start = min(openings)
+        stack = []
+        in_string = False
+        escaped = False
+
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char in "{[":
+                stack.append(char)
+            elif char in "}]":
+                expected = "{" if char == "}" else "["
+                if not stack or stack[-1] != expected:
+                    # Consume the malformed candidate rather than inspecting a
+                    # nested object as if it were a top-level model response.
+                    position = index + 1
+                    break
+                stack.pop()
+                if not stack:
+                    yield text[start:index + 1]
+                    position = index + 1
+                    break
+        else:
+            # An unclosed leading container makes the boundary ambiguous.
+            # Failing closed is safer than recovering an object from inside it.
+            return
+
+
+def _object_without_duplicate_keys(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("duplicate JSON field")
+        obj[key] = value
+    return obj
+
+
+def _reject_json_constant(value):
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _valid_structured(obj):
+    """Whether *obj* exactly matches the model-answer contract."""
+    if not isinstance(obj, dict) or set(obj) != {"dayanak", "cevap"}:
+        return False
+    if not isinstance(obj["dayanak"], list):
+        return False
+    if not isinstance(obj["cevap"], str) or not obj["cevap"].strip():
+        return False
+
+    for evidence in obj["dayanak"]:
+        if not isinstance(evidence, dict) or \
+                set(evidence) != {"pasaj", "alinti"}:
+            return False
+        handle = evidence["pasaj"]
+        if type(handle) is not int or handle < 1:
+            return False
+        quote = evidence["alinti"]
+        if not isinstance(quote, str) or not quote.strip():
+            return False
+    return True
+
+
 def parse_structured(text):
     """The answer object a model was asked for, or None if it did not produce one.
 
     Models wrap JSON in prose or a code fence however firmly they are told not
-    to, so the object is located by brace matching rather than by parsing the
-    whole reply. Returning None rather than raising matters: a malformed reply
-    is a flag on that answer, never a failed request.
+    to, so complete JSON containers are located before parsing. Discovery is
+    tolerant; acceptance is not. Only the exact requested object is returned,
+    with duplicate fields, wrapper objects and array wrappers rejected.
+    JSON object-member order is not part of the schema; evidence-first remains
+    a generation instruction, not an uncalibrated reason to reject an answer.
+    Returning None rather than raising matters: a malformed reply is a flag on
+    that answer, never a failed request.
     """
-    if not text:
+    if not isinstance(text, str) or not text:
         return None
-    start = text.find("{")
-    while start != -1:
-        depth, in_string, escaped = 0, False, False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-            elif ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        obj = json.loads(text[start:i + 1])
-                    except ValueError:
-                        break
-                    if isinstance(obj, dict) and "cevap" in obj:
-                        return obj
-                    break
-        start = text.find("{", start + 1)
+    for candidate in _json_containers(text):
+        try:
+            obj = json.loads(
+                candidate,
+                object_pairs_hook=_object_without_duplicate_keys,
+                parse_constant=_reject_json_constant,
+            )
+        except (TypeError, ValueError):
+            continue
+        if _valid_structured(obj):
+            return obj
     return None
 
 
 def _quoted(parsed):
-    return " \n ".join(str(d.get("alinti", ""))
-                       for d in parsed.get("dayanak") or []
-                       if isinstance(d, dict))
+    return " \n ".join(item["alinti"] for item in parsed["dayanak"])
 
 
 def check_structured(reply, context, minimum=0, derive=True):
@@ -177,28 +253,25 @@ def check_structured(reply, context, minimum=0, derive=True):
     if not context.numbered:
         raise ValueError("structured answers require a numbered RagContext")
 
-    parsed = reply if isinstance(reply, dict) else parse_structured(reply)
+    if isinstance(reply, dict):
+        parsed = reply if _valid_structured(reply) else None
+    else:
+        parsed = parse_structured(reply) if isinstance(reply, str) else None
     if parsed is None:
         return [("bicimsiz_yanit", [])]
 
-    answer = str(parsed.get("cevap", ""))
+    answer = parsed["cevap"]
     known = context.by_handle()
     flags = []
 
     cited, bad_handles, bad_quotes = [], [], []
-    for item in parsed.get("dayanak") or []:
-        if not isinstance(item, dict):
-            continue
-        try:
-            handle = int(item.get("pasaj"))
-        except (TypeError, ValueError):
-            bad_handles.append(item.get("pasaj"))
-            continue
+    for item in parsed["dayanak"]:
+        handle = item["pasaj"]
         if handle not in known:
             bad_handles.append(handle)
             continue
         cited.append(handle)
-        quote = fold(str(item.get("alinti", "")))
+        quote = fold(item["alinti"])
         if quote and quote not in fold(known[handle].text):
             bad_quotes.append(handle)
 

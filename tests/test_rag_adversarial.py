@@ -27,10 +27,6 @@ from pipeline.validation.rag.answer_guard import (
 )
 
 
-SCHEMA_GAP = pytest.mark.xfail(
-    strict=True,
-    reason="Adim 4: structured yanit semasi henuz kati dogrulanmiyor",
-)
 POLICY_GAP = pytest.mark.xfail(
     strict=True,
     reason="Adim 5: guvenli guard ve judge politikasi henuz uygulanmiyor",
@@ -39,12 +35,6 @@ API_GAP = pytest.mark.xfail(
     strict=True,
     reason="Adim 6: API henuz kontrol edilmis yanit sozlesmesini zorunlu kilmiyor",
 )
-PROMPT_BOUNDARY_GAP = pytest.mark.xfail(
-    strict=True,
-    reason="Adim 4: guvenilir politika ve guvenilmeyen pasajlar ayri rollerde degil",
-)
-
-
 CHUNKS = [
     {
         "filename": "kurgu-belge.pdf",
@@ -172,34 +162,28 @@ def test_document_text_cannot_create_a_supported_page():
 
 # --- strict JSON shape ------------------------------------------------------
 
-@SCHEMA_GAP
 def test_dayanak_must_be_a_list():
     _assert_malformed({"dayanak": 1, "cevap": "kurgu yanit"})
 
 
-@SCHEMA_GAP
 @pytest.mark.parametrize("handle", [1.9, True, "1"])
 def test_passage_handle_must_be_an_integer_but_not_a_boolean(handle):
     _assert_malformed(_reply(pasaj=handle))
 
 
-@SCHEMA_GAP
 def test_dayanak_is_a_required_top_level_field():
     _assert_malformed({"cevap": "kurgu yanit"})
 
 
-@SCHEMA_GAP
 def test_each_evidence_item_must_be_an_object():
     _assert_malformed({"dayanak": ["kurgu"], "cevap": "kurgu yanit"})
 
 
-@SCHEMA_GAP
 @pytest.mark.parametrize("answer", ["", 73, {"metin": "kurgu"}])
 def test_cevap_must_be_a_nonempty_string(answer):
     _assert_malformed({"dayanak": [], "cevap": answer})
 
 
-@SCHEMA_GAP
 @pytest.mark.parametrize(
     "reply",
     [
@@ -224,7 +208,6 @@ def test_unknown_schema_fields_are_rejected(reply):
     _assert_malformed(reply)
 
 
-@SCHEMA_GAP
 def test_parser_skips_an_incomplete_answer_object():
     complete = {
         "dayanak": [],
@@ -238,7 +221,6 @@ def test_parser_skips_an_incomplete_answer_object():
     assert parse_structured(text) == complete
 
 
-@SCHEMA_GAP
 def test_parser_rejects_duplicate_json_fields():
     text = (
         '{"dayanak": [], "cevap": "ilk kurgu", '
@@ -247,12 +229,10 @@ def test_parser_rejects_duplicate_json_fields():
     assert parse_structured(text) is None
 
 
-@SCHEMA_GAP
 def test_evidence_quote_cannot_be_empty():
     _assert_malformed(_reply(alinti="", cevap="Sayfa 17'ye gore zeta vardir."))
 
 
-@SCHEMA_GAP
 def test_evidence_quote_must_be_a_string():
     _assert_malformed(_reply(alinti=73))
 
@@ -361,7 +341,6 @@ def test_similarity_fallback_logs_programmer_errors(monkeypatch, caplog):
 
 # --- trusted prompt policy vs untrusted document text -----------------------
 
-@PROMPT_BOUNDARY_GAP
 @pytest.mark.parametrize(
     ("generator_name", "policy_marker"),
     [("generate", "sayfa"), ("generate_structured", "dayanak")],

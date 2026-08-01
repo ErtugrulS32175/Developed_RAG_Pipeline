@@ -60,6 +60,48 @@ def test_a_leading_object_that_is_not_the_answer_is_skipped():
     assert parse_structured(text)["cevap"] == "47 000"
 
 
+def test_an_answer_nested_in_a_wrapper_is_not_a_top_level_answer():
+    text = '{"sonuc": {"dayanak": [], "cevap": "kurgu"}}'
+    assert parse_structured(text) is None
+
+
+def test_an_answer_wrapped_in_an_array_is_rejected():
+    text = '[{"dayanak": [], "cevap": "kurgu"}]'
+    assert parse_structured(text) is None
+
+
+def test_top_level_field_order_does_not_change_schema_meaning():
+    text = '{"cevap": "kurgu", "dayanak": []}'
+    assert parse_structured(text) == {"dayanak": [], "cevap": "kurgu"}
+
+    reply = {
+        "cevap": "Sayfa 42'ye gore 47 000 birim.",
+        "dayanak": [{
+            "pasaj": 1,
+            "alinti": "Zeta uretimi 47 000 birimdir.",
+        }],
+    }
+    assert check_structured(reply, CONTEXT) == []
+
+
+def test_whitespace_only_answer_and_quote_are_rejected():
+    assert parse_structured('{"dayanak": [], "cevap": "   "}') is None
+    reply = {"dayanak": [{"pasaj": 1, "alinti": " \n "}],
+             "cevap": "kurgu"}
+    assert check_structured(reply, CONTEXT) == [("bicimsiz_yanit", [])]
+
+
+def test_passage_handles_must_be_positive():
+    for handle in (0, -1):
+        reply = _reply(handle, "kurgu", "kurgu")
+        assert check_structured(reply, CONTEXT) == [("bicimsiz_yanit", [])]
+
+
+def test_non_finite_json_numbers_are_rejected():
+    text = '{"dayanak": [{"pasaj": NaN, "alinti": "kurgu"}], "cevap": "kurgu"}'
+    assert parse_structured(text) is None
+
+
 def test_unparseable_output_is_a_flag_not_an_exception():
     """A malformed reply must degrade to a warning on that answer. Raising here
     would turn a formatting slip into a failed request."""
@@ -132,8 +174,9 @@ def test_the_structured_path_holds_together_end_to_end(monkeypatch):
 
     seen = {}
 
-    def fake_complete(prompt):
-        seen["prompt"] = prompt
+    def fake_complete(policy, user_content):
+        seen["policy"] = policy
+        seen["user_content"] = user_content
         return ('```json\n{"dayanak": [{"pasaj": 1, '
                 '"alinti": "Zeta uretimi 47 000 birimdir."}], '
                 '"cevap": "Sayfa 42\'ye gore 47 000 birim."}\n```')
@@ -146,8 +189,9 @@ def test_the_structured_path_holds_together_end_to_end(monkeypatch):
 
     # the model was actually shown handles it could point at, and asked for the
     # evidence before the answer
-    assert "[P1]" in seen["prompt"] and "[P2]" in seen["prompt"]
-    assert seen["prompt"].index("dayanak") < seen["prompt"].index('"cevap"')
+    assert "[P1]" in seen["user_content"] and "[P2]" in seen["user_content"]
+    assert seen["policy"].index("dayanak") < seen["policy"].index('"cevap"')
+    assert "Zeta uretimi" not in seen["policy"]
 
     parsed = parse_structured(reply)
     assert parsed["cevap"].endswith("47 000 birim.")
@@ -163,9 +207,13 @@ def test_the_plain_path_is_untouched(monkeypatch):
     seen = {}
     monkeypatch.setattr(query, "retrieve", lambda q, top_k=None: CHUNKS)
     monkeypatch.setattr(query, "rerank", lambda q, chunks, top_n=None: chunks)
-    monkeypatch.setattr(gen, "complete",
-                        lambda p: seen.setdefault("prompt", p) and "" or "duz cevap")
+    def fake_complete(policy, user_content):
+        seen["policy"] = policy
+        seen["user_content"] = user_content
+        return "duz cevap"
 
+    monkeypatch.setattr(gen, "complete", fake_complete)
     assert query.ask("zeta uretimi nedir?") == "duz cevap"
-    assert "[P1]" not in seen["prompt"]
-    assert "json" not in seen["prompt"].lower()
+    assert "[P1]" not in seen["user_content"]
+    assert "json" not in (seen["policy"] + seen["user_content"]).lower()
+    assert "Zeta uretimi" not in seen["policy"]
