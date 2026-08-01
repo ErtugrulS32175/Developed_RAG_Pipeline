@@ -8,34 +8,46 @@ that the right value was chosen. The tests that matter most are the ones
 pinning down what the checks CANNOT see, because that is what decides whether
 they may ever be allowed to block an answer.
 """
+from pipeline.retrieval.query import build_rag_context
 from pipeline.validation.rag.answer_guard import (
     check, context_pages, unsupported_figures, unsupported_pages)
 
-CONTEXT = (
-    "[belge.pdf | Sayfa 42 | Bolum]\n"
-    "47 000 zeta uretildi.\n"
-    "\n---\n\n"
-    "[belge.pdf | Sayfa 43]\n"
-    "milyonda 47 oraninda ucret alinir."
-)
+CHUNKS = [
+    {
+        "filename": "belge.pdf",
+        "page": 42,
+        "headings": ["Bolum"],
+        "text": "47 000 zeta uretildi.",
+    },
+    {
+        "filename": "belge.pdf",
+        "page": 43,
+        "text": "milyonda 47 oraninda ucret alinir.",
+    },
+]
+RAG_CONTEXT = build_rag_context(CHUNKS)
+CONTEXT = RAG_CONTEXT.model_text
 
 
 # --- which pages were actually supplied -------------------------------------
 
-def test_pages_come_from_the_citation_lines():
-    assert context_pages(CONTEXT) == {42, 43}
+def test_pages_come_from_trusted_retrieval_metadata():
+    assert context_pages(RAG_CONTEXT) == {42, 43}
 
 
 def test_a_page_named_inside_a_passage_is_not_a_supplied_page():
-    """A document refers to its own pages. Only the citation line this pipeline
-    writes says what was actually retrieved."""
-    ctx = "[belge.pdf | Sayfa 42]\nayrintilar Sayfa 99 uzerinde yer alir."
+    """A document refers to its own pages; only retrieval metadata is trusted."""
+    ctx = build_rag_context([{
+        "filename": "belge.pdf",
+        "page": 42,
+        "text": "ayrintilar Sayfa 99 uzerinde yer alir.",
+    }])
     assert context_pages(ctx) == {42}
 
 
 def test_a_cited_page_that_was_never_supplied_is_flagged():
-    assert unsupported_pages("Sayfa 90'a gore boyledir.", CONTEXT) == [90]
-    assert unsupported_pages("Sayfa 42'ye gore boyledir.", CONTEXT) == []
+    assert unsupported_pages("Sayfa 90'a gore boyledir.", RAG_CONTEXT) == [90]
+    assert unsupported_pages("Sayfa 42'ye gore boyledir.", RAG_CONTEXT) == []
 
 
 # --- figures ----------------------------------------------------------------
@@ -97,15 +109,15 @@ def test_deriving_over_the_whole_context_can_absorb_a_real_error():
 # --- the combined check -----------------------------------------------------
 
 def test_a_clean_answer_raises_nothing():
-    assert check("Sayfa 42'ye gore 47 000 zeta uretilmistir", CONTEXT) == []
+    assert check("Sayfa 42'ye gore 47 000 zeta uretilmistir", RAG_CONTEXT) == []
 
 
 def test_both_kinds_of_flag_are_reported_together():
     names = {name for name, _ in
-             check("Sayfa 90'a gore 8 000 zeta uretilmistir", CONTEXT)}
+             check("Sayfa 90'a gore 8 000 zeta uretilmistir", RAG_CONTEXT)}
     assert names == {"kaynaksiz_sayi", "kaynaksiz_sayfa"}
 
 
-def test_empty_input_does_not_raise():
-    assert check("", "") == []
-    assert check(None, None) == []
+def test_empty_answer_and_context_do_not_raise():
+    assert check("", build_rag_context([])) == []
+    assert check(None, build_rag_context([])) == []

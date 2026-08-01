@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from pipeline.generation import answer as gen
 from pipeline.index import db
 from pipeline.index.embeddings import embed_dense, embed_sparse
+from pipeline.retrieval.context import Passage, RagContext
 
 load_dotenv()
 
@@ -66,6 +67,12 @@ def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict
     return [chunk for _, chunk in scored[:top_n]]
 
 
+def _trusted_page(chunk: dict) -> int | None:
+    """A page number fit for provenance, not merely for display."""
+    value = chunk.get("page")
+    return value if type(value) is int and value > 0 else None
+
+
 def citation(chunk: dict) -> str:
     """Source line for one passage, built from its stored metadata.
 
@@ -78,7 +85,8 @@ def citation(chunk: dict) -> str:
     The section path is included because it is the strongest disambiguator in a
     long report, where similar tables and figures repeat across sections.
     """
-    parts = [str(chunk.get("filename") or "?"), f"Sayfa {chunk.get('page', 0)}"]
+    page = _trusted_page(chunk)
+    parts = [str(chunk.get("filename") or "?"), f"Sayfa {page or 0}"]
 
     headings = chunk.get("headings") or []
     if headings:
@@ -95,19 +103,45 @@ def citation(chunk: dict) -> str:
     return "[" + " | ".join(parts) + "]"
 
 
-def build_context(chunks: list[dict], numbered: bool = False) -> str:
-    """The passages as the model sees them.
+def build_rag_context(chunks: list[dict], numbered: bool = False) -> RagContext:
+    """Build model-visible text and trusted provenance from the same chunks.
 
     `numbered` puts a [P1], [P2] handle on each one so an answer can say which
     passage it used. Without a handle the only thing checkable afterwards is
     whether a figure appears SOMEWHERE in fifteen passages, and measurement
     showed that set is large enough to cover values the answer got wrong.
+
+    The rendered text is deliberately never parsed back into provenance.
+    Document content may contain the separator, a fake handle or a citation
+    line; none of those can alter the tuple built directly from ``chunks``.
     """
-    blocks = []
+    passages = []
     for i, chunk in enumerate(chunks, start=1):
-        head = f"[P{i}] {citation(chunk)}" if numbered else citation(chunk)
-        blocks.append(f"{head}\n{chunk.get('text', '')}")
-    return "\n\n---\n\n".join(blocks)
+        raw_text = chunk.get("text")
+        text = "" if raw_text is None else str(raw_text)
+        passages.append(Passage(
+            handle=i,
+            page=_trusted_page(chunk),
+            text=text,
+            citation=citation(chunk),
+        ))
+    return RagContext(
+        passages=tuple(passages),
+        numbered=numbered,
+    )
+
+
+def build_context(chunks: list[dict], numbered: bool = False) -> str:
+    """Backward-compatible model-visible text.
+
+    Validation callers must keep the full ``RagContext`` returned by
+    ``build_rag_context`` instead of passing this string back to a parser.
+    Numbered text is refused here because discarding its paired provenance is
+    precisely the unsafe legacy shape this boundary removes.
+    """
+    if numbered:
+        raise ValueError("numbered context requires build_rag_context")
+    return build_rag_context(chunks).model_text
 
 
 def ask(question: str, structured: bool = False) -> str:
@@ -119,9 +153,9 @@ def ask(question: str, structured: bool = False) -> str:
     """
     chunks  = retrieve(question)
     chunks  = rerank(question, chunks)
-    context = build_context(chunks, numbered=structured)
+    context = build_rag_context(chunks, numbered=structured)
     generate = gen.generate_structured if structured else gen.generate
-    return generate(question, context)
+    return generate(question, context.model_text)
 
 
 # --- Interactive loop ---
@@ -137,5 +171,3 @@ if __name__ == "__main__":
         answer = ask(question)
         print(f"\nCevap:\n{answer}\n")
         print("-" * 60)
-
-        

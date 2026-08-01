@@ -17,13 +17,29 @@ BLOCKS = [
         "Gamma uretimi 19 000 birimdir."
     ),
 ]
+SAVED_CONTEXT = guard_floor.BLOCK.join(BLOCKS)
+RAG_CONTEXT = guard_floor.legacy_context(SAVED_CONTEXT)
+
+
+def test_legacy_adapter_preserves_saved_passages_and_adds_only_handles():
+    assert RAG_CONTEXT.model_text == guard_floor.BLOCK.join([
+        f"[P1] {BLOCKS[0]}",
+        f"[P2] {BLOCKS[1]}",
+    ])
+    assert [
+        (passage.handle, passage.page, passage.text)
+        for passage in RAG_CONTEXT.passages
+    ] == [
+        (1, 17, "Zeta uretimi 73 000 birimdir."),
+        (2, 18, "Gamma uretimi 19 000 birimdir."),
+    ]
 
 
 def test_ideal_evidence_quotes_a_line_for_each_answer_figure():
     evidence = guard_floor.ideal_evidence(
         "Zeta uretimi 73 000",
         "Sayfa 17'ye gore 73 000, Sayfa 18'e gore 19 000 birimdir.",
-        BLOCKS,
+        RAG_CONTEXT,
     )
 
     assert {item["pasaj"] for item in evidence} == {1, 2}
@@ -35,7 +51,7 @@ def test_ideal_evidence_covers_a_cited_page_even_without_an_extra_figure():
     evidence = guard_floor.ideal_evidence(
         "Zeta uretimi 73 000",
         "Sayfa 18'e gore zeta icin kurgu sonuc bildirilmistir.",
-        BLOCKS,
+        RAG_CONTEXT,
     )
 
     assert {item["pasaj"] for item in evidence} == {1, 2}

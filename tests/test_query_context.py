@@ -1,7 +1,10 @@
 """Context assembly: every retrieved passage must reach the model with a usable
 source citation, since the answer prompt requires the answer to cite its page.
 """
-from pipeline.retrieval.query import build_context, citation
+import pytest
+
+from pipeline.retrieval.context import RagContext
+from pipeline.retrieval.query import build_context, build_rag_context, citation
 
 
 def _chunk(**kw):
@@ -44,6 +47,29 @@ def test_every_passage_in_the_context_gets_a_citation():
     assert ctx.count("belge.pdf") == 3
     for page in (3, 7, 11):
         assert f"Sayfa {page}" in ctx
+
+
+def test_model_text_and_provenance_are_built_from_the_same_chunks():
+    context = build_rag_context(
+        [_chunk(page=3, text="zeta"), _chunk(page=7, text="gamma")],
+        numbered=True,
+    )
+
+    assert "[P1]" in context.model_text and "[P2]" in context.model_text
+    assert [(p.handle, p.page, p.text) for p in context.passages] == [
+        (1, 3, "zeta"),
+        (2, 7, "gamma"),
+    ]
+
+
+def test_numbered_text_cannot_discard_its_paired_provenance():
+    with pytest.raises(ValueError, match="build_rag_context"):
+        build_context([_chunk()], numbered=True)
+
+
+def test_provenance_collection_cannot_be_mutable():
+    with pytest.raises(TypeError, match="immutable tuple"):
+        RagContext(passages=[], numbered=False)
 
 
 def test_passages_stay_separated():

@@ -21,20 +21,19 @@ import json
 import re
 
 from pipeline.lang.tr_notation import _readings, fold, normalize, number_forms, numbers
+from pipeline.retrieval.context import RagContext
 
-# the citation line build_context puts at the head of every passage
-_CITATION = re.compile(r"^\[.*?\|\s*Sayfa\s*(\d+)", re.IGNORECASE)
 # the citation shape the answer prompt asks the model to produce
 _ANSWER_PAGE = re.compile(r"sayfa\s*\d+", re.IGNORECASE)
 _PAGE_NUMBER = re.compile(r"sayfa\s*(\d+)", re.IGNORECASE)
 
 
 def context_pages(context):
-    """Pages actually supplied, read from the citation lines rather than the
-    passage text -- a document can mention a page number of its own."""
-    return {int(m.group(1))
-            for line in (context or "").splitlines()
-            if (m := _CITATION.match(line.strip()))}
+    """Pages actually supplied, taken from trusted retrieval metadata."""
+    if not isinstance(context, RagContext):
+        raise TypeError("context_pages requires a RagContext")
+    return {passage.page for passage in context.passages
+            if passage.page is not None}
 
 
 def cited_pages(answer):
@@ -111,26 +110,7 @@ def unsupported_pages(answer, context):
 
 # --- structured answers -----------------------------------------------------
 
-_PASSAGE_HEAD = re.compile(r"^\[P(\d+)\]")
 _BLOCK = "\n\n---\n\n"
-
-
-def passages(context):
-    """{handle: {"page": int|None, "text": str}} from a numbered context.
-
-    Empty for an unnumbered context, which is the honest result: without a
-    handle there is nothing an answer could have pointed at.
-    """
-    out = {}
-    for block in (context or "").split(_BLOCK):
-        head, _, body = block.partition("\n")
-        m = _PASSAGE_HEAD.match(head.strip())
-        if not m:
-            continue
-        page = _PAGE_NUMBER.search(head)
-        out[int(m.group(1))] = {"page": int(page.group(1)) if page else None,
-                                "text": body}
-    return out
 
 
 def parse_structured(text):
@@ -186,13 +166,23 @@ def check_structured(reply, context, minimum=0, derive=True):
     whole reason for asking. The unscoped version of these checks was measured
     against fifteen passages at once and the supported set came out wide enough
     to cover a figure the answer had got wrong by a factor of ten.
+
+    ``context`` must be the exact ``RagContext`` used for generation. Parsing
+    the model-visible string here would let document text mint a fake handle or
+    page, so a string is a programmer error rather than a tolerated legacy
+    input.
     """
+    if not isinstance(context, RagContext):
+        raise TypeError("check_structured requires a RagContext")
+    if not context.numbered:
+        raise ValueError("structured answers require a numbered RagContext")
+
     parsed = reply if isinstance(reply, dict) else parse_structured(reply)
     if parsed is None:
         return [("bicimsiz_yanit", [])]
 
     answer = str(parsed.get("cevap", ""))
-    known = passages(context)
+    known = context.by_handle()
     flags = []
 
     cited, bad_handles, bad_quotes = [], [], []
@@ -209,7 +199,7 @@ def check_structured(reply, context, minimum=0, derive=True):
             continue
         cited.append(handle)
         quote = fold(str(item.get("alinti", "")))
-        if quote and quote not in fold(known[handle]["text"]):
+        if quote and quote not in fold(known[handle].text):
             bad_quotes.append(handle)
 
     if bad_handles:
@@ -217,7 +207,7 @@ def check_structured(reply, context, minimum=0, derive=True):
     if bad_quotes:
         flags.append(("uydurma_alinti", sorted(set(bad_quotes))))
 
-    scope = _BLOCK.join(known[h]["text"] for h in cited) if cited else ""
+    scope = _BLOCK.join(known[h].text for h in cited) if cited else ""
     figures = unsupported_figures(answer, scope, minimum, derive)
     if figures:
         flags.append(("kaynaksiz_sayi", figures))
@@ -229,7 +219,7 @@ def check_structured(reply, context, minimum=0, derive=True):
         if loose:
             flags.append(("alintisiz_sayi", loose))
 
-    pages = {known[h]["page"] for h in cited} - {None}
+    pages = {known[h].page for h in cited} - {None}
     stray = sorted(cited_pages(answer) - pages) if pages else []
     if stray:
         flags.append(("kaynaksiz_sayfa", stray))
@@ -243,8 +233,12 @@ def check(answer, context, minimum=0, derive=True):
     figures themselves are document content, so a report that aggregates over
     many answers should count these, not print them.
     """
+    if not isinstance(context, RagContext):
+        raise TypeError("check requires a RagContext")
+
     flags = []
-    figures = unsupported_figures(answer, context, minimum, derive)
+    passage_text = _BLOCK.join(passage.text for passage in context.passages)
+    figures = unsupported_figures(answer, passage_text, minimum, derive)
     if figures:
         flags.append(("kaynaksiz_sayi", figures))
     pages = unsupported_pages(answer, context)

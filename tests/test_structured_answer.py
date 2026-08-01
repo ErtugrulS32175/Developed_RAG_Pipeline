@@ -9,15 +9,15 @@ at all, because "the figure appears somewhere in fifteen passages" is satisfied
 by almost any figure. These tests pin down what changes once the answer has to
 say WHICH passage, and which line of it.
 """
-from pipeline.retrieval.query import build_context
+from pipeline.retrieval.query import build_rag_context
 from pipeline.validation.rag.answer_guard import (
-    check_structured, parse_structured, passages)
+    check_structured, parse_structured)
 
 CHUNKS = [
     {"filename": "belge.pdf", "page": 42, "text": "Zeta uretimi 47 000 birimdir."},
     {"filename": "belge.pdf", "page": 43, "text": "Gamma uretimi 8 000 birimdir."},
 ]
-CONTEXT = build_context(CHUNKS, numbered=True)
+CONTEXT = build_rag_context(CHUNKS, numbered=True)
 
 
 def _reply(pasaj, alinti, cevap):
@@ -27,13 +27,15 @@ def _reply(pasaj, alinti, cevap):
 # --- the numbered context ---------------------------------------------------
 
 def test_passages_carry_a_handle_and_a_page():
-    p = passages(CONTEXT)
+    p = CONTEXT.by_handle()
     assert set(p) == {1, 2}
-    assert p[1]["page"] == 42 and "47 000" in p[1]["text"]
+    assert p[1].page == 42 and "47 000" in p[1].text
 
 
-def test_an_unnumbered_context_offers_nothing_to_point_at():
-    assert passages(build_context(CHUNKS)) == {}
+def test_an_unnumbered_context_shows_no_handles_to_the_model():
+    context = build_rag_context(CHUNKS)
+    assert context.numbered is False
+    assert "[P1]" not in context.model_text
 
 
 # --- getting the object back out of whatever the model wrote ----------------
@@ -103,7 +105,7 @@ def test_a_figure_in_the_passage_but_on_no_quoted_line_is_flagged_softly():
     took a figure from one it never quoted."""
     chunks = [{"filename": "belge.pdf", "page": 42,
                "text": "zeta | 47 000\ngamma | 8 000"}]
-    ctx = build_context(chunks, numbered=True)
+    ctx = build_rag_context(chunks, numbered=True)
     reply = _reply(1, "zeta | 47 000", "Sayfa 42'ye gore 8 000 birim.")
     names = {n for n, _ in check_structured(reply, ctx)}
     assert names == {"alintisiz_sayi"}
@@ -149,7 +151,7 @@ def test_the_structured_path_holds_together_end_to_end(monkeypatch):
 
     parsed = parse_structured(reply)
     assert parsed["cevap"].endswith("47 000 birim.")
-    assert check_structured(reply, build_context(CHUNKS, numbered=True)) == []
+    assert check_structured(reply, build_rag_context(CHUNKS, numbered=True)) == []
 
 
 def test_the_plain_path_is_untouched(monkeypatch):

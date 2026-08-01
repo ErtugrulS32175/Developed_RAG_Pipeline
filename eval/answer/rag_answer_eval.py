@@ -149,7 +149,7 @@ def main():
     args = ap.parse_args()
 
     from pipeline.index import db
-    from pipeline.retrieval.query import build_context
+    from pipeline.retrieval.query import build_rag_context
     from pipeline.generation.answer import generate, generate_structured
     from pipeline.validation.rag.answer_guard import (
         check, check_structured, parse_structured)
@@ -163,7 +163,8 @@ def main():
         chunks = retrieve_chunks(conn, q["q"], top_k=args.top_k,
                                  rrf_k=args.rrf_k, rerank_to=rerank_to,
                                  backend=args.backend)
-        context = build_context(chunks, numbered=args.structured)
+        rag_context = build_rag_context(chunks, numbered=args.structured)
+        context = rag_context.model_text
         try:
             reply = (generate_structured if args.structured else generate)(q["q"], context)
         except Exception as e:                      # keep the run alive, record it
@@ -177,8 +178,11 @@ def main():
         row = score_one(q, answer, context)
         row["ham_yanit"] = reply if args.structured else None
         row["dayanak"] = (parsed or {}).get("dayanak") if args.structured else None
-        row["bayraklar"] = (check_structured(reply, context) if args.structured
-                            else check(answer, context))
+        row["bayraklar"] = (
+            check_structured(reply, rag_context)
+            if args.structured
+            else check(answer, rag_context)
+        )
         rows.append(row)
         print(f"  {i}/{len(questions)} {'OK ' if row['cevap_dogru'] else 'HATA'}"
               f"{' !' if row['bayraklar'] else '  '}{q['q'][:58]}")

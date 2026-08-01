@@ -15,6 +15,7 @@ import argparse
 import json
 from pathlib import Path
 
+from eval.answer.guard_floor import legacy_context
 from eval.answer.judge import DOGRU, INCELE, YANLIS
 from eval.answer.rag_answer_eval import score_one
 from eval.retrieval.rag_eval import QUESTION_DIR
@@ -42,7 +43,12 @@ def measure(run_dirs, minimum, derive):
     for run_dir in run_dirs:
         for _, g, answer, context in rows(run_dir):
             durum = score_one(g, answer, context)["durum"]
-            flags = check(answer, context, minimum, derive)
+            flags = check(
+                answer,
+                legacy_context(context),
+                minimum,
+                derive,
+            )
             seen = {name for name, _ in flags}
             t = tally.setdefault(durum, {"n": 0, "flagged": 0,
                                          "kaynaksiz_sayi": 0, "kaynaksiz_sayfa": 0})

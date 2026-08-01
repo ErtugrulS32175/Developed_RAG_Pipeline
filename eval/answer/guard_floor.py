@@ -33,6 +33,7 @@ from pathlib import Path
 from eval.answer.judge import notation_match
 from eval.retrieval.rag_eval import QUESTION_DIR, contains_key
 from pipeline.lang.tr_notation import normalize, number_forms, numbers
+from pipeline.retrieval.context import Passage, RagContext
 from pipeline.validation.rag.answer_guard import check_structured
 
 BLOCK = "\n\n---\n\n"
@@ -65,33 +66,42 @@ def confirmed_correct(run_dir):
                 yield name, g, answer, context
 
 
-def number(context):
-    """Re-render a saved context with the [P1] handles a structured run adds.
+def legacy_context(context):
+    """Rebuild a ``RagContext`` from a saved pre-provenance run.
 
-    The saved runs predate numbering, so the handles are reconstructed here
-    rather than re-retrieved -- re-retrieving would fetch a context the answer
-    was never produced from.
+    This parser is an eval-only compatibility adapter, not production
+    provenance.  The saved runs contain only rendered context strings, so their
+    original chunk records cannot be recovered. Re-retrieving would be worse:
+    it would fetch a context the saved answer was never produced from.
     """
     blocks = [b for b in (context or "").split(BLOCK) if b.strip()]
-    out = []
+    passages = []
     for i, block in enumerate(blocks, start=1):
         head, _, body = block.partition("\n")
-        out.append(f"[P{i}] {head}\n{body}")
-    return BLOCK.join(out), blocks
+        page_match = _PAGE.search(head)
+        page = int(page_match.group(1)) if page_match else None
+        page = page if page and page > 0 else None
+        passages.append(Passage(
+            handle=i,
+            page=page,
+            text=body,
+            citation=head,
+        ))
+    return RagContext(
+        passages=tuple(passages),
+        numbered=True,
+    )
 
 
-def _lines(blocks):
+def _lines(context):
     """(handle, page, line) for every non-empty line of every passage."""
-    for i, block in enumerate(blocks, start=1):
-        head, _, body = block.partition("\n")
-        page = _PAGE.search(head)
-        page = int(page.group(1)) if page else None
-        for line in body.splitlines():
+    for passage in context.passages:
+        for line in passage.text.splitlines():
             if line.strip():
-                yield i, page, line.strip()
+                yield passage.handle, passage.page, line.strip()
 
 
-def ideal_evidence(key, answer, blocks):
+def ideal_evidence(key, answer, context):
     """Everything an obedient model would have quoted, or None if it could not.
 
     The prompt does not ask for one line -- it asks that EVERY figure in the
@@ -106,7 +116,7 @@ def ideal_evidence(key, answer, blocks):
     shortcut -- 21.4% of it -- which is why the synthesis has to match what the
     prompt actually demands before any number here means anything.
     """
-    rows = list(_lines(blocks))
+    rows = list(_lines(context))
     if not rows:
         return None
 
@@ -152,8 +162,8 @@ def measure(run_dirs, derive):
     for run_dir in run_dirs:
         for _, g, answer, context in confirmed_correct(run_dir):
             total += 1
-            numbered, blocks = number(context)
-            dayanak = ideal_evidence(g["key"], answer, blocks)
+            rag_context = legacy_context(context)
+            dayanak = ideal_evidence(g["key"], answer, rag_context)
             if not dayanak:
                 # the key is in no passage: nothing an obedient model could
                 # have cited, so the guard is not on trial here
@@ -163,7 +173,14 @@ def measure(run_dirs, derive):
             seen["pasaj_sayisi"] += len({d["pasaj"] for d in dayanak})
             seen["olculen"] += 1
             reply = {"dayanak": dayanak, "cevap": answer}
-            names = {name for name, _ in check_structured(reply, numbered, derive=derive)}
+            names = {
+                name
+                for name, _ in check_structured(
+                    reply,
+                    rag_context,
+                    derive=derive,
+                )
+            }
             if names:
                 flagged["_herhangi"] += 1
                 for name in names:
