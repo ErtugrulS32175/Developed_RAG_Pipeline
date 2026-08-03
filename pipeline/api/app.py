@@ -3,6 +3,7 @@ import logging
 import os
 import secrets
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Union
@@ -16,6 +17,13 @@ from pipeline.index import db
 from pipeline.index import ingest
 from pipeline.api import owui_chat
 from pipeline.retrieval import rag_backends
+from pipeline.validation.rag.answer_guard import (
+    ABSTAINED,
+    ANSWERED,
+    REVIEW_REQUIRED,
+    GuardResult,
+    is_abstention,
+)
 
 load_dotenv()
 
@@ -30,6 +38,16 @@ TABLE_MODEL_ID = "ragtest-table"
 # way the table flow is picked today. Both answer the same questions from the
 # same documents; which one is better is a measurement, not a default.
 LLAMAINDEX_MODEL_ID = "ragtest-rag-llamaindex"
+RAG_MODELS = {
+    RAG_MODEL_ID: "native",
+    LLAMAINDEX_MODEL_ID: "llamaindex",
+}
+REVIEW_MESSAGE = (
+    "Yanıt kaynaklarla otomatik olarak doğrulanamadı; "
+    "insan incelemesi gerekiyor."
+)
+RAG_UNAVAILABLE_MESSAGE = "Seçilen RAG motoru şu anda kullanılamıyor."
+RAG_FAILURE_MESSAGE = "RAG yanıtı üretilemedi."
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -150,21 +168,40 @@ def list_models():
 
 @app.post("/v1/chat/completions", dependencies=AUTH)
 def chat_completions(req: ChatRequest):
-    """OpenAI-compatible wrapper. Routes by model id: the table model runs the
-    image->consensus->table flow; anything else falls through to the existing
-    retrieve/rerank/generate RAG pipeline. OpenWebUI does not know or care which
-    happens underneath."""
-    is_table = req.model == TABLE_MODEL_ID
-    # which question-answering engine this conversation asked for
-    backend = "llamaindex" if req.model == LLAMAINDEX_MODEL_ID else "native"
+    """OpenAI-compatible wrapper with a checked publication boundary.
 
-    def ask_text():
+    Table extraction keeps its separate service path. A RAG model may publish
+    only the text carried by an answered/abstained ``GuardResult``; review
+    results become a fixed notice and never expose the unchecked model reply.
+    """
+    if req.model not in {*RAG_MODELS, TABLE_MODEL_ID}:
+        raise HTTPException(status_code=404, detail="bilinmeyen model")
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="en az bir mesaj gerekli")
+
+    is_table = req.model == TABLE_MODEL_ID
+    backend = RAG_MODELS.get(req.model)
+
+    def ask_checked():
         question = owui_chat.message_text(req.messages[-1].content)
-        return rag_backends.answer(question, backend=backend)
+        if not question.strip():
+            raise HTTPException(status_code=400, detail="soru bos olamaz")
+        try:
+            result = rag_backends.answer_checked(question, backend=backend)
+        except RuntimeError as e:
+            _log_rag_failure(e, backend)
+            raise HTTPException(status_code=503, detail=RAG_UNAVAILABLE_MESSAGE)
+        except Exception as e:
+            _log_rag_failure(e, backend)
+            raise HTTPException(status_code=502, detail=RAG_FAILURE_MESSAGE)
+        return _publish_checked(result)
 
     if req.stream:
-        gen = (owui_chat.stream_tables(req.messages, req.model) if is_table
-               else owui_chat.stream_text(ask_text(), req.model))
+        if is_table:
+            gen = owui_chat.stream_tables(req.messages, req.model)
+        else:
+            status, answer = ask_checked()
+            gen = owui_chat.stream_text(answer, req.model, rag_status=status)
         return StreamingResponse(gen, media_type="text/event-stream")
 
     if is_table:
@@ -173,13 +210,9 @@ def chat_completions(req: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"tablo cikarimi basarisiz: {e}")
     else:
-        try:
-            answer = ask_text()
-        except RuntimeError as e:
-            # an engine that is selected but not installed should say so plainly
-            raise HTTPException(status_code=503, detail=str(e))
+        status, answer = ask_checked()
 
-    return {
+    response = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:10]}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -188,6 +221,65 @@ def chat_completions(req: ChatRequest):
             {"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}
         ],
     }
+    if not is_table:
+        response["rag_status"] = status
+    return response
+
+
+def _publish_checked(result):
+    """Project a validated result to public status and text.
+
+    Malformed internal values are programmer errors, not review decisions. They
+    fail closed with a generic response rather than hiding the bug or coercing a
+    raw string into something publishable.
+    """
+    if not isinstance(result, GuardResult):
+        log.error("RAG backend checked contract returned %s",
+                  type(result).__name__)
+        raise HTTPException(status_code=500, detail="gecersiz RAG yanit sozlesmesi")
+    has_text = isinstance(result.answer, str) and bool(result.answer.strip())
+    clean = result.diagnostics == ()
+    if (
+        result.status == ANSWERED
+        and has_text
+        and clean
+        and not is_abstention(result.answer)
+    ):
+        return result.status, result.answer
+    if (
+        result.status == ABSTAINED
+        and has_text
+        and clean
+        and is_abstention(result.answer)
+    ):
+        return result.status, result.answer
+    if result.status == REVIEW_REQUIRED and result.answer is None:
+        return result.status, REVIEW_MESSAGE
+    log.error("RAG backend returned inconsistent checked status")
+    raise HTTPException(status_code=500, detail="gecersiz RAG yanit sozlesmesi")
+
+
+def _log_rag_failure(error, backend):
+    """Log enough traceback structure to debug without logging its message.
+
+    Exception messages from HTTP/model/database clients can contain endpoints,
+    credentials or model text. File basename, line and function retain the code
+    path while deliberately excluding those values and all request content.
+    """
+    frames = [
+        {
+            "dosya": Path(frame.filename).name,
+            "satir": frame.lineno,
+            "fonksiyon": frame.name,
+        }
+        for frame in traceback.extract_tb(error.__traceback__)
+    ]
+    log.error(json.dumps({
+        "olay": "rag_yanit_hatasi",
+        "backend": backend,
+        "hata": type(error).__name__,
+        "iz": frames,
+    }))
 
 
 @app.get("/files/{name}")

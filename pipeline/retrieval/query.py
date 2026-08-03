@@ -158,6 +158,23 @@ def ask(question: str, structured: bool = False) -> str:
     return generate(question, context.model_text)
 
 
+def ask_checked(question: str):
+    """Generate a structured answer and return its publication decision.
+
+    This is the product path. The plain ``ask`` function remains available for
+    historical comparisons, but a public caller must not receive its unchecked
+    string. Keeping the ``RagContext`` beside the exact model-visible text also
+    prevents validation against different retrieval results.
+    """
+    from pipeline.validation.rag.answer_guard import validate_structured
+
+    chunks = retrieve(question)
+    chunks = rerank(question, chunks)
+    context = build_rag_context(chunks, numbered=True)
+    reply = gen.generate_structured(question, context.model_text)
+    return validate_structured(reply, context)
+
+
 # --- Interactive loop ---
 if __name__ == "__main__":
     print("RAG Pipeline hazır. Çıkmak için 'quit' yaz.\n")

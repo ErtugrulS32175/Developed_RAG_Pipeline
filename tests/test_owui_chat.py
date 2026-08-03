@@ -214,6 +214,17 @@ def test_stream_text_emits_answer_then_stop_then_done():
     assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+def test_stream_text_carries_the_checked_status_on_every_json_event():
+    chunks = list(owui_chat.stream_text(
+        "cevap",
+        "ragtest-rag",
+        rag_status="answered",
+    ))
+    assert {
+        payload["rag_status"] for payload in _payloads(chunks)
+    } == {"answered"}
+
+
 def test_stream_tables_reports_missing_image_and_terminates():
     chunks = list(owui_chat.stream_tables([{"role": "user", "content": "selam"}], "m"))
     assert owui_chat.NO_IMAGE_MSG in _payloads(chunks)[0]["choices"][0]["delta"]["content"]

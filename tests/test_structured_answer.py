@@ -239,6 +239,49 @@ def test_the_structured_path_holds_together_end_to_end(monkeypatch):
     assert check_structured(reply, build_rag_context(CHUNKS, numbered=True)) == []
 
 
+def test_the_native_public_path_returns_only_a_checked_result(monkeypatch):
+    from pipeline.generation import answer as gen
+    from pipeline.retrieval import query
+
+    reply = {
+        "dayanak": [{
+            "pasaj": 1,
+            "alinti": "Zeta uretimi 47 000 birimdir.",
+        }],
+        "cevap": "Sayfa 42'ye gore 47 000 birim.",
+    }
+    monkeypatch.setattr(query, "retrieve", lambda q, top_k=None: CHUNKS)
+    monkeypatch.setattr(query, "rerank", lambda q, chunks, top_n=None: chunks)
+    monkeypatch.setattr(gen, "generate_structured", lambda q, c: reply)
+
+    result = query.ask_checked("zeta uretimi nedir?")
+
+    assert result.status == ANSWERED
+    assert result.answer == reply["cevap"]
+    assert result.diagnostics == ()
+
+
+def test_the_llamaindex_public_path_returns_only_a_checked_result(monkeypatch):
+    from pipeline.generation import answer as gen
+    from pipeline.retrieval import rag_llamaindex
+
+    reply = {
+        "dayanak": [{
+            "pasaj": 1,
+            "alinti": "Zeta uretimi 47 000 birimdir.",
+        }],
+        "cevap": "Sayfa 42'ye gore 47 000 birim.",
+    }
+    monkeypatch.setattr(rag_llamaindex, "retrieve", lambda q: CHUNKS)
+    monkeypatch.setattr(gen, "generate_structured", lambda q, c: reply)
+
+    result = rag_llamaindex.answer_checked("zeta uretimi nedir?")
+
+    assert result.status == ANSWERED
+    assert result.answer == reply["cevap"]
+    assert result.diagnostics == ()
+
+
 def test_the_plain_path_is_untouched(monkeypatch):
     """The default must keep producing exactly what every earlier run produced,
     or nothing is comparable with anything."""

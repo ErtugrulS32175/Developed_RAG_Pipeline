@@ -191,6 +191,17 @@ def answer(question):
     return generate(question, build_context(retrieve(question)))
 
 
+def answer_checked(question):
+    """Structured, provenance-checked answer for the public API."""
+    from pipeline.generation.answer import generate_structured
+    from pipeline.retrieval.query import build_rag_context
+    from pipeline.validation.rag.answer_guard import validate_structured
+
+    context = build_rag_context(retrieve(question), numbered=True)
+    reply = generate_structured(question, context.model_text)
+    return validate_structured(reply, context)
+
+
 if __name__ == "__main__":
     import sys
 

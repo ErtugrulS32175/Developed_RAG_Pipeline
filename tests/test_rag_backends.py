@@ -7,6 +7,7 @@ message instead of breaking anything that does not use it.
 import pytest
 
 from pipeline.retrieval import rag_backends
+from pipeline.validation.rag.answer_guard import ANSWERED, GuardResult
 
 
 def test_the_default_is_the_engine_built_here():
@@ -44,10 +45,35 @@ def test_a_missing_optional_engine_says_how_to_install_it(monkeypatch):
 
 
 def test_selecting_an_engine_routes_to_it(monkeypatch):
-    monkeypatch.setitem(rag_backends.BACKENDS, "sahte",
-                        lambda: (lambda q, k=15: [{"text": "x"}], lambda q: "cevap"))
+    checked = GuardResult(ANSWERED, "kontrol edilmis cevap", ())
+    monkeypatch.setitem(
+        rag_backends.BACKENDS,
+        "sahte",
+        lambda: (
+            lambda q, k=15: [{"text": "x"}],
+            lambda q: "cevap",
+            lambda q: checked,
+        ),
+    )
     assert rag_backends.answer("soru", backend="sahte") == "cevap"
     assert rag_backends.retrieve("soru", backend="sahte") == [{"text": "x"}]
+    assert rag_backends.answer_checked("soru", backend="sahte") is checked
+
+
+def test_a_legacy_two_callable_backend_keeps_its_plain_path(monkeypatch):
+    monkeypatch.setitem(
+        rag_backends.BACKENDS,
+        "eski",
+        lambda: (
+            lambda q, k=15: [{"text": "x"}],
+            lambda q: "cevap",
+        ),
+    )
+
+    assert rag_backends.answer("soru", backend="eski") == "cevap"
+    assert rag_backends.retrieve("soru", backend="eski") == [{"text": "x"}]
+    with pytest.raises(RuntimeError):
+        rag_backends.answer_checked("soru", backend="eski")
 
 
 def test_the_alternative_engine_reuses_this_project_s_prompt():
@@ -60,3 +86,6 @@ def test_the_alternative_engine_reuses_this_project_s_prompt():
 
     src = inspect.getsource(rag_llamaindex.answer)
     assert "build_context" in src and "generate" in src
+    checked_src = inspect.getsource(rag_llamaindex.answer_checked)
+    assert "generate_structured" in checked_src
+    assert "validate_structured" in checked_src

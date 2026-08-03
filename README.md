@@ -120,6 +120,12 @@ coverage, review rate, false review among confirmed-correct answers, and
 selective risk among settled published answers. Coverage and risk must be read
 together: suppressing every answer would otherwise look perfectly safe.
 
+The public RAG API uses only that checked path. Both regular JSON replies and
+streaming events expose `rag_status`; a review-required result displays a fixed
+review notice instead of any unchecked model text. Unknown model ids are
+rejected before a retrieval backend is called. The table-extraction model keeps
+its separate service route and does not use the RAG status contract.
+
 ### Checking the checker
 
 Scoring here is deterministic: an expected answer is present in the text or it

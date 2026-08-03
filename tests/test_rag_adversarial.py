@@ -3,11 +3,10 @@
 Every name, filename, page and figure below is invented.  No fixture is copied
 from a document.
 
-These tests intentionally describe the behaviour the product must reach before
-the checked answer path is enabled in the API.  A strict xfail is the red phase:
-the normal suite stays usable while ``--runxfail`` proves that every attack is
-still effective.  Each marker must be removed when its named implementation
-step closes the gap; an unexpected pass fails the normal suite.
+These tests were introduced as strict xfails before the checked path existed.
+Their markers were removed only as each implementation step closed its gap;
+the whole file now runs as ordinary regression tests, including the public API
+boundary.
 
 Scope: these are answer-path contracts, not every open RAG defect.  Partial
 ingest completion, embedding-window truncation and document identity collisions
@@ -27,10 +26,6 @@ from pipeline.validation.rag.answer_guard import (
 )
 
 
-API_GAP = pytest.mark.xfail(
-    strict=True,
-    reason="Adim 6: API henuz kontrol edilmis yanit sozlesmesini zorunlu kilmiyor",
-)
 CHUNKS = [
     {
         "filename": "kurgu-belge.pdf",
@@ -412,7 +407,6 @@ def _api_headers(api):
     )
 
 
-@API_GAP
 @pytest.mark.parametrize(
     "model",
     ["ragtest-rag", "ragtest-rag-llamaindex"],
@@ -424,7 +418,7 @@ def test_api_never_exposes_an_unchecked_backend_string(monkeypatch, model, strea
     unchecked = "DENETLENMEMIS_ZETA_CEVABI"
     monkeypatch.setattr(
         api.rag_backends,
-        "answer",
+        "answer_checked",
         lambda question, backend=None: unchecked,
     )
     response = TestClient(api.app).post(
@@ -439,14 +433,13 @@ def test_api_never_exposes_an_unchecked_backend_string(monkeypatch, model, strea
     assert unchecked not in response.text
 
 
-@API_GAP
 def test_unknown_model_id_is_rejected_instead_of_falling_back_to_native(monkeypatch):
     from pipeline.api import app as api
 
     called = []
     monkeypatch.setattr(
         api.rag_backends,
-        "answer",
+        "answer_checked",
         lambda question, backend=None: called.append(backend) or "kurgu",
     )
     response = TestClient(api.app).post(
@@ -467,7 +460,7 @@ def test_table_model_keeps_its_separate_service_route(monkeypatch):
     def rag_must_not_run(*_args, **_kwargs):
         raise AssertionError("table istegi RAG backendine yonlendirildi")
 
-    monkeypatch.setattr(api.rag_backends, "answer", rag_must_not_run)
+    monkeypatch.setattr(api.rag_backends, "answer_checked", rag_must_not_run)
     monkeypatch.setattr(
         api.owui_chat,
         "tables_reply",

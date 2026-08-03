@@ -173,7 +173,7 @@ def tables_reply(messages) -> str:
     return render_tables(entry)
 
 
-def sse_chunk(chat_id, model, delta=None, finish=None) -> str:
+def sse_chunk(chat_id, model, delta=None, finish=None, rag_status=None) -> str:
     payload = {
         "id": chat_id,
         "object": "chat.completion.chunk",
@@ -185,6 +185,8 @@ def sse_chunk(chat_id, model, delta=None, finish=None) -> str:
             "finish_reason": finish,
         }],
     }
+    if rag_status is not None:
+        payload["rag_status"] = rag_status
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
@@ -219,10 +221,12 @@ def stream_tables(messages, model):
     yield "data: [DONE]\n\n"
 
 
-def stream_text(answer, model):
+def stream_text(answer, model, rag_status=None):
     """The RAG path has no mid-flight stages worth reporting, so it emits one
-    chunk -- enough that OpenWebUI's stream toggle works for both models."""
+    chunk -- enough that OpenWebUI's stream toggle works for both models. The
+    checked publication status is repeated on every JSON event so a consumer
+    never has to infer it from the displayed text."""
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:10]}"
-    yield sse_chunk(chat_id, model, delta=answer)
-    yield sse_chunk(chat_id, model, finish="stop")
+    yield sse_chunk(chat_id, model, delta=answer, rag_status=rag_status)
+    yield sse_chunk(chat_id, model, finish="stop", rag_status=rag_status)
     yield "data: [DONE]\n\n"
