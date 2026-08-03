@@ -12,8 +12,8 @@ Because the expensive resource is the GPU and it is done the moment vLLM has
 answered the N images, this does all images in one shot and writes everything to
 output/eval/pod_results.json (raw text + every parsed table + scores + timing).
 
-    gemma_env/bin/python -m eval.pod_eval
-    ADAPTER_URL=http://127.0.0.1:8101/table gemma_env/bin/python -m eval.pod_eval
+    gemma_env/bin/python -m eval.table.pod_eval
+    ADAPTER_URL=http://127.0.0.1:8101/table gemma_env/bin/python -m eval.table.pod_eval
 
 Images that have a GT are scored (TEDS / number_fid / cell_acc); images without a
 GT yet are dumped (raw + parsed) for offline scoring later -- pass those via the

@@ -48,6 +48,15 @@ REVIEW_MESSAGE = (
 )
 RAG_UNAVAILABLE_MESSAGE = "Seçilen RAG motoru şu anda kullanılamıyor."
 RAG_FAILURE_MESSAGE = "RAG yanıtı üretilemedi."
+DOCUMENT_PROCESSING_FAILURE_MESSAGE = "Belge işlenemedi."
+_WINDOWS_DEVICE_NAMES = frozenset({
+    "con", "prn", "aux", "nul", "clock$", "conin$", "conout$",
+    *(
+        f"{prefix}{suffix}"
+        for prefix in ("com", "lpt")
+        for suffix in (*map(str, range(1, 10)), "¹", "²", "³")
+    ),
+})
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -80,9 +89,18 @@ async def log_requests(request, call_next):
     started = time.perf_counter()
     try:
         response = await call_next(request)
-    except Exception:
-        log.exception(json.dumps({"istek": request_id, "yol": request.url.path,
-                                  "yontem": request.method, "durum": "exception"}))
+    except Exception as error:
+        # An arbitrary exception message can contain a DSN, a local path or
+        # document/model text. The shared helper keeps safe frame locations
+        # without copying that untrusted detail into a second storage system.
+        _log_safe_failure(
+            error,
+            "api_istek_hatasi",
+            istek=request_id,
+            yol=request.url.path,
+            yontem=request.method,
+            durum="exception",
+        )
         raise
     log.info(json.dumps({
         "istek": request_id,
@@ -259,7 +277,7 @@ def _publish_checked(result):
     raise HTTPException(status_code=500, detail="gecersiz RAG yanit sozlesmesi")
 
 
-def _log_rag_failure(error, backend):
+def _log_safe_failure(error, event, **fields):
     """Log enough traceback structure to debug without logging its message.
 
     Exception messages from HTTP/model/database clients can contain endpoints,
@@ -275,11 +293,49 @@ def _log_rag_failure(error, backend):
         for frame in traceback.extract_tb(error.__traceback__)
     ]
     log.error(json.dumps({
-        "olay": "rag_yanit_hatasi",
-        "backend": backend,
+        "olay": event,
+        **fields,
         "hata": type(error).__name__,
         "iz": frames,
     }))
+
+
+def _log_rag_failure(error, backend):
+    _log_safe_failure(error, "rag_yanit_hatasi", backend=backend)
+
+
+def _safe_upload_filename(filename):
+    """Reject path syntax, trailing aliases and Windows device spellings."""
+    if not isinstance(filename, str):
+        raise HTTPException(status_code=400, detail="gecersiz dosya adi")
+    original = filename
+    raw = original.strip()
+    portable = raw.replace("\\", "/")
+    stem = portable.split(".", 1)[0].rstrip(" .").casefold()
+    if (
+        not portable
+        or raw != original
+        or any(ord(char) < 32 for char in portable)
+        or "\x00" in portable
+        or ":" in portable
+        or portable.rstrip(". ") != portable
+        or stem in _WINDOWS_DEVICE_NAMES
+        or portable in {".", ".."}
+        or Path(portable).name != portable
+    ):
+        raise HTTPException(status_code=400, detail="gecersiz dosya adi")
+    return portable
+
+
+def _set_document_error(conn, document_id):
+    """Best-effort terminal status update without masking the primary failure."""
+    try:
+        db.set_document_status(conn, document_id, "error")
+    except Exception as status_error:
+        _log_safe_failure(
+            status_error,
+            "belge_durumu_yazilamadi",
+        )
 
 
 @app.get("/files/{name}")
@@ -300,29 +356,72 @@ def download_export(name: str):
 
 @app.post("/documents/upload", dependencies=AUTH)
 async def upload_document(file: UploadFile = File(...)):
-    dest = UPLOAD_DIR / file.filename
+    filename = _safe_upload_filename(file.filename)
+    dest = UPLOAD_DIR / filename
     dest.write_bytes(await file.read())
     file_type = dest.suffix.lower().lstrip(".")
-    document_id = db.upsert_document(get_conn(), file.filename, file_type, status="pending")
-    return {"document_id": document_id, "filename": file.filename, "status": "pending"}
+    document_id = db.upsert_document(
+        get_conn(),
+        filename,
+        file_type,
+        status="pending",
+    )
+    return {
+        "document_id": document_id,
+        "filename": filename,
+        "status": "pending",
+    }
 
 
 @app.post("/documents/{document_id}/process", dependencies=AUTH)
 def process_document(document_id: str):
-    doc = db.get_document(get_conn(), document_id)
+    conn = get_conn()
+    doc = db.get_document(conn, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
 
-    path = UPLOAD_DIR / doc["filename"]
+    try:
+        filename = _safe_upload_filename(doc["filename"])
+    except HTTPException:
+        _set_document_error(conn, document_id)
+        log.error(json.dumps({
+            "olay": "gecersiz_kayitli_dosya_adi",
+            "hata": "InvalidFilename",
+        }))
+        raise HTTPException(
+            status_code=500,
+            detail=DOCUMENT_PROCESSING_FAILURE_MESSAGE,
+        )
+
+    path = UPLOAD_DIR / filename
     if not path.exists():
-        raise HTTPException(status_code=404, detail=f"uploaded file missing on disk: {path}")
+        _set_document_error(conn, document_id)
+        raise HTTPException(status_code=404, detail="uploaded file missing")
 
     try:
-        ingest_router.main(str(path))
+        db.set_document_status(conn, document_id, "processing")
+        ingest.main(str(path))
+        processed = db.get_document(conn, document_id)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ingest failed: {e}")
+        _set_document_error(conn, document_id)
+        _log_safe_failure(e, "belge_isleme_hatasi")
+        raise HTTPException(
+            status_code=500,
+            detail=DOCUMENT_PROCESSING_FAILURE_MESSAGE,
+        )
 
-    return {"document_id": document_id, "status": "done"}
+    if processed is None or processed.get("status") != "done":
+        _set_document_error(conn, document_id)
+        log.error(json.dumps({
+            "olay": "belge_tamamlanmadan_dondu",
+            "hata": "IncompleteIngest",
+        }))
+        raise HTTPException(
+            status_code=500,
+            detail=DOCUMENT_PROCESSING_FAILURE_MESSAGE,
+        )
+
+    return {"document_id": document_id, "status": processed["status"]}
 
 
 @app.get("/documents/{document_id}", dependencies=AUTH)

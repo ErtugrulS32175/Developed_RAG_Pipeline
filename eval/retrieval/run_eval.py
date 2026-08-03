@@ -1,8 +1,8 @@
 """A/B eval runner: run each backend on each labeled image, score vs ground truth.
 
-    python -m eval.run_eval                      # all GTs x default backends
-    python -m eval.run_eval --backends tatr docling gemma
-    python -m eval.run_eval --images sample1
+    python -m eval.retrieval.run_eval                      # all GTs x default backends
+    python -m eval.retrieval.run_eval --backends tatr docling gemma
+    python -m eval.retrieval.run_eval --images sample1
 
 Prints a comparison table (TEDS / number-fidelity / cell-accuracy) and writes the
 full results to output/eval/results.json. Backends are reached exactly as in

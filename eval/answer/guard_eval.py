@@ -1,6 +1,6 @@
 """How often would the answer checks cry wolf?
 
-    python -m eval.guard_eval output/RAG_Outputs/run1/native
+    python -m eval.answer.guard_eval output/RAG_Outputs/run1/native
 
 A guard that flags answers nobody would have questioned is worse than no
 guard: people stop reading the warnings, and then the one real warning is

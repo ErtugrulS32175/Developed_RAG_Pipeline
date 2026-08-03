@@ -3,6 +3,7 @@
 logs/
 data/
 output/
+uploads/
 __pycache__/
 *.pyc
 paddle_env/

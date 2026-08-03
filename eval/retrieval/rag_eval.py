@@ -1,9 +1,9 @@
 """Retrieval eval: does the right passage come back, and at what rank?
 
-    python -m eval.rag_eval --bootstrap 60     # build a known-item question set
-    python -m eval.rag_eval                    # score with production settings
-    python -m eval.rag_eval --top-k 100 --rerank
-    python -m eval.rag_eval --sweep-top-k 15 50 100 --rerank
+    python -m eval.retrieval.rag_eval --bootstrap 60     # build a known-item question set
+    python -m eval.retrieval.rag_eval                    # score with production settings
+    python -m eval.retrieval.rag_eval --top-k 100 --rerank
+    python -m eval.retrieval.rag_eval --sweep-top-k 15 50 100 --rerank
 
 Scored at PAGE level: a retrieved chunk counts as a hit when its page is one of
 the expected pages. That survives re-chunking, is what a human can actually
@@ -144,7 +144,7 @@ def load_questions(name):
     if not path.exists():
         raise SystemExit(
             f"soru dosyasi yok: {path}\n"
-            f"once 'python -m eval.rag_eval --bootstrap 60' calistir, "
+            f"once 'python -m eval.retrieval.rag_eval --bootstrap 60' calistir, "
             f"ya da elle {path} olustur: [{{\"q\": \"...\", \"pages\": [12]}}, ...]")
     return json.loads(path.read_text(encoding="utf-8"))
 

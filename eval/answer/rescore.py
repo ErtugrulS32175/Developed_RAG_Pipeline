@@ -1,6 +1,6 @@
 """Re-score a saved answer run with the CURRENT scorer, and queue what still fails.
 
-    python -m eval.rescore output/RAG_Outputs/run1/native
+    python -m eval.answer.rescore output/RAG_Outputs/run1/native
 
 Answers cost GPU time; scoring does not. Keeping the raw answers means a fix to
 the scorer can be applied to every past run for free, which is the only way to

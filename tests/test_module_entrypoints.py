@@ -1,11 +1,15 @@
 """Executable ``python -m`` targets must survive package moves."""
 import ast
 import importlib.util
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE_DIRS = ("pipeline", "eval", "scripts", "services")
+DOCUMENTED_MODULE = re.compile(
+    r"\bpython(?:\.exe)?\s+-m\s+([A-Za-z_][A-Za-z0-9_.]*)"
+)
 
 
 def _module_targets(path):
@@ -46,3 +50,28 @@ def test_executable_module_paths_resolve():
         if importlib.util.find_spec(module) is None
     ]
     assert missing == [], "cozulemeyen -m hedefleri: " + ", ".join(missing)
+
+
+def test_documented_module_paths_resolve():
+    """A command in a help string is an interface, not a harmless comment."""
+    targets = []
+    for directory in SOURCE_DIRS:
+        base = ROOT / directory
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            targets.extend(
+                (path, text.count("\n", 0, match.start()) + 1, match.group(1))
+                for match in DOCUMENTED_MODULE.finditer(text)
+            )
+
+    assert targets, "en az bir belgelenmis -m hedefi bekleniyordu"
+    missing = [
+        f"{path.name}:{line} -> {module}"
+        for path, line, module in targets
+        if importlib.util.find_spec(module) is None
+    ]
+    assert missing == [], (
+        "belgelenmis ama cozulemeyen -m hedefleri: " + ", ".join(missing)
+    )

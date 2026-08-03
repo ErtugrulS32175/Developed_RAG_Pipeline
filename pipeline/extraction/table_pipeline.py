@@ -328,7 +328,7 @@ def _print_report(results):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("kullanim: python -m pipeline.table_pipeline <image> [backend]")
+        print("kullanim: python -m pipeline.extraction.table_pipeline <image> [backend]")
         sys.exit(1)
     img = sys.argv[1]
     be = sys.argv[2] if len(sys.argv) > 2 else None

@@ -1,7 +1,7 @@
 """Measure the judge before trusting it, and pick its threshold from data.
 
-    python -m eval.calibrate_judge output/RAG_Outputs/run1/native \
-                                   output/RAG_Outputs/run1/llamaindex
+    python -m eval.answer.calibrate_judge output/RAG_Outputs/run1/native \
+                                          output/RAG_Outputs/run1/llamaindex
 
 Three things get measured, because a scorer that is only checked against the
 cases it was written for proves nothing:

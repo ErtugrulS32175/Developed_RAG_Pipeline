@@ -5,7 +5,7 @@ Everything below is offline (no GPU): re-parse each model's raw, reconcile the t
 readings, score each vs GT, and write a consensus .xlsx with disagreements
 highlighted. Parser/reconcile fixes never need the GPU re-rented.
 
-    python -m eval.consensus_report output/eval/vl.json output/eval/hy.json
+    python -m eval.table.consensus_report <reading-a.json> <reading-b.json>
         [--primary paddleocr_vl] [--xlsx-dir output/eval]
 
 The two files are eval.pod_eval outputs (they carry raw + per-model scores). Images

@@ -20,7 +20,7 @@ The package is optional and deliberately not in requirements.txt: nobody using
 the default engine should have to install it. Set it up with
 
     pip install -r requirements-llamaindex.txt
-    python -m pipeline.rag_llamaindex build
+    python -m pipeline.retrieval.rag_llamaindex build
 """
 import os
 
@@ -34,7 +34,7 @@ TOP_K = int(os.getenv("LLAMAINDEX_TOP_K", "15"))
 _MISSING = (
     "LlamaIndex kurulu degil. Bu motoru kullanmak icin:\n"
     "    pip install -r requirements-llamaindex.txt\n"
-    "    python -m pipeline.rag_llamaindex build"
+    "    python -m pipeline.retrieval.rag_llamaindex build"
 )
 
 
