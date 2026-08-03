@@ -111,6 +111,15 @@ Retrieval and answer quality are measured by `eval/retrieval/rag_eval.py` (does 
 reach the context, and at what rank) and `eval/answer/rag_answer_eval.py` (is the answer
 right, is the cited page right, and which stage is at fault when it is not).
 
+Structured answers are checked against the exact passage and literal quote they
+claim to use. The checked result is `answered`, `abstained` or
+`review_required`; the last state carries no publishable answer text. Rate
+derivation is off by default because it previously absorbed a measured
+arithmetic restatement error. Structured evaluation reports publication
+coverage, review rate, false review among confirmed-correct answers, and
+selective risk among settled published answers. Coverage and risk must be read
+together: suppressing every answer would otherwise look perfectly safe.
+
 ### Checking the checker
 
 Scoring here is deterministic: an expected answer is present in the text or it

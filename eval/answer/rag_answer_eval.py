@@ -121,6 +121,37 @@ def summarize(rows, split_by_type=True):
         out["bayrak_dagilimi"] = {k: raised.count(k) for k in sorted(set(raised))}
         out["bayrakli_dogru"] = sum(1 for r in rows
                                     if r.get("bayraklar") and r["cevap_dogru"])
+    guard_rows = [r for r in rows if r.get("guard_status")]
+    if guard_rows:
+        from pipeline.validation.rag.answer_guard import REVIEW_REQUIRED
+
+        statuses = [r["guard_status"] for r in guard_rows]
+        reviewed = [r for r in guard_rows
+                    if r["guard_status"] == REVIEW_REQUIRED]
+        published = [r for r in guard_rows
+                     if r["guard_status"] != REVIEW_REQUIRED]
+        correct_rows = [r for r in guard_rows if r["durum"] == DOGRU]
+        settled_published = [
+            r for r in published if r["durum"] in {DOGRU, YANLIS}
+        ]
+        wrong_published = [
+            r for r in settled_published if r["durum"] == YANLIS
+        ]
+        out["guard_durum_dagilimi"] = {
+            status: statuses.count(status) for status in sorted(set(statuses))
+        }
+        out["guard_yayin_kapsami"] = round(len(published) / len(guard_rows), 4)
+        out["guard_inceleme_orani"] = round(len(reviewed) / len(guard_rows), 4)
+        out["guard_yanlis_inceleme_orani"] = (
+            round(sum(r["guard_status"] == REVIEW_REQUIRED
+                      for r in correct_rows) / len(correct_rows), 4)
+            if correct_rows else None
+        )
+        out["guard_selective_risk"] = (
+            round(len(wrong_published) / len(settled_published), 4)
+            if settled_published else None
+        )
+        out["guard_selective_n"] = len(settled_published)
     # Figures and prose fail differently: a figure is copied or it is not, while
     # a prose answer can be fluent and still miss the point. Reporting one number
     # over both hides whichever is the weaker half.
@@ -152,7 +183,7 @@ def main():
     from pipeline.retrieval.query import build_rag_context
     from pipeline.generation.answer import generate, generate_structured
     from pipeline.validation.rag.answer_guard import (
-        check, check_structured, parse_structured)
+        check, parse_structured, validate_structured)
 
     questions = json.loads((QUESTION_DIR / f"{args.set}.json").read_text(encoding="utf-8"))
     conn = db.get_conn()
@@ -178,11 +209,13 @@ def main():
         row = score_one(q, answer, context)
         row["ham_yanit"] = reply if args.structured else None
         row["dayanak"] = (parsed or {}).get("dayanak") if args.structured else None
-        row["bayraklar"] = (
-            check_structured(reply, rag_context)
-            if args.structured
-            else check(answer, rag_context)
-        )
+        if args.structured:
+            guard_result = validate_structured(reply, rag_context)
+            row["guard_status"] = guard_result.status
+            row["bayraklar"] = list(guard_result.diagnostics)
+        else:
+            row["guard_status"] = None
+            row["bayraklar"] = check(answer, rag_context)
         rows.append(row)
         print(f"  {i}/{len(questions)} {'OK ' if row['cevap_dogru'] else 'HATA'}"
               f"{' !' if row['bayraklar'] else '  '}{q['q'][:58]}")

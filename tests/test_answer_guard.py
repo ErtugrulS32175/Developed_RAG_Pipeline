@@ -86,12 +86,17 @@ def test_a_rate_restated_as_a_percentage_is_supported():
     """Turkish states a small rate as a fraction phrase and a model restates it
     as a percentage. The restated value is nowhere in the source, so without
     this every such answer is flagged."""
-    assert unsupported_figures("oran yuzde 0,0047 seviyesindedir", CONTEXT) == []
+    assert unsupported_figures(
+        "oran yuzde 0,0047 seviyesindedir",
+        CONTEXT,
+        derive=True,
+    ) == []
 
 
 def test_without_derivation_the_same_answer_is_flagged():
-    assert unsupported_figures("oran yuzde 0,0047 seviyesindedir", CONTEXT,
-                               derive=False) == [[0.0047]]
+    answer = "oran yuzde 0,0047 seviyesindedir"
+    assert unsupported_figures(answer, CONTEXT) == [[0.0047]]
+    assert unsupported_figures(answer, CONTEXT, derive=False) == [[0.0047]]
 
 
 def test_deriving_over_the_whole_context_can_absorb_a_real_error():
@@ -101,7 +106,7 @@ def test_deriving_over_the_whole_context_can_absorb_a_real_error():
     WHICH passage it used can, which is why the check has to become passage
     scoped before it is ever allowed to block anything."""
     ctx = CONTEXT + "\n\n---\n\n[belge.pdf | Sayfa 44]\nyuzde 47 pay ayrilir."
-    assert unsupported_figures("oran 0,47 seviyesindedir", ctx) == []
+    assert unsupported_figures("oran 0,47 seviyesindedir", ctx, derive=True) == []
     assert unsupported_figures("oran 0,47 seviyesindedir", ctx,
                                derive=False) == [[0.47]]
 

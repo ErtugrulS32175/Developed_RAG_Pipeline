@@ -11,8 +11,10 @@ similarity directly, so the suite stays runnable with no containers up.
 """
 import pytest
 
-from eval.answer.judge import (DOGRU, INCELE, YANLIS, expand_cardinals, expand_months,
-                        judge, normalize, notation_match, stems)
+from eval.answer.calibrate_judge import selective_stats
+from eval.answer.judge import (
+    DOGRU, INCELE, YANLIS, accepts_without_similarity, expand_cardinals,
+    expand_months, judge, normalize, notation_match, stems)
 
 
 # --- suffix stripping -------------------------------------------------------
@@ -41,7 +43,7 @@ def test_an_inflected_word_meets_its_bare_form():
 
 def test_number_words_become_digits():
     assert expand_cardinals("kirk yedi bin zeta") == "47000 zeta"
-    assert expand_cardinals("iki yuz elli bin") == "250000"
+    assert expand_cardinals("dokuz yuz kirk bin") == "940000"
     assert expand_cardinals("on iki gamma") == "12 gamma"
 
 
@@ -109,6 +111,13 @@ def test_an_inflected_unit_meets_its_bare_form():
     assert notation_match("kapasitesi 47 000 zetadir", "47 bin zeta")
 
 
+def test_short_roots_are_allowed_only_in_measured_safe_directions():
+    assert notation_match("47 zet bildirilmistir", "47 zete")
+    assert notation_match("zetdur 47 olarak verilmistir", "47 zet")
+    assert notation_match("47 uvde bildirilmistir", "47 uv")
+    assert not notation_match("47 zeta bildirilmistir", "47 zet")
+
+
 def test_a_written_date_meets_a_dotted_one():
     assert notation_match("15 Mart 1977 tarihli kapanislara gore", "15.3.1977")
 
@@ -134,6 +143,34 @@ def test_a_word_that_carries_the_meaning_is_not_excused():
     """The anchor case: an expected 'en gec' against an answered 'en cok' has
     the same figure and opposite meanings. It has to stay unresolved."""
     assert not notation_match("en cok dokuz zeta icinde", "en gec dokuz zeta")
+
+
+def test_explicit_negation_changes_polarity():
+    assert not notation_match("zeta aktif degildir", "zeta aktiftir")
+
+
+@pytest.mark.parametrize(
+    ("key", "answer"),
+    [
+        ("zeta odendi", "zeta odendi iddiasi yanlistir"),
+        ("kirk yedi bin zeta", "47 000 zeta iddiasi yanlistir"),
+        ("zeta odendi", "yanlis olan su: zeta odendi"),
+        ("zeta odendi", "aksine, zeta odendi denemez"),
+        ("zeta odendi", "zeta odendi denmesi gercek disidir"),
+    ],
+)
+def test_a_matching_proposition_that_is_refuted_is_not_accepted(key, answer):
+    assert not accepts_without_similarity(key, answer)
+    assert judge(key, answer, reference=key, sim=0.99)[0] == INCELE
+
+
+def test_refuting_a_different_proposition_does_not_veto_the_match():
+    answer = (
+        "Zeta odendi. Gamma odendi iddiasi dogru degildir. "
+        "Delta odendi iddiasi yanlistir."
+    )
+    assert accepts_without_similarity("zeta odendi", answer)
+    assert judge("zeta odendi", answer)[0] == DOGRU
 
 
 # --- the three states -------------------------------------------------------
@@ -167,6 +204,23 @@ def test_high_similarity_never_counts_as_correct():
     durum, _ = judge("en gec dokuz zeta", "en cok dokuz zeta", "en gec dokuz zeta",
                      sim=0.999)
     assert durum != DOGRU
+
+
+def test_selective_risk_counts_only_automatic_decisions():
+    stats = selective_stats(
+        [DOGRU, DOGRU, YANLIS, INCELE],
+        [DOGRU, INCELE, YANLIS, DOGRU],
+    )
+
+    assert stats == {
+        "n": 4,
+        "decided": 3,
+        "review": 1,
+        "coverage": 0.75,
+        "selective_risk": pytest.approx(1 / 3),
+        "false_accepts": 1,
+        "false_rejects": 0,
+    }
 
 
 def test_without_a_reference_nothing_is_called_wrong():

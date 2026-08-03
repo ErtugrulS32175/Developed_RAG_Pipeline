@@ -31,7 +31,10 @@ def fold(text):
     # DELETED, not replaced with a space: a model bolds the STEM of a word and
     # leaves the suffix outside the emphasis. In an agglutinative language that
     # is the normal case, so substituting a space would split the word in two.
-    s = _MARKDOWN.sub("", str(text).lower()).replace("ı", "i")
+    s = _MARKDOWN.sub("", str(text).lower())
+    # Accept correct Turkish dotless-i and the legacy y-acute produced by an
+    # old encoding error in saved outputs. Both represent the same letter here.
+    s = s.replace("ı", "i").replace("\u00fd", "i")
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
     return " ".join(s.split())

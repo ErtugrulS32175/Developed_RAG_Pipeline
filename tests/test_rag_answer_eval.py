@@ -161,6 +161,49 @@ def test_summary_counts_each_dimension_separately():
     assert m["hata_dagilimi"] == {"retrieval": 1}
 
 
+def test_guard_scorecard_reports_coverage_false_review_and_selective_risk():
+    rows = [
+        {
+            **score_one(_q(), "Sayfa 42: 555 birim", "555 birim"),
+            "guard_status": "answered",
+            "bayraklar": [],
+        },
+        {
+            **score_one(_q(), "Sayfa 42: 555 birim", "555 birim"),
+            "guard_status": "review_required",
+            "bayraklar": [("kurgu_tani", [])],
+        },
+        {
+            **score_one(
+                _q(answer="555 birim"),
+                "Sayfa 42: 444 birim",
+                "555 birim",
+                sim=0.1,
+            ),
+            "guard_status": "answered",
+            "bayraklar": [],
+        },
+        {
+            **score_one(
+                _q(answer="555 birim"),
+                "Sayfa 42: belirsiz",
+                "555 birim",
+                sim=0.9,
+            ),
+            "guard_status": "abstained",
+            "bayraklar": [],
+        },
+    ]
+
+    metrics = summarize(rows)
+
+    assert metrics["guard_yayin_kapsami"] == 0.75
+    assert metrics["guard_inceleme_orani"] == 0.25
+    assert metrics["guard_yanlis_inceleme_orani"] == 0.5
+    assert metrics["guard_selective_risk"] == 0.5
+    assert metrics["guard_selective_n"] == 2
+
+
 def test_empty_run_does_not_divide_by_zero():
     assert summarize([]) == {"n": 0}
 

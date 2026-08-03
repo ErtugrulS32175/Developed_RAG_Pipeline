@@ -8,17 +8,18 @@ can be verified with no model and no ground truth:
   * every PAGE the answer cites is a page that was actually supplied
 
 Both are one-sided. Passing means nothing was invented outright; it does NOT
-mean the figure was taken from the right row, which is the failure this whole
-line of work is aimed at and which needs the answer to say WHICH passage it
-used. That comes next. What these buy now is a measurement: run them over
-answers already known to be correct and the false-flag rate falls out, and that
-rate decides whether a check can ever be promoted from a warning to a block.
+mean the figure was taken from the right row. Structured answers therefore name
+the passage and quote the line they used, so checks are scoped to claimed
+evidence rather than the whole context.
 
-Everything here is a FLAG, never a gate. A check whose false-positive rate is
-unknown must not be allowed to refuse an answer.
+The low-level checks return diagnostics. ``validate_structured`` applies the
+measured publication policy and returns one of answered, abstained or
+review_required. A review result carries no answer text, so the API integration
+cannot accidentally publish the unchecked model response through that object.
 """
 import json
 import re
+from dataclasses import dataclass
 
 from pipeline.lang.tr_notation import _readings, fold, normalize, number_forms, numbers
 from pipeline.retrieval.context import RagContext
@@ -26,6 +27,27 @@ from pipeline.retrieval.context import RagContext
 # the citation shape the answer prompt asks the model to produce
 _ANSWER_PAGE = re.compile(r"sayfa\s*\d+", re.IGNORECASE)
 _PAGE_NUMBER = re.compile(r"sayfa\s*(\d+)", re.IGNORECASE)
+_ABSTENTION = "bu bilgi mevcut belgelerde bulunamadi"
+_SURROUNDING_PUNCTUATION = " \t\r\n.!?;:\"'"
+
+ANSWERED = "answered"
+ABSTAINED = "abstained"
+REVIEW_REQUIRED = "review_required"
+
+
+@dataclass(frozen=True)
+class GuardResult:
+    """A checked answer, or a review decision that withholds its text."""
+
+    status: str
+    answer: str | None
+    diagnostics: tuple
+
+
+def is_abstention(answer):
+    """Only the exact refusal instructed by the prompt counts as abstention."""
+    normalized = fold(answer or "").strip(_SURROUNDING_PUNCTUATION)
+    return normalized == _ABSTENTION
 
 
 def context_pages(context):
@@ -73,7 +95,7 @@ def derived_figures(context):
     return out
 
 
-def unsupported_figures(answer, context, minimum=0, derive=True):
+def unsupported_figures(answer, context, minimum=0, derive=False):
     """Figures stated by the answer that no passage contains.
 
     Page citations are stripped first: "Sayfa 72" is the model pointing at its
@@ -84,9 +106,9 @@ def unsupported_figures(answer, context, minimum=0, derive=True):
     one side and as digits on the other is not a mismatch. `minimum` drops
     small numbers, which are mostly clause and item markers rather than data.
 
-    `derive` decides whether a rate restated as a percentage counts as
-    supported, and the choice is genuinely open -- see the note on
-    derived_figures. Measured both ways it trades detection for quiet.
+    `derive` opts into treating rate restatements as supported. It defaults off:
+    a measured factor-of-ten error was absorbed when derivation widened the
+    supported set. Callers that accept that trade-off must request it.
     """
     body = _ANSWER_PAGE.sub(" ", answer or "")
     context_n = normalize(context or "")
@@ -235,7 +257,7 @@ def _quoted(parsed):
     return " \n ".join(item["alinti"] for item in parsed["dayanak"])
 
 
-def check_structured(reply, context, minimum=0, derive=True):
+def check_structured(reply, context, minimum=0, derive=False):
     """Flags for an answer that was asked to cite its evidence.
 
     Everything here is scoped to what the answer SAID it used, which is the
@@ -247,6 +269,9 @@ def check_structured(reply, context, minimum=0, derive=True):
     the model-visible string here would let document text mint a fake handle or
     page, so a string is a programmer error rather than a tolerated legacy
     input.
+
+    Rate derivation defaults off. It is an explicit experimental trade-off,
+    never an implicit expansion of what counts as source-supported.
     """
     if not isinstance(context, RagContext):
         raise TypeError("check_structured requires a RagContext")
@@ -261,8 +286,14 @@ def check_structured(reply, context, minimum=0, derive=True):
         return [("bicimsiz_yanit", [])]
 
     answer = parsed["cevap"]
+    abstained = is_abstention(answer)
     known = context.by_handle()
     flags = []
+
+    if not abstained and not parsed["dayanak"]:
+        flags.append(("dayanaksiz_yanit", []))
+    if not abstained and not cited_pages(answer):
+        flags.append(("eksik_sayfa", []))
 
     cited, bad_handles, bad_quotes = [], [], []
     for item in parsed["dayanak"]:
@@ -299,7 +330,26 @@ def check_structured(reply, context, minimum=0, derive=True):
     return flags
 
 
-def check(answer, context, minimum=0, derive=True):
+def validate_structured(reply, context, minimum=0, derive=False):
+    """Status-bearing contract consumed by the checked API path.
+
+    Review-required output deliberately carries no answer text. This makes the
+    safe publication rule structural: a caller cannot accidentally display the
+    unchecked model response by reading ``result.answer``.
+    """
+    if isinstance(reply, dict):
+        parsed = reply if _valid_structured(reply) else None
+    else:
+        parsed = parse_structured(reply) if isinstance(reply, str) else None
+    diagnostics = tuple(check_structured(reply, context, minimum, derive))
+    if parsed is None or diagnostics:
+        return GuardResult(REVIEW_REQUIRED, None, diagnostics)
+    answer = parsed["cevap"]
+    status = ABSTAINED if is_abstention(answer) else ANSWERED
+    return GuardResult(status, answer, diagnostics)
+
+
+def check(answer, context, minimum=0, derive=False):
     """Every flag raised against one answer; empty means nothing was invented.
 
     Returned as data rather than text so a caller decides what to show. The

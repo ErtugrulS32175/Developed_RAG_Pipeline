@@ -30,8 +30,8 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from eval.answer.judge import notation_match
-from eval.retrieval.rag_eval import QUESTION_DIR, contains_key
+from eval.answer.judge import accepts_without_similarity
+from eval.retrieval.rag_eval import QUESTION_DIR
 from pipeline.lang.tr_notation import normalize, number_forms, numbers
 from pipeline.retrieval.context import Passage, RagContext
 from pipeline.validation.rag.answer_guard import check_structured
@@ -62,7 +62,7 @@ def confirmed_correct(run_dir):
             if not g or not g.get("key"):
                 continue
             answer, context = r["cevap"], r.get("baglam") or ""
-            if contains_key(answer, g["key"]) or notation_match(answer, g["key"]):
+            if accepts_without_similarity(g["key"], answer):
                 yield name, g, answer, context
 
 
@@ -128,7 +128,7 @@ def ideal_evidence(key, answer, context):
             chosen[handle].append(line)
 
     key_line = next(((h, l) for h, _, l in rows
-                     if contains_key(l, key) or notation_match(l, key)), None)
+                     if accepts_without_similarity(key, l)), None)
     if not key_line:
         return None
     take(*key_line)

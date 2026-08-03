@@ -9,10 +9,10 @@ cases it was written for proves nothing:
   1. **Adjudicated cases.** The answers a human has ruled on. Tiers 1-2 must
      accept every one ruled correct and none ruled wrong.
   2. **Mismatched pairs.** Every expected answer against a DIFFERENT question's
-     answer. These are wrong by construction and cost nothing to make, so they
-     are the only large sample of true negatives available. Any acceptance here
-     is a false one, and that rate is what says whether tier 2's looseness --
-     stems, number words, excused connectives -- is safe.
+     answer. These are free proxy negatives, not guaranteed true negatives: a
+     short or generic key can occur in both questions by coincidence. Their
+     acceptance rate is still a useful regression signal, especially when the
+     exact sampled pairs are compared before and after a matcher change.
   3. **A similarity sweep.** For each candidate threshold, how many adjudicated
      cases land on the wrong side, and how many mismatched pairs survive as
      review. The threshold to choose is the highest one that sends NO case a
@@ -27,7 +27,8 @@ import json
 import random
 from pathlib import Path
 
-from eval.answer.judge import DOGRU, INCELE, YANLIS, notation_match, similarity
+from eval.answer.judge import (
+    DOGRU, INCELE, YANLIS, accepts_without_similarity, similarity)
 from eval.retrieval.rag_eval import QUESTION_DIR, contains_key
 
 ADJUDICATED = QUESTION_DIR / "adjudicated.json"
@@ -39,7 +40,35 @@ MIN_FILTERED = 0.95
 
 
 def tiers_accept(answer, key):
-    return bool(contains_key(answer, key)) or notation_match(answer, key)
+    return accepts_without_similarity(key, answer)
+
+
+def selective_stats(expected, predicted):
+    """Coverage and error rate among decisions not sent to review."""
+    if len(expected) != len(predicted):
+        raise ValueError("expected and predicted lengths differ")
+    total = len(expected)
+    decided = [
+        (wanted, got)
+        for wanted, got in zip(expected, predicted)
+        if got != INCELE
+    ]
+    errors = sum(wanted != got for wanted, got in decided)
+    false_accepts = sum(
+        wanted != DOGRU and got == DOGRU for wanted, got in decided
+    )
+    false_rejects = sum(
+        wanted != YANLIS and got == YANLIS for wanted, got in decided
+    )
+    return {
+        "n": total,
+        "decided": len(decided),
+        "review": total - len(decided),
+        "coverage": len(decided) / total if total else 0.0,
+        "selective_risk": errors / len(decided) if decided else 0.0,
+        "false_accepts": false_accepts,
+        "false_rejects": false_rejects,
+    }
 
 
 def load_answers(run_dirs):
@@ -71,24 +100,40 @@ def check_adjudicated(cases):
             wrong.append(c)
             print(f"   HATA {c['id']:3} bekl={c['karar']:7} kabul={accepted} [{c['sinif']}]")
     print(f"   {len(cases) - len(wrong)}/{len(cases)} dogru siniflandi\n")
+    stats = selective_stats(
+        [case["karar"] for case in cases],
+        [DOGRU if tiers_accept(case["answer"], case["key"]) else INCELE
+         for case in cases],
+    )
+    print("   deterministik kapsam "
+          f"{stats['decided']}/{stats['n']} = {stats['coverage']:.1%}; "
+          f"selective risk={stats['selective_risk']:.1%}; "
+          f"yanlis kabul={stats['false_accepts']}; "
+          f"yanlis ret={stats['false_rejects']}\n")
     return wrong
 
 
 def check_mismatched(pairs, sample, seed):
-    """False-accept rate of tiers 1-2 on pairs that cannot be correct."""
-    print("2) ESLESMEYEN CIFTLER (kurgu geregi yanlis)")
+    """Acceptance regression on different-question proxy negatives."""
+    print("2) ESLESMEYEN CIFTLER (proxy negatif)")
     rng = random.Random(seed)
-    tried = accepted = 0
+    tried = accepted = introduced = retired = 0
     examples = []
     for _ in range(sample):
         (key, _, _), (_, _, answer) = rng.sample(pairs, 2)
         tried += 1
-        if tiers_accept(answer, key):
+        current = tiers_accept(answer, key)
+        legacy = bool(contains_key(answer, key))
+        introduced += current and not legacy
+        retired += legacy and not current
+        if current:
             accepted += 1
             if len(examples) < 5:
                 examples.append(key)
     rate = accepted / tried if tried else 0.0
     print(f"   {accepted}/{tried} yanlis kabul  ({rate:.3%})")
+    print(f"   legacy ustune yeni kabul: {introduced}; "
+          f"artik kabul edilmeyen legacy: {retired}")
     # the LENGTH of what was falsely accepted, never the text: a short expected
     # answer has fewer words to disagree on, so a false accept is far likelier
     # there, and seeing them cluster at two or three words says the rules are
@@ -122,18 +167,32 @@ def sweep(cases, pairs, sample, seed):
             if s is not None:
                 negatives.append(s)
 
-    print(f"\n   {'esik':>6}{'yanlis diyip hata':>20}{'incelemede kalan':>19}"
-          f"{'alakasiz eleme':>17}{'marj':>8}")
+    print(f"\n   {'esik':>6}{'yanlis diyip hata':>20}{'kapsam':>10}"
+          f"{'risk':>10}{'alakasiz eleme':>17}{'marj':>8}")
     best, best_margin = None, -1.0
     for threshold in [x / 100 for x in range(30, 96, 5)]:
         misjudged = sum(1 for c, s in scored if c["karar"] != YANLIS and s < threshold)
-        in_review = sum(1 for c, s in scored if s >= threshold)
         filtered = sum(1 for s in negatives if s < threshold) / len(negatives) \
             if negatives else 0.0
+        score_by_id = {case["id"]: score for case, score in scored}
+        predicted = []
+        for case in cases:
+            if tiers_accept(case["answer"], case["key"]):
+                predicted.append(DOGRU)
+                continue
+            score = score_by_id.get(case["id"])
+            predicted.append(
+                YANLIS if score is not None and score < threshold else INCELE
+            )
+        stats = selective_stats(
+            [case["karar"] for case in cases],
+            predicted,
+        )
         # distance to the nearest case the threshold has to separate: a cut that
         # only just clears an anchor is one rephrasing away from misjudging it
         margin = min(abs(s - threshold) for _, s in scored) if scored else 0.0
-        print(f"   {threshold:>6.2f}{misjudged:>20}{in_review:>19}"
+        print(f"   {threshold:>6.2f}{misjudged:>20}"
+              f"{stats['coverage']:>9.1%}{stats['selective_risk']:>10.1%}"
               f"{filtered:>16.1%}{margin:>8.3f}")
         if misjudged == 0 and filtered >= MIN_FILTERED and margin > best_margin:
             best, best_margin = threshold, margin

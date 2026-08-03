@@ -27,10 +27,6 @@ from pipeline.validation.rag.answer_guard import (
 )
 
 
-POLICY_GAP = pytest.mark.xfail(
-    strict=True,
-    reason="Adim 5: guvenli guard ve judge politikasi henuz uygulanmiyor",
-)
 API_GAP = pytest.mark.xfail(
     strict=True,
     reason="Adim 6: API henuz kontrol edilmis yanit sozlesmesini zorunlu kilmiyor",
@@ -239,19 +235,16 @@ def test_evidence_quote_must_be_a_string():
 
 # --- answer policy ----------------------------------------------------------
 
-@POLICY_GAP
 def test_a_substantive_answer_requires_evidence():
     reply = {"dayanak": [], "cevap": "Zeta uretimi artmistir."}
     _assert_review(reply, "dayanaksiz_yanit")
 
 
-@POLICY_GAP
 def test_a_substantive_answer_requires_a_page_citation():
     reply = _reply(cevap="Zeta uretimi 73 000 birimdir.")
     _assert_review(reply, "eksik_sayfa")
 
 
-@POLICY_GAP
 def test_structured_guard_does_not_derive_unquoted_rates_by_default():
     context = build_rag_context(
         [{
@@ -274,18 +267,17 @@ def test_structured_guard_does_not_derive_unquoted_rates_by_default():
 
 # --- scorer false accepts and silent failures ------------------------------
 
-@POLICY_GAP
 def test_swapped_figure_to_label_mappings_are_not_accepted():
-    verdict, _ = judge(
-        "zeta 73 gamma 19",
-        "gamma 73 zeta 19",
-        reference="zeta 73 gamma 19",
-        sim=0.99,
-    )
-    assert verdict != DOGRU
+    for answer in ("gamma 73 zeta 19", "zeta 19 gamma 73"):
+        verdict, _ = judge(
+            "zeta 73 gamma 19",
+            answer,
+            reference="zeta 73 gamma 19",
+            sim=0.99,
+        )
+        assert verdict != DOGRU
 
 
-@POLICY_GAP
 def test_a_negated_statement_is_not_accepted_by_word_overlap():
     verdict, _ = judge(
         "zeta aktiftir",
@@ -296,7 +288,16 @@ def test_a_negated_statement_is_not_accepted_by_word_overlap():
     assert verdict != DOGRU
 
 
-@POLICY_GAP
+def test_a_quoted_claim_that_is_then_refuted_is_not_accepted():
+    verdict, _ = judge(
+        "zeta odendi",
+        "zeta odendi iddiasi yanlistir",
+        reference="zeta odendi",
+        sim=0.99,
+    )
+    assert verdict == INCELE
+
+
 @pytest.mark.parametrize(
     ("key", "answer"),
     [
@@ -310,7 +311,6 @@ def test_suffix_ambiguity_cannot_remove_or_change_a_content_word(key, answer):
     assert not notation_match(answer, key)
 
 
-@POLICY_GAP
 def test_nan_similarity_goes_to_review():
     verdict, _ = judge(
         "zeta 73",
@@ -321,7 +321,6 @@ def test_nan_similarity_goes_to_review():
     assert verdict == INCELE
 
 
-@POLICY_GAP
 def test_similarity_fallback_logs_programmer_errors(monkeypatch, caplog):
     def programmer_error(_text):
         raise AssertionError("kurgu programlama hatasi")

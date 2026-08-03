@@ -11,7 +11,8 @@ say WHICH passage, and which line of it.
 """
 from pipeline.retrieval.query import build_rag_context
 from pipeline.validation.rag.answer_guard import (
-    check_structured, parse_structured)
+    ABSTAINED, ANSWERED, REVIEW_REQUIRED, check_structured, parse_structured,
+    validate_structured)
 
 CHUNKS = [
     {"filename": "belge.pdf", "page": 42, "text": "Zeta uretimi 47 000 birimdir."},
@@ -161,6 +162,46 @@ def test_a_page_no_cited_passage_came_from_is_flagged():
 def test_an_abstention_with_no_evidence_raises_nothing():
     reply = {"dayanak": [], "cevap": "Bu bilgi mevcut belgelerde bulunamadı."}
     assert check_structured(reply, CONTEXT) == []
+
+
+def test_abstention_must_be_the_exact_refusal_not_a_substantive_suffix():
+    for answer in (
+        "Bu bilgi mevcut belgelerde bulunamadi ama zeta vardir.",
+        "Bu bilgi mevcut belgelerde bulunamadi 47.",
+    ):
+        reply = {"dayanak": [], "cevap": answer}
+        names = {name for name, _ in check_structured(reply, CONTEXT)}
+        assert {"dayanaksiz_yanit", "eksik_sayfa"} <= names
+
+
+def test_checked_result_has_an_explicit_publication_status():
+    clean = _reply(
+        1,
+        "Zeta uretimi 47 000 birimdir.",
+        "Sayfa 42'ye gore 47 000 birim.",
+    )
+    abstention = {
+        "dayanak": [],
+        "cevap": "Bu bilgi mevcut belgelerde bulunamadi.",
+    }
+    unsafe = _reply(
+        1,
+        "Zeta uretimi 47 000 birimdir.",
+        "Sayfa 42'ye gore 8 000 birim.",
+    )
+
+    answered = validate_structured(clean, CONTEXT)
+    abstained = validate_structured(abstention, CONTEXT)
+    review = validate_structured(unsafe, CONTEXT)
+
+    assert (answered.status, answered.answer) == (ANSWERED, clean["cevap"])
+    assert (abstained.status, abstained.answer) == (
+        ABSTAINED,
+        abstention["cevap"],
+    )
+    assert review.status == REVIEW_REQUIRED
+    assert review.answer is None
+    assert {code for code, _ in review.diagnostics} == {"kaynaksiz_sayi"}
 
 
 # --- the whole path, with the model faked out -------------------------------
