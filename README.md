@@ -114,26 +114,44 @@ right, is the cited page right, and which stage is at fault when it is not).
 ### Checking the checker
 
 Scoring here is deterministic: an expected answer is present in the text or it
-is not. That is cheap and repeatable, but blind to two things — whether the
-claims *around* a correct figure are supported by the context, and how much of
-the retrieved context was useless.
+is not. That is cheap and repeatable, but blind to whether the claims *around*
+a correct figure are supported by the context.
 
-Ragas measures both, using an LLM as judge. Whether an LLM judges Turkish
-reliably is not something to assume, so the same run also scores
-`FactualCorrectness` against the hand-written reference answers and reports how
-often the judge and the deterministic verdict agree — and in which direction
-they differ when they do not.
+Ragas adds two diagnostic signals, neither of which is a release gate:
+`Faithfulness` checks claims against the supplied context, and
+`SemanticSimilarity` compares the answer with the hand-written reference.
+Similarity is reported as a continuous score with NO correctness threshold;
+the adjudicated set is not large enough to calibrate one. `FactualCorrectness`
+and per-chunk `ContextPrecision` were retired after the former disagreed too
+often with the validated scorer and the latter dominated evaluation cost.
 
     python -m venv ragas_env
     ragas_env\Scripts\pip install -r requirements-ragas.txt
-    ragas_env\Scripts\python -m eval.answer.ragas_check --set human
+    ragas_env\Scripts\python -m eval.answer.ragas_check --set human --limit 5
 
 The judge is whatever `LLM_API_URL` points at — the same self-hosted model the
 pipeline answers with, so nothing leaves the machines it already runs on.
-Judgements are cached on disk, so re-scoring after a change costs nothing.
+Judgements and embeddings are cached on disk, so re-scoring after a change
+costs nothing.
 
-Each question costs several LLM calls, and context precision costs one per
-retrieved chunk, so start with `--limit` before running a whole set.
+By default similarity reuses the production embedding model and every output
+labels that result as correlated with retrieval. Set both
+`EVAL_EMBED_API_URL` and `EVAL_EMBED_MODEL_NAME` to use a separately configured
+audit model. A separate endpoint is not by itself proof of independence; model
+identity is saved with the result.
+
+Current output names carry the set, embedding mode and a deterministic
+evaluation-configuration ID, for example
+`ragas_diagnostic_v2_human_production_embedding_correlated_<id>_limit5.json`.
+The same ID is saved inside the file with the metric set, model identities,
+calibration status and per-metric timing. Reports must compare or aggregate
+scores only when this ID and `embedding_mode` are carried with the score.
+An existing result is never overwritten. Use `--run-tag tekrar-1` when the
+same configuration must be run again; a limited smoke run and a full run
+already receive different filenames.
+Unversioned historical `ragas_<set>.json` files predate this contract and are
+retired; they must not be quoted as current measurements. Start every new
+configuration with `--limit 5` and price the full run from the recorded timing.
 
 ### Two engines, one measurement
 

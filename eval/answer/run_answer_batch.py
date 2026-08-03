@@ -1,8 +1,8 @@
 """Run every question set against the pod LLM in one unattended batch.
 
-    python -m eval.run_answer_batch                 # her set, uretim ayari
-    python -m eval.run_answer_batch --context-ab    # + ayni setler 10 chunk ile
-    python -m eval.run_answer_batch --sets X Y      # yalnizca secilenler
+    python -m eval.answer.run_answer_batch                 # her set
+    python -m eval.answer.run_answer_batch --context-ab    # + 10 chunk
+    python -m eval.answer.run_answer_batch --sets X Y      # secilenler
 
 Written for rented-GPU time, which is why it does two things a plain loop would
 not:
@@ -90,22 +90,31 @@ def preflight(sets):
 
     import requests
     from pipeline.index import embeddings as emb
+    from pipeline.generation import answer as generation
     from pipeline.retrieval import query
 
-    base = query.LLM_API_URL.rsplit("/v1/", 1)[0] + "/v1"
+    base = generation.LLM_API_URL.rsplit("/v1/", 1)[0] + "/v1"
     try:
-        r = requests.get(f"{base}/models", headers=query.llm_headers(), timeout=10)
+        r = requests.get(
+            f"{base}/models",
+            headers=generation.llm_headers(),
+            timeout=10,
+        )
         if r.status_code == 401:
             # Worth its own message: a wrong key looks exactly like a dead
             # endpoint if you only read "the LLM check failed".
             problems.append("LLM 401 -- LLM_API_KEY yanlis ya da eksik "
                             "(sunucu --api-key ile korunuyor)")
         else:
+            r.raise_for_status()
             ids = [m["id"] for m in r.json().get("data", [])]
             notes.append(f"LLM: {', '.join(ids) or 'model listesi bos'}"
-                         f"{'  [key ile]' if query.llm_headers() else ''}")
-            if query.LLM_MODEL_NAME not in ids:
-                problems.append(f"LLM_MODEL_NAME='{query.LLM_MODEL_NAME}' sunucuda yok: {ids}")
+                         f"{'  [key ile]' if generation.llm_headers() else ''}")
+            if generation.LLM_MODEL_NAME not in ids:
+                problems.append(
+                    f"LLM_MODEL_NAME='{generation.LLM_MODEL_NAME}' "
+                    f"sunucuda yok: {ids}"
+                )
     except Exception as e:
         problems.append(f"LLM'e ulasilamadi ({base}) -- adres/tunel dogru mu? "
                         f"[{type(e).__name__}]")
@@ -124,7 +133,7 @@ def run_set(name, rerank_to, top_k=TOP_K, backend="native", out_dir=None,
             structured=False):
     """One question set. Returns its summary dict, or None if the run failed."""
     out_dir = out_dir or OUT_DIR
-    cmd = [sys.executable, "-m", "eval.rag_answer_eval", "--set", name,
+    cmd = [sys.executable, "-m", "eval.answer.rag_answer_eval", "--set", name,
            "--top-k", str(top_k), "--rerank", "--rerank-to", str(rerank_to),
            "--backend", backend, "--out-dir", str(out_dir)]
     if structured:
@@ -217,7 +226,8 @@ def main():
         table(results, title=f"motor: {backend}"
                              + (f"   klasor: {out_dir}" if out_dir else ""))
     print("\nSonraki adim: hakemi kucuk baslat --")
-    print("  ragas_env\\Scripts\\python -m eval.ragas_check --set human --limit 5")
+    print("  ragas_env\\Scripts\\python -m eval.answer.ragas_check "
+          "--set human --limit 5")
 
 
 if __name__ == "__main__":

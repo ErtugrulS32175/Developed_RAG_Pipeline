@@ -1,8 +1,8 @@
 """Answer eval: given the context retrieval produced, does the model answer
 correctly and cite the right page?
 
-    python -m eval.rag_answer_eval --set human
-    python -m eval.rag_answer_eval --set human --top-k 50 --rerank
+    python -m eval.answer.rag_answer_eval --set human
+    python -m eval.answer.rag_answer_eval --set human --top-k 50 --rerank
 
 Runs the REAL production pieces -- retrieval assembles the context and
 generation writes the answer -- so

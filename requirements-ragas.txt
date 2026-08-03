@@ -1,9 +1,7 @@
-# Ragas, used to cross-check the deterministic scoring with an LLM judge and to
-# measure the two things key-matching cannot see: whether an answer's claims are
-# actually supported by the context, and how much of the retrieved context was
-# useless. Kept out of requirements.txt and installed into its OWN virtualenv --
-# it pulls the LangChain tree, which must not touch the pins the ingest side
-# depends on:
+# Ragas, used only for diagnostic Faithfulness and threshold-free semantic
+# answer similarity. Neither score is a release gate. Kept out of
+# requirements.txt and installed into its OWN virtualenv -- it pulls the
+# LangChain tree, which must not touch the pins the ingest side depends on:
 #
 #     python -m venv ragas_env
 #     ragas_env\Scripts\pip install -r requirements-ragas.txt
