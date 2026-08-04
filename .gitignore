@@ -4,6 +4,7 @@ logs/
 data/
 output/
 uploads/
+contracts/
 __pycache__/
 *.pyc
 paddle_env/
