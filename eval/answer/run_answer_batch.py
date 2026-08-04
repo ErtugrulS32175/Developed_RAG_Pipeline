@@ -43,14 +43,80 @@ OUT_DIR = Path("output/eval")
 # The flat layout let a re-run silently replace answers that cost GPU time, and
 # it had nowhere to put a second engine's results at all.
 RUNS_DIR = Path("output/RAG_Outputs")
+REQUIRED_QUESTION_KEYS = frozenset({"q", "key", "answer", "pages"})
+
+
+def _question_set_status(name):
+    """(count, problems) without ever copying question content into a report."""
+    path = QUESTION_DIR / f"{name}.json"
+    if not path.exists():
+        return 0, [f"soru seti yok: {path}"]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return 0, [f"{name}: okunamadi ({type(error).__name__})"]
+    if not isinstance(payload, list) or not payload:
+        return 0, [f"{name}: bos olmayan bir JSON listesi olmali"]
+
+    problems = []
+    questions = set()
+    for index, row in enumerate(payload, start=1):
+        if not isinstance(row, dict):
+            problems.append(f"{name}[{index}]: soru kaydi nesne degil")
+            continue
+        missing = sorted(REQUIRED_QUESTION_KEYS - set(row))
+        if missing:
+            problems.append(
+                f"{name}[{index}]: eksik alanlar: {', '.join(missing)}"
+            )
+            continue
+        for field in ("q", "key", "answer"):
+            if not isinstance(row[field], str) or not row[field].strip():
+                problems.append(
+                    f"{name}[{index}]: {field} bos olmayan metin olmali"
+                )
+        pages = row["pages"]
+        if (
+            not isinstance(pages, list)
+            or not pages
+            or any(type(page) is not int or page < 1 for page in pages)
+        ):
+            problems.append(
+                f"{name}[{index}]: pages pozitif tam sayi listesi olmali"
+            )
+        question = row.get("q")
+        if isinstance(question, str):
+            if question in questions:
+                problems.append(f"{name}[{index}]: yinelenen soru")
+            questions.add(question)
+    return len(payload), problems
 
 
 def discover_sets():
-    """Question sets found in the question directory, sorted.
+    """Only scoreable question sets found in the question directory, sorted.
 
-    Discovered rather than listed, so adding a set needs no code change.
+    Auxiliary calibration and bootstrap JSON files deliberately live beside
+    question sets. Discovery therefore validates the scoring contract instead
+    of treating every JSON file as rented-GPU work.
     """
-    return sorted(p.stem for p in QUESTION_DIR.glob("*.json"))
+    discovered = []
+    for path in sorted(QUESTION_DIR.glob("*.json")):
+        _, problems = _question_set_status(path.stem)
+        if not problems:
+            discovered.append(path.stem)
+    return discovered
+
+
+def validate_sets(sets):
+    """Cheap schema preflight, including an explicit execution plan."""
+    problems = []
+    notes = [f"calistirilacak setler: {', '.join(sets)}"] if sets else []
+    for name in sets:
+        count, set_problems = _question_set_status(name)
+        problems.extend(set_problems)
+        if not set_problems:
+            notes.append(f"{name}: {count} soru")
+    return problems, notes
 
 
 # Production defaults: query.py ranks with the reranker but never SHRINKS the
@@ -62,14 +128,9 @@ RERANK_TO = 15
 
 def preflight(sets):
     """Everything that can fail cheaply, checked before the GPU meter runs."""
-    problems, notes = [], []
-
-    for s in sets:
-        p = QUESTION_DIR / f"{s}.json"
-        if not p.exists():
-            problems.append(f"soru seti yok: {p}")
-        else:
-            notes.append(f"{s}: {len(json.loads(p.read_text(encoding='utf-8')))} soru")
+    problems, notes = validate_sets(sets)
+    if problems:
+        return problems, notes
 
     try:
         import psycopg
@@ -193,16 +254,27 @@ def main():
     if not sets:
         raise SystemExit(f"soru seti bulunamadi: {QUESTION_DIR}/*.json")
 
-    if not args.skip_preflight:
-        print("On kontrol...")
+    print("On kontrol...")
+    if args.skip_preflight:
+        problems, notes = validate_sets(sets)
+    else:
         problems, notes = preflight(sets)
-        for n in notes:
-            print(f"  ok   {n}")
-        for p in problems:
-            print(f"  HATA {p}")
-        if problems:
-            print("\nGPU saati yakilmadan durduruldu. Yukaridakileri duzelt.")
-            raise SystemExit(1)
+    if not args.sets:
+        all_json = {path.stem for path in QUESTION_DIR.glob("*.json")}
+        excluded = sorted(all_json - set(sets))
+        if excluded:
+            notes.append(
+                "puanlama sozlesmesine uymayan dosyalar atlandi: "
+                + ", ".join(excluded)
+            )
+    for n in notes:
+        print(f"  ok   {n}")
+    for p in problems:
+        print(f"  HATA {p}")
+    if problems:
+        print("\nGPU saati yakilmadan durduruldu. Yukaridakileri duzelt.")
+        raise SystemExit(1)
+    if not args.skip_preflight:
         print("  -> hazir\n")
 
     for backend in args.backends:

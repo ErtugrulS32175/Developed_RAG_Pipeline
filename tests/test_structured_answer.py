@@ -11,8 +11,8 @@ say WHICH passage, and which line of it.
 """
 from pipeline.retrieval.query import build_rag_context
 from pipeline.validation.rag.answer_guard import (
-    ABSTAINED, ANSWERED, REVIEW_REQUIRED, check_structured, parse_structured,
-    validate_structured)
+    ABSTAINED, ANSWERED, DERIVED_CITATION, MODEL_CITATION, REVIEW_REQUIRED,
+    PageCitation, check_structured, parse_structured, validate_structured)
 
 CHUNKS = [
     {"filename": "belge.pdf", "page": 42, "text": "Zeta uretimi 47 000 birimdir."},
@@ -157,6 +157,143 @@ def test_a_figure_in_the_passage_but_on_no_quoted_line_is_flagged_softly():
 def test_a_page_no_cited_passage_came_from_is_flagged():
     reply = _reply(1, "Zeta uretimi 47 000 birimdir.", "Sayfa 43'e gore 47 000 birim.")
     assert ("kaynaksiz_sayfa", [43]) in check_structured(reply, CONTEXT)
+
+
+def test_a_missing_page_is_annotated_from_one_passage_without_rewriting_answer():
+    ctx = build_rag_context([{
+        "filename": "kurgu.pdf",
+        "page": 953761,
+        "text": "KURGU_OMEGA_NESNESI 731641 birimdir.",
+    }], numbered=True)
+    reply = _reply(
+        1,
+        "KURGU_OMEGA_NESNESI 731641 birimdir.",
+        "KURGU_OMEGA_NESNESI 731641 birimdir.",
+    )
+
+    result = validate_structured(reply, ctx)
+
+    assert result.status == ANSWERED
+    assert result.answer == reply["cevap"]
+    assert result.citations == (
+        PageCitation(953761, DERIVED_CITATION),
+    )
+
+
+def test_several_passages_on_one_page_still_have_one_derived_page():
+    ctx = build_rag_context([
+        {
+            "filename": "kurgu.pdf",
+            "page": 953762,
+            "text": "KURGU_OMEGA_NESNESI ilk satirdadir.",
+        },
+        {
+            "filename": "kurgu.pdf",
+            "page": 953762,
+            "text": "KURGU_OMEGA_NESNESI ikinci satirdadir.",
+        },
+    ], numbered=True)
+    reply = {
+        "dayanak": [
+            {"pasaj": 1, "alinti": "KURGU_OMEGA_NESNESI ilk satirdadir."},
+            {"pasaj": 2, "alinti": "KURGU_OMEGA_NESNESI ikinci satirdadir."},
+        ],
+        "cevap": "KURGU_OMEGA_NESNESI dayanaklarla desteklenir.",
+    }
+
+    result = validate_structured(reply, ctx)
+
+    assert result.status == ANSWERED
+    assert result.diagnostics == ()
+    assert result.citations == (
+        PageCitation(953762, DERIVED_CITATION),
+    )
+
+
+def test_several_pages_stay_open_even_when_only_one_contains_the_figure():
+    """A unique figure-bearing page did not rescue another saved answer."""
+    ctx = build_rag_context([
+        {
+            "filename": "kurgu.pdf",
+            "page": 953763,
+            "text": "KURGU_OMEGA_NESNESI 731641 birimdir.",
+        },
+        {
+            "filename": "kurgu.pdf",
+            "page": 953764,
+            "text": "KURGU_OMEGA_NESNESI aciklamasi buradadir.",
+        },
+    ], numbered=True)
+    reply = {
+        "dayanak": [
+            {
+                "pasaj": 1,
+                "alinti": "KURGU_OMEGA_NESNESI 731641 birimdir.",
+            },
+            {
+                "pasaj": 2,
+                "alinti": "KURGU_OMEGA_NESNESI aciklamasi buradadir.",
+            },
+        ],
+        "cevap": "KURGU_OMEGA_NESNESI 731641 birimdir.",
+    }
+
+    result = validate_structured(reply, ctx)
+
+    assert result.status == REVIEW_REQUIRED
+    assert result.answer is None
+    assert result.citations == ()
+    assert result.diagnostics == (("eksik_sayfa", []),)
+
+
+def test_a_valid_handle_cannot_hide_an_unknown_handle_during_derivation():
+    ctx = build_rag_context([{
+        "filename": "kurgu.pdf",
+        "page": 953761,
+        "text": "KURGU_OMEGA_NESNESI 731641 birimdir.",
+    }], numbered=True)
+    reply = {
+        "dayanak": [
+            {
+                "pasaj": 1,
+                "alinti": "KURGU_OMEGA_NESNESI 731641 birimdir.",
+            },
+            {
+                "pasaj": 842753,
+                "alinti": "KURGU_OMEGA_NESNESI desteklenir.",
+            },
+        ],
+        "cevap": "KURGU_OMEGA_NESNESI 731641 birimdir.",
+    }
+
+    result = validate_structured(reply, ctx)
+
+    assert result.status == REVIEW_REQUIRED
+    assert result.citations == ()
+    assert {code for code, _ in result.diagnostics} == {
+        "eksik_sayfa",
+        "uydurma_pasaj",
+    }
+
+
+def test_an_explicit_valid_page_is_marked_as_model_supplied():
+    ctx = build_rag_context([{
+        "filename": "kurgu.pdf",
+        "page": 953761,
+        "text": "KURGU_OMEGA_NESNESI 842753 birimdir.",
+    }], numbered=True)
+    reply = _reply(
+        1,
+        "KURGU_OMEGA_NESNESI 842753 birimdir.",
+        "Sayfa 953761: KURGU_OMEGA_NESNESI 842753 birimdir.",
+    )
+
+    result = validate_structured(reply, ctx)
+
+    assert result.status == ANSWERED
+    assert result.citations == (
+        PageCitation(953761, MODEL_CITATION),
+    )
 
 
 def test_an_abstention_with_no_evidence_raises_nothing():

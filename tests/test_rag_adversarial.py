@@ -235,9 +235,11 @@ def test_a_substantive_answer_requires_evidence():
     _assert_review(reply, "dayanaksiz_yanit")
 
 
-def test_a_substantive_answer_requires_a_page_citation():
+def test_one_passage_can_supply_missing_page_metadata():
     reply = _reply(cevap="Zeta uretimi 73 000 birimdir.")
-    _assert_review(reply, "eksik_sayfa")
+    status, codes = _guard_outcome(reply)
+    assert status == "answered"
+    assert codes == set()
 
 
 def test_structured_guard_does_not_derive_unquoted_rates_by_default():

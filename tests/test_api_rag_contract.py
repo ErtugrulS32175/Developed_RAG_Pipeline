@@ -7,8 +7,10 @@ from fastapi.testclient import TestClient
 from pipeline.validation.rag.answer_guard import (
     ABSTAINED,
     ANSWERED,
+    DERIVED_CITATION,
     REVIEW_REQUIRED,
     GuardResult,
+    PageCitation,
 )
 
 
@@ -54,6 +56,22 @@ def _public_reply(response, stream):
         for payload in payloads
     )
     return statuses.pop(), text
+
+
+def _public_citations(response, stream):
+    if not stream:
+        return response.json()["rag_citations"]
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    citations = {json.dumps(
+        payload["rag_citations"],
+        sort_keys=True,
+    ) for payload in payloads}
+    assert len(citations) == 1
+    return json.loads(citations.pop())
 
 
 @pytest.mark.parametrize(("model", "backend"), MODELS)
@@ -119,6 +137,36 @@ def test_both_api_shapes_publish_only_the_checked_decision(
 
 @pytest.mark.parametrize(("model", "_backend"), MODELS)
 @pytest.mark.parametrize("stream", [False, True])
+def test_derived_citations_are_separate_metadata(
+        monkeypatch, model, _backend, stream):
+    from pipeline.api import app as api
+
+    result = GuardResult(
+        ANSWERED,
+        "KURGU_OMEGA_NESNESI yanitidir.",
+        (),
+        (PageCitation(953761, DERIVED_CITATION),),
+    )
+    monkeypatch.setattr(
+        api.rag_backends,
+        "answer_checked",
+        lambda *_args, **_kwargs: result,
+    )
+
+    response = _request(api, model, stream)
+
+    assert response.status_code == 200
+    assert _public_citations(response, stream) == [{
+        "page": 953761,
+        "source": DERIVED_CITATION,
+    }]
+    _, text = _public_reply(response, stream)
+    assert text == result.answer
+    assert "953761" not in text
+
+
+@pytest.mark.parametrize(("model", "_backend"), MODELS)
+@pytest.mark.parametrize("stream", [False, True])
 def test_a_raw_checked_backend_value_fails_closed(
         monkeypatch, model, _backend, stream):
     from pipeline.api import app as api
@@ -134,6 +182,27 @@ def test_a_raw_checked_backend_value_fails_closed(
 
     assert response.status_code == 500
     assert raw not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_invalid_citation_metadata_fails_closed(monkeypatch, stream):
+    from pipeline.api import app as api
+
+    monkeypatch.setattr(
+        api.rag_backends,
+        "answer_checked",
+        lambda *_args, **_kwargs: GuardResult(
+            ANSWERED,
+            "KURGU_OMEGA_NESNESI yanitidir.",
+            (),
+            ("gecersiz",),
+        ),
+    )
+
+    response = _request(api, "ragtest-rag", stream)
+
+    assert response.status_code == 500
+    assert "KURGU_OMEGA_NESNESI" not in response.text
 
 
 @pytest.mark.parametrize(

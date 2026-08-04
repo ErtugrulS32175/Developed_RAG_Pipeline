@@ -33,6 +33,22 @@ _SURROUNDING_PUNCTUATION = " \t\r\n.!?;:\"'"
 ANSWERED = "answered"
 ABSTAINED = "abstained"
 REVIEW_REQUIRED = "review_required"
+MODEL_CITATION = "model"
+DERIVED_CITATION = "derived"
+
+
+@dataclass(frozen=True)
+class PageCitation:
+    """A page attached as metadata without rewriting the model's answer."""
+
+    page: int
+    source: str
+
+    def __post_init__(self):
+        if type(self.page) is not int or self.page < 1:
+            raise ValueError("citation page must be a positive integer")
+        if self.source not in {MODEL_CITATION, DERIVED_CITATION}:
+            raise ValueError("unknown citation source")
 
 
 @dataclass(frozen=True)
@@ -42,6 +58,7 @@ class GuardResult:
     status: str
     answer: str | None
     diagnostics: tuple
+    citations: tuple[PageCitation, ...] = ()
 
 
 def is_abstention(answer):
@@ -257,6 +274,44 @@ def _quoted(parsed):
     return " \n ".join(item["alinti"] for item in parsed["dayanak"])
 
 
+def _unambiguous_evidence_page(parsed, known):
+    """The one page all claimed evidence resolves to, or None.
+
+    Every handle has to exist and carry retrieval metadata. A valid handle
+    cannot compensate for an invented one, and several pages are never guessed
+    between. Multiple passages are safe only when they converge on the same
+    trusted page.
+    """
+    handles = list(dict.fromkeys(
+        item["pasaj"] for item in parsed["dayanak"]
+    ))
+    if not handles or any(handle not in known for handle in handles):
+        return None
+    pages = {known[handle].page for handle in handles}
+    if None in pages or len(pages) != 1:
+        return None
+    return next(iter(pages))
+
+
+def _page_citations(parsed, context):
+    """Validated citation metadata, preserving whether the model supplied it."""
+    answer = parsed["cevap"]
+    if is_abstention(answer):
+        return ()
+    model_pages = cited_pages(answer)
+    if model_pages:
+        return tuple(
+            PageCitation(page, MODEL_CITATION)
+            for page in sorted(model_pages)
+        )
+    page = _unambiguous_evidence_page(parsed, context.by_handle())
+    return (
+        (PageCitation(page, DERIVED_CITATION),)
+        if page is not None
+        else ()
+    )
+
+
 def check_structured(reply, context, minimum=0, derive=False):
     """Flags for an answer that was asked to cite its evidence.
 
@@ -292,8 +347,6 @@ def check_structured(reply, context, minimum=0, derive=False):
 
     if not abstained and not parsed["dayanak"]:
         flags.append(("dayanaksiz_yanit", []))
-    if not abstained and not cited_pages(answer):
-        flags.append(("eksik_sayfa", []))
 
     cited, bad_handles, bad_quotes = [], [], []
     for item in parsed["dayanak"]:
@@ -310,6 +363,13 @@ def check_structured(reply, context, minimum=0, derive=False):
         flags.append(("uydurma_pasaj", bad_handles))
     if bad_quotes:
         flags.append(("uydurma_alinti", sorted(set(bad_quotes))))
+
+    if (
+        not abstained
+        and not cited_pages(answer)
+        and _unambiguous_evidence_page(parsed, known) is None
+    ):
+        flags.append(("eksik_sayfa", []))
 
     scope = _BLOCK.join(known[h].text for h in cited) if cited else ""
     figures = unsupported_figures(answer, scope, minimum, derive)
@@ -342,11 +402,12 @@ def validate_structured(reply, context, minimum=0, derive=False):
     else:
         parsed = parse_structured(reply) if isinstance(reply, str) else None
     diagnostics = tuple(check_structured(reply, context, minimum, derive))
+    citations = _page_citations(parsed, context) if parsed is not None else ()
     if parsed is None or diagnostics:
-        return GuardResult(REVIEW_REQUIRED, None, diagnostics)
+        return GuardResult(REVIEW_REQUIRED, None, diagnostics, citations)
     answer = parsed["cevap"]
     status = ABSTAINED if is_abstention(answer) else ANSWERED
-    return GuardResult(status, answer, diagnostics)
+    return GuardResult(status, answer, diagnostics, citations)
 
 
 def check(answer, context, minimum=0, derive=False):

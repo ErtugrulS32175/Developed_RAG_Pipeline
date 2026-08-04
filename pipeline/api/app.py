@@ -22,6 +22,7 @@ from pipeline.validation.rag.answer_guard import (
     ANSWERED,
     REVIEW_REQUIRED,
     GuardResult,
+    PageCitation,
     is_abstention,
 )
 
@@ -218,8 +219,13 @@ def chat_completions(req: ChatRequest):
         if is_table:
             gen = owui_chat.stream_tables(req.messages, req.model)
         else:
-            status, answer = ask_checked()
-            gen = owui_chat.stream_text(answer, req.model, rag_status=status)
+            status, answer, citations = ask_checked()
+            gen = owui_chat.stream_text(
+                answer,
+                req.model,
+                rag_status=status,
+                rag_citations=_citation_payload(citations),
+            )
         return StreamingResponse(gen, media_type="text/event-stream")
 
     if is_table:
@@ -228,7 +234,7 @@ def chat_completions(req: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"tablo cikarimi basarisiz: {e}")
     else:
-        status, answer = ask_checked()
+        status, answer, citations = ask_checked()
 
     response = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:10]}",
@@ -241,7 +247,15 @@ def chat_completions(req: ChatRequest):
     }
     if not is_table:
         response["rag_status"] = status
+        response["rag_citations"] = _citation_payload(citations)
     return response
+
+
+def _citation_payload(citations):
+    return [
+        {"page": citation.page, "source": citation.source}
+        for citation in citations
+    ]
 
 
 def _publish_checked(result):
@@ -257,22 +271,31 @@ def _publish_checked(result):
         raise HTTPException(status_code=500, detail="gecersiz RAG yanit sozlesmesi")
     has_text = isinstance(result.answer, str) and bool(result.answer.strip())
     clean = result.diagnostics == ()
+    valid_citations = (
+        type(result.citations) is tuple
+        and all(isinstance(citation, PageCitation)
+                for citation in result.citations)
+    )
+    if not valid_citations:
+        log.error("RAG backend returned invalid citation metadata")
+        raise HTTPException(status_code=500, detail="gecersiz RAG yanit sozlesmesi")
     if (
         result.status == ANSWERED
         and has_text
         and clean
         and not is_abstention(result.answer)
     ):
-        return result.status, result.answer
+        return result.status, result.answer, result.citations
     if (
         result.status == ABSTAINED
         and has_text
         and clean
         and is_abstention(result.answer)
+        and result.citations == ()
     ):
-        return result.status, result.answer
+        return result.status, result.answer, result.citations
     if result.status == REVIEW_REQUIRED and result.answer is None:
-        return result.status, REVIEW_MESSAGE
+        return result.status, REVIEW_MESSAGE, ()
     log.error("RAG backend returned inconsistent checked status")
     raise HTTPException(status_code=500, detail="gecersiz RAG yanit sozlesmesi")
 

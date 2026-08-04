@@ -6,6 +6,7 @@ real document.
 """
 from eval.answer.rag_answer_eval import abstained, cited_pages, score_one, summarize
 from eval.retrieval.rag_eval import contains_key
+from pipeline.validation.rag.answer_guard import cited_pages as guard_cited_pages
 
 
 def _q(**kw):
@@ -100,6 +101,19 @@ def test_reads_the_page_the_prompt_asks_for():
     assert cited_pages("Sayfa 7'ye göre deger 5'tir.") == {7}
     assert cited_pages("sayfa 42 ve Sayfa 96") == {42, 96}
     assert cited_pages("hicbir atif yok") == set()
+
+
+def test_eval_and_product_share_the_same_citation_parser():
+    assert cited_pages is guard_cited_pages
+
+
+def test_unlabelled_legal_numbers_do_not_count_as_page_citations():
+    answer = (
+        "Kanun 731641, madde 842753 ve gazete 953764 birlikte anilmistir."
+    )
+
+    assert cited_pages(answer) == set()
+    assert cited_pages(f"{answer} Sayfa 953761.") == {953761}
 
 
 def test_abstention_is_recognised():
@@ -202,6 +216,35 @@ def test_guard_scorecard_reports_coverage_false_review_and_selective_risk():
     assert metrics["guard_yanlis_inceleme_orani"] == 0.5
     assert metrics["guard_selective_risk"] == 0.5
     assert metrics["guard_selective_n"] == 2
+
+
+def test_guard_scorecard_separates_model_and_derived_citations():
+    rows = [
+        {
+            **score_one(_q(), "Sayfa 42: 555 birim", "555 birim"),
+            "guard_status": "answered",
+            "bayraklar": [],
+            "guard_atiflari": [{"page": 42, "source": "model"}],
+        },
+        {
+            **score_one(_q(), "555 birim", "555 birim"),
+            "guard_status": "answered",
+            "bayraklar": [],
+            "guard_atiflari": [{"page": 42, "source": "derived"}],
+        },
+        {
+            **score_one(_q(), "555 birim", "555 birim"),
+            "guard_status": "review_required",
+            "bayraklar": [("kurgu_tani", [])],
+            "guard_atiflari": [],
+        },
+    ]
+
+    metrics = summarize(rows)
+
+    assert metrics["sayfa_verdi"] == round(1 / 3, 4)
+    assert metrics["guard_atif_kapsami"] == round(2 / 3, 4)
+    assert metrics["guard_turetilmis_atif_orani"] == round(1 / 3, 4)
 
 
 def test_empty_run_does_not_divide_by_zero():

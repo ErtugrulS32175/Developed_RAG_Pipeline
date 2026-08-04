@@ -24,21 +24,19 @@ corrected offline instead of paying for another GPU hour to regenerate them.
 """
 import argparse
 import json
-import re
 import time
 from pathlib import Path
 
 from eval.answer.judge import DOGRU, INCELE, YANLIS, judge
 from eval.retrieval.rag_eval import QUESTION_DIR, OUT_DIR, contains_key, retrieve_chunks
+from pipeline.validation.rag.answer_guard import (
+    DERIVED_CITATION,
+    REVIEW_REQUIRED,
+    cited_pages,
+)
 
-# "Sayfa 204'e göre" / "sayfa 199" -- the citation shape the answer prompt asks for
-_PAGE_CITE = re.compile(r"sayfa\s*(\d+)", re.IGNORECASE)
 # the exact refusal the prompt instructs the model to use when it cannot answer
 _ABSTAIN = "bulunamadı"
-
-
-def cited_pages(answer):
-    return {int(m) for m in _PAGE_CITE.findall(answer or "")}
 
 
 def abstained(answer):
@@ -123,8 +121,6 @@ def summarize(rows, split_by_type=True):
                                     if r.get("bayraklar") and r["cevap_dogru"])
     guard_rows = [r for r in rows if r.get("guard_status")]
     if guard_rows:
-        from pipeline.validation.rag.answer_guard import REVIEW_REQUIRED
-
         statuses = [r["guard_status"] for r in guard_rows]
         reviewed = [r for r in guard_rows
                     if r["guard_status"] == REVIEW_REQUIRED]
@@ -152,6 +148,26 @@ def summarize(rows, split_by_type=True):
             if settled_published else None
         )
         out["guard_selective_n"] = len(settled_published)
+        citation_rows = [
+            r for r in guard_rows if r.get("guard_atiflari") is not None
+        ]
+        if citation_rows:
+            out["guard_atif_kapsami"] = round(
+                sum(bool(r["guard_atiflari"]) for r in citation_rows)
+                / len(citation_rows),
+                4,
+            )
+            out["guard_turetilmis_atif_orani"] = round(
+                sum(
+                    any(
+                        citation.get("source") == DERIVED_CITATION
+                        for citation in r["guard_atiflari"]
+                    )
+                    for r in citation_rows
+                )
+                / len(citation_rows),
+                4,
+            )
     # Figures and prose fail differently: a figure is copied or it is not, while
     # a prose answer can be fluent and still miss the point. Reporting one number
     # over both hides whichever is the weaker half.
@@ -213,9 +229,14 @@ def main():
             guard_result = validate_structured(reply, rag_context)
             row["guard_status"] = guard_result.status
             row["bayraklar"] = list(guard_result.diagnostics)
+            row["guard_atiflari"] = [
+                {"page": citation.page, "source": citation.source}
+                for citation in guard_result.citations
+            ]
         else:
             row["guard_status"] = None
             row["bayraklar"] = check(answer, rag_context)
+            row["guard_atiflari"] = None
         rows.append(row)
         print(f"  {i}/{len(questions)} {'OK ' if row['cevap_dogru'] else 'HATA'}"
               f"{' !' if row['bayraklar'] else '  '}{q['q'][:58]}")

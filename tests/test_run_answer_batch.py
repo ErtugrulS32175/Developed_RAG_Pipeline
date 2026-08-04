@@ -8,6 +8,15 @@ import requests
 from eval.answer import run_answer_batch
 
 
+def _valid_question():
+    return {
+        "q": "KURGU_OMEGA_NESNESI nedir?",
+        "key": "731641 birim",
+        "answer": "KURGU_OMEGA_NESNESI 731641 birimdir.",
+        "pages": [953761],
+    }
+
+
 def test_preflight_reports_a_dead_llm_endpoint_instead_of_crashing(
         monkeypatch, tmp_path):
     import psycopg
@@ -17,7 +26,7 @@ def test_preflight_reports_a_dead_llm_endpoint_instead_of_crashing(
     question_dir = tmp_path / "questions"
     question_dir.mkdir()
     (question_dir / "kurgu.json").write_text(
-        json.dumps([{"q": "Kurgu soru"}]),
+        json.dumps([_valid_question()]),
         encoding="utf-8",
     )
     monkeypatch.setattr(run_answer_batch, "QUESTION_DIR", question_dir)
@@ -50,11 +59,41 @@ def test_preflight_reports_a_dead_llm_endpoint_instead_of_crashing(
     problems, notes = run_answer_batch.preflight(["kurgu"])
 
     assert any("1 soru" in note for note in notes)
+    assert "calistirilacak setler: kurgu" in notes
     llm_problems = [problem for problem in problems
                     if problem.startswith("LLM'e ulasilamadi")]
     assert len(llm_problems) == 1
     assert "127.0.0.1:9/v1" in llm_problems[0]
     assert "[ConnectionError]" in llm_problems[0]
+
+
+def test_discovery_excludes_auxiliary_json_that_is_not_scoreable(
+        monkeypatch, tmp_path):
+    (tmp_path / "kurgu.json").write_text(
+        json.dumps([_valid_question()]),
+        encoding="utf-8",
+    )
+    (tmp_path / "yardimci.json").write_text(
+        json.dumps([{"q": "KURGU_OMEGA_NESNESI nedir?"}]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(run_answer_batch, "QUESTION_DIR", tmp_path)
+
+    assert run_answer_batch.discover_sets() == ["kurgu"]
+
+
+def test_schema_preflight_refuses_an_explicit_invalid_set_before_services(
+        monkeypatch, tmp_path):
+    (tmp_path / "yardimci.json").write_text(
+        json.dumps([{"q": "KURGU_OMEGA_NESNESI nedir?"}]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(run_answer_batch, "QUESTION_DIR", tmp_path)
+
+    problems, notes = run_answer_batch.preflight(["yardimci"])
+
+    assert any("eksik alanlar" in problem for problem in problems)
+    assert notes == ["calistirilacak setler: yardimci"]
 
 
 def test_preflight_uses_generation_model_and_auth(monkeypatch, tmp_path):
