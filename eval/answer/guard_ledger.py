@@ -24,11 +24,18 @@ from pipeline.validation.rag.answer_guard import (
     cited_pages,
     is_abstention,
 )
+from pipeline.validation.rag.binding_guard import check_binding
 
 PLAIN = "plain"
 STRUCTURED_DERIVED = "structured_derived"
 STRUCTURED_EXPLICIT = "structured_explicit_page"
-POLICIES = (PLAIN, STRUCTURED_DERIVED, STRUCTURED_EXPLICIT)
+# Measurement-only variants: the base policy's flags UNIONED with the
+# wrong-binding check. They price "what would wiring the binding validator in
+# cost and catch" on any saved run, without touching the publication path.
+PLAIN_BINDING = "plain_binding"
+STRUCTURED_DERIVED_BINDING = "structured_derived_binding"
+POLICIES = (PLAIN, STRUCTURED_DERIVED, STRUCTURED_EXPLICIT,
+            PLAIN_BINDING, STRUCTURED_DERIVED_BINDING)
 _SWEEP_SUFFIX = re.compile(r"_k\d+$")
 _MISSING_PAGE = "eksik_sayfa"
 
@@ -43,10 +50,24 @@ def _reply(row):
     }
 
 
+def _binding_flags(row, context):
+    claims = row.get("dayanak") or []
+    handles = [c.get("pasaj") for c in claims
+               if isinstance(c, dict) and isinstance(c.get("pasaj"), int)]
+    return list(check_binding(row.get("soru") or "", row.get("cevap") or "",
+                              context, handles or None))
+
+
 def replay_flags(row, context, policy):
     """Flags under one policy, independent of what the run saved."""
     if policy == PLAIN:
         return list(check(row.get("cevap") or "", context))
+    if policy == PLAIN_BINDING:
+        return (list(check(row.get("cevap") or "", context))
+                + _binding_flags(row, context))
+    if policy == STRUCTURED_DERIVED_BINDING:
+        return (list(check_structured(_reply(row), context))
+                + _binding_flags(row, context))
     if policy not in {STRUCTURED_DERIVED, STRUCTURED_EXPLICIT}:
         raise ValueError(f"unknown guard policy: {policy}")
 
