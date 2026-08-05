@@ -22,6 +22,7 @@ The persisted report carries counts and fingerprints only.
 """
 
 import argparse
+import hashlib
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -53,8 +54,10 @@ from eval.answer.adversarial_feasibility import (
 )
 from eval.answer.guard_ledger import (
     PLAIN,
+    PLAIN_BINDING,
     POLICIES,
     STRUCTURED_DERIVED,
+    STRUCTURED_DERIVED_BINDING,
     STRUCTURED_EXPLICIT,
     replay_flags,
 )
@@ -62,6 +65,29 @@ from eval.answer.judge import accepts_without_similarity
 from eval.retrieval.rag_eval import contains_key
 from pipeline.lang.tr_notation import fold, normalize, numbers
 from pipeline.retrieval.context import RagContext
+
+# Segmentation is duplicated here rather than imported from the binding
+# validator ON PURPOSE. The harness MEASURES that validator; sharing the
+# helper would make subject and instrument move together, so a segmentation
+# bug would hide itself in both. Same reasoning as the duplicated label
+# frame -- the two copies are allowed to drift.
+#
+# Drift in IMPLEMENTATION, not in the shapes handled: when the validator
+# learned that lower-cased passages and single-letter abbreviations exist,
+# this copy still demanded an uppercase start -- so a lower-cased passage
+# never split, every figure landed in the key's "own record", and a valid
+# sibling produced no mutant. An instrument blind to a shape the subject
+# handles under-measures exactly there. No uppercase requirement; a dot
+# closing a single letter ("A.S.") is an abbreviation, not a boundary.
+_MUT_SEGMENT_BOUNDARY = re.compile(
+    r"(?<!\b[A-Za-zÇĞİÖŞÜçğıöşü])[.;!?]\s+|\n+")
+
+
+def _segments(text: str):
+    for piece in _MUT_SEGMENT_BOUNDARY.split(text):
+        piece = piece.strip()
+        if piece:
+            yield piece
 
 PROTOCOL_VERSION = "adversarial_dev_mutation_v1"
 
@@ -156,10 +182,30 @@ def _label_frame(text: str, index: int) -> str:
 
 
 def _framed_tokens(text: str):
-    """Every raw figure token with its span and label frame."""
+    """Every raw figure token with its label frame.
+
+    Single-digit tokens are excluded, always. In this corpus they are
+    footnote markers ("(birim) 1 = ..."), and one such marker sharing the
+    key's label frame became a "sibling value" -- a mutant whose figure
+    appears in every segment, which can neither be caught nor adjudicated.
+
+    A KNOWN POPULATION LIMIT follows and is stated rather than papered over:
+    a question whose own answer is a bare single digit yields no wrong_row
+    mutant, because its genuine siblings are single digits too. Two attempts
+    to admit that shape safely both failed -- the marker was readmitted
+    outright, then a rule about how much prose follows the token was walked
+    through by putting the marker at the end of a record. There is no local
+    signal separating "value 2" from "footnote 2": the document says the
+    same thing in both cases, and only the notes elsewhere disambiguate. An
+    instrument that cannot tell must not manufacture the subject; losing a
+    shape is a gap we can name, admitting markers is a contaminant we cannot
+    see. On the development split this costs nothing measurable -- one case
+    has a single-digit key and it produced no mutant either way."""
     for match in _RAW_FIGURE.finditer(text):
         token = match.group()
         if token.count(".") + token.count(",") + token.count("/") > 1:
+            continue
+        if len(re.sub(r"\D", "", token)) < 2:
             continue
         forms = frozenset(numbers(token))
         if forms:
@@ -283,10 +329,20 @@ def mutate_wrong_row(case: BaseCase, peers) -> Mutant | None:
         )
         if len(key_frame.split()) < 2:
             continue
+        # Figures inside the key's OWN record are not sibling values: a
+        # repeated column-header year shares the key's frame once digits are
+        # stripped, and one such year became the "sibling" -- producing a
+        # mutant answer of "%2024" that no check could meaningfully judge.
+        key_record_forms = frozenset().union(frozenset(), *(
+            frozenset(numbers(normalize(segment)))
+            for segment in _segments(passage.text)
+            if frozenset(numbers(normalize(segment))) & key_forms
+        ))
         for token, forms, frame in _framed_tokens(passage.text):
             # a SIBLING record: same label, different value. Any other nearby
             # number is not a row relation and must not count as one.
-            if forms.isdisjoint(key_forms) and frame == key_frame:
+            if (forms.isdisjoint(key_record_forms)
+                    and forms.isdisjoint(key_forms) and frame == key_frame):
                 return Mutant(
                     case.stable_id, WRONG_ROW,
                     _replace(case.answer, start, end, token),
@@ -446,6 +502,29 @@ MUTATORS = {
 }
 
 
+def _single_digit_key(case: BaseCase) -> bool:
+    forms = numbers(normalize(case.key))
+    return bool(forms) and all(
+        abs(value) < 10 and float(value).is_integer() for value in forms)
+
+
+def population_exclusions(dev_cases) -> dict:
+    """Cases a class refuses BY POLICY, counted out loud.
+
+    In a report that only counts produced mutants, "excluded by rule" and
+    "found nothing to mutate" read identically -- a silent denominator
+    change, the same failure shape as the silent zero the binding policies
+    once scored. Every declared population gap must appear here, and the
+    frozen contract's class definition must carry the same exclusion before
+    any locked run is scored against it."""
+    return {
+        WRONG_ROW: {
+            "single_digit_key": sum(
+                1 for case in dev_cases if _single_digit_key(case)),
+        },
+    }
+
+
 def development_cases(cases) -> tuple:
     """Filter by RECOMPUTED identity and refuse records that lie about it."""
     kept = []
@@ -458,8 +537,11 @@ def development_cases(cases) -> tuple:
     return tuple(kept)
 
 
-def _row(answer: str, evidence) -> dict:
-    return {"cevap": answer, "dayanak": list(evidence)}
+def _row(answer: str, evidence, question: str = "") -> dict:
+    # The question travels with the row: policies that check BINDING need it,
+    # and a row without it silently scores zero for them -- which is exactly
+    # what an early version of this reported.
+    return {"soru": question, "cevap": answer, "dayanak": list(evidence)}
 
 
 def build_mutants(dev_cases) -> dict:
@@ -495,10 +577,12 @@ def replay(produced) -> dict:
             flags_seen = Counter()
             for case, mutant in pairs:
                 mutant_flags = replay_flags(
-                    _row(mutant.answer, mutant.evidence), mutant.context, policy)
+                    _row(mutant.answer, mutant.evidence, case.question),
+                    mutant.context, policy)
                 control_flags = replay_flags(
                     _row(case.answer, _claims_as_rows(
-                        (c.handle, c.quote) for c in case.evidence)),
+                        (c.handle, c.quote) for c in case.evidence),
+                        case.question),
                     case.context, policy)
                 codes = {code for code, _ in mutant_flags}
                 counts["n"] += 1
@@ -527,6 +611,117 @@ def replay(produced) -> dict:
     return report
 
 
+# Anchored through __file__, never the working directory: metadata that goes
+# null because the caller stood in the wrong directory is a silent zero, the
+# exact failure shape this project already paid for once.
+_CONTRACT_DIR = Path(__file__).resolve().parents[2] / "contracts" / "rag"
+
+
+def _declared_protocol(body: bytes):
+    """The file's single Protocol declaration, or None if it makes none.
+
+    Returning the FIRST match left a gap the cross-file check could not
+    see: a file carrying two Protocol lines silently resolved to whichever
+    came first, with the chain still reported complete. Ambiguity refuses
+    identically wherever it lives -- between files or inside one.
+
+    Leading whitespace and a BOM are stripped BEFORE the match, because
+    each hid a declaration from the count: an indented second line was
+    invisible, and a BOM hid the FIRST line so the second silently won --
+    the worse direction. The cost is that an indented example in a code
+    block now counts as a declaration and trips the refusal; refusing an
+    example is safer than silently electing a wrong version, and the
+    owner's fix is to reword the example."""
+    declared = []
+    for line in body.decode("utf-8", errors="ignore").splitlines():
+        candidate = line.lstrip("\ufeff \t")
+        if candidate.lower().startswith("protocol:"):
+            declared.append(candidate.split(":", 1)[1].strip(" `"))
+    if len(declared) > 1:
+        raise ValueError(
+            "ayni dosyada birden fazla Protocol satiri; bildirim belirsiz")
+    return declared[0] if declared else None
+
+
+def contract_metadata(directory: Path = _CONTRACT_DIR) -> dict:
+    """SHA-bind the frozen contract text into every report, FAIL-CLOSED.
+
+    The contract lives outside version control by publication policy, so a
+    report must say WHICH text governed the run: the protocol line, the
+    contract file's hash, and the name, hash and declared protocol of every
+    addendum beside it. ``effective_protocol_version`` is the one field a
+    scorer reads, and precisely because of that it is only ever set on top
+    of a complete chain:
+
+      * no base contract, or a base without a Protocol line, means NO
+        effective version -- an addendum standing alone must not be able to
+        dress a run in a version whose governing text was never hashed;
+      * at most ONE addendum may declare a Protocol line. Two declarers
+        raise instead of electing a winner, because filename order is not
+        version order ("v2.10" sorts before "v2.2") and a silently chosen
+        wrong contract is the worst outcome a metadata field can produce;
+      * an addendum that declares no Protocol line changes the effective
+        version NOT AT ALL -- the owner's cue to declare one, not this
+        module's cue to guess.
+
+    ``contract_complete`` says the chain held end to end; a LOCKED run must
+    require it True rather than null-checking individual fields. This
+    module never writes to contracts/: the contract has an owner, and it is
+    not the implementer."""
+    meta = {"contract_version": None, "contract_sha256": None,
+            "effective_protocol_version": None, "contract_complete": False,
+            "addenda": {}}
+    if not directory.is_dir():
+        return meta
+    contract = directory / "adversarial_contract.md"
+    if contract.exists():
+        body = contract.read_bytes()
+        meta["contract_sha256"] = hashlib.sha256(body).hexdigest()
+        meta["contract_version"] = _declared_protocol(body)
+    declared_by_addenda = []
+    for path in sorted(directory.glob("*.md")):
+        if path.name == contract.name:
+            continue
+        body = path.read_bytes()
+        declared = _declared_protocol(body)
+        meta["addenda"][path.name] = {
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "protocol": declared,
+        }
+        if declared:
+            declared_by_addenda.append(declared)
+    if len(declared_by_addenda) > 1:
+        raise ValueError(
+            "birden fazla addendum surum bildiriyor; sozlesme zinciri belirsiz")
+    if meta["contract_sha256"] and meta["contract_version"]:
+        meta["effective_protocol_version"] = (
+            declared_by_addenda[0] if declared_by_addenda
+            else meta["contract_version"])
+        meta["contract_complete"] = True
+    return meta
+
+
+def build_report(cases, source_metadata) -> dict:
+    """The whole report from loaded cases -- separated from main() so a test
+    can hold the assembled dict, contract metadata included, in its hand."""
+    dev = development_cases(cases)
+    produced = build_mutants(dev)
+    classes = replay(produced)
+    for name, reasons in population_exclusions(dev).items():
+        classes[name]["excluded_by_reason"] = reasons
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "contract": contract_metadata(),
+        "repository_head": repository_head(),
+        "evaluation_layer": "generator_guard",
+        "population": "development_clusters_only",
+        "development_cases": len(dev),
+        "locked_cases_excluded": len(cases) - len(dev),
+        "source": source_metadata,
+        "classes": classes,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("run_dir", nargs="?",
@@ -537,32 +732,36 @@ def main():
     args = parser.parse_args()
 
     cases, source_metadata = load_cases(Path(args.run_dir), Path(args.question_dir))
-    dev = development_cases(cases)
-    produced = build_mutants(dev)
-    report = {
-        "protocol_version": PROTOCOL_VERSION,
-        "repository_head": repository_head(),
-        "evaluation_layer": "generator_guard",
-        "population": "development_clusters_only",
-        "development_cases": len(dev),
-        "locked_cases_excluded": len(cases) - len(dev),
-        "source": source_metadata,
-        "classes": replay(produced),
-    }
+    report = build_report(cases, source_metadata)
     path = checked_output_path(Path(args.output))
     write_report(report, path)
 
-    print(f"development kumeleri: {len(dev)}  (locked haric: {len(cases) - len(dev)})")
+    contract = report["contract"]
+    print(f"sozlesme: {contract['effective_protocol_version'] or 'BULUNAMADI'}"
+          f"  (taban: {contract['contract_version'] or '-'})"
+          f"  sha={str(contract['contract_sha256'])[:16]}"
+          f"  ek={len(contract['addenda'])}"
+          f"  zincir={'tam' if contract['contract_complete'] else 'EKSIK'}")
+    print(f"development kumeleri: {report['development_cases']}"
+          f"  (locked haric: {report['locked_cases_excluded']})")
     print(f"{'sinif':<30}{'mutant':>7}   politika bazinda yakalanan/n")
     for name in CLASS_ORDER:
         body = report["classes"][name]
         cells = []
         for policy, result in body["policies"].items():
             counts = result["counts"]
-            cells.append(f"{policy.split('_')[-1]}:{counts.get('caught', 0)}"
+            # abbreviate distinctly: two policies used to both render as
+            # "binding", printing the same label twice with different numbers
+            short = {PLAIN: "A", STRUCTURED_DERIVED: "B",
+                     STRUCTURED_EXPLICIT: "C", PLAIN_BINDING: "A+bind",
+                     STRUCTURED_DERIVED_BINDING: "B+bind"}.get(policy, policy)
+            cells.append(f"{short}:{counts.get('caught', 0)}"
                          f"/{counts.get('n', 0)}")
         label = name + (" *" if body["population_role"] == CANDIDATE_ROLE else "")
-        print(f"{label:<30}{body['mutants']:>7}   {'  '.join(cells)}")
+        excluded = "".join(
+            f"  [haric: {reason} {count}]"
+            for reason, count in body.get("excluded_by_reason", {}).items())
+        print(f"{label:<30}{body['mutants']:>7}   {'  '.join(cells)}{excluded}")
     print(f"\nyazildi: {path}")
     print("NOT: bunlar DEVELOPMENT sayilari; kapi karari yeni holdout ister.")
     print("  *  ADAY populasyon: yapisal on-eleme gecti ama gercek kayit/etiket")

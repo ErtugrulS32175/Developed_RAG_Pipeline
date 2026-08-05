@@ -5,6 +5,7 @@ data/
 output/
 uploads/
 contracts/
+ROADMAP.md
 __pycache__/
 *.pyc
 paddle_env/

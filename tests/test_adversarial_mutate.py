@@ -24,6 +24,9 @@ from eval.answer.adversarial_mutate import (
     mutate_question_answer_mismatch,
     mutate_unsupported_figure,
     mutate_wrong_row,
+    population_exclusions,
+    build_report,
+    contract_metadata,
     replay,
     replay_flags,
 )
@@ -174,6 +177,274 @@ def test_wrong_row_refuses_numbers_without_a_row_relation():
                  passages=[Passage(1, 42, BARE, "kurgu-belge s.42")],
                  evidence=[(1, BARE)])
     assert mutate_wrong_row(case, ()) is None
+
+
+def test_wrong_row_refuses_a_footnote_marker_as_sibling_value():
+    """The diagnosed escape: '(birim) 1 = ...' footnote markers share the
+    key's label frame but are not record values. A mutant built from one has
+    a figure that appears in every segment -- uncatchable and unadjudicable."""
+    text = "Alfa Sirketi, Zeta Endeksi (birim) 1 = 47 000."
+    case = _case(DEV_ID,
+                 passages=[Passage(1, 42, text, "kurgu-belge s.42")],
+                 evidence=[(1, text)])
+    assert mutate_wrong_row(case, ()) is None
+
+
+def test_wrong_row_skips_figures_from_the_keys_own_record():
+    """The diagnosed escape: a column-header year repeated in every row
+    shares the key's label frame after digit-stripping, but it also sits in
+    the key's own record -- so it is not a sibling VALUE. The real sibling
+    value must be chosen instead."""
+    text = ("Alfa Sirketi, Zeta Endeksi 2024 = 47 000. "
+            "Beta Sirketi, Zeta Endeksi 2024 = 88 000.")
+    case = _case(DEV_ID,
+                 passages=[Passage(1, 42, text, "kurgu-belge s.42")],
+                 evidence=[(1, text)])
+    mutant = mutate_wrong_row(case, ())
+    assert mutant is not None
+    assert "88 000" in mutant.answer
+    assert "2024" not in mutant.answer.replace("Sayfa 42", "")
+
+
+def test_a_single_digit_key_is_a_declared_gap_not_a_silent_one():
+    """MUT-02 across three audit rounds, and the limit we settled on.
+
+    A single-digit answer has single-digit siblings, so admitting the shape
+    means admitting footnote markers with it. Two attempts to separate them
+    failed -- the marker was let in outright, then a rule about how much
+    prose follows the token was walked through by putting the marker at the
+    end of its record. The document writes "Zeta Sayisi 2" for a value and
+    for a reference alike; nothing local tells them apart. So the shape is
+    OUT of the population and the harness says so by producing nothing,
+    rather than producing something no one can adjudicate.
+
+    Both fixtures below are the shape: one with a clean sibling, one with a
+    marker. Neither yields a mutant, and that is the intended behaviour."""
+    clean = "Alfa Sirketi, Zeta Sayisi = 3. Beta Sirketi, Zeta Sayisi = 7."
+    marker = ("Alfa Sirketi, Zeta Sayisi = 3. "
+              "Gama Sirketi, Zeta Sayisi 2. "
+              "Beta Sirketi, Zeta Sayisi = 7.")
+    for text in (clean, marker):
+        case = _case(DEV_ID, key="3", answer="Sayfa 42'ye gore 3 adettir.",
+                     passages=[Passage(1, 42, text, "kurgu-belge s.42")],
+                     evidence=[(1, text)])
+        assert mutate_wrong_row(case, ()) is None
+
+
+def test_a_lower_case_passage_still_yields_a_sibling_mutant():
+    """Auditor finding MUT-R5-01: the mutator's segmenter demanded an
+    uppercase start after the boundary, so a lower-cased passage never
+    split -- every figure landed inside the key's "own record" and a valid
+    sibling produced no mutant. The validator had already learned this
+    shape; the instrument had not, and an instrument blind to a shape the
+    subject handles under-measures exactly there."""
+    text = ("alfa sirketi, zeta endeksi = 47 000. "
+            "beta sirketi, zeta endeksi = 88 000.")
+    case = _case(DEV_ID, key="47 000",
+                 answer="Sayfa 42'ye gore 47 000 birimdir.",
+                 passages=[Passage(1, 42, text, "kurgu-belge s.42")],
+                 evidence=[(1, text)])
+    mutant = mutate_wrong_row(case, ())
+    assert mutant is not None
+    assert "88 000" in mutant.answer
+
+
+def test_population_exclusions_count_the_declared_gap():
+    """Auditor finding MUT-R5-02: a policy exclusion that only shows up as
+    "produced nothing" is a silent denominator change. The report must say
+    how many cases each declared rule removed."""
+    text = "Alfa Sirketi, Zeta Sayisi = 3. Beta Sirketi, Zeta Sayisi = 7."
+    single = _case(DEV_ID, key="3", answer="Sayfa 42'ye gore 3 adettir.",
+                   passages=[Passage(1, 42, text, "kurgu-belge s.42")],
+                   evidence=[(1, text)])
+    multi = _case(DEV_ID, key="47 000",
+                  answer="Sayfa 42'ye gore 47 000 birimdir.",
+                  passages=[Passage(1, 42, SIRA, "kurgu-belge s.42")],
+                  evidence=[(1, SIRA)])
+    counts = population_exclusions((single, multi))
+    assert counts["wrong_row"] == {"single_digit_key": 1}
+
+
+def test_contract_metadata_reads_version_hash_and_addenda(tmp_path):
+    """Round-9 P2: the SHA linkage existed but nothing tested it. Pinned:
+    missing directory is all-null and incomplete; a base contract yields
+    its declared protocol, exact hash and a COMPLETE chain; an addendum
+    appears by name with its own hash and the effective version follows its
+    declaration, so a scorer reads one field instead of inferring a version
+    from a filename map."""
+    import hashlib
+
+    assert contract_metadata(tmp_path / "yok") == {
+        "contract_version": None, "contract_sha256": None,
+        "effective_protocol_version": None, "contract_complete": False,
+        "addenda": {}}
+
+    base = tmp_path / "adversarial_contract.md"
+    base.write_text("# Kurgu sozlesme\n\nProtocol: `kurgu_protokol_v9`\n",
+                    encoding="utf-8")
+    meta = contract_metadata(tmp_path)
+    assert meta["contract_version"] == "kurgu_protokol_v9"
+    assert meta["effective_protocol_version"] == "kurgu_protokol_v9"
+    assert meta["contract_sha256"] == hashlib.sha256(
+        base.read_bytes()).hexdigest()
+    assert meta["contract_complete"] is True
+    assert meta["addenda"] == {}
+
+    addendum = tmp_path / "adversarial_contract_ek.md"
+    addendum.write_text("Protocol: `kurgu_protokol_v9.1`\n", encoding="utf-8")
+    meta = contract_metadata(tmp_path)
+    assert meta["contract_version"] == "kurgu_protokol_v9"
+    assert meta["effective_protocol_version"] == "kurgu_protokol_v9.1"
+    assert meta["contract_complete"] is True
+    assert meta["addenda"] == {"adversarial_contract_ek.md": {
+        "sha256": hashlib.sha256(addendum.read_bytes()).hexdigest(),
+        "protocol": "kurgu_protokol_v9.1"}}
+
+    # an addendum that declares nothing changes the effective version not
+    # at all -- the owner's cue to declare, not this module's cue to guess
+    silent = tmp_path / "adversarial_contract_not.md"
+    silent.write_text("Sadece aciklama.\n", encoding="utf-8")
+    meta = contract_metadata(tmp_path)
+    assert meta["effective_protocol_version"] == "kurgu_protokol_v9.1"
+    assert meta["contract_complete"] is True
+    assert meta["addenda"]["adversarial_contract_not.md"]["protocol"] is None
+
+
+def test_contract_chain_fails_closed(tmp_path):
+    """Auditor finding, round 10: the chain was fail-open in two ways. An
+    addendum standing WITHOUT its base contract filled the effective
+    version while the hash stayed null -- a scorer reading only that field
+    would run a locked measurement bound to nothing. And two declaring
+    addenda elected a winner by filename sort, which is not version order
+    ("v2.10" sorts before "v2.2"). Now: no complete base means no effective
+    version at all, and two declarers raise instead of choosing."""
+    import pytest as _pytest
+
+    # addendum only, no base: recorded, but never effective
+    orphan = tmp_path / "adversarial_contract_ek.md"
+    orphan.write_text("Protocol: `kurgu_protokol_v9.1`\n", encoding="utf-8")
+    meta = contract_metadata(tmp_path)
+    assert meta["contract_sha256"] is None
+    assert meta["effective_protocol_version"] is None
+    assert meta["contract_complete"] is False
+    assert meta["addenda"]["adversarial_contract_ek.md"]["protocol"] == (
+        "kurgu_protokol_v9.1")
+
+    # base present but declaring no Protocol line: hashed, still incomplete
+    base = tmp_path / "adversarial_contract.md"
+    base.write_text("# Kurgu sozlesme, surum satiri yok\n", encoding="utf-8")
+    meta = contract_metadata(tmp_path)
+    assert meta["contract_sha256"] is not None
+    assert meta["contract_version"] is None
+    assert meta["effective_protocol_version"] is None
+    assert meta["contract_complete"] is False
+
+    # two declaring addenda: refuse, never silently pick
+    second = tmp_path / "adversarial_contract_iki.md"
+    second.write_text("Protocol: `kurgu_protokol_v9.2`\n", encoding="utf-8")
+    with _pytest.raises(ValueError):
+        contract_metadata(tmp_path)
+
+
+def test_two_protocol_lines_inside_one_file_are_refused(tmp_path):
+    """Auditor finding, round 11: the cross-file ambiguity check could not
+    see INSIDE a file -- two Protocol lines in one document silently
+    resolved to the first, chain still reported complete. Ambiguity must
+    refuse identically wherever it lives: a double-declaring base and a
+    double-declaring lone addendum both raise."""
+    import pytest as _pytest
+
+    base = tmp_path / "adversarial_contract.md"
+    base.write_text("Protocol: `kurgu_protokol_v9`\n"
+                    "Protocol: `kurgu_protokol_v8`\n", encoding="utf-8")
+    with _pytest.raises(ValueError):
+        contract_metadata(tmp_path)
+
+    base.write_text("Protocol: `kurgu_protokol_v9`\n", encoding="utf-8")
+    addendum = tmp_path / "adversarial_contract_ek.md"
+    addendum.write_text("Protocol: `kurgu_protokol_v9.1`\n"
+                        "Protocol: `kurgu_protokol_v9.2`\n", encoding="utf-8")
+    with _pytest.raises(ValueError):
+        contract_metadata(tmp_path)
+
+    # and the repaired addendum restores a complete chain
+    addendum.write_text("Protocol: `kurgu_protokol_v9.1`\n", encoding="utf-8")
+    meta = contract_metadata(tmp_path)
+    assert meta["contract_complete"] is True
+    assert meta["effective_protocol_version"] == "kurgu_protokol_v9.1"
+
+
+def test_whitespace_or_bom_cannot_hide_a_protocol_declaration(tmp_path):
+    """Auditor finding, round 12: the match required the line to START with
+    the keyword, so a second declaration behind a space or tab went
+    uncounted -- and a BOM hid the FIRST one, silently electing the second:
+    the worse direction, because the invisible byte chose the version. All
+    three now count and the ambiguity refuses. The declared cost: an
+    indented example inside a code block counts too, and refusing an
+    example beats electing a wrong version."""
+    import pytest as _pytest
+
+    base = tmp_path / "adversarial_contract.md"
+    for body in (
+        "Protocol: `kurgu_protokol_v9`\n Protocol: `kurgu_protokol_v8`\n",
+        "Protocol: `kurgu_protokol_v9`\n\tProtocol: `kurgu_protokol_v8`\n",
+        "\ufeffProtocol: `kurgu_protokol_v9`\nProtocol: `kurgu_protokol_v8`\n",
+    ):
+        base.write_text(body, encoding="utf-8")
+        with _pytest.raises(ValueError):
+            contract_metadata(tmp_path)
+
+    # a BOM on a file with ONE declaration is an encoding artefact, not an
+    # ambiguity: the declaration is seen and the chain completes
+    base.write_text("\ufeffProtocol: `kurgu_protokol_v9`\n", encoding="utf-8")
+    meta = contract_metadata(tmp_path)
+    assert meta["contract_version"] == "kurgu_protokol_v9"
+    assert meta["contract_complete"] is True
+
+
+def test_contract_metadata_ignores_the_working_directory(tmp_path, monkeypatch):
+    """Round-9 P2: the directory was a relative path, so calling from
+    anywhere but the repo root silently produced all-null metadata -- the
+    silent-zero shape again. Anchoring goes through __file__; the same
+    answer must come back from any working directory."""
+    at_root = contract_metadata()
+    monkeypatch.chdir(tmp_path)
+    assert contract_metadata() == at_root
+
+
+def test_the_report_carries_the_contract_metadata():
+    """The linkage the locked run will refuse to score without."""
+    report = build_report((), {})
+    assert report["contract"] == contract_metadata()
+    assert "effective_protocol_version" in report["contract"]
+
+
+def test_the_replayed_row_carries_the_question():
+    """Policies that check BINDING need the question; a row without it
+    scores zero for them silently -- which an early version reported as a
+    real 0/2 result."""
+    from eval.answer.adversarial_mutate import _row
+
+    row = _row("cevap", [], "kurgu soru?")
+    assert row["soru"] == "kurgu soru?"
+
+    report = replay(_small_population())
+    binding = report["wrong_row"]["policies"].get("plain_binding")
+    assert binding is not None
+    assert binding["counts"]["n"] > 0
+
+
+def test_the_harness_does_not_borrow_the_validators_segmenter():
+    """Auditor finding MUT-01: instrument and subject must be independent,
+    or a segmentation bug hides itself in both."""
+    import inspect
+
+    import eval.answer.adversarial_mutate as harness
+    from pipeline.validation.rag import binding_guard
+
+    assert harness._segments is not binding_guard._segments
+    source = inspect.getsource(harness)
+    assert "from pipeline.validation.rag.binding_guard import" not in source
 
 
 def test_label_value_swap_refuses_two_bare_numbers():
