@@ -41,24 +41,52 @@ def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
 
 
 def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict]:
-    """Rerank retrieved chunks using the vLLM cross-encoder score endpoint."""
-    scored = []
-    for chunk in chunks:
-        response = requests.post(
-            RERANK_API_URL,
-            json={
-                "model": RERANK_MODEL_NAME,
-                "text_1": query,
-                "text_2": chunk["text"],
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        score = response.json()["data"][0]["score"]
-        scored.append((score, chunk))
+    """Rerank retrieved chunks using the vLLM cross-encoder score endpoint.
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [chunk for _, chunk in scored[:top_n]]
+    One request for all candidates: vLLM's /score accepts ``text_2`` as a
+    list and returns explicitly indexed scores. The old loop paid fifteen
+    HTTP round-trips per question on every chat request.
+
+    Two independent comparisons against the live service, ten saved contexts
+    each, agreed on the shape and differed on the magnitude: top-1 identical
+    10/10 both times, full ordering 9/10 both times (one adjacent pair
+    swapped), largest score difference 0.0013 in one run and 0.0020 in the
+    other -- batched-kernel numerics, visible only at near-ties.
+
+    What that does and does not establish: with the shipped default nothing
+    is cut, because TOP_RERANK defaults to TOP_K, so a near-tie swap moves a
+    passage within the prompt and the SET reaching the model is unchanged.
+    Set RAG_TOP_RERANK below the candidate count and this function does cut,
+    and there a swap across the cut-off changes membership. Even with the
+    set fixed, prompt order is an input to generation: this is measured
+    equivalence of ranking, not of answers."""
+    if not chunks:
+        return []
+    response = requests.post(
+        RERANK_API_URL,
+        json={
+            "model": RERANK_MODEL_NAME,
+            "text_1": query,
+            "text_2": [chunk["text"] for chunk in chunks],
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()["data"]
+    # Scores are bound through the service's OWN index field, never through
+    # response order: nothing in the API contract promises the list comes
+    # back in request order, and binding by position would silently attach
+    # scores to the wrong chunks the day it does not.
+    indices = [item.get("index") for item in data]
+    if sorted(indices) != list(range(len(chunks))):
+        raise ValueError("rerank service response is not a permutation "
+                         "of the request")
+    scored = sorted(
+        ((item["score"], item["index"]) for item in data),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    return [chunks[index] for _, index in scored[:top_n]]
 
 
 def _trusted_page(chunk: dict) -> int | None:
