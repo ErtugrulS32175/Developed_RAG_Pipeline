@@ -28,6 +28,57 @@ def get_conn() -> psycopg.Connection:
     return conn
 
 
+_pool = None
+
+
+def _configure_pooled(conn) -> None:
+    # register_vector queries pg_type, which opens a transaction; the pool
+    # expects a configure hook to hand the connection back idle.
+    register_vector(conn)
+    conn.commit()
+
+
+def get_pool():
+    """Lazy process-wide connection pool for request-scoped work.
+
+    The API used to cache ONE module-level connection. psycopg serialises
+    concurrent statements on it, nothing ever called rollback(), and a single
+    failed statement left the connection in a failed transaction -- every later
+    request then died with InFailedSqlTransaction until the process restarted.
+    A server-side kill (idle timeout, restart) had the same permanent effect.
+
+    The pool closes all four holes at once: each request borrows its own
+    connection, `check=` revalidates it on checkout so a dead one is replaced
+    instead of served, and the pool's context manager commits on clean exit and
+    rolls back on exception. min_size=0 keeps import and startup free of any
+    database dependency -- nothing connects until the first checkout.
+    """
+    global _pool
+    if _pool is None:
+        from psycopg_pool import ConnectionPool
+        _pool = ConnectionPool(
+            PG_DSN,
+            min_size=0,
+            max_size=int(os.getenv("PG_POOL_MAX", "4")),
+            configure=_configure_pooled,
+            check=ConnectionPool.check_connection,
+        )
+    return _pool
+
+
+def close_pool() -> None:
+    """Close the pool explicitly on controlled shutdown.
+
+    The OS reclaims sockets when the process dies, but a reload or a test
+    process that never exits keeps the pool's worker thread and any idle
+    connections alive; closing makes shutdown deterministic. Safe to call
+    when no pool was ever created."""
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+
 def init_schema(conn) -> None:
     sql = Path(__file__).parent.joinpath("schema.sql").read_text()
     with conn.cursor() as cur:

@@ -7,9 +7,17 @@ guard and public response projection remain real.
 Every filename, passage and figure below is invented.
 """
 import json
+from contextlib import contextmanager
 
 import pytest
 from fastapi.testclient import TestClient
+
+
+@contextmanager
+def _fake_db_conn():
+    """Stands in for the pooled per-request connection; the db helpers are
+    monkeypatched, so the connection object itself is never touched."""
+    yield object()
 
 from pipeline.validation.rag.answer_guard import ANSWERED, REVIEW_REQUIRED
 
@@ -170,7 +178,7 @@ def _document_api(monkeypatch, tmp_path, *, ingest_status="done",
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
     monkeypatch.setattr(api, "UPLOAD_DIR", upload_dir)
-    monkeypatch.setattr(api, "get_conn", lambda: object())
+    monkeypatch.setattr(api, "db_conn", _fake_db_conn)
 
     document_id = "kurgu-belge-kimligi"
     state = {}
@@ -416,7 +424,7 @@ def test_unhandled_dependency_error_never_copies_its_message_to_logs(
     from pipeline.api import app as api
 
     private = "OZEL_KURGU_BAGLANTI_AYRINTISI"
-    monkeypatch.setattr(api, "get_conn", lambda: object())
+    monkeypatch.setattr(api, "db_conn", _fake_db_conn)
 
     def fail(_conn, _document_id):
         raise RuntimeError(private)

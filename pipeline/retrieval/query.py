@@ -25,25 +25,19 @@ TOP_K      = int(os.getenv("RAG_TOP_K", "15"))
 # shrink the context again.
 TOP_RERANK = int(os.getenv("RAG_TOP_RERANK", str(TOP_K)))
 
-# --- Init ---
-_conn = None
-
-
-def get_conn():
-    """Connect on first use rather than at import, so importing this module (for
-    build_context, for a test, for anything that isn't a query) doesn't require a
-    running database."""
-    global _conn
-    if _conn is None:
-        _conn = db.get_conn()
-    return _conn
-
-
 def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
-    """Hybrid search in Postgres (pgvector) combining dense and sparse vectors via RRF."""
+    """Hybrid search in Postgres (pgvector) combining dense and sparse vectors via RRF.
+
+    Borrows a pooled connection per query instead of caching one at module
+    level: the cached connection had no rollback and no reconnect, so a single
+    failed statement (or a server-side kill) took down every later chat request
+    until the process restarted. The pool revalidates on checkout and nothing
+    connects until the first query, so importing this module still needs no
+    database."""
     dense_vector = embed_dense(query)
     sparse_indices, sparse_values = embed_sparse(query)
-    return db.hybrid_search(get_conn(), dense_vector, sparse_indices, sparse_values, top_k=top_k)
+    with db.get_pool().connection() as conn:
+        return db.hybrid_search(conn, dense_vector, sparse_indices, sparse_values, top_k=top_k)
 
 
 def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict]:

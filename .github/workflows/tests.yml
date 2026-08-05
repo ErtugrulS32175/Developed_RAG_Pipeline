@@ -35,7 +35,7 @@ jobs:
         # the default wheels drag in several GB of CUDA libraries.
         run: |
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
-          pip install docling docling-core transformers 'psycopg[binary]' pgvector fastembed python-dotenv requests openpyxl fastapi uvicorn python-multipart
+          pip install docling docling-core transformers 'psycopg[binary,pool]' pgvector fastembed python-dotenv requests openpyxl fastapi uvicorn python-multipart
           pip install pytest httpx
       - name: Run tests
         run: python -m pytest tests/ -q

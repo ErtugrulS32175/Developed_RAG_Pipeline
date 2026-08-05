@@ -5,6 +5,7 @@ import secrets
 import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Union
 
@@ -30,6 +31,10 @@ load_dotenv()
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./data/uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# Cap chosen from the data this system actually ingests: the largest source
+# document seen so far is ~30MB, so 50MB passes everything legitimate while an
+# unbounded read no longer lets one request hold the whole file in memory.
+UPLOAD_MAX_BYTES = int(os.getenv("UPLOAD_MAX_BYTES", str(50 * 1024 * 1024)))
 
 # Two OpenAI-style model ids OpenWebUI shows in its selector. The RAG one keeps
 # the existing text pipeline; the table one runs the image->consensus->table flow.
@@ -70,7 +75,19 @@ log = logging.getLogger("ragtest.api")
 # is reachable by someone else, and there is no reason to publish its surface to
 # a caller who cannot use any of it.
 _DOCS_OPEN = not os.getenv("API_KEY", "").strip()
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    # Nothing to do on startup: the pool is created lazily on first checkout.
+    # Closing it explicitly makes reloads and test processes deterministic
+    # instead of leaving idle connections to the OS.
+    yield
+    db.close_pool()
+
+
 app = FastAPI(
+    lifespan=_lifespan,
     docs_url="/docs" if _DOCS_OPEN else None,
     redoc_url="/redoc" if _DOCS_OPEN else None,
     openapi_url="/openapi.json" if _DOCS_OPEN else None,
@@ -113,17 +130,24 @@ async def log_requests(request, call_next):
     return response
 
 
-_conn = None
+_schema_ready = False
 
 
-def get_conn():
-    """Connect on first use rather than at import, so this module can be
-    imported (by a test, by tooling) without a running database."""
-    global _conn
-    if _conn is None:
-        _conn = db.get_conn()
-        db.init_schema(_conn)
-    return _conn
+@contextmanager
+def db_conn():
+    """One pooled connection per request, connected on first use rather than at
+    import so this module stays importable without a running database.
+
+    The pool's context manager commits on clean exit and rolls back on
+    exception, and checkout revalidates the connection -- so one failed
+    statement can no longer poison every request that follows, which is
+    exactly what the previous single cached module-level connection did."""
+    global _schema_ready
+    with db.get_pool().connection() as conn:
+        if not _schema_ready:
+            db.init_schema(conn)
+            _schema_ready = True
+        yield conn
 
 
 # Shared-secret auth. Enforced when API_KEY is set; when it is not, the API is
@@ -350,10 +374,15 @@ def _safe_upload_filename(filename):
     return portable
 
 
-def _set_document_error(conn, document_id):
-    """Best-effort terminal status update without masking the primary failure."""
+def _set_document_error(document_id):
+    """Best-effort terminal status update without masking the primary failure.
+
+    Borrows its own pooled connection: the primary failure may have poisoned
+    the transaction this request was using, and this write must not depend on
+    that transaction still being usable."""
     try:
-        db.set_document_status(conn, document_id, "error")
+        with db_conn() as conn:
+            db.set_document_status(conn, document_id, "error")
     except Exception as status_error:
         _log_safe_failure(
             status_error,
@@ -380,15 +409,27 @@ def download_export(name: str):
 @app.post("/documents/upload", dependencies=AUTH)
 async def upload_document(file: UploadFile = File(...)):
     filename = _safe_upload_filename(file.filename)
+    # Read in chunks against the cap BEFORE anything touches disk or the
+    # database, so an oversized upload leaves no partial file and no row.
+    pieces, size = [], 0
+    while True:
+        piece = await file.read(1024 * 1024)
+        if not piece:
+            break
+        size += len(piece)
+        if size > UPLOAD_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="dosya cok buyuk")
+        pieces.append(piece)
     dest = UPLOAD_DIR / filename
-    dest.write_bytes(await file.read())
+    dest.write_bytes(b"".join(pieces))
     file_type = dest.suffix.lower().lstrip(".")
-    document_id = db.upsert_document(
-        get_conn(),
-        filename,
-        file_type,
-        status="pending",
-    )
+    with db_conn() as conn:
+        document_id = db.upsert_document(
+            conn,
+            filename,
+            file_type,
+            status="pending",
+        )
     return {
         "document_id": document_id,
         "filename": filename,
@@ -398,15 +439,18 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.post("/documents/{document_id}/process", dependencies=AUTH)
 def process_document(document_id: str):
-    conn = get_conn()
-    doc = db.get_document(conn, document_id)
+    # Three SHORT borrows instead of one connection held across the whole
+    # request: ingest can run for minutes on its own connection, and a pooled
+    # connection parked here for that long would starve every other request.
+    with db_conn() as conn:
+        doc = db.get_document(conn, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
 
     try:
         filename = _safe_upload_filename(doc["filename"])
     except HTTPException:
-        _set_document_error(conn, document_id)
+        _set_document_error(document_id)
         log.error(json.dumps({
             "olay": "gecersiz_kayitli_dosya_adi",
             "hata": "InvalidFilename",
@@ -418,15 +462,17 @@ def process_document(document_id: str):
 
     path = UPLOAD_DIR / filename
     if not path.exists():
-        _set_document_error(conn, document_id)
+        _set_document_error(document_id)
         raise HTTPException(status_code=404, detail="uploaded file missing")
 
     try:
-        db.set_document_status(conn, document_id, "processing")
+        with db_conn() as conn:
+            db.set_document_status(conn, document_id, "processing")
         ingest.main(str(path))
-        processed = db.get_document(conn, document_id)
+        with db_conn() as conn:
+            processed = db.get_document(conn, document_id)
     except Exception as e:
-        _set_document_error(conn, document_id)
+        _set_document_error(document_id)
         _log_safe_failure(e, "belge_isleme_hatasi")
         raise HTTPException(
             status_code=500,
@@ -434,7 +480,7 @@ def process_document(document_id: str):
         )
 
     if processed is None or processed.get("status") != "done":
-        _set_document_error(conn, document_id)
+        _set_document_error(document_id)
         log.error(json.dumps({
             "olay": "belge_tamamlanmadan_dondu",
             "hata": "IncompleteIngest",
@@ -449,7 +495,8 @@ def process_document(document_id: str):
 
 @app.get("/documents/{document_id}", dependencies=AUTH)
 def read_document(document_id: str):
-    doc = db.get_document(get_conn(), document_id)
+    with db_conn() as conn:
+        doc = db.get_document(conn, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
     return doc
@@ -492,7 +539,7 @@ def ready(response: Response):
     from pipeline.index import embeddings
 
     def check_db():
-        with get_conn().cursor() as cur:
+        with db_conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT 1")
 
     def check_embed():

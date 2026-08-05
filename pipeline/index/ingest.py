@@ -293,73 +293,79 @@ def main(path):
     print(f"[INGEST] Toplam {len(all_chunks)} chunk"
           + (f" ({folded} kirinti komsusuna katildi)" if folded else ""))
 
+    # The connection's whole life sits inside one try/finally: an exception in
+    # schema init, in the metadata reads, or in the finalisation below used to
+    # leak it just as surely as one in the embed loop.
     conn = db.get_conn()
-    db.init_schema(conn)
-    document_id = db.upsert_document(conn, filename, Path(path).suffix.lower().lstrip("."))
-    print(f"[INGEST] Belge: {filename} ({document_id})")
-
-    # Chunks already stored from an earlier, interrupted run. Their ids are
-    # derived from the content, so anything unchanged is skipped rather than
-    # embedded a second time -- the embedding call is the expensive part.
-    already = db.existing_chunk_ids(conn, document_id)
-    if already:
-        # how many of these get reused is not known yet: an id changes whenever
-        # the text does, so a re-chunked document matches none of them
-        print(f"[INGEST] bu belgeden {len(already)} chunk zaten var, "
-              f"degismeyenler tekrar gomulmeyecek")
-
     try:
-        batch, written_ids, skipped = [], set(), 0
-        for i, c in enumerate(all_chunks):
-            if not c["text"].strip():
-                continue
-            chunk_id = _chunk_id(document_id, c, i)
-            written_ids.add(chunk_id)
-            if chunk_id in already:
-                skipped += 1
-                continue
-            sparse_indices, sparse_values = _retry(lambda: embed_sparse(c["text"]))
-            batch.append({
-                "id": chunk_id,
-                "document_id": document_id,
-                "type": c["type"],
-                "text": c["text"],
-                "source_tag": c["source_tag"],
-                "page": c["page"],
-                "headings": c["headings"],
-                "table_data": c.get("table_data"),
-                "dense": _retry(lambda: embed_dense(c["text"])),
-                "sparse": db.sparse_to_literal(sparse_indices, sparse_values),
-            })
-            if len(batch) >= 32:
+        db.init_schema(conn)
+        document_id = db.upsert_document(conn, filename, Path(path).suffix.lower().lstrip("."))
+        print(f"[INGEST] Belge: {filename} ({document_id})")
+
+        # Chunks already stored from an earlier, interrupted run. Their ids are
+        # derived from the content, so anything unchanged is skipped rather than
+        # embedded a second time -- the embedding call is the expensive part.
+        already = db.existing_chunk_ids(conn, document_id)
+        if already:
+            # how many of these get reused is not known yet: an id changes whenever
+            # the text does, so a re-chunked document matches none of them
+            print(f"[INGEST] bu belgeden {len(already)} chunk zaten var, "
+                  f"degismeyenler tekrar gomulmeyecek")
+
+        try:
+            batch, written_ids, skipped = [], set(), 0
+            for i, c in enumerate(all_chunks):
+                if not c["text"].strip():
+                    continue
+                chunk_id = _chunk_id(document_id, c, i)
+                written_ids.add(chunk_id)
+                if chunk_id in already:
+                    skipped += 1
+                    continue
+                sparse_indices, sparse_values = _retry(lambda: embed_sparse(c["text"]))
+                batch.append({
+                    "id": chunk_id,
+                    "document_id": document_id,
+                    "type": c["type"],
+                    "text": c["text"],
+                    "source_tag": c["source_tag"],
+                    "page": c["page"],
+                    "headings": c["headings"],
+                    "table_data": c.get("table_data"),
+                    "dense": _retry(lambda: embed_dense(c["text"])),
+                    "sparse": db.sparse_to_literal(sparse_indices, sparse_values),
+                })
+                if len(batch) >= 32:
+                    db.upsert_chunks(conn, batch)
+                    batch = []
+                    print(f"  {i+1}/{len(all_chunks)} yazildi...")
+            if batch:
                 db.upsert_chunks(conn, batch)
-                batch = []
-                print(f"  {i+1}/{len(all_chunks)} yazildi...")
-        if batch:
-            db.upsert_chunks(conn, batch)
-    except Exception:
-        db.set_document_status(conn, document_id, "error")
-        # what has been written stays: ids are content-derived, so re-running
-        # this command picks up from here instead of starting over
-        print(f"[INGEST] HATA -- yazilanlar korundu, ayni komutu tekrar "
-              f"calistirarak kaldigi yerden devam edebilirsin")
-        raise
+        except Exception:
+            db.set_document_status(conn, document_id, "error")
+            # what has been written stays: ids are content-derived, so re-running
+            # this command picks up from here instead of starting over
+            print(f"[INGEST] HATA -- yazilanlar korundu, ayni komutu tekrar "
+                  f"calistirarak kaldigi yerden devam edebilirsin")
+            raise
 
-    # only now that everything is stored: drop rows from an older version of
-    # this file that the current run did not produce
-    stale = db.delete_stale_chunks(conn, document_id, written_ids)
-    db.set_document_status(conn, document_id, "done")
+        # only now that everything is stored: drop rows from an older version of
+        # this file that the current run did not produce
+        stale = db.delete_stale_chunks(conn, document_id, written_ids)
+        db.set_document_status(conn, document_id, "done")
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM chunks WHERE document_id = %s", (document_id,))
-        count = cur.fetchone()[0]
-    extra = []
-    if skipped:
-        extra.append(f"{skipped} atlandi")
-    if stale:
-        extra.append(f"{stale} eskimis chunk silindi")
-    suffix = f" ({', '.join(extra)})" if extra else ""
-    print(f"\n[INGEST] Tamamlandi. Bu belge icin vektor sayisi: {count}{suffix}")
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM chunks WHERE document_id = %s", (document_id,))
+            count = cur.fetchone()[0]
+        extra = []
+        if skipped:
+            extra.append(f"{skipped} atlandi")
+        if stale:
+            extra.append(f"{stale} eskimis chunk silindi")
+        suffix = f" ({', '.join(extra)})" if extra else ""
+        print(f"\n[INGEST] Tamamlandi. Bu belge icin vektor sayisi: {count}{suffix}")
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "./data/sample.pdf"
