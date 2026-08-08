@@ -50,3 +50,14 @@ def test_directories_holding_document_content_are_not_visible_to_git():
 
     assert exposed == [], (
         "belge iceren dizin git tarafindan goruluyor: " + ", ".join(exposed))
+
+
+# THE DATA-TREE GUARD LIVES IN conftest.py, not here, and it no longer
+# works by recognising the suite's own byte literals. That version called
+# byte equality proof of test origin -- which it is not, since a
+# legitimate short file can carry the same bytes -- and it printed the
+# matching content and the plain path in its failure message, against
+# this project's rule that a report may carry counts, masked paths and
+# opaque ids and nothing else. A before/after inventory of the session
+# proves what the equality check only guessed, and proves it without
+# reading anything back out.
