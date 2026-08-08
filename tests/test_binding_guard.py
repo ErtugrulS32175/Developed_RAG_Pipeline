@@ -111,14 +111,14 @@ def test_alias_defined_outside_the_cited_scope_still_counts():
 
 def test_a_question_qualifier_is_cleared_by_the_sibling_rule_not_by_exemption():
     """A year the question states is not blamed -- but nothing special-cases
-    it. "2024" carries no label a best-matching segment offers a different
+    it. "1907" carries no label a best-matching segment offers a different
     value under, so the sibling precondition clears it on its own. The
     special case that used to do this job is gone; it was an attack surface
     (see the planted-figure test) and measurement showed it bought nothing."""
     text = ("Alfa Sirketi, Zeta Endeksi = 47 000. "
-            "Beta Sirketi 2024, Zeta Endeksi = 88 000.")
-    flags = check_binding("2024'te Alfa Sirketi'nin Zeta Endeksi kacti?",
-                          "2024 itibariyla 88 000 birim.", _ctx(text))
+            "Beta Sirketi 1907, Zeta Endeksi = 88 000.")
+    flags = check_binding("1907'te Alfa Sirketi'nin Zeta Endeksi kacti?",
+                          "1907 itibariyla 88 000 birim.", _ctx(text))
     assert [code for code, _ in flags] == [WRONG_BINDING]
     assert flags[0][1] == ("88 000",)
 
@@ -152,10 +152,10 @@ def test_a_figure_planted_in_the_question_cannot_silence_the_check():
     assert [code for code, _ in flags] == [WRONG_BINDING]
     assert flags[0][1] == ("88 000",)
     # a qualifier stated in both records is still not blamed
-    text = ("Alfa Sirketi 2024, Zeta Endeksi = 47 000. "
-            "Beta Sirketi 2024, Zeta Endeksi = 88 000.")
-    flags = check_binding("2024'te Alfa Sirketi'nin Zeta Endeksi neydi?",
-                          "2024 yilinda 88 000 birim.", _ctx(text))
+    text = ("Alfa Sirketi 1907, Zeta Endeksi = 47 000. "
+            "Beta Sirketi 1907, Zeta Endeksi = 88 000.")
+    flags = check_binding("1907'te Alfa Sirketi'nin Zeta Endeksi neydi?",
+                          "1907 yilinda 88 000 birim.", _ctx(text))
     assert flags[0][1] == ("88 000",)
 
 
@@ -266,7 +266,7 @@ def test_a_figure_bearing_header_is_a_known_false_annotation_limit():
     those guesses end. If this behaviour ever changes, this test failing is
     the announcement that the limit moved."""
     question = "Omega Kurumu Zeta Endeksi nedir?"
-    year_header = ("Omega Kurumu 2024 Ozeti\n"
+    year_header = ("Omega Kurumu 1907 Ozeti\n"
                    "Zeta Endeksi 47 000\n"
                    "Beta Kurumu Zeta Endeksi 88 000")
     numbered_header = ("Omega Kurumu\nCizelge 7\n"
@@ -370,12 +370,12 @@ def test_an_alias_phrase_must_sit_inside_one_segment():
 
 
 def test_a_year_in_the_label_keeps_two_columns_apart():
-    """Auditor finding BG-03: the frame deleted digits, so "Endeks 2023"
-    and "Endeks 2024" became one label and a value from the other year
+    """Auditor finding BG-03: the frame deleted digits, so "Endeks 1903"
+    and "Endeks 1907" became one label and a value from the other year
     counted as a sibling -- flagging a correct answer."""
-    text = ("Endeks 2023 47 000. "
-            "Omega Kurumu Endeks 2024 88 000.")
-    assert check_binding("Omega Kurumu 2023 Endeksi nedir?",
+    text = ("Endeks 1903 47 000. "
+            "Omega Kurumu Endeks 1907 88 000.")
+    assert check_binding("Omega Kurumu 1903 Endeksi nedir?",
                          "Cevap 47 000 birimdir.", _ctx(text)) == []
 
 

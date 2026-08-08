@@ -48,7 +48,7 @@ async def extract_table(file: UploadFile = File(...)):
     proc, model = _load()
     # The chat template expects a system turn; the official client sends an empty
     # one. Omitting it builds a malformed prompt -> scrambled output (Tencent's
-    # 2025-11-28 "system prompt config" fix). Sampling stays greedy per the recipe.
+    # "system prompt config" fix). Sampling stays greedy per the recipe.
     messages = [
         {"role": "system", "content": ""},
         {"role": "user", "content": [

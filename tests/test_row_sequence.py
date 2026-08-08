@@ -20,7 +20,7 @@ def test_ignores_a_table_without_one():
 
 def test_ignores_a_column_that_does_not_start_near_one():
     """Years ascend too, but they are not a row count."""
-    rows = [[str(y), "x"] for y in (2019, 2020, 2021, 2022)]
+    rows = [[str(y), "x"] for y in (1901, 1902, 1903, 1904)]
     assert find_index_column(rows) is None
 
 

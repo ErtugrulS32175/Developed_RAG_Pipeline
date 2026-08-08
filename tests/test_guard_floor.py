@@ -60,10 +60,10 @@ def test_ideal_evidence_covers_a_cited_page_even_without_an_extra_figure():
 def test_measurement_separates_rate_derivation_policy(monkeypatch):
     context = (
         "[kurgu-belge.pdf | Sayfa 17]\n"
-        "Zeta orani binde 73 seviyesindedir."
+        "Zeta orani binde 73 mertebesindedir."
     )
     ground_truth = {"key": "Zeta orani binde 73"}
-    answer = "Sayfa 17'ye gore oran yuzde 7,3 seviyesindedir."
+    answer = "Sayfa 17'ye gore oran yuzde 7,3 mertebesindedir."
 
     def confirmed_correct(_run_dir):
         yield "kurgu", ground_truth, answer, context

@@ -195,15 +195,15 @@ def test_wrong_row_skips_figures_from_the_keys_own_record():
     shares the key's label frame after digit-stripping, but it also sits in
     the key's own record -- so it is not a sibling VALUE. The real sibling
     value must be chosen instead."""
-    text = ("Alfa Sirketi, Zeta Endeksi 2024 = 47 000. "
-            "Beta Sirketi, Zeta Endeksi 2024 = 88 000.")
+    text = ("Alfa Sirketi, Zeta Endeksi 1907 = 47 000. "
+            "Beta Sirketi, Zeta Endeksi 1907 = 88 000.")
     case = _case(DEV_ID,
                  passages=[Passage(1, 42, text, "kurgu-belge s.42")],
                  evidence=[(1, text)])
     mutant = mutate_wrong_row(case, ())
     assert mutant is not None
     assert "88 000" in mutant.answer
-    assert "2024" not in mutant.answer.replace("Sayfa 42", "")
+    assert "1907" not in mutant.answer.replace("Sayfa 42", "")
 
 
 def test_a_single_digit_key_is_a_declared_gap_not_a_silent_one():

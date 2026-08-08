@@ -210,7 +210,7 @@ def _label_frame(text: str, index: int) -> str:
     if measurement and product ever need different framings.
 
     Digits stay in the frame. Dropping them merged labels that a document
-    keeps apart -- "Endeks 2023" and "Endeks 2024", "Tablo 1 Toplam" and
+    keeps apart -- "Endeks 1903" and "Endeks 1907", "Tablo 1 Toplam" and
     "Tablo 2 Toplam" all collapsed to one label, so a value from a different
     year or a different table counted as a sibling of the one asked about.
     """
@@ -318,7 +318,7 @@ def check_binding(question: str, answer: str, context: RagContext,
     best_forms = frozenset().union(*(entry[2] for entry in best_entries))
 
     # No exemption for figures the QUESTION also states. An earlier version
-    # skipped them as mere echoes of the question's qualifier ("2024'te ...
+    # skipped them as mere echoes of the question's qualifier ("1907'te ...
     # kac artti?"), which handed an attacker the whole check: plant the wrong
     # value in the question, have the answer affirm it, and the figure was
     # never examined. Measured on both saved runs, the exemption bought

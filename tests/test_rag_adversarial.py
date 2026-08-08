@@ -247,13 +247,13 @@ def test_structured_guard_does_not_derive_unquoted_rates_by_default():
         [{
             "filename": "kurgu-belge.pdf",
             "page": 17,
-            "text": "Zeta orani binde 73 seviyesindedir.",
+            "text": "Zeta orani binde 73 mertebesindedir.",
         }],
         numbered=True,
     )
     reply = _reply(
-        alinti="Zeta orani binde 73 seviyesindedir.",
-        cevap="Sayfa 17'ye gore oran yuzde 7,3 seviyesindedir.",
+        alinti="Zeta orani binde 73 mertebesindedir.",
+        cevap="Sayfa 17'ye gore oran yuzde 7,3 mertebesindedir.",
     )
     _assert_review(
         reply,
