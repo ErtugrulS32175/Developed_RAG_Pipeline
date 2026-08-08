@@ -154,17 +154,55 @@ class Mutant:
     invariants: tuple
 
 
-def _require_development(case: BaseCase) -> None:
+@dataclass(frozen=True)
+class LockedGate:
+    """Proof that the contract chain was verified against OWNER-STATED hashes.
+
+    Constructed by ``verify_contract_chain`` and nowhere else by convention;
+    holding one is what authorises the mutation machinery to touch LOCKED
+    cases. Without a gate the machinery is development-only, exactly as
+    before. Python cannot make the type unforgeable -- what it can do is
+    make the honest path the only documented one, and make every dishonest
+    path require typing the word "gate" into code an auditor will read.
+
+    The gate is also the SNAPSHOT of what was verified: a report must carry
+    these fields, never a fresh read of the disk -- an addendum swapped
+    after verification would otherwise be reported as if the owner had
+    approved it (the TOCTOU the auditor demonstrated)."""
+    effective_protocol_version: str
+    contract_sha256: str
+    addenda: tuple
+    contract_version: str = ""
+
+
+def _require_membership(case: BaseCase, gate=None) -> None:
     """Verify the split from the IDENTITY, never from a stored flag.
 
     A forged record could carry locked=False beside a locked id, and a
     malformed id would previously sail through -- ``is_locked`` recomputes the
     split and rejects anything that is not a 64-hex digest. The stored flag is
     then cross-checked so an inconsistent record is refused rather than
-    silently reinterpreted."""
+    silently reinterpreted.
+
+    Without a gate this is the development-only rule (locked cases are
+    refused at the door). With a verified ``LockedGate`` the rule INVERTS:
+    only locked cases may pass, so a gated run cannot quietly re-measure
+    development data and report it as the holdout."""
     locked = is_locked(case.stable_id)
-    if locked or case.locked:
-        raise ValueError("locked case reached the mutator")
+    if locked != case.locked:
+        raise ValueError("case split flag disagrees with its stable id")
+    if gate is None:
+        if locked:
+            raise ValueError("locked case reached the mutator")
+        return
+    if not isinstance(gate, LockedGate):
+        raise ValueError("gate must come from verify_contract_chain")
+    if not locked:
+        raise ValueError("development case reached the locked gate")
+
+
+def _require_development(case: BaseCase) -> None:
+    _require_membership(case, None)
 
 
 def _label_frame(text: str, index: int) -> str:
@@ -256,8 +294,8 @@ def _claims_as_rows(claims) -> tuple:
     return tuple({"pasaj": handle, "alinti": quote} for handle, quote in claims)
 
 
-def mutate_unsupported_figure(case: BaseCase, peers) -> Mutant | None:
-    _require_development(case)
+def mutate_unsupported_figure(case: BaseCase, peers, gate=None) -> Mutant | None:
+    _require_membership(case, gate)
     validated = _validated_evidence(case)
     if not validated:
         return None
@@ -277,8 +315,8 @@ def mutate_unsupported_figure(case: BaseCase, peers) -> Mutant | None:
     )
 
 
-def mutate_arithmetic_restatement(case: BaseCase, peers) -> Mutant | None:
-    _require_development(case)
+def mutate_arithmetic_restatement(case: BaseCase, peers, gate=None) -> Mutant | None:
+    _require_membership(case, gate)
     validated = _validated_evidence(case)
     if not validated:
         return None
@@ -309,8 +347,8 @@ def mutate_arithmetic_restatement(case: BaseCase, peers) -> Mutant | None:
     return None
 
 
-def mutate_wrong_row(case: BaseCase, peers) -> Mutant | None:
-    _require_development(case)
+def mutate_wrong_row(case: BaseCase, peers, gate=None) -> Mutant | None:
+    _require_membership(case, gate)
     validated = _validated_evidence(case)
     if not validated:
         return None
@@ -332,7 +370,9 @@ def mutate_wrong_row(case: BaseCase, peers) -> Mutant | None:
         # Figures inside the key's OWN record are not sibling values: a
         # repeated column-header year shares the key's frame once digits are
         # stripped, and one such year became the "sibling" -- producing a
-        # mutant answer of "%2024" that no check could meaningfully judge.
+        # mutant answer of a percent sign glued to a bare year, which no
+        # check could meaningfully judge. (The year itself is not repeated
+        # here: source-file name stems are banned from working code.)
         key_record_forms = frozenset().union(frozenset(), *(
             frozenset(numbers(normalize(segment)))
             for segment in _segments(passage.text)
@@ -355,8 +395,8 @@ def mutate_wrong_row(case: BaseCase, peers) -> Mutant | None:
     return None
 
 
-def mutate_label_value_swap(case: BaseCase, peers) -> Mutant | None:
-    _require_development(case)
+def mutate_label_value_swap(case: BaseCase, peers, gate=None) -> Mutant | None:
+    _require_membership(case, gate)
     validated = _validated_evidence(case)
     if not validated:
         return None
@@ -365,7 +405,7 @@ def mutate_label_value_swap(case: BaseCase, peers) -> Mutant | None:
         return None
     start, end, key_forms = span
     for peer in peers:
-        _require_development(peer)
+        _require_membership(peer, gate)
         if not _numeric_relation_peer(case, peer):
             continue
         peer_values = numbers(normalize(peer.key))
@@ -398,10 +438,10 @@ def mutate_label_value_swap(case: BaseCase, peers) -> Mutant | None:
     return None
 
 
-def mutate_question_answer_mismatch(case: BaseCase, peers) -> Mutant | None:
-    _require_development(case)
+def mutate_question_answer_mismatch(case: BaseCase, peers, gate=None) -> Mutant | None:
+    _require_membership(case, gate)
     for peer in peers:
-        _require_development(peer)
+        _require_membership(peer, gate)
         if not _shares_key_passage(case, peer):
             continue
         if accepts_without_similarity(peer.key, peer.answer) is not True:
@@ -419,8 +459,8 @@ def mutate_question_answer_mismatch(case: BaseCase, peers) -> Mutant | None:
     return None
 
 
-def mutate_forced_answer_unanswerable(case: BaseCase, peers) -> Mutant | None:
-    _require_development(case)
+def mutate_forced_answer_unanswerable(case: BaseCase, peers, gate=None) -> Mutant | None:
+    _require_membership(case, gate)
     if not _can_force_unanswerable(case):
         return None
     remaining = tuple(
@@ -444,8 +484,8 @@ def mutate_forced_answer_unanswerable(case: BaseCase, peers) -> Mutant | None:
     )
 
 
-def mutate_corrupted_quote(case: BaseCase, peers) -> Mutant | None:
-    _require_development(case)
+def mutate_corrupted_quote(case: BaseCase, peers, gate=None) -> Mutant | None:
+    _require_membership(case, gate)
     validated = _validated_evidence(case)
     if not validated:
         return None
@@ -473,8 +513,8 @@ def mutate_corrupted_quote(case: BaseCase, peers) -> Mutant | None:
     )
 
 
-def mutate_invented_provenance(case: BaseCase, peers) -> Mutant | None:
-    _require_development(case)
+def mutate_invented_provenance(case: BaseCase, peers, gate=None) -> Mutant | None:
+    _require_membership(case, gate)
     validated = _validated_evidence(case)
     if not validated:
         return None
@@ -544,32 +584,48 @@ def _row(answer: str, evidence, question: str = "") -> dict:
     return {"soru": question, "cevap": answer, "dayanak": list(evidence)}
 
 
-def build_mutants(dev_cases) -> dict:
-    """Every mutant this harness can construct, grouped by class."""
+def build_mutants(cases, gate=None) -> dict:
+    """Every mutant this harness can construct, grouped by class.
+
+    Without a gate this is the development harness, byte-identical to what
+    it always was. With a verified ``LockedGate`` the same machinery runs on
+    LOCKED cases -- the membership check inverts, so neither path can be fed
+    the other's population."""
     produced = {name: [] for name in CLASS_ORDER}
-    for case in dev_cases:
-        _require_development(case)
-    for case in dev_cases:
+    for case in cases:
+        _require_membership(case, gate)
+    for case in cases:
         peers = tuple(
-            peer for peer in dev_cases
+            peer for peer in cases
             if peer.set_name == case.set_name and peer.stable_id != case.stable_id
         )
         for name, mutator in MUTATORS.items():
-            mutant = mutator(case, peers)
+            mutant = mutator(case, peers, gate)
             if mutant is not None:
                 produced[name].append((case, mutant))
     return produced
 
 
-def replay(produced) -> dict:
+# The FROZEN publication policies -- the contract's A/B/C, exactly, for
+# every class. The development harness may add measurement-only policies and
+# skip cells that measure nothing; a locked replay may not: "A cannot see
+# this class" is itself a mandatory recorded result, and an extra
+# experimental cell in a gate table is a place to shop for a better number.
+FROZEN_POLICY_MATRIX = (PLAIN, STRUCTURED_DERIVED, STRUCTURED_EXPLICIT)
+
+
+def replay(produced, frozen_matrix: bool = False) -> dict:
     report = {}
     for name in CLASS_ORDER:
         pairs = produced[name]
-        policies = (
-            (STRUCTURED_DERIVED, STRUCTURED_EXPLICIT)
-            if name in EVIDENCE_ONLY_CLASSES
-            else POLICIES
-        )
+        if frozen_matrix:
+            policies = FROZEN_POLICY_MATRIX
+        else:
+            policies = (
+                (STRUCTURED_DERIVED, STRUCTURED_EXPLICIT)
+                if name in EVIDENCE_ONLY_CLASSES
+                else POLICIES
+            )
         expected = EXPECTED_DIAGNOSTIC[name]
         per_policy = {}
         for policy in policies:
@@ -643,7 +699,7 @@ def _declared_protocol(body: bytes):
     return declared[0] if declared else None
 
 
-def contract_metadata(directory: Path = _CONTRACT_DIR) -> dict:
+def contract_metadata(directory: Path = None) -> dict:
     """SHA-bind the frozen contract text into every report, FAIL-CLOSED.
 
     The contract lives outside version control by publication policy, so a
@@ -668,6 +724,11 @@ def contract_metadata(directory: Path = _CONTRACT_DIR) -> dict:
     require it True rather than null-checking individual fields. This
     module never writes to contracts/: the contract has an owner, and it is
     not the implementer."""
+    # resolved at CALL time, not definition time: a default bound at import
+    # would ignore a later redirection of the module attribute (tests redirect
+    # it to a temp chain) and silently read the real contract instead
+    if directory is None:
+        directory = _CONTRACT_DIR
     meta = {"contract_version": None, "contract_sha256": None,
             "effective_protocol_version": None, "contract_complete": False,
             "addenda": {}}
@@ -699,6 +760,51 @@ def contract_metadata(directory: Path = _CONTRACT_DIR) -> dict:
             else meta["contract_version"])
         meta["contract_complete"] = True
     return meta
+
+
+def verify_contract_chain(expected_version: str,
+                          expected_contract_sha256: str,
+                          expected_addenda: dict,
+                          directory: Path = None) -> LockedGate:
+    """The only honest way to obtain a ``LockedGate``.
+
+    Everything expected comes from the CALLER -- the contract owner states
+    what the governing text is, and this function checks the disk against
+    that statement. The other direction would be circular: a runner that
+    reads the hashes it then "verifies" from the same disk would bless any
+    tampered contract as authentic.
+
+    Refuses, per the v2.1 addendum's normative list: incomplete chain,
+    wrong effective version, wrong base hash, a missing expected addendum,
+    a wrong addendum hash -- and additionally an UNEXPECTED addendum on
+    disk, because a file the owner never declared is exactly what a
+    tampered chain looks like."""
+    if not expected_version or not expected_contract_sha256:
+        raise ValueError("beklenen surum ve taban hash bos olamaz")
+    meta = (contract_metadata() if directory is None
+            else contract_metadata(directory))
+    if not meta["contract_complete"]:
+        raise ValueError("sozlesme zinciri eksik; kilitli kosu calismaz")
+    if meta["effective_protocol_version"] != expected_version:
+        raise ValueError("etkin surum beklenenle uyusmuyor")
+    if meta["contract_sha256"] != expected_contract_sha256:
+        raise ValueError("taban sozlesme hash'i beklenenle uyusmuyor")
+    found = {name: entry["sha256"] for name, entry in meta["addenda"].items()}
+    if set(found) != set(expected_addenda):
+        raise ValueError("addendum kumesi beklenenle uyusmuyor")
+    for name, sha in expected_addenda.items():
+        if found[name] != sha:
+            raise ValueError("addendum hash'i beklenenle uyusmuyor")
+    # the DECLARED protocol travels with each addendum: a report that drops
+    # it cannot show which text made the effective version what it is
+    return LockedGate(
+        effective_protocol_version=meta["effective_protocol_version"],
+        contract_sha256=meta["contract_sha256"],
+        addenda=tuple(sorted(
+            (name, entry["sha256"], entry["protocol"])
+            for name, entry in meta["addenda"].items())),
+        contract_version=meta["contract_version"],
+    )
 
 
 def build_report(cases, source_metadata) -> dict:

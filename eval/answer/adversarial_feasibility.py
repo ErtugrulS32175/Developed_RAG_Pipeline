@@ -216,27 +216,52 @@ def _selected_result_paths(run_dir: Path) -> dict[str, Path]:
     return selected
 
 
-def _file_group_fingerprint(paths: list[Path]) -> str:
+def _content_group_fingerprint(named_bodies) -> str:
+    """Fingerprint over (name, bytes) pairs read ONCE by the caller.
+
+    The earlier shape took paths and re-read them here -- so what was
+    PARSED and what was FINGERPRINTED were two separate reads, and an audit
+    probe that swapped the file in between produced a report whose numbers
+    came from the old content and whose fingerprint blessed the new. One
+    read, one buffer, both uses."""
     items = [
         {
-            "content_sha256": _digest(path.read_bytes()),
-            "logical_name_sha256": _digest(path.name),
+            "content_sha256": _digest(body),
+            "logical_name_sha256": _digest(name),
         }
-        for path in sorted(paths, key=lambda item: item.name)
+        for name, body in sorted(named_bodies, key=lambda item: item[0])
     ]
     return _digest(_canonical(items))
 
 
 def load_cases(run_dir: Path, question_dir: Path):
-    """Load scoreable saved sets without consuming saved guard decisions."""
+    """Load scoreable saved sets without consuming saved guard decisions.
+
+    Every file is read EXACTLY ONCE: the same bytes are parsed and
+    fingerprinted, so a file swapped mid-run cannot leave the numbers from
+    one content and the fingerprint from another.
+
+    Within a set the coverage is EXACT: an audit probe fed a two-question
+    set with a one-row result file and the missing question simply
+    vanished from the population -- denominators shrank with no error.
+    Every question now needs exactly one result row. (Whether the
+    DIRECTORY may hold question sets with no results is the caller's
+    contract: the shared eval directory legitimately carries holdout sets
+    no development run has answered, so the dev harness tolerates them,
+    while the locked runner separately requires its question directory to
+    be exactly the measured population.) Errors carry COUNTS, never
+    names -- set names are content."""
     result_paths = _selected_result_paths(run_dir)
     cases = []
-    question_paths = []
+    result_bodies = []
+    question_bodies = []
     for set_name, result_path in sorted(result_paths.items()):
         question_path = question_dir / f"{set_name}.json"
         if not question_path.is_file():
             raise ValueError("matching question set is missing")
-        questions = json.loads(question_path.read_text(encoding="utf-8"))
+        question_bytes = question_path.read_bytes()
+        question_bodies.append((question_path.name, question_bytes))
+        questions = json.loads(question_bytes.decode("utf-8"))
         if not isinstance(questions, list):
             raise ValueError("question set must be a list")
         by_question = {}
@@ -250,7 +275,9 @@ def load_cases(run_dir: Path, question_dir: Path):
                 raise ValueError("duplicate question in question set")
             by_question[question] = record
 
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        result_bytes = result_path.read_bytes()
+        result_bodies.append((result_path.name, result_bytes))
+        payload = json.loads(result_bytes.decode("utf-8"))
         rows = payload.get("sorular") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             raise ValueError("saved result has no question rows")
@@ -265,7 +292,10 @@ def load_cases(run_dir: Path, question_dir: Path):
                 raise ValueError("duplicate saved question row")
             seen.add(question)
             cases.append(make_case(set_name, row, by_question[question]))
-        question_paths.append(question_path)
+        if seen != set(by_question):
+            raise ValueError(
+                f"sonuc dosyasi soru setini tam kapsamiyor: "
+                f"{len(set(by_question) - seen)} soru sonucsuz")
 
     stable_ids = [case.stable_id for case in cases]
     if len(stable_ids) != len(set(stable_ids)):
@@ -273,11 +303,13 @@ def load_cases(run_dir: Path, question_dir: Path):
 
     metadata = {
         "result_files": len(result_paths),
-        "question_files": len(question_paths),
-        "raw_result_files_fingerprint": _file_group_fingerprint(
-            list(result_paths.values())
+        "question_files": len(question_bodies),
+        "raw_result_files_fingerprint": _content_group_fingerprint(
+            result_bodies
         ),
-        "question_files_fingerprint": _file_group_fingerprint(question_paths),
+        "question_files_fingerprint": _content_group_fingerprint(
+            question_bodies
+        ),
         "eligibility_input_fingerprint": _digest(_canonical(sorted(
             case.source_row_fingerprint for case in cases
         ))),
@@ -709,12 +741,20 @@ def build_report(cases: tuple[BaseCase, ...], source_metadata: dict):
     }
 
 
+# Git and output/ operations are ANCHORED here, never to the process's
+# working directory: a probe invoked the runner from a different (clean)
+# repository and the clean-tree check blessed the WRONG repo while HEAD
+# named a commit of code that was not running.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def repository_head() -> str | None:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         capture_output=True,
         text=True,
         check=False,
+        cwd=REPO_ROOT,
     )
     value = result.stdout.strip()
     return value if result.returncode == 0 and re.fullmatch(
@@ -723,8 +763,9 @@ def repository_head() -> str | None:
 
 
 def checked_output_path(path: Path) -> Path:
-    output_root = (Path.cwd() / "output").resolve()
-    resolved = path.resolve()
+    output_root = (REPO_ROOT / "output").resolve()
+    anchored = path if path.is_absolute() else REPO_ROOT / path
+    resolved = anchored.resolve()
     try:
         resolved.relative_to(output_root)
     except ValueError as exc:

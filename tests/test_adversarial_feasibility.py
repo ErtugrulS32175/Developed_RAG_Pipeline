@@ -298,6 +298,73 @@ def test_loader_excludes_sweeps_and_raw_guard_fields_from_eligibility_hash(
     )
 
 
+def _population_dirs(tmp_path):
+    """One complete set on disk: a question file and its full result."""
+    run_dir = tmp_path / "run"
+    question_dir = tmp_path / "questions"
+    run_dir.mkdir()
+    question_dir.mkdir()
+    context = _context()
+    questions = [
+        {"q": "Birinci kurgu kaydinin degeri nedir?", "key": PRIMARY_KEY,
+         "type": "sayisal"},
+        {"q": "Ikinci kurgu kaydinin degeri nedir?", "key": PRIMARY_KEY,
+         "type": "sayisal"},
+    ]
+    rows = [
+        {"soru": q["q"], "cevap": PRIMARY_KEY, "baglam": context.model_text,
+         "dayanak": [{"pasaj": 1, "alinti": PRIMARY_KEY}]}
+        for q in questions
+    ]
+    (question_dir / "kurgu.json").write_text(
+        json.dumps(questions), encoding="utf-8")
+    (run_dir / "rag_answers_kurgu.json").write_text(
+        json.dumps({"sorular": rows}), encoding="utf-8")
+    return run_dir, question_dir, questions, rows
+
+
+def test_a_result_file_missing_a_question_row_refuses(tmp_path):
+    """Round 17: a two-question set with a one-row result file loaded as a
+    one-case population -- a question VANISHED and the screening's
+    denominators shrank silently. Coverage is exact now; the error carries
+    a count, never a name."""
+    run_dir, question_dir, questions, rows = _population_dirs(tmp_path)
+    (run_dir / "rag_answers_kurgu.json").write_text(
+        json.dumps({"sorular": rows[:1]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="1 soru sonucsuz"):
+        load_cases(run_dir, question_dir)
+
+
+def test_the_dev_loader_tolerates_unanswered_question_sets(tmp_path):
+    """The shared eval directory carries holdout question sets no
+    development run has answered -- BY DESIGN. The dev loader must keep
+    working over that layout; the locked runner separately refuses it
+    (see test_locked_runner: the question directory must be exactly the
+    measured population)."""
+    run_dir, question_dir, questions, _rows = _population_dirs(tmp_path)
+    (question_dir / "yetim.json").write_text(
+        json.dumps([{"q": "Yetim kurgu soru nedir?", "key": PRIMARY_KEY,
+                     "type": "sayisal"}]), encoding="utf-8")
+    cases, metadata = load_cases(run_dir, question_dir)
+    assert len(cases) == len(questions)
+    assert metadata["question_files"] == 1  # only what was measured
+
+
+def test_an_orphan_result_set_still_refuses(tmp_path):
+    run_dir, question_dir, _questions, rows = _population_dirs(tmp_path)
+    (run_dir / "rag_answers_yetimsonuc.json").write_text(
+        json.dumps({"sorular": []}), encoding="utf-8")
+    with pytest.raises(ValueError, match="question set is missing"):
+        load_cases(run_dir, question_dir)
+
+
+def test_a_complete_population_still_loads(tmp_path):
+    run_dir, question_dir, questions, _rows = _population_dirs(tmp_path)
+    cases, metadata = load_cases(run_dir, question_dir)
+    assert len(cases) == len(questions)
+    assert metadata["result_files"] == 1
+
+
 def test_aggregate_report_does_not_persist_private_case_text():
     primary = _case(
         "Birinci kurgu kaydinin degeri nedir?",
@@ -376,15 +443,35 @@ def test_private_review_package_is_ordered_and_aggregate_keeps_only_metadata():
     ] is False
 
 
-def test_report_path_must_stay_under_output(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+def test_report_path_is_anchored_to_the_repo_not_the_cwd(
+        tmp_path, monkeypatch):
+    """Round 18: output/ used to resolve against the WORKING DIRECTORY --
+    invoked from elsewhere, "output/x.json" pointed outside the repo and
+    an absolute foreign path could pass by matching ITS cwd. Everything
+    anchors to the repository root now, wherever the process stands."""
+    from pathlib import Path
 
-    allowed = checked_output_path(tmp_path / "output" / "report.json")
-    assert allowed == (tmp_path / "output" / "report.json").resolve()
+    import eval.answer.adversarial_feasibility as feas
+
+    repo = tmp_path / "depo"
+    elsewhere = tmp_path / "baska"
+    repo.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.setattr(feas, "REPO_ROOT", repo)
+    monkeypatch.chdir(elsewhere)
+
+    # a relative path lands under the REPO's output/, not the cwd's
+    relative = checked_output_path(Path("output/kurgu.json"))
+    assert relative == (repo / "output" / "kurgu.json").resolve()
+    # a foreign absolute path is refused even though its cwd would match
     with pytest.raises(ValueError):
-        checked_output_path(tmp_path / "report.json")
+        checked_output_path(elsewhere / "output" / "kurgu.json")
+    with pytest.raises(ValueError):
+        checked_output_path(repo / "kurgu.json")
 
-    allowed.parent.mkdir()
-    allowed.write_text("existing", encoding="utf-8")
+    # an existing anchored path still refuses overwrite
+    target = repo / "output" / "rapor.json"
+    target.parent.mkdir(parents=True)
+    target.write_text("var", encoding="utf-8")
     with pytest.raises(FileExistsError):
-        checked_output_path(allowed)
+        checked_output_path(Path("output/rapor.json"))
