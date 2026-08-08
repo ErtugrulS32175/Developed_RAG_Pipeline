@@ -100,14 +100,20 @@ def render_page_to_image(src_path, page_idx, out_path, scale=2.0):
 
 def _describe_service_error(e):
     """Turn a requests exception into a message that says *why* it failed, so a
-    down service (ConnectionError) reads differently from a model crash (500)."""
+    down service (ConnectionError) reads differently from a model crash (500).
+
+    The unknown branch reports the exception TYPE and nothing else. It used
+    to echo str(e), and an audit probe walked a synthetic token and a
+    private path from an exception message into the documents table and out
+    through the API's status_note -- an error string is attacker-influenced
+    text and never belongs in a persisted, published field."""
     if isinstance(e, requests.ConnectionError):
         return "baglanti kurulamadi (servis calisiyor mu / URL dogru mu?)"
     if isinstance(e, requests.Timeout):
         return "zaman asimi (SERVICE_TIMEOUT'u artirmayi dene)"
     if isinstance(e, requests.HTTPError) and e.response is not None:
         return f"servis hatasi HTTP {e.response.status_code}"
-    return str(e)[:80]
+    return f"beklenmeyen hata ({type(e).__name__})"
 
 def ocr_via_paddle(image_path):
     # Upload the file itself, not a path -- a path is meaningless to a service
@@ -160,10 +166,19 @@ def tables_from_image_verified(image_path, ocr_text=None):
     return table_pipeline.run_consensus(image_path, ocr_text=ocr_text)
 
 def route_and_parse(path, tmp_dir="./output/router_tmp"):
+    """Parse an input into (results, failures) -- BOTH halves of the truth.
+
+    A page that failed OCR or a table detection that errored used to be a
+    PRINT and nothing else: the caller received the survivors, stored them,
+    and marked the document fully ingested. A document with half its pages
+    missing was indistinguishable from a complete one anywhere but the
+    console scrollback. Failures now travel with the results so the caller
+    can record honestly what it actually has."""
     kind = classify_input(path)
     print("[ROUTER] Girdi:", path, "-> tip:", kind)
     native_conv = build_native_converter()
     results = []  # (source_tag, ("docling", DoclingDocument) | ("text", str))
+    failures = []  # {"kaynak": tag, "asama": step, "hata": description}
 
     Path(tmp_dir).mkdir(parents=True, exist_ok=True)
 
@@ -180,7 +195,10 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
                 results.append(("image:tables", ("tables", tables)))
                 print("  ", len(tables), "tablo bulundu")
         except Exception as e:
-            print("  tablo tespiti -> HATA:", _describe_service_error(e))
+            described = _describe_service_error(e)
+            failures.append({"kaynak": "image:tables",
+                             "asama": "tablo_tespiti", "hata": described})
+            print("  tablo tespiti -> HATA:", described)
 
     elif kind == "pdf":
         page_types = analyze_pdf_pages(path)
@@ -209,17 +227,30 @@ def route_and_parse(path, tmp_dir="./output/router_tmp"):
                             results.append(("page" + str(page_no) + ":tables", ("tables", tables)))
                             print("  sayfa", page_no, ":", len(tables), "tablo bulundu")
                     except Exception as e:
-                        print("  sayfa", page_no, ": tablo tespiti -> HATA:", _describe_service_error(e))
+                        described = _describe_service_error(e)
+                        failures.append({"kaynak": f"page{page_no}:tables",
+                                         "asama": "tablo_tespiti",
+                                         "hata": described})
+                        print("  sayfa", page_no, ": tablo tespiti -> HATA:", described)
                     Path(tmp_img).unlink(missing_ok=True)
                     print("  sayfa", page_no, ": scanned -> OCR OK")
             except Exception as e:
-                print("  sayfa", page_no, ":", ptype, "-> HATA:", _describe_service_error(e))
+                described = _describe_service_error(e)
+                failures.append({"kaynak": f"page{page_no}:{ptype}",
+                                 "asama": "sayfa", "hata": described})
+                print("  sayfa", page_no, ":", ptype, "-> HATA:", described)
     else:
+        # an unsupported input parsing to NOTHING is the worst partial of
+        # all: without this entry the caller would store zero chunks and
+        # still be told everything went fine
+        failures.append({"kaynak": "girdi", "asama": "girdi_tipi",
+                         "hata": "desteklenmeyen tip"})
         print("[ROUTER] Desteklenmeyen tip:", path)
 
-    return results
+    return results, failures
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "./data/sample.pdf"
-    docs = route_and_parse(target)
-    print("\n[ROUTER] Toplam", len(docs), "parca islendi.")
+    docs, parse_failures = route_and_parse(target)
+    print("\n[ROUTER] Toplam", len(docs), "parca islendi,",
+          len(parse_failures), "hata.")

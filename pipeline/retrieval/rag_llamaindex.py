@@ -28,7 +28,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TABLE = os.getenv("LLAMAINDEX_TABLE", "llamaindex_chunks")
+# lowercased on purpose: SQLAlchemy folds unquoted identifiers to lower
+# case while our own reset/swap statements quote them exactly -- a
+# mixed-case value here would make the store write one table and the
+# maintenance statements manage another
+TABLE = os.getenv("LLAMAINDEX_TABLE", "llamaindex_chunks").strip().lower()
 TOP_K = int(os.getenv("LLAMAINDEX_TOP_K", "15"))
 
 _MISSING = (
@@ -95,13 +99,13 @@ def _configure_models():
     )
 
 
-def _store():
+def _store(table_name: str | None = None):
     """LlamaIndex's own table. It expects a schema of its own design, so the
     chunks are copied into that shape rather than read from ours in place."""
     (_, _, _, _, _, PGVectorStore) = _require()
     return PGVectorStore.from_params(
         **_dsn_parts(),
-        table_name=TABLE,
+        table_name=table_name or TABLE,
         # bge-m3; must match what the embedding service returns
         embed_dim=int(os.getenv("EMBED_DIM", "1024")),
         hybrid_search=True,
@@ -123,32 +127,85 @@ def build_index():
     Reads from `chunks` rather than re-parsing the PDFs so both engines answer
     from identical text -- the comparison is about retrieval, not about who
     parses a document better. That is worth measuring too, but separately.
+
+    The build is SHADOW-FIRST with an atomic swap: an earlier version
+    dropped the live table before building, so a build that failed midway
+    left NO comparison index at all -- the healthy old snapshot died for
+    a new one that never arrived. Now the copy lands in a shadow table;
+    only after the write succeeds and the shadow verifies non-empty does
+    one transaction drop the old table and rename the shadow into place.
+    A failed build leaves the previous snapshot serving, untouched.
+    Queries issued DURING the swap transaction wait; a comparison run
+    still should not race a rebuild -- written down rather than
+    pretended away.
     """
     from llama_index.core import Document, StorageContext, VectorStoreIndex
+
+    from psycopg import sql as _sql
 
     from pipeline.index import db
 
     _configure_models()
-    store = _store()
+    # PGVectorStore prefixes its table with "data_"; the shadow gets the
+    # same treatment, so the swap below renames data_<shadow> onto
+    # data_<table>.
+    shadow = f"{TABLE}_kurulum"
+    store = _store(shadow)
 
     conn = db.get_conn()
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT c.text, c.page, c.type, d.filename "
-            "FROM chunks c LEFT JOIN documents d ON c.document_id = d.id"
-        )
-        rows = cur.fetchall()
+    try:
+        with conn.cursor() as cur:
+            # a dead previous attempt's shadow must not pollute this build
+            cur.execute(_sql.SQL("DROP TABLE IF EXISTS {}").format(
+                _sql.Identifier(f"data_{shadow}")))
+        conn.commit()
+        with conn.cursor() as cur:
+            # The SAME active-generation filter as the native engine's
+            # hybrid_search, or the two engines stop answering from the
+            # same chunk set: without it this copy swept staging, partial
+            # and superseded rows into LlamaIndex while native retrieval
+            # saw only the served generation -- and the A/B comparison
+            # silently stopped measuring retrieval strategy.
+            cur.execute(
+                "SELECT c.text, c.page, c.type, d.filename "
+                "FROM chunks c LEFT JOIN documents d ON c.document_id = d.id "
+                "AND c.generation = d.active_generation "
+                "WHERE c.document_id IS NULL OR d.id IS NOT NULL"
+            )
+            rows = cur.fetchall()
 
-    docs = [
-        Document(text=text, metadata={"page": page, "type": ctype, "filename": filename})
-        for text, page, ctype, filename in rows
-    ]
-    print(f"[LLAMAINDEX] {len(docs)} chunk aktariliyor -> {TABLE}")
-    VectorStoreIndex.from_documents(
-        docs, storage_context=StorageContext.from_defaults(vector_store=store),
-        show_progress=True,
-    )
-    print("[LLAMAINDEX] tamam")
+        docs = [
+            Document(text=text,
+                     metadata={"page": page, "type": ctype,
+                               "filename": filename})
+            for text, page, ctype, filename in rows
+        ]
+        print(f"[LLAMAINDEX] {len(docs)} chunk golge tabloya aktariliyor "
+              f"({len(rows)} satir); eski indeks takasa kadar hizmette")
+        VectorStoreIndex.from_documents(
+            docs,
+            storage_context=StorageContext.from_defaults(vector_store=store),
+            show_progress=True,
+        )
+
+        with conn.cursor() as cur:
+            cur.execute(_sql.SQL("SELECT count(*) FROM {}").format(
+                _sql.Identifier(f"data_{shadow}")))
+            built = int(cur.fetchone()[0])
+        if docs and built == 0:
+            raise RuntimeError(
+                "golge tablo bos kaldi; takas yapilmadi, eski indeks "
+                "hizmette")
+        with conn.cursor() as cur:
+            cur.execute(_sql.SQL("DROP TABLE IF EXISTS {}").format(
+                _sql.Identifier(f"data_{TABLE}")))
+            cur.execute(_sql.SQL("ALTER TABLE {} RENAME TO {}").format(
+                _sql.Identifier(f"data_{shadow}"),
+                _sql.Identifier(f"data_{TABLE}")))
+        conn.commit()
+        print("[LLAMAINDEX] tamam: golge tablo atomik takasla hizmete girdi")
+    finally:
+        conn.close()
 
 
 def _as_chunks(nodes):

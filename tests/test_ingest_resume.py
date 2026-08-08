@@ -12,34 +12,47 @@ def _c(text, tag="page7:native"):
     return {"type": "text", "text": text, "source_tag": tag, "page": 7, "headings": []}
 
 
-# --- ids are derived from content, which is what makes resuming possible ---
+# --- content keys are derived from content: that is what makes embedding
+# --- reuse possible; row ids are the key QUALIFIED by the generation
 
-def test_the_same_chunk_always_gets_the_same_id():
-    a = ir._chunk_id("doc-1", _c("zeta gamma"), 3)
-    b = ir._chunk_id("doc-1", _c("zeta gamma"), 3)
+def test_the_same_chunk_always_gets_the_same_content_key():
+    a = ir._content_key("doc-1", _c("zeta gamma"), 3)
+    b = ir._content_key("doc-1", _c("zeta gamma"), 3)
     assert a == b
 
 
-def test_different_text_gets_a_different_id():
-    a = ir._chunk_id("doc-1", _c("zeta"), 3)
-    b = ir._chunk_id("doc-1", _c("gamma"), 3)
+def test_different_text_gets_a_different_content_key():
+    a = ir._content_key("doc-1", _c("zeta"), 3)
+    b = ir._content_key("doc-1", _c("gamma"), 3)
     assert a != b
 
 
 def test_the_same_text_in_a_different_position_is_a_different_chunk():
     """A phrase repeated on two pages is two chunks, not one."""
-    assert ir._chunk_id("doc-1", _c("zeta"), 3) != ir._chunk_id("doc-1", _c("zeta"), 4)
-    assert (ir._chunk_id("doc-1", _c("zeta", "page7:native"), 3)
-            != ir._chunk_id("doc-1", _c("zeta", "page8:native"), 3))
+    assert (ir._content_key("doc-1", _c("zeta"), 3)
+            != ir._content_key("doc-1", _c("zeta"), 4))
+    assert (ir._content_key("doc-1", _c("zeta", "page7:native"), 3)
+            != ir._content_key("doc-1", _c("zeta", "page8:native"), 3))
 
 
-def test_two_documents_never_share_a_chunk_id():
-    assert ir._chunk_id("doc-1", _c("zeta"), 3) != ir._chunk_id("doc-2", _c("zeta"), 3)
+def test_two_documents_never_share_a_content_key():
+    assert (ir._content_key("doc-1", _c("zeta"), 3)
+            != ir._content_key("doc-2", _c("zeta"), 3))
 
 
-def test_the_id_is_a_valid_uuid():
+def test_row_ids_differ_across_generations_but_share_the_key():
+    """Round 16: rows are copied between generations, never moved -- so two
+    generations of one content are two ROWS with one content key."""
+    first = ir._chunk_id("doc-1", _c("zeta"), 3, 1)
+    second = ir._chunk_id("doc-1", _c("zeta"), 3, 2)
+    assert first != second
+    assert first == ir._chunk_id("doc-1", _c("zeta"), 3, 1)  # deterministic
+
+
+def test_ids_and_keys_are_valid_uuids():
     import uuid
-    uuid.UUID(ir._chunk_id("doc-1", _c("zeta"), 3))
+    uuid.UUID(ir._content_key("doc-1", _c("zeta"), 3))
+    uuid.UUID(ir._chunk_id("doc-1", _c("zeta"), 3, 7))
 
 
 # --- retry ---
