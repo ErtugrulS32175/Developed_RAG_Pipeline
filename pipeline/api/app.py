@@ -16,6 +16,14 @@ from dotenv import load_dotenv
 
 from pipeline.index import db
 from pipeline.index import ingest
+from pipeline.index import publication
+from pipeline.index.attempt_contract import (
+    AttemptAlreadyRunning,
+    AttemptOutcome,
+    CandidateConflict,
+    CandidateNotPublished,
+    CandidateSuperseded,
+)
 from pipeline.api import owui_chat
 from pipeline.retrieval import rag_backends
 from pipeline.validation.rag.answer_guard import (
@@ -374,20 +382,13 @@ def _safe_upload_filename(filename):
     return portable
 
 
-def _set_document_error(document_id):
-    """Best-effort terminal status update without masking the primary failure.
-
-    Borrows its own pooled connection: the primary failure may have poisoned
-    the transaction this request was using, and this write must not depend on
-    that transaction still being usable."""
-    try:
-        with db_conn() as conn:
-            db.set_document_status(conn, document_id, "error")
-    except Exception as status_error:
-        _log_safe_failure(
-            status_error,
-            "belge_durumu_yazilamadi",
-        )
+# THE API NO LONGER STAMPS A DOCUMENT `error` ANYWHERE. The helper that
+# did it is gone rather than merely unused, so nothing can quietly start
+# calling it again. Every remaining case it served has moved to the
+# subject it was actually about: a run's own failure goes on that run's
+# ATTEMPT, a request's failure is the HTTP status, and a source file
+# that has gone missing is a storage problem that says nothing about the
+# generation currently being served.
 
 
 @app.get("/files/{name}")
@@ -406,8 +407,31 @@ def download_export(name: str):
     )
 
 
+# The endpoint used to keep a per-filename lock of its own, IN THIS
+# PROCESS, as a cheap first fence in front of its hand-written publish
+# sequence. There is no sequence here any more: the publication service
+# holds a database SESSION lock, which serialises across PROCESSES and
+# therefore across every worker, not just this one. A second, weaker lock
+# in front of it fenced nothing the first did not already fence.
 @app.post("/documents/upload", dependencies=AUTH)
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(file: UploadFile = File(...), replace: bool = False):
+    """Publish a candidate -- through the SHARED SERVICE and nothing else.
+
+    This endpoint used to carry its own copy of the whole sequence:
+    resolve the canonical name, check the conflict, write a temp file,
+    upsert the row, os.replace. The CLI had no publication step at all,
+    so the two paths drifted until they carried different guarantees.
+    Everything below the read is now one call, and the lock, the crash
+    windows and the disk target live where they belong -- in
+    ``publication.publish_candidate``.
+
+    NO ``replaced`` FIELD any more. It used to be computed by hashing
+    whatever was on disk before writing, which the service (rightly)
+    does not report back; recomputing it here would mean a read OUTSIDE
+    the publish lock, and a guess printed as a fact is exactly what this
+    audit has been removing. ``candidate_id`` answers the same question
+    truthfully: the same bytes keep it, different bytes mint a new one.
+    """
     filename = _safe_upload_filename(file.filename)
     # Read in chunks against the cap BEFORE anything touches disk or the
     # database, so an oversized upload leaves no partial file and no row.
@@ -420,21 +444,80 @@ async def upload_document(file: UploadFile = File(...)):
         if size > UPLOAD_MAX_BYTES:
             raise HTTPException(status_code=413, detail="dosya cok buyuk")
         pieces.append(piece)
-    dest = UPLOAD_DIR / filename
-    dest.write_bytes(b"".join(pieces))
-    file_type = dest.suffix.lower().lstrip(".")
+    body = b"".join(pieces)
+    file_type = Path(filename).suffix.lower().lstrip(".")
+
     with db_conn() as conn:
-        document_id = db.upsert_document(
-            conn,
-            filename,
-            file_type,
-            status="pending",
-        )
+        try:
+            document_id, candidate_id, canonical = (
+                publication.publish_candidate(
+                    conn, filename, file_type, body,
+                    allow_replace=replace))
+        except CandidateConflict:
+            # same name, different bytes, no explicit authority. The
+            # refusal is atomic in the database, so nothing was staged
+            # and nothing reached the disk.
+            raise HTTPException(
+                status_code=409,
+                detail="ayni adla farkli icerik zaten kayitli; degistirmek "
+                       "bilincliyse replace=true ver")
+        except CandidateSuperseded:
+            # a NEWER candidate was staged while these bytes were being
+            # written: the disk moved but this candidate was not
+            # published. Answering 200 here would report a publication
+            # the database declined.
+            raise HTTPException(
+                status_code=409,
+                detail="yayin sirasinda daha yeni bir aday evrelendi; bu "
+                       "yukleme yayimlanmadi")
+        except publication.UnsafeCanonicalName:
+            _log_safe_failure(ValueError("kanonik_ad"), "kanonik_ad_guvensiz")
+            raise HTTPException(
+                status_code=500,
+                detail="kanonik ad tutarsizligi; dosya yazilmadi")
     return {
         "document_id": document_id,
-        "filename": filename,
+        "filename": canonical,
+        "candidate_id": candidate_id,
         "status": "pending",
     }
+
+
+def _release_attempt(attempt, note):
+    """Make sure the lease THIS REQUEST took does not outlive the request.
+
+    The endpoint takes the attempt before anything is parsed, so a run
+    that ends without recording its own verdict -- it raised on the way,
+    or came back with nothing terminal -- leaves the lease held. The HTTP
+    side was already fail-closed; the LIFECYCLE was not, and a retry then
+    had to wait out the whole lease window for a run that was long over.
+
+    Idempotent by construction, not by a flag: a run that did record its
+    verdict cleared the lease in the same statement, so this second
+    closure is refused as a lost lease and absorbed. Only an attempt that
+    really ended still holding its lease is closed here.
+
+    A closure that FAILS is not swallowed into silence -- it gets its own
+    log event with the exception type. The request is answered 500
+    either way, but "we could not close the attempt" is a second problem
+    and it must be findable as one."""
+    try:
+        ingest.abandon_attempt(attempt, note)
+    except Exception as closure_error:
+        _log_safe_failure(closure_error, "deneme_kapatilamadi")
+
+
+def _reported_outcome(returned):
+    """The run's own terminal verdict, or None if it did not give one.
+
+    Fail-closed by shape: only ``done`` and ``partial`` are outcomes a
+    completed run may report. Anything else -- None, a bare string, an
+    unexpected tuple -- means we do not know how the run ended, and not
+    knowing is never reported to a client as success."""
+    if (isinstance(returned, tuple) and len(returned) == 2
+            and returned[0] in (AttemptOutcome.DONE, AttemptOutcome.PARTIAL)):
+        return returned
+    return None
 
 
 @app.post("/documents/{document_id}/process", dependencies=AUTH)
@@ -446,11 +529,28 @@ def process_document(document_id: str):
         doc = db.get_document(conn, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
+    # A row with no recorded candidate has nothing for an ingest to bind
+    # to: processing it would be exactly the unbound run the P0 exploited.
+    if not doc.get("candidate_id") or not doc.get("content_sha256"):
+        raise HTTPException(
+            status_code=409,
+            detail="belgenin kayitli adayi yok; once upload ile aday "
+                   "kaydedilmeli")
 
+    # NEITHER OF THE TWO CHECKS BELOW MARKS THE DOCUMENT. Both used to,
+    # and both were saying the wrong thing about the wrong subject: a
+    # source file that has gone missing, or a stored name that is not a
+    # safe basename, tells you nothing about the generation currently
+    # being SERVED. That generation's chunks are in the index and still
+    # answering questions -- the file is only needed to build the NEXT
+    # one. A probe made the mismatch plain: HTTP 404, active_generation
+    # 4 -> 4, and `status` done -> error. A healthy index wearing a
+    # failure label. These are failures of the REQUEST and of source
+    # STORAGE; if they ever need to be visible on the row, they need a
+    # column of their own, not this one.
     try:
         filename = _safe_upload_filename(doc["filename"])
     except HTTPException:
-        _set_document_error(document_id)
         log.error(json.dumps({
             "olay": "gecersiz_kayitli_dosya_adi",
             "hata": "InvalidFilename",
@@ -462,25 +562,59 @@ def process_document(document_id: str):
 
     path = UPLOAD_DIR / filename
     if not path.exists():
-        _set_document_error(document_id)
         raise HTTPException(status_code=404, detail="uploaded file missing")
 
+    # THE LEASE IS TAKEN HERE, before anything is parsed. Two refusals
+    # have to be answers rather than failures halfway through an ingest:
+    # a candidate that is still STAGED (the upload committed its row but
+    # has not finished writing the bytes) and a document another worker
+    # is already indexing. Both are 409, both leave every document and
+    # attempt column exactly as they were -- the audited version fell
+    # into the publish gap, refused correctly deep inside the ingest, and
+    # stamped the document `error` while the upload returned 200 pending.
+    with db_conn() as conn:
+        try:
+            attempt = db.begin_attempt(conn, document_id)
+        except CandidateNotPublished:
+            raise HTTPException(
+                status_code=409,
+                detail="belgenin adayi henuz yayimlanmadi; yukleme bitince "
+                       "tekrar deneyin")
+        except AttemptAlreadyRunning:
+            raise HTTPException(
+                status_code=409,
+                detail="bu belge icin calisan bir islem var; bitmesini "
+                       "bekleyin")
+
+    # THE DOCUMENT ROW IS NOT THIS REQUEST'S SCRATCHPAD. It used to be
+    # stamped `processing` here and `error` in the handler below, and the
+    # result was then read back off it -- three mistakes with one root.
+    # `documents.status` describes the SERVED version; a run's own
+    # verdict belongs to its attempt (rule 5). A real PARTIAL run leaves
+    # the row alone by design, so reading it back showed `processing`,
+    # which this endpoint called "never finished": 500, and a healthy
+    # served generation relabelled `error`. The run now REPORTS its
+    # verdict, and nothing here writes the served status at all --
+    # promotion is the only thing that moves it.
     try:
-        with db_conn() as conn:
-            db.set_document_status(conn, document_id, "processing")
-        ingest.main(str(path))
-        with db_conn() as conn:
-            processed = db.get_document(conn, document_id)
+        # bound to the attempt, not to a tuple the endpoint read: the
+        # candidate id, its bytes and the observed generation all travel
+        # inside the one object the lease was minted with
+        verdict = _reported_outcome(ingest.main(str(path), attempt=attempt))
     except Exception as e:
-        _set_document_error(document_id)
+        _release_attempt(attempt, type(e).__name__)
         _log_safe_failure(e, "belge_isleme_hatasi")
         raise HTTPException(
             status_code=500,
             detail=DOCUMENT_PROCESSING_FAILURE_MESSAGE,
         )
 
-    if processed is None or processed.get("status") != "done":
-        _set_document_error(document_id)
+    if verdict is None:
+        # the run came back without a terminal verdict: not a partial and
+        # not a failure, just an answer nobody can act on. It is reported
+        # as a failure of THE REQUEST, and the served version -- which
+        # this run never touched -- keeps saying what it said.
+        _release_attempt(attempt, "IncompleteIngest")
         log.error(json.dumps({
             "olay": "belge_tamamlanmadan_dondu",
             "hata": "IncompleteIngest",
@@ -490,7 +624,15 @@ def process_document(document_id: str):
             detail=DOCUMENT_PROCESSING_FAILURE_MESSAGE,
         )
 
-    return {"document_id": document_id, "status": processed["status"]}
+    # "partial" is a TRUE statement, not a failure to hide: some pages were
+    # lost and the stored chunks are real. An earlier version rewrote it as
+    # "error" and answered 500 -- destroying exactly the honesty the partial
+    # status was built to carry.
+    status, note = verdict
+    response = {"document_id": document_id, "status": status}
+    if note:
+        response["status_note"] = note
+    return response
 
 
 @app.get("/documents/{document_id}", dependencies=AUTH)

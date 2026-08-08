@@ -37,8 +37,17 @@ class FakePool:
 @pytest.fixture
 def pooled(monkeypatch):
     pool = FakePool()
+
+    @contextmanager
+    def publish_lock(_conn, _filename):
+        # the session lock talks to a real cursor; these tests hand out
+        # bare objects on purpose -- the lock's own contract is covered
+        # in test_api_end_to_end
+        yield
+
     monkeypatch.setattr(api.db, "get_pool", lambda: pool)
     monkeypatch.setattr(api.db, "init_schema", lambda conn: None)
+    monkeypatch.setattr(api.db, "document_publish_lock", publish_lock)
     monkeypatch.setattr(api, "_schema_ready", False)
     return pool
 
@@ -125,11 +134,28 @@ def test_oversized_upload_is_refused_before_disk_and_database(
 
 
 def test_upload_under_the_cap_still_works(pooled, monkeypatch, tmp_path):
+    from pipeline.index import publication
+
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
     monkeypatch.setattr(api, "UPLOAD_DIR", upload_dir)
+    # Package 3C: the endpoint publishes through the shared service, so
+    # the destination and the two candidate seams live there now.
+    monkeypatch.setattr(publication, "UPLOAD_DIR", upload_dir)
     monkeypatch.setattr(api, "UPLOAD_MAX_BYTES", 10)
-    monkeypatch.setattr(api.db, "upsert_document", lambda *a, **k: "kurgu-id")
+    monkeypatch.setattr(api.db, "lookup_document", lambda *a, **k: None)
+    monkeypatch.setattr(
+        api.db, "stage_candidate",
+        lambda _conn, filename, *a, **k: ("kurgu-id", "kurgu-aday",
+                                          filename))
+    monkeypatch.setattr(api.db, "finalize_candidate_publication",
+                        lambda *a, **k: True)
+
+    @contextmanager
+    def publish_lock(_conn, _filename):
+        yield
+
+    monkeypatch.setattr(api.db, "document_publish_lock", publish_lock)
 
     response = TestClient(api.app).post(
         "/documents/upload", headers=_headers(),
