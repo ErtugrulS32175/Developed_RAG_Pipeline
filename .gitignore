@@ -18,3 +18,4 @@ ragas_env/
 /test_*.py
 .pytest_cache/
 .vscode/
+.agent-loop/
