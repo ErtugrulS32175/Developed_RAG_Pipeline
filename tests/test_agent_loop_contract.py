@@ -39,13 +39,24 @@ BACKSLASH = chr(92)
 
 
 def _runner():
-    """The production runner, or a clear explanation of its absence."""
+    """The production runner, or a clear explanation of its absence.
+
+    XFAIL, NOT FAIL. These tests are red BY DESIGN until Phase B lands,
+    and `pytest.fail` made that design permanently red in CI -- both
+    remotes run the whole suite on every push to main, so a deliberately
+    unfinished battery turned the build red for everyone until the
+    runner existed. `xfail` reports exactly the same fact ("this cannot
+    run yet") without claiming the build is broken.
+
+    It also cleans itself up: the moment `tools.agent_loop.runner`
+    imports, this helper returns it and every test below runs for real.
+    There is no marker left behind to forget -- which is the failure
+    mode of decorating twenty-six tests by hand."""
     try:
         from tools.agent_loop import runner
     except ImportError as missing:            # pragma: no cover -- phase A
-        pytest.fail(
-            "tools.agent_loop.runner yok (Faz B henuz yazilmadi): "
-            f"{missing}. Bu KIRMIZI beklenen kirmizidir.")
+        pytest.xfail(
+            f"tools.agent_loop.runner yok (Faz B henuz yazilmadi): {missing}")
     return runner
 
 
