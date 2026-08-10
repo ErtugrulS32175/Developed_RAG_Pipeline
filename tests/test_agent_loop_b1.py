@@ -1793,7 +1793,21 @@ def test_every_mutation_still_applies_to_the_current_source():
     NOT-APPLIED, turning a missing guard into a quiet pass. That failure
     is loud here instead."""
     tool = _mutation_tool()
-    assert len(tool.MUTATIONS) >= 32
+    # PINNED at the current census, not a stale floor: `>= 32` stayed
+    # green with every R2A mutation deleted, because 35 B1 entries
+    # already cleared it. The R2A labels are pinned BY NAME too, so a
+    # deletion has to show up as a missing name rather than as a
+    # count that still happens to pass.
+    assert len(tool.MUTATIONS) >= 51
+    labels = {label for label, *_ in tool.MUTATIONS}
+    expected_r2a = {
+        "r2a-hazir-kontrolu", "r2a-kayit-depo", "r2a-kayit-kosu",
+        "r2a-kayit-taban", "r2a-gomulu-kimlik", "r2a-bag-varligi",
+        "r2a-bag-agac", "r2a-bag-depo", "r2a-bag-kosu", "r2a-bag-taban",
+        "r2a-bas-kontrolu", "r2a-git-kutugu", "r2a-ana-agac",
+        "r2a-kap-sinirlama", "r2a-bag-cagrisi-yok", "r2a-cagiran-yolu"}
+    assert expected_r2a <= labels, \
+        f"eksik r2a mutasyonu: {sorted(expected_r2a - labels)}"
     root = Path(__file__).resolve().parent.parent
     stale = [label for label, module, old, _, _ in tool.MUTATIONS
              if old not in (root / "tools" / "agent_loop"
@@ -1803,12 +1817,47 @@ def test_every_mutation_still_applies_to_the_current_source():
 
 def test_every_mutation_names_a_test_that_exists():
     """An expected-target that matches nothing would make every verdict
-    MISDIRECTED, which reads like a finding and is a typo."""
+    MISDIRECTED, which reads like a finding and is a typo. R2A grew the
+    manifest targets into the B2 execution battery, so both agent-loop
+    test files are the namespace now."""
     tool = _mutation_tool()
-    body = Path(__file__).read_text(encoding="utf-8")
+    here = Path(__file__).resolve().parent
+    body = Path(__file__).read_text(encoding="utf-8") + \
+        (here / "test_agent_loop_b2_execution.py").read_text(
+            encoding="utf-8")
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
     assert missing == [], f"var olmayan hedef test adi: {missing}"
+
+
+def test_the_mutation_harness_exit_code_is_fail_closed():
+    """The harness printed its verdicts and exited 0 REGARDLESS -- a
+    red baseline, a missed mutation, a misdirected kill and a modified
+    live tree all looked like success to automation. The exit code is
+    the verdict now, and each failure class is pinned here cheaply,
+    without running the battery."""
+    tool = _mutation_tool()
+    caught = {"mutasyon": "kurgu", "hukum": "YAKALANDI"}
+    assert tool.verdict_exit_code(1, [], True) != 0, "kirmizi taban 0 cikti"
+    assert tool.verdict_exit_code(0, [], True) != 0, "hic hukum yokken 0"
+    for bad in ("KACIRILDI", "YANLIS-HEDEF", "UYGULANAMADI", "GECERSIZ"):
+        verdicts = [caught, {"mutasyon": "kurgu2", "hukum": bad}]
+        assert tool.verdict_exit_code(0, verdicts, True) != 0, \
+            f"{bad} hukmu 0 cikti"
+    assert tool.verdict_exit_code(0, [caught], False) != 0, \
+        "degisen ana agac 0 cikti"
+    assert tool.verdict_exit_code(0, [caught], True) == 0, \
+        "temiz kosu 0 donmuyor"
+
+
+def test_the_mutation_harness_main_is_wired_to_the_exit_code():
+    """`main` computing a code that `__main__` throws away would be the
+    same hole with extra steps."""
+    body = (Path(__file__).resolve().parent.parent / "eval" / "tools"
+            / "mutate_agent_loop.py").read_text(encoding="utf-8")
+    assert "sys.exit(main())" in body, "cikis kodu surece baglanmamis"
+    assert "return verdict_exit_code(" in body, \
+        "main hukum kodunu hesaplamiyor"
 
 
 def test_no_b1_module_runs_a_shell():
@@ -1827,3 +1876,77 @@ def test_no_b1_module_runs_a_shell():
                 if ast.unparse(node.func) in ("os.system", "os.popen"):
                     offenders.append(f"{name}:{ast.unparse(node.func)}")
     assert not offenders, f"keyfi kabuk: {offenders}"
+
+
+# =====================================================================
+# R2A -- the execution binding seam: identities in, ONE derived path out
+# =====================================================================
+
+def test_the_execution_binding_returns_only_the_derived_path(repo, state_dir):
+    """The positive face of the seam: a worktree B1 itself created and
+    marked READY binds, and what comes back is the holder-derived path
+    -- the same one `create` returned."""
+    baseline = _git(repo, "rev-parse", "HEAD")
+    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
+                                        baseline_sha=baseline)
+    state.write_binding(state_dir, {
+        "protocol_version": contract.PROTOCOL_VERSION, "run_id": RUN,
+        "repo_id": state.repo_identity(repo), "baseline_sha": baseline,
+        "manifest_digest": "0" * 64, "worktree_id": worktree_id})
+    try:
+        derived = worktree.assert_execution_binding(
+            repo, state_dir=state_dir, run_id=RUN, worktree_id=worktree_id,
+            baseline_sha=baseline)
+        assert derived == worktree.holder_for(worktree_id) \
+            / worktree.WORKTREE_DIRNAME
+        assert derived.resolve() == path.resolve()
+    finally:
+        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
+
+
+def test_the_execution_binding_takes_identities_never_a_path():
+    """No parameter carries a location. The path COMES OUT of the seam;
+    a caller holding a directory has nowhere to put it."""
+    import inspect as inspect_module
+
+    parameters = inspect_module.signature(
+        worktree.assert_execution_binding).parameters
+    assert set(parameters) == {"repo", "state_dir", "run_id",
+                               "worktree_id", "baseline_sha"}
+    for escape in ("path", "cwd", "directory", "worktree"):
+        assert escape not in parameters
+
+
+def test_the_execution_binding_error_texts_stay_abstract(repo, state_dir):
+    """Every refusal is a fixed sentence -- no absolute path, no id, no
+    sha, no record content. Checked on a real refusal rather than by
+    reading the source."""
+    baseline = _git(repo, "rev-parse", "HEAD")
+    with pytest.raises(worktree.WorktreeError) as refusal:
+        worktree.assert_execution_binding(
+            repo, state_dir=state_dir, run_id=RUN, worktree_id="e" * 32,
+            baseline_sha=baseline)
+    text = str(refusal.value) + repr(refusal.value)
+    assert "/" not in text and "\\" not in text
+    assert "e" * 32 not in text and baseline not in text
+
+
+def test_case_twin_paths_are_distinct_on_case_sensitive_filesystems(tmp_path):
+    """R2A-R1 P1: unconditional casefold gave two DISTINCT case-twin
+    directories one `_comparable` spelling and two distinct case-twin
+    repositories one `repo_identity` -- an identity two repositories
+    share authorises either against records the other wrote. Folding
+    now happens only where the filesystem folds."""
+    probe = tmp_path / "kucuk-harf-sondasi.txt"
+    probe.write_text("k", encoding="ascii")
+    if (tmp_path / "KUCUK-HARF-SONDASI.TXT").exists():
+        pytest.skip("dosya sistemi harfe duyarsiz; ikiz kurulamiyor")
+    upper = tmp_path / "IKIZ"
+    lower = tmp_path / "ikiz"
+    upper.mkdir()
+    lower.mkdir()
+    assert upper.resolve() != lower.resolve(), "senaryo kurulmadi"
+    assert worktree._comparable(upper) != worktree._comparable(lower), \
+        "case-twin dizinler ayni sayildi"
+    assert state.repo_identity(upper) != state.repo_identity(lower), \
+        "case-twin depolar ayni kimligi aldi"

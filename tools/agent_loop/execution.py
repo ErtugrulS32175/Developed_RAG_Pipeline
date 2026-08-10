@@ -1,14 +1,23 @@
 """The implementer subprocess adapter. PACKAGE B2A.
 
 ONE primitive: launch the Claude implementer binary the caller supplied,
-inside the disposable worktree the caller already created, and bring
-back a reply that has been validated against the frozen schema. It does
-not create worktrees, read diffs, run acceptance commands, call the
-evaluator, apply patches or advance the run. Those live in B2B and B3,
-and keeping them out is the only reason this file can be read in one
-sitting.
+inside the disposable worktree B1 RECORDED, and bring back a reply that
+has been validated against the frozen schema. It does not create
+worktrees, read diffs, run acceptance commands, call the evaluator,
+apply patches or advance the run. Those live in B2B and B3, and keeping
+them out is the only reason this file can be read in one sitting.
 
-NOTHING IS DISCOVERED. The binary, the worktree, the schema path, the
+THE WORKING DIRECTORY IS DERIVED, NEVER RECEIVED. The first version
+took a `worktree` path and checked `is_dir()`, which made the main
+checkout -- or any directory at all -- an acceptable place to run the
+model, with B1's ownership record sitting unread beside it. Now the
+caller passes identities (repository, state directory, run, worktree
+id, baseline) and `worktree.assert_execution_binding` turns them into
+the one directory they may name, refusing everything else before a
+process exists. There is no parameter through which a caller can
+inject a path.
+
+NOTHING IS DISCOVERED. The binary, the identities, the schema path, the
 budget, the timeout and the output ceiling are all mandatory arguments.
 A caller who forgets one gets a `TypeError`; a caller who passes a bare
 name like `claude` gets a refusal rather than whatever is on PATH. The
@@ -48,7 +57,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from tools.agent_loop import cli, contract, schemas
+from tools.agent_loop import cli, contract, schemas, worktree
 from tools.agent_loop.process import (
     BoundedStream, Container, ContainmentError, PromptWriter,
     REAP_SECONDS, READ_CHUNK_BYTES, join_within,
@@ -279,10 +288,18 @@ def _usable_binary(binary):
     return path
 
 
-def _usable_worktree(worktree):
-    if not worktree or not Path(worktree).is_dir():
-        raise BinaryNotUsable("calisma agaci dizini mevcut degil")
-    return Path(worktree)
+class WorktreeNotBound(AdapterError):
+    """The identities do not name a recorded, READY, git-verified
+    disposable worktree, so no process was started.
+
+    The predecessor of this class accepted any existing directory --
+    `is_dir()` was the whole check -- and the main checkout passed it.
+    The refusal text is the binding's own fixed sentence; it carries no
+    path, no repository name and no record content."""
+
+    def __init__(self, message):
+        super().__init__(message, event=contract.EventCode.PREFLIGHT_FAILED,
+                         reason=contract.StopReason.PREFLIGHT_FAILED)
 
 
 class ContainmentFailed(AdapterError):
@@ -339,19 +356,32 @@ def _parse_reply(raw, measurements):
     return payload
 
 
-def run_implementer(binary, *, worktree, prompt, schema_path, budget_usd,
+def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
+                    baseline_sha, prompt, schema_path, budget_usd,
                     timeout_seconds, max_output_bytes, model=None):
     """Run the implementer once and return its validated reply.
 
+    The working directory is derived from the identities by
+    `worktree.assert_execution_binding`; there is no way to pass one in.
     Raises a typed `AdapterError` for every refusal. Nothing here
     retries, repairs or decides what happens next."""
     _assert_budget(budget_usd)
     _assert_limits(timeout_seconds, max_output_bytes)
     payload = _prompt_bytes(prompt)
     _usable_binary(binary)
-    cwd = _usable_worktree(worktree)
     argv = cli.build_implementer_argv(binary, schema_path=schema_path,
                                       budget_usd=budget_usd, model=model)
+
+    # LAST before the launch, so nothing sits between the proof and the
+    # use of it. The filesystem offers no transaction here -- a hostile
+    # same-user process can still race this window -- but the window is
+    # kept to the launch itself.
+    try:
+        cwd = worktree.assert_execution_binding(
+            repo, state_dir=state_dir, run_id=run_id,
+            worktree_id=worktree_id, baseline_sha=baseline_sha)
+    except worktree.WorktreeError as refused:
+        raise WorktreeNotBound(str(refused)) from None
 
     # THE CONTAINER EXISTS BEFORE THE PROGRAM RUNS. Creating the
     # process and containing it afterwards leaves a window in which the

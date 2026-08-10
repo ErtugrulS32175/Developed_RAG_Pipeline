@@ -182,23 +182,39 @@ def _authorised_record(state_dir, repo, worktree_id):
     return record
 
 
-def _registered_here(repo, path) -> bool:
-    """Does GIT, in this repository, report this worktree as its own?
+def _comparable(path) -> str:
+    """One spelling for a path, so equality means the same directory.
+
+    Case folding follows `os.name` -- Windows's STANDARD
+    case-insensitive assumption, not a per-directory measurement: a
+    case-sensitive NTFS directory on Windows is still folded, a known
+    and accepted limit. Folding used to be unconditional, and on Linux
+    that stopped meaning one spelling per directory: a probe showed a
+    registered tree and its unregistered case-twin comparing EQUAL --
+    an equality that WIDENS what the git registry vouches for, not one
+    that merely refuses more."""
+    text = str(Path(path).resolve()).replace("\\", "/")
+    return text.casefold() if os.name == "nt" else text
+
+
+def _worktree_listing(repo):
+    """Every working tree git reports for this repository, main first.
 
     CHECKED. With `check=False` a failed `git worktree list` returned an
     empty listing, and empty reads as "not registered here" -- so an
     unverifiable git state became a verified absence and removal carried
     on to delete the holder and the ledger entry. A question we could
-    not ask has no answer, and no answer is not `False`."""
+    not ask has no answer, and no answer is not an empty list."""
     listing = _git(repo, "worktree", "list", "--porcelain").stdout
-    resolved = str(Path(path).resolve()).replace("\\", "/").casefold()
-    for line in listing.splitlines():
-        if not line.startswith("worktree "):
-            continue
-        entry = str(Path(line.split(" ", 1)[1]).resolve())
-        if entry.replace("\\", "/").casefold() == resolved:
-            return True
-    return False
+    return [line.split(" ", 1)[1] for line in listing.splitlines()
+            if line.startswith("worktree ")]
+
+
+def _registered_here(repo, path) -> bool:
+    """Does GIT, in this repository, report this worktree as its own?"""
+    resolved = _comparable(path)
+    return any(_comparable(entry) == resolved
+               for entry in _worktree_listing(repo))
 
 
 def create(repo, *, state_dir, run_id, baseline_sha):
@@ -246,6 +262,123 @@ def create(repo, *, state_dir, run_id, baseline_sha):
             # caught by the residue assertion, and by `find_orphans`
             pass
         raise
+
+
+def assert_execution_binding(repo, *, state_dir, run_id, worktree_id,
+                             baseline_sha) -> Path:
+    """The ONE directory these identities are allowed to execute in.
+
+    The caller hands over identities -- repository, state directory,
+    run, worktree id, baseline -- and NEVER a path. The path comes out
+    of this function or it does not exist: `run_implementer` used to
+    take any directory that happened to be on disk, which made the main
+    checkout a perfectly acceptable working directory for the model and
+    left B1's write-ahead ownership record unread at the exact moment it
+    was supposed to matter.
+
+    Fail-closed, in this order:
+
+      1. the record exists, parses and matches its schema;
+      2. the record NAMES this id, this run, this repository and this
+         baseline, and says READY -- a record copied under another
+         filename, or one still PLANNED, refuses;
+      3. the RUN'S OWN BINDING (`binding.json`) exists, parses, and
+         pins exactly this worktree, repository, run and baseline. The
+         registry only says a worktree EXISTS and who made it; without
+         this document any READY sibling of the right run was
+         acceptable, and the one tree the run had actually pinned was
+         in no way special;
+      4. the path is DERIVED from the id alone and is a real directory
+         whose resolved location is exactly where the runner-owned root
+         says it must be -- a symlink or junction planted at the holder
+         or at the tree resolves elsewhere and refuses;
+      5. git reports that directory as a worktree of THIS repository,
+         it is not the main checkout, and its HEAD is exactly the
+         recorded baseline.
+
+    Every refusal is a fixed sentence: no absolute path, no repository
+    name, no record content travels in the error text.
+
+    TOCTOU, stated honestly: this function proves the state of the
+    world at the moment it runs. A hostile process under the same user
+    account can still swap the directory between this check and the
+    `Popen` that follows it; the filesystem offers no transaction that
+    would close that window, so the caller's obligation is to keep it
+    to nothing but the launch itself."""
+    record = read_record(state_dir, worktree_id)
+    if record is None:
+        raise WorktreeError("yurutme bagi: kayit yok ya da bozuk")
+    if record["worktree_id"] != worktree_id:
+        raise WorktreeError("yurutme bagi: kayit baska bir kimligi adliyor")
+    if record["status"] != STATUS_READY:
+        raise WorktreeError("yurutme bagi: kayit hazir durumda degil")
+    repo_id = state_module.repo_identity(repo)
+    if record["repo_id"] != repo_id:
+        raise WorktreeError("yurutme bagi: kayit bu depoya ait degil")
+    if record["run_id"] != run_id:
+        raise WorktreeError("yurutme bagi: kayit bu kosuya ait degil")
+    if record["baseline_sha"] != baseline_sha:
+        raise WorktreeError("yurutme bagi: kayit taban surumle uyusmuyor")
+    try:
+        binding = state_module.read_binding(state_dir)
+    except state_module.CorruptState:
+        raise WorktreeError(
+            "yurutme bagi: kosu baglamasi yok ya da bozuk") from None
+    if binding["worktree_id"] != worktree_id:
+        raise WorktreeError(
+            "yurutme bagi: kosu bu calisma agacina bagli degil")
+    if binding["repo_id"] != repo_id:
+        raise WorktreeError(
+            "yurutme bagi: kosu baglamasi bu depoya ait degil")
+    if binding["run_id"] != run_id:
+        raise WorktreeError(
+            "yurutme bagi: kosu baglamasi bu kosuya ait degil")
+    if binding["baseline_sha"] != baseline_sha:
+        raise WorktreeError(
+            "yurutme bagi: kosu baglamasi taban surumle uyusmuyor")
+    holder = holder_for(worktree_id)
+    derived = holder / WORKTREE_DIRNAME
+    if not derived.is_dir():
+        raise WorktreeError("yurutme bagi: turetilen dizin mevcut degil")
+    # The EXPECTED location is rebuilt from the root, not read from the
+    # holder: a junction planted at the holder itself would make
+    # `holder.resolve()` agree with wherever it points.
+    try:
+        resolved = derived.resolve(strict=True)
+        expected = runner_temp_root().resolve(strict=True) \
+            / holder.name / WORKTREE_DIRNAME
+    except OSError:
+        raise WorktreeError("yurutme bagi: yol cozulemedi") from None
+    # Compared as TEXT, each side resolved exactly once. `_comparable`
+    # resolves its argument -- and resolving `expected` again would
+    # follow the very link this comparison exists to catch, making the
+    # two sides agree about wherever the link points. Case folding
+    # follows `os.name` (Windows's standard case-insensitive
+    # assumption; a case-sensitive NTFS directory is a known limit):
+    # folding on Linux would let a twin directory differing only in
+    # case stand in for the real holder.
+    left = str(resolved).replace("\\", "/")
+    right = str(expected).replace("\\", "/")
+    if os.name == "nt":
+        left, right = left.casefold(), right.casefold()
+    if left != right:
+        raise WorktreeError("yurutme bagi: yol kabin disina cozuluyor")
+    listing = _worktree_listing(repo)
+    if not listing:
+        raise WorktreeError("yurutme bagi: git calisma agaci listesi bos")
+    # git lists the MAIN working tree first. Refusing it by position and
+    # refusing the repository argument itself are separate comparisons
+    # on purpose: `repo` may be handed in as a subdirectory.
+    if _comparable(resolved) in (_comparable(listing[0]), _comparable(repo)):
+        raise WorktreeError("yurutme bagi: ana calisma agaci yurutulemez")
+    if not any(_comparable(entry) == _comparable(resolved)
+               for entry in listing[1:]):
+        raise WorktreeError(
+            "yurutme bagi: calisma agaci bu depoda kayitli degil")
+    head = _git(derived, "rev-parse", "HEAD").stdout.strip()
+    if head != baseline_sha:
+        raise WorktreeError("yurutme bagi: calisma agaci taban surumde degil")
+    return derived
 
 
 def remove(repo, *, state_dir, worktree_id):

@@ -15,12 +15,13 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import pytest
 
-from tools.agent_loop import execution
+from tools.agent_loop import contract, execution, state, worktree
 from tools.agent_loop import process as process_module
 
 # The grandchild: writes a heartbeat immediately, then keeps writing.
@@ -136,6 +137,54 @@ def worktree_dir(tmp_path):
     return path
 
 
+@pytest.fixture
+def bound_identity(tmp_path):
+    """R2A MECHANICAL UPDATE: `run_implementer` no longer takes a path,
+    so the four lifecycle tests that reach it hand over the identities
+    of a REAL recorded worktree, built exactly the way B1 builds one --
+    inside a private temp root, so nothing here touches the
+    machine-wide holder directory. No assertion below changed."""
+    private = tmp_path / "runner-temp"
+    private.mkdir()
+    isolation = pytest.MonkeyPatch()
+    isolation.setattr(tempfile, "tempdir", str(private))
+    for variable in ("TMPDIR", "TEMP", "TMP"):
+        isolation.setenv(variable, str(private))
+
+    def git(*args):
+        done = subprocess.run(["git", "-C", str(repo), *args],
+                              capture_output=True, text=True,
+                              errors="replace")
+        assert done.returncode == 0, done.stderr
+        return done.stdout.strip()
+
+    repo = tmp_path / "kurgu-depo"
+    repo.mkdir()
+    git("init", "-q")
+    git("config", "user.email", "k@example.invalid")
+    git("config", "user.name", "Kurgu")
+    (repo / "kurgu.py").write_text("VALUE = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "kurgu")
+    baseline = git("rev-parse", "HEAD")
+    state_dir = tmp_path / "durum"
+    _, worktree_id = worktree.create(repo, state_dir=state_dir,
+                                     run_id="kurgu-run-1",
+                                     baseline_sha=baseline)
+    state.write_binding(state_dir, {
+        "protocol_version": contract.PROTOCOL_VERSION,
+        "run_id": "kurgu-run-1", "repo_id": state.repo_identity(repo),
+        "baseline_sha": baseline, "manifest_digest": "0" * 64,
+        "worktree_id": worktree_id})
+    yield {"repo": repo, "state_dir": state_dir, "run_id": "kurgu-run-1",
+           "worktree_id": worktree_id, "baseline_sha": baseline}
+    try:
+        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
+    except Exception:                                  # noqa: BLE001
+        pass
+    isolation.undo()
+
+
 def _still_writing(beat, seconds=1.5):
     first = beat.read_text(encoding="utf-8")
     time.sleep(seconds)
@@ -177,7 +226,7 @@ def test_the_program_is_frozen_until_it_has_been_contained(tmp_path,
 
 
 def test_a_container_that_cannot_be_built_stops_the_call_before_the_model(
-        tmp_path, worktree_dir, monkeypatch):
+        tmp_path, bound_identity, monkeypatch):
     """Refused BEFORE the prompt is sent. Discovering it afterwards
     means the invoice already exists -- the previous version launched
     anyway and only noticed at the end."""
@@ -196,7 +245,7 @@ def test_a_container_that_cannot_be_built_stops_the_call_before_the_model(
     monkeypatch.setattr(process_module, "_attach_job", refusing_attach)
     with pytest.raises(execution.ContainmentFailed) as refusal:
         execution.run_implementer(
-            stub, worktree=worktree_dir, prompt="kurgu", schema_path=schema,
+            stub, **bound_identity, prompt="kurgu", schema_path=schema,
             budget_usd=1.0, timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
             max_output_bytes=65536)
     assert refusal.value.reason in ("model_process_failed",)
@@ -209,7 +258,7 @@ def test_a_container_that_cannot_be_built_stops_the_call_before_the_model(
 # =====================================================================
 
 def test_an_exception_after_containment_still_empties_the_container(
-        tmp_path, worktree_dir, monkeypatch):
+        tmp_path, bound_identity, monkeypatch):
     """THE P0. The lifecycle after the launch was not wrapped, so an
     unexpected failure -- a thread that would not start, an interrupt --
     skipped the drain entirely and left the model process running with
@@ -228,7 +277,7 @@ def test_an_exception_after_containment_still_empties_the_container(
     monkeypatch.setattr(process_module.threading.Thread, "start", exploding)
     with pytest.raises(RuntimeError, match="kurgu"):
         execution.run_implementer(
-            stub, worktree=worktree_dir, prompt="kurgu", schema_path=schema,
+            stub, **bound_identity, prompt="kurgu", schema_path=schema,
             budget_usd=1.0, timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
             max_output_bytes=65536)
     monkeypatch.setattr(process_module.threading.Thread, "start", real_start)
@@ -240,7 +289,7 @@ def test_an_exception_after_containment_still_empties_the_container(
 
 
 def test_a_grandchild_does_not_survive_a_successful_call(tmp_path,
-                                                         worktree_dir):
+                                                         bound_identity):
     """Success is not an exemption: a bounded call that leaves an
     unbounded descendant behind was not bounded."""
     schema = tmp_path / "s.json"
@@ -254,7 +303,7 @@ def test_a_grandchild_does_not_survive_a_successful_call(tmp_path,
                  child_code=_CHILD.format(beat=str(beat)))
 
     result = execution.run_implementer(
-        stub, worktree=worktree_dir, prompt="kurgu", schema_path=schema,
+        stub, **bound_identity, prompt="kurgu", schema_path=schema,
         budget_usd=1.0, timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
         max_output_bytes=65536)
     assert result.reply["status"] == "implemented"
@@ -263,7 +312,7 @@ def test_a_grandchild_does_not_survive_a_successful_call(tmp_path,
 
 
 def test_a_grandchild_holding_the_pipes_does_not_cost_the_grace_period(
-        tmp_path, worktree_dir):
+        tmp_path, bound_identity):
     """The drain used to happen AFTER the thread joins, so a descendant
     holding stdout open kept the readers alive and the adapter waited
     out the whole grace window before killing anything."""
@@ -279,7 +328,7 @@ def test_a_grandchild_holding_the_pipes_does_not_cost_the_grace_period(
 
     started = time.monotonic()
     execution.run_implementer(
-        stub, worktree=worktree_dir, prompt="kurgu", schema_path=schema,
+        stub, **bound_identity, prompt="kurgu", schema_path=schema,
         budget_usd=1.0, timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
         max_output_bytes=65536)
     elapsed = time.monotonic() - started

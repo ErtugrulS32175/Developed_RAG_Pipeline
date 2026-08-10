@@ -92,9 +92,17 @@ def repo_identity(repo) -> str:
     """A stable, path-free id for a repository.
 
     Derived from the absolute path but never REVEALING it: reports and
-    state files may carry identity, not location."""
-    resolved = str(Path(repo).resolve()).casefold().encode("utf-8")
-    return hashlib.sha256(resolved).hexdigest()[:32]
+    state files may carry identity, not location. Case folding follows
+    `os.name` -- Windows's STANDARD case-insensitive assumption, not a
+    per-directory measurement, so a case-sensitive NTFS directory on
+    Windows is a known, accepted limit. Folding everywhere gave two
+    distinct case-twin repositories on Linux the SAME identity, and an
+    identity two repositories share authorises either one against
+    records the other wrote."""
+    resolved = str(Path(repo).resolve())
+    if os.name == "nt":
+        resolved = resolved.casefold()
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:32]
 
 
 def _validate(payload, schema, what):

@@ -29,8 +29,18 @@ import tempfile
 from pathlib import Path
 
 SOURCE_REPO = Path(__file__).resolve().parents[2]
-MODULES = ("state", "locking", "worktree", "preflight")
+MODULES = ("state", "locking", "worktree", "preflight", "execution")
 NL = chr(10)
+
+# The execution-binding block in `run_implementer`, verbatim: two R2A
+# mutations rewrite it and both must keep matching the real source.
+BINDING_TRY = (
+    "    try:" + NL
+    + "        cwd = worktree.assert_execution_binding(" + NL
+    + "            repo, state_dir=state_dir, run_id=run_id," + NL
+    + "            worktree_id=worktree_id, baseline_sha=baseline_sha)" + NL
+    + "    except worktree.WorktreeError as refused:" + NL
+    + "        raise WorktreeNotBound(str(refused)) from None")
 BS = chr(92)
 
 # (label, module, old, new, expected_test_substring)
@@ -183,7 +193,120 @@ MUTATIONS = [
      + "    return record",
      "    return record",
      "record_is_written_before_anything_exists"),
+    # ----------------------------------------------------------------
+    # R2A -- the execution binding. Each mutation deletes exactly one
+    # refusal and its target test must be the one that notices.
+    # ----------------------------------------------------------------
+    ("r2a-hazir-kontrolu", "worktree",
+     '        raise WorktreeError("yurutme bagi: kayit hazir durumda degil")',
+     "        pass",
+     "test_a_planned_record_is_refused_even_with_the_tree_on_disk"),
+    ("r2a-kayit-depo", "worktree",
+     '        raise WorktreeError("yurutme bagi: kayit bu depoya ait degil")',
+     "        pass",
+     "test_a_record_issued_to_a_different_repository_identity_is_refused"),
+    ("r2a-kayit-kosu", "worktree",
+     '        raise WorktreeError("yurutme bagi: kayit bu kosuya ait degil")',
+     "        pass",
+     "test_a_record_whose_run_was_rewritten_is_refused"),
+    ("r2a-kayit-taban", "worktree",
+     '        raise WorktreeError("yurutme bagi: kayit taban surumle '
+     'uyusmuyor")',
+     "        pass",
+     "test_a_record_whose_baseline_was_rewritten_is_refused"),
+    ("r2a-gomulu-kimlik", "worktree",
+     '        raise WorktreeError("yurutme bagi: kayit baska bir kimligi '
+     'adliyor")',
+     "        pass",
+     "test_a_record_copied_under_another_id_is_refused"),
+    ("r2a-bag-varligi", "worktree",
+     "    except state_module.CorruptState:" + NL
+     + "        raise WorktreeError(" + NL
+     + '            "yurutme bagi: kosu baglamasi yok ya da bozuk") from None',
+     "    except state_module.CorruptState:" + NL
+     + '        binding = {"worktree_id": worktree_id, "repo_id": repo_id,'
+     + NL
+     + '                   "run_id": run_id, "baseline_sha": baseline_sha}',
+     "test_a_missing_run_binding_is_refused"),
+    ("r2a-bag-agac", "worktree",
+     "        raise WorktreeError(" + NL
+     + '            "yurutme bagi: kosu bu calisma agacina bagli degil")',
+     "        pass",
+     "test_a_second_ready_worktree_the_binding_does_not_name_is_refused"),
+    ("r2a-bag-depo", "worktree",
+     "        raise WorktreeError(" + NL
+     + '            "yurutme bagi: kosu baglamasi bu depoya ait degil")',
+     "        pass",
+     "test_a_binding_issued_to_a_different_repository_is_refused"),
+    ("r2a-bag-kosu", "worktree",
+     "        raise WorktreeError(" + NL
+     + '            "yurutme bagi: kosu baglamasi bu kosuya ait degil")',
+     "        pass",
+     "test_a_binding_for_a_different_run_is_refused"),
+    ("r2a-bag-taban", "worktree",
+     "        raise WorktreeError(" + NL
+     + '            "yurutme bagi: kosu baglamasi taban surumle uyusmuyor")',
+     "        pass",
+     "test_a_binding_at_a_different_baseline_is_refused"),
+    ("r2a-bas-kontrolu", "worktree",
+     '    head = _git(derived, "rev-parse", "HEAD").stdout.strip()' + NL
+     + "    if head != baseline_sha:" + NL
+     + '        raise WorktreeError("yurutme bagi: calisma agaci taban '
+     'surumde degil")' + NL
+     + "    return derived",
+     "    return derived",
+     "test_a_worktree_whose_head_moved_is_refused"),
+    ("r2a-git-kutugu", "worktree",
+     "        raise WorktreeError(" + NL
+     + '            "yurutme bagi: calisma agaci bu depoda kayitli degil")',
+     "        pass",
+     "test_a_copied_tree_that_git_does_not_register_is_refused"),
+    ("r2a-ana-agac", "worktree",
+     '        raise WorktreeError("yurutme bagi: ana calisma agaci '
+     'yurutulemez")',
+     "        pass",
+     "test_the_repository_argument_may_never_be_the_execution_target"),
+    ("r2a-kap-sinirlama", "worktree",
+     '        raise WorktreeError("yurutme bagi: yol kabin disina '
+     'cozuluyor")',
+     "        pass",
+     "test_a_link_that_resolves_outside_the_holder_is_refused"),
+    ("r2a-bag-cagrisi-yok", "execution",
+     BINDING_TRY,
+     "    cwd = worktree.holder_for(worktree_id) / worktree.WORKTREE_DIRNAME",
+     "test_a_missing_record_is_refused"),
+    ("r2a-cagiran-yolu", "execution",
+     BINDING_TRY,
+     BINDING_TRY.replace("cwd = worktree.assert_execution_binding(",
+                         "worktree.assert_execution_binding(")
+     + NL + "    cwd = Path(repo)",
+     "test_the_model_runs_exactly_in_the_derived_recorded_worktree"),
 ]
+
+
+def verdict_exit_code(baseline_rc, results, intact):
+    """The process exit code, derived from EVERYTHING that can go wrong.
+
+    This used to be implicit: every path fell off the end of `main` and
+    the process exited 0 -- a red baseline, a missed mutation, a
+    misdirected kill and even a modified live tree all LOOKED like
+    success to any automation reading the exit code. Printed text is
+    not a verdict; the exit code is.
+
+      0  every mutation YAKALANDI, baseline green, live tree untouched
+      1  at least one verdict is not YAKALANDI
+      2  the baseline battery was red, or nothing was judged at all
+      3  the live tree changed while the harness ran
+    """
+    if baseline_rc != 0:
+        return 2
+    if not intact:
+        return 3
+    if not results:
+        return 2
+    if any(entry["hukum"] != "YAKALANDI" for entry in results):
+        return 1
+    return 0
 
 
 def digest(path):
@@ -198,6 +321,7 @@ def originals():
 
 def _pytest(workdir, extra):
     argv = [sys.executable, "-m", "pytest", "tests/test_agent_loop_b1.py",
+            "tests/test_agent_loop_b2_execution.py",
             "-q", "--no-header", "-p", "no:cacheprovider", "-rf"] + extra
     # a temp directory of the HARNESS's own. The battery derives its
     # worktree root from the process temp directory, so a run that
@@ -262,7 +386,7 @@ def main():
     if rc != 0:
         print("BASELINE RED -- sonuclar anlamsiz olurdu.")
         shutil.rmtree(workroot, ignore_errors=True)
-        return
+        return verdict_exit_code(rc, [], True)
 
     results = []
     for label, module, old, new, expected in MUTATIONS:
@@ -276,7 +400,8 @@ def main():
         path.write_text(original.replace(old, new, 1), encoding="utf-8")
         imported = subprocess.run(
             [sys.executable, "-c",
-             "from tools.agent_loop import state, locking, worktree, preflight"],
+             "from tools.agent_loop import (state, locking, worktree, "
+             "preflight, execution)"],
             cwd=str(workdir), capture_output=True, text=True)
         if imported.returncode != 0:
             path.write_text(original, encoding="utf-8")
@@ -316,7 +441,8 @@ def main():
                       encoding="utf-8")
     print("makinece okunabilir rapor: " + str(report))
     shutil.rmtree(workroot, ignore_errors=True)
+    return verdict_exit_code(0, results, intact)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
