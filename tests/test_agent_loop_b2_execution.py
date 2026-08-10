@@ -54,6 +54,11 @@ def main():
     elif mode == "raw":
         sys.stdout.buffer.write(bytes.fromhex(cfg["hex"]))
         sys.stdout.buffer.flush()
+    elif mode == "consume":
+        received = sys.stdin.buffer.read()
+        Path(cfg["record"]).write_text(str(len(received)), encoding="ascii")
+        sys.stdout.buffer.write(bytes.fromhex(cfg["hex"]))
+        sys.stdout.buffer.flush()
     elif mode == "flood":
         target = (sys.stdout if cfg["stream"] == "out" else sys.stderr).buffer
         block = b"x" * 4096
@@ -805,6 +810,27 @@ def test_a_reply_produced_without_reading_the_prompt_is_refused(
     assert refusal.value.reason == contract.StopReason.INTERRUPTED
     assert refusal.value.exit_code == 0, \
         "surec basariyla bitti; reddedilen sey teslimat"
+
+
+def test_a_large_prompt_arrives_whole(tmp_path, worktree_dir, schema_file):
+    """End to end: a prompt many times a pipe buffer arrives entire.
+
+    Asserted on the BYTES THE CHILD RECEIVED rather than on the writer's
+    own completion flag, because the flag is precisely what was wrong
+    once.
+
+    HONEST LIMIT, measured rather than assumed: this does NOT catch the
+    partial-write defect. With a child that reads, the kernel moves the
+    whole buffer even through a single raw `write`, so the truncation is
+    invisible here -- verified by running this against the broken writer
+    on Linux, where it still passed. The guard for that defect is
+    `test_a_reply_produced_without_reading_the_prompt_is_refused`, and
+    it only fails on POSIX."""
+    prompt = "K" * (2 * 1024 * 1024)
+    report = _dump_report(tmp_path, worktree_dir, schema_file, prompt=prompt)
+    assert len(report["stdin"]) == len(prompt), \
+        f"istem kirpildi: {len(report['stdin'])} / {len(prompt)} bayt"
+    assert report["stdin"] == prompt
 
 
 def test_a_delivered_prompt_is_still_accepted(tmp_path, worktree_dir,

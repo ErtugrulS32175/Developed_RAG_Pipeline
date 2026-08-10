@@ -463,7 +463,20 @@ class PromptWriter(threading.Thread):
 
     def run(self):
         try:
-            self._stream.write(self._payload)
+            # WRITTEN IN FULL, or not written. `bufsize=0` makes stdin a
+            # RAW stream, and a raw write is one `write(2)`: it may move
+            # only part of the buffer and return that count without
+            # raising. Treating the call's return as "done" sent the
+            # model a TRUNCATED prompt and reported success -- a reply
+            # to a question that was cut in half. Windows hid it by
+            # blocking until the whole buffer had gone; Linux did not,
+            # and CI is where it surfaced.
+            remaining = memoryview(self._payload)
+            while remaining:
+                written = self._stream.write(remaining)
+                if not written:
+                    return                  # the pipe stopped accepting
+                remaining = remaining[written:]
             self._stream.flush()
             self.completed = True
         except (OSError, ValueError):           # the child went away
