@@ -386,6 +386,15 @@ def test_the_implementer_tool_list_is_a_contract_constant_not_an_argument():
         contract.IMPLEMENTER_ALLOWED_TOOLS)
 
 
+def test_a_failed_model_process_has_its_own_closed_stop_reason():
+    """A process that failed after preflight must not blame preflight,
+    and a terminal state cannot carry an open-ended or missing reason."""
+    reason = contract.StopReason.MODEL_PROCESS_FAILED
+    assert reason == "model_process_failed"
+    assert reason in contract.ALL_STOP_REASONS
+    assert reason != contract.StopReason.PREFLIGHT_FAILED
+
+
 # =====================================================================
 # THE CONTROL PLANE -- a running loop may not rewrite its own rules
 # =====================================================================

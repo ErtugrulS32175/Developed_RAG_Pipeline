@@ -187,6 +187,7 @@ class StopReason:
 
     COMPLETED = "completed"
     PREFLIGHT_FAILED = "preflight_failed"
+    MODEL_PROCESS_FAILED = "model_process_failed"
     DIRTY_WORKTREE = "dirty_worktree"
     STAGED_CHANGES = "staged_changes"
     BASELINE_MISMATCH = "baseline_mismatch"
