@@ -237,6 +237,15 @@ CONTROL_PLANE_PATHS = (
     "eval/tools/leak_scan.py",
 )
 
+# The loop's safety battery grows by phase. Listing today's test files one by
+# one made the next phase's tests editable by the loop until somebody
+# remembered to extend this tuple. Patterns are therefore part of the frozen
+# control-plane contract too; implementations must match candidate paths
+# against these globs in addition to the exact prefixes above.
+CONTROL_PLANE_GLOBS = (
+    "tests/test_agent_loop*.py",
+)
+
 # ANCESTORS COUNT. `allowed_paths: ["tools/"]` was accepted because only
 # the exact protected prefix was refused -- and `tools/` contains
 # `tools/agent_loop/`. So does `tests/`, `eval/` and `scripts/`. The
