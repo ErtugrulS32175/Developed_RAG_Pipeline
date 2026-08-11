@@ -17,12 +17,15 @@ the one directory they may name, refusing everything else before a
 process exists. There is no parameter through which a caller can
 inject a path.
 
-NOTHING IS DISCOVERED. The binary, the identities, the schema path, the
-budget, the timeout and the output ceiling are all mandatory arguments.
-A caller who forgets one gets a `TypeError`; a caller who passes a bare
-name like `claude` gets a refusal rather than whatever is on PATH. The
-argv itself is built only by `cli.build_implementer_argv`, so the flag
-rules stay in the module that already proves them.
+NOTHING IS DISCOVERED. The binary, the identities, the budget, the
+timeout and the output ceiling are all mandatory arguments. A caller
+who forgets one gets a `TypeError`; a caller who passes a bare name
+like `claude` gets a refusal rather than whatever is on PATH. The argv
+itself is built only by `cli.build_implementer_argv`, so the flag rules
+stay in the module that already proves them. The SCHEMA is not an
+argument at all: it is the frozen canonical binding, inline on the
+argv, hash-checked before launch, and the validator is parsed from the
+same bytes.
 
 THE PROMPT GOES OVER STDIN. Never argv, never the environment: a prompt
 on a command line is a prompt in every process listing, and an
@@ -45,6 +48,7 @@ subtract from a budget, and it would be an invention.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -171,7 +175,11 @@ class SchemaViolation(AdapterError):
 
 @dataclass
 class ImplementerRun:
-    """A validated reply plus what the call cost in time and bytes."""
+    """A validated reply plus what the call cost in time and bytes.
+
+    `schema_sha256` names the EXACT canonical schema bytes that were on
+    the argv and that validated this reply -- the one 64-hex code a
+    report may carry about the schema, and the only thing it needs."""
 
     reply: dict
     exit_code: int
@@ -179,6 +187,7 @@ class ImplementerRun:
     stdout_bytes: int
     stderr_bytes: int
     event: str
+    schema_sha256: str
 
 
 def _assert_budget(budget_usd):
@@ -288,6 +297,66 @@ def _usable_binary(binary):
     return path
 
 
+class SchemaNotBound(AdapterError):
+    """The argv's inline schema is not the frozen canonical binding, so
+    no process was started.
+
+    The schema used to travel as a caller-chosen FILE PATH -- to a flag
+    that takes inline JSON -- while the validator used a separate live
+    dictionary; nothing tied the two, and rewriting the file to garbage
+    between build and launch changed nothing anybody checked. Now the
+    bytes actually on the argv are hashed and compared to the binding
+    immediately before launch; anything else refuses here."""
+
+    def __init__(self, message):
+        super().__init__(message, event=contract.EventCode.PREFLIGHT_FAILED,
+                         reason=contract.StopReason.PREFLIGHT_FAILED)
+
+
+def _argv_schema(argv):
+    """The inline schema ACTUALLY on the argv, or a refusal.
+
+    Verified, not trusted: exactly one `--json-schema`, its value's
+    exact UTF-8 bytes hashing to the frozen binding's SHA-256. The
+    validator returned is parsed from THOSE bytes, so the schema the
+    model receives and the schema that judges its reply cannot be two
+    things. Never launches anything; never puts schema text in an
+    error."""
+    positions = [index for index, token in enumerate(argv)
+                 if token == "--json-schema"]
+    if len(positions) != 1 or positions[0] + 1 >= len(argv):
+        raise SchemaNotBound("argv tam olarak bir inline sema tasimiyor")
+    text = argv[positions[0] + 1]
+    binding = schemas.IMPLEMENTER_SCHEMA_BINDING
+    # EXACTLY `str`, not "a kind of str". `isinstance` accepts
+    # SUBCLASSES, and a subclass answers whatever it likes: an audit
+    # built one whose real content was `{}` but whose `__eq__` claimed
+    # equality with the canonical text and whose `encode()` returned
+    # the canonical BYTES. Both guards passed, `json.loads` then read
+    # the real `{}`, and a permissive validator accepted an arbitrary
+    # reply. Every check below asks the object a question; only an
+    # exact `str` cannot lie about the answer.
+    #
+    # This also subsumes the earlier crash classes -- bytes, numbers,
+    # None and unencodable strings -- which used to escape as
+    # AttributeError or UnicodeEncodeError: operationally closed,
+    # contractually untyped.
+    if type(text) is not str:
+        raise SchemaNotBound("argv'deki sema degeri metin degil")
+    try:
+        payload = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise SchemaNotBound(
+            "argv'deki sema UTF-8'e kodlanamiyor") from None
+    # Both the byte-exact text comparison against the frozen canonical
+    # form AND a fresh hash of what is actually on the argv: either
+    # divergence refuses, and neither trusts the other.
+    if text != binding.canonical_json \
+            or hashlib.sha256(payload).hexdigest() != binding.sha256:
+        raise SchemaNotBound("argv'deki sema kanonik baglamayla eslesmiyor")
+    return Draft202012Validator(json.loads(text)), binding.sha256
+
+
 class WorktreeNotBound(AdapterError):
     """The identities do not name a recorded, READY, git-verified
     disposable worktree, so no process was started.
@@ -328,11 +397,14 @@ class ProcessTreeSurvived(AdapterError):
                          **measurements)
 
 
-def _parse_reply(raw, measurements):
+def _parse_reply(raw, measurements, validator):
     """Decode, parse and validate -- refusing at every step.
 
     Strict UTF-8: replacement characters would turn undecodable bytes
-    into a string that might then parse into something plausible."""
+    into a string that might then parse into something plausible. The
+    validator ARRIVES here, built from the argv's own inline schema
+    bytes -- validating against a separate in-process schema is exactly
+    the unbound state R2B removed."""
     try:
         text = bytes(raw).decode("utf-8")
     except UnicodeDecodeError:
@@ -345,8 +417,7 @@ def _parse_reply(raw, measurements):
     if not isinstance(payload, dict):
         raise SchemaViolation("cikti bir JSON nesnesi degil", **measurements)
     try:
-        Draft202012Validator(
-            schemas.IMPLEMENTER_RESULT_SCHEMA).validate(payload)
+        validator.validate(payload)
     except ValidationError as invalid:
         # the failing FIELD PATH, never the failing value: the value is
         # model output and this text travels into reports
@@ -357,20 +428,26 @@ def _parse_reply(raw, measurements):
 
 
 def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
-                    baseline_sha, prompt, schema_path, budget_usd,
+                    baseline_sha, prompt, budget_usd,
                     timeout_seconds, max_output_bytes, model=None):
     """Run the implementer once and return its validated reply.
 
     The working directory is derived from the identities by
-    `worktree.assert_execution_binding`; there is no way to pass one in.
+    `worktree.assert_execution_binding`, and the schema is the frozen
+    canonical binding -- there is no way to pass either one in.
     Raises a typed `AdapterError` for every refusal. Nothing here
     retries, repairs or decides what happens next."""
     _assert_budget(budget_usd)
     _assert_limits(timeout_seconds, max_output_bytes)
     payload = _prompt_bytes(prompt)
     _usable_binary(binary)
-    argv = cli.build_implementer_argv(binary, schema_path=schema_path,
-                                      budget_usd=budget_usd, model=model)
+    argv = cli.build_implementer_argv(binary, budget_usd=budget_usd,
+                                      model=model)
+    # The bytes ACTUALLY on the argv, hashed against the frozen binding
+    # before anything runs -- and the validator is parsed from those
+    # same bytes, so what the model receives and what judges its reply
+    # cannot diverge.
+    validator, schema_sha256 = _argv_schema(argv)
 
     # LAST before the launch, so nothing sits between the proof and the
     # use of it. The filesystem offers no transaction here -- a hostile
@@ -485,7 +562,7 @@ def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
                             else time.monotonic() + REAP_SECONDS)
 
     reply = _parse_reply(streams[0].buffer,
-                         dict(measurements, exit_code=exit_code))
+                         dict(measurements, exit_code=exit_code), validator)
     return ImplementerRun(reply=reply, exit_code=exit_code,
                           event=contract.EventCode.MODEL_CALL_FINISHED,
-                          **measurements)
+                          schema_sha256=schema_sha256, **measurements)

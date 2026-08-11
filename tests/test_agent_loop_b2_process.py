@@ -245,7 +245,7 @@ def test_a_container_that_cannot_be_built_stops_the_call_before_the_model(
     monkeypatch.setattr(process_module, "_attach_job", refusing_attach)
     with pytest.raises(execution.ContainmentFailed) as refusal:
         execution.run_implementer(
-            stub, **bound_identity, prompt="kurgu", schema_path=schema,
+            stub, **bound_identity, prompt="kurgu",
             budget_usd=1.0, timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
             max_output_bytes=65536)
     assert refusal.value.reason in ("model_process_failed",)
@@ -277,7 +277,7 @@ def test_an_exception_after_containment_still_empties_the_container(
     monkeypatch.setattr(process_module.threading.Thread, "start", exploding)
     with pytest.raises(RuntimeError, match="kurgu"):
         execution.run_implementer(
-            stub, **bound_identity, prompt="kurgu", schema_path=schema,
+            stub, **bound_identity, prompt="kurgu",
             budget_usd=1.0, timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
             max_output_bytes=65536)
     monkeypatch.setattr(process_module.threading.Thread, "start", real_start)
@@ -303,7 +303,7 @@ def test_a_grandchild_does_not_survive_a_successful_call(tmp_path,
                  child_code=_CHILD.format(beat=str(beat)))
 
     result = execution.run_implementer(
-        stub, **bound_identity, prompt="kurgu", schema_path=schema,
+        stub, **bound_identity, prompt="kurgu",
         budget_usd=1.0, timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
         max_output_bytes=65536)
     assert result.reply["status"] == "implemented"
@@ -328,7 +328,7 @@ def test_a_grandchild_holding_the_pipes_does_not_cost_the_grace_period(
 
     started = time.monotonic()
     execution.run_implementer(
-        stub, **bound_identity, prompt="kurgu", schema_path=schema,
+        stub, **bound_identity, prompt="kurgu",
         budget_usd=1.0, timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
         max_output_bytes=65536)
     elapsed = time.monotonic() - started

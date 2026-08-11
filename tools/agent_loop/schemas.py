@@ -30,8 +30,11 @@ redundant key beats teaching the scanner an exception.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+
+from jsonschema import Draft202012Validator
 
 from tools.agent_loop.contract import (
     ALL_AUDIT_KINDS,
@@ -434,6 +437,80 @@ ALL_SCHEMAS = {
 }
 
 ALL_AUDIT_KINDS = ALL_AUDIT_KINDS  # re-exported for the tests' convenience
+
+
+def canonical_json(document) -> str:
+    """ONE spelling for a JSON document, so equal documents have equal
+    bytes and equal bytes have equal hashes.
+
+    The exact rules are the contract: `sort_keys=True` (insertion order
+    must not change the hash), `separators=(",", ":")` (compact, no
+    whitespace to disagree about), `ensure_ascii=True` (no encoding
+    ambiguity), `allow_nan=False` (NaN/Infinity are not JSON and would
+    otherwise serialize into something no parser owes us a meaning
+    for)."""
+    return json.dumps(document, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False)
+
+
+class SchemaBinding:
+    """A schema frozen into canonical bytes, their SHA-256, and a
+    validator parsed back from THOSE SAME BYTES.
+
+    R2B exists because the schema handed to the Claude CLI and the
+    schema the adapter validated with were two unrelated things: the
+    CLI got a file path (the flag takes INLINE JSON, so the path was
+    wrong twice over), the validator got a live module dictionary, and
+    rewriting the file to garbage between building the argv and running
+    it changed nothing anybody checked.
+
+    The validator here is constructed from `json.loads` of the
+    canonical text -- a fresh object -- so the mutable source
+    dictionary stops being a live authority the moment the binding is
+    built. Construction is fail-closed: the canonical text must
+    round-trip to the source document exactly, and the document must
+    satisfy `Draft202012Validator.check_schema`.
+
+    FROZEN THROUGH THE NORMAL API. The first version's fields were
+    ordinary writable attributes, and an evaluator probe rewrote the
+    canonical text and the hash TOGETHER: the substitute entered the
+    argv, the hash comparison agreed with itself, and a permissive
+    validator accepted an arbitrary reply. Attribute assignment and
+    deletion now refuse. What this does NOT claim: `object.__setattr__`
+    still exists in the language -- a hostile actor with code execution
+    in this process is outside the threat model, and the refusal below
+    is for the normal API, exactly as stated."""
+
+    __slots__ = ("canonical_json", "canonical_bytes", "sha256", "_validator")
+
+    def __init__(self, schema):
+        text = canonical_json(schema)
+        parsed = json.loads(text)
+        if parsed != schema:
+            raise ValueError("kanonik gosterim kaynak semayla ayni degil")
+        Draft202012Validator.check_schema(parsed)
+        object.__setattr__(self, "canonical_json", text)
+        object.__setattr__(self, "canonical_bytes", text.encode("utf-8"))
+        object.__setattr__(self, "sha256",
+                           hashlib.sha256(self.canonical_bytes).hexdigest())
+        object.__setattr__(self, "_validator", Draft202012Validator(parsed))
+
+    def __setattr__(self, name, value):
+        raise AttributeError("baglama donduruldu; alan yeniden yazilamaz")
+
+    def __delattr__(self, name):
+        raise AttributeError("baglama donduruldu; alan silinemez")
+
+    def validate(self, payload):
+        """Raises `jsonschema.ValidationError` exactly like the raw
+        validator would; carries no schema text into the error path."""
+        self._validator.validate(payload)
+
+
+# THE implementer binding. Built once at import, used by the argv
+# builder and the adapter alike, so there is exactly one schema in
+# flight and one hash that names it.
+IMPLEMENTER_SCHEMA_BINDING = SchemaBinding(IMPLEMENTER_RESULT_SCHEMA)
 
 
 def locked_audit_schema(*, run_id, issued_finding_ids, issued_mechanism_ids):

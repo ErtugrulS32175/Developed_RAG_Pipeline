@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tools.agent_loop import schemas
 from tools.agent_loop.contract import (
     CODEX_APPROVAL_OVERRIDE,
     IMPLEMENTER_ALLOWED_TOOLS,
@@ -54,11 +55,19 @@ def assert_safe_argv(argv):
     return tokens
 
 
-def build_implementer_argv(binary, *, schema_path, budget_usd,
+def build_implementer_argv(binary, *, budget_usd,
                            allowed_tools=IMPLEMENTER_ALLOWED_TOOLS,
                            prompt_is_stdin=True, model=None,
                            permission_mode="acceptEdits"):
     """`claude` in non-interactive mode, bounded by schema and budget.
+
+    THE SCHEMA IS NOT A PARAMETER. `--json-schema` takes INLINE JSON --
+    measured against the installed CLI's own help -- and this builder
+    used to pass a file path there, chosen by the caller and mutable on
+    disk between building the argv and running it. The value is now the
+    frozen canonical text of `IMPLEMENTER_RESULT_SCHEMA`, from the one
+    binding the validator also uses; there is nothing for a caller to
+    substitute.
 
     THE TOOL LIST IS NOT THE CALLER'S TO CHOOSE. `allowed_tools=["Bash"]`
     used to be accepted, and a Claude holding Bash can `git add`,
@@ -88,7 +97,7 @@ def build_implementer_argv(binary, *, schema_path, budget_usd,
         str(binary),
         "--print",
         "--output-format", "json",
-        "--json-schema", str(schema_path),
+        "--json-schema", schemas.IMPLEMENTER_SCHEMA_BINDING.canonical_json,
         "--max-budget-usd", str(budget_usd),
         "--permission-mode", permission_mode,
         "--allowedTools", *allowed_tools,

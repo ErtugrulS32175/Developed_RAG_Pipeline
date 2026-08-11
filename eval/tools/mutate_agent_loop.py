@@ -29,7 +29,8 @@ import tempfile
 from pathlib import Path
 
 SOURCE_REPO = Path(__file__).resolve().parents[2]
-MODULES = ("state", "locking", "worktree", "preflight", "execution")
+MODULES = ("state", "locking", "worktree", "preflight", "execution",
+           "cli", "schemas")
 NL = chr(10)
 
 # The execution-binding block in `run_implementer`, verbatim: two R2A
@@ -281,6 +282,70 @@ MUTATIONS = [
                          "worktree.assert_execution_binding(")
      + NL + "    cwd = Path(repo)",
      "test_the_model_runs_exactly_in_the_derived_recorded_worktree"),
+    # ----------------------------------------------------------------
+    # R2B -- one canonical inline schema: bytes, hash, argv, validator
+    # ----------------------------------------------------------------
+    ("r2b-yol-degeri", "cli",
+     '        "--json-schema", schemas.IMPLEMENTER_SCHEMA_BINDING.'
+     'canonical_json,',
+     '        "--json-schema", str(binary),',
+     "test_the_argv_schema_is_inline_canonical_and_hashed"),
+    ("r2b-kanonik-sirasiz", "schemas",
+     '    return json.dumps(document, sort_keys=True, '
+     'separators=(",", ":"),',
+     '    return json.dumps(document, sort_keys=False, '
+     'separators=(",", ":"),',
+     "test_canonical_json_is_order_independent_compact_and_deterministic"),
+    ("r2b-ham-sozluk", "execution",
+     "        validator.validate(payload)",
+     "        Draft202012Validator(" + NL
+     + "            schemas.IMPLEMENTER_RESULT_SCHEMA).validate(payload)",
+     "test_the_validator_cannot_be_the_raw_module_dictionary"),
+    ("r2b-esitlik-kontrolu", "execution",
+     "    if text != binding.canonical_json " + BS + NL
+     + "            or hashlib.sha256(payload).hexdigest() != "
+     "binding.sha256:" + NL
+     + '        raise SchemaNotBound("argv\'deki sema kanonik baglamayla '
+     'eslesmiyor")',
+     "    if False:" + NL
+     + '        raise SchemaNotBound("argv\'deki sema kanonik baglamayla '
+     'eslesmiyor")',
+     "test_a_builder_that_smuggles_a_different_schema_is_refused_before_"
+     "launch"),
+    # ----------------------------------------------------------------
+    # R2B-R1 -- the binding is frozen and every divergence is TYPED
+    # ----------------------------------------------------------------
+    ("r2br1-dondurma", "schemas",
+     "    def __setattr__(self, name, value):" + NL
+     + '        raise AttributeError("baglama donduruldu; alan yeniden '
+     'yazilamaz")',
+     "    def __setattr__(self, name, value):" + NL
+     + "        object.__setattr__(self, name, value)",
+     "test_the_binding_refuses_attribute_rewrites"),
+    ("r2br1-tip-kontrolu", "execution",
+     "    if type(text) is not str:" + NL
+     + '        raise SchemaNotBound("argv\'deki sema degeri metin degil")',
+     "    if False:" + NL
+     + '        raise SchemaNotBound("argv\'deki sema degeri metin degil")',
+     "test_a_malformed_schema_token_is_the_same_typed_refusal"),
+    # The exact-type check, weakened to the isinstance form that let a
+    # lying `str` subclass through. Only the impersonation test sees it.
+    ("r2br11-alt-sinif", "execution",
+     "    if type(text) is not str:",
+     "    if not isinstance(text, str):",
+     "test_a_lying_str_subclass_cannot_impersonate_the_schema"),
+    ("r2br1-kodlama-sarici", "execution",
+     "    except UnicodeEncodeError:" + NL
+     + "        raise SchemaNotBound(" + NL
+     + '            "argv\'deki sema UTF-8\'e kodlanamiyor") from None',
+     "    except UnicodeEncodeError:" + NL
+     + "        raise",
+     "test_a_malformed_schema_token_is_the_same_typed_refusal"),
+    ("r2b-yanlis-sha", "execution",
+     "    return Draft202012Validator(json.loads(text)), binding.sha256",
+     "    return Draft202012Validator(json.loads(text)), "
+     "binding.sha256[::-1]",
+     "test_the_argv_schema_is_inline_canonical_and_hashed"),
 ]
 
 
@@ -320,8 +385,11 @@ def originals():
 
 
 def _pytest(workdir, extra):
+    # R2B mutation targets live in the CONTRACT battery too (the
+    # canonicalization rules are contract tests), so it runs here.
     argv = [sys.executable, "-m", "pytest", "tests/test_agent_loop_b1.py",
             "tests/test_agent_loop_b2_execution.py",
+            "tests/test_agent_loop_contract.py",
             "-q", "--no-header", "-p", "no:cacheprovider", "-rf"] + extra
     # a temp directory of the HARNESS's own. The battery derives its
     # worktree root from the process temp directory, so a run that
@@ -374,9 +442,18 @@ def main():
             shutil.copytree(source, workdir / tree,
                             ignore=shutil.ignore_patterns(
                                 "__pycache__", ".pytest_cache", "*.pyc"))
-    for loose in ("pytest.ini", "requirements.txt"):
+    for loose in ("pytest.ini", "requirements.txt", ".gitignore"):
         if (SOURCE_REPO / loose).is_file():
             shutil.copy2(SOURCE_REPO / loose, workdir / loose)
+    # The battery includes contract tests that ask GIT about the
+    # repository (tracked scripts, ignored state directory), so the
+    # copy has to BE a repository; without this the baseline is red for
+    # a reason that has nothing to do with any mutation.
+    for git_argv in (("init", "-q"), ("add", "-A"),
+                     ("-c", "user.email=k@example.invalid",
+                      "-c", "user.name=Kurgu", "commit", "-qm", "kurgu")):
+        subprocess.run(["git", "-C", str(workdir), *git_argv],
+                       capture_output=True, text=True)
 
     targets = {m: workdir / "tools" / "agent_loop" / (m + ".py")
                for m in MODULES}
@@ -401,7 +478,7 @@ def main():
         imported = subprocess.run(
             [sys.executable, "-c",
              "from tools.agent_loop import (state, locking, worktree, "
-             "preflight, execution)"],
+             "preflight, execution, cli, schemas)"],
             cwd=str(workdir), capture_output=True, text=True)
         if imported.returncode != 0:
             path.write_text(original, encoding="utf-8")

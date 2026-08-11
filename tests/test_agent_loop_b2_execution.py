@@ -19,9 +19,11 @@ refusal.
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +33,7 @@ import types
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator, ValidationError
 
 from tools.agent_loop import cli, contract, execution, schemas, state, worktree
 from tools.agent_loop import process as process_module
@@ -227,12 +230,9 @@ def _no_binding(tmp_path):
             "baseline_sha": "0" * 40}
 
 
-@pytest.fixture
-def schema_file(tmp_path):
-    path = tmp_path / "implementer.schema.json"
-    path.write_text(json.dumps(schemas.IMPLEMENTER_RESULT_SCHEMA),
-                    encoding="utf-8")
-    return path
+# R2B removed the schema_file fixture: the schema is not a file, not a
+# parameter and not a fixture any more -- it is the frozen canonical
+# binding, inline on the argv, and nothing here can substitute it.
 
 
 @pytest.fixture(autouse=True)
@@ -331,23 +331,22 @@ def fast_clock(monkeypatch):
 # =====================================================================
 
 def test_the_adapter_launches_exactly_the_argv_the_cli_builds(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     binary = _fake_binary(tmp_path, stdout_json=None,
                           mode="raw",
                           hex=json.dumps(_valid_reply()).encode().hex())
     execution.run_implementer(
         binary, **bound.identity, prompt="kurgu istem",
-        schema_path=schema_file, budget_usd=1.0, timeout_seconds=60,
+        budget_usd=1.0, timeout_seconds=60,
         max_output_bytes=65536)
 
-    expected = cli.build_implementer_argv(binary, schema_path=schema_file,
-                                          budget_usd=1.0)
+    expected = cli.build_implementer_argv(binary, budget_usd=1.0)
     assert only_fake_binaries_may_run[0] == expected, \
         "adapter cli.py'nin urettigi argv'yi degistirdi"
 
 
 def test_the_process_runs_inside_the_derived_worktree(
-        tmp_path, bound, schema_file):
+        tmp_path, bound):
     """WHERE it ran, read from the child itself: `dump` emits a report
     rather than a reply, so the refusal proves the process really
     executed, and the trace file carries its cwd out. The adapter was
@@ -357,30 +356,28 @@ def test_the_process_runs_inside_the_derived_worktree(
     with pytest.raises(execution.SchemaViolation):
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu istem",
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=60,
+            budget_usd=1.0, timeout_seconds=60,
             max_output_bytes=65536)
     assert trace.exists(), "senaryo kurulmadi: cocuk hic calismadi"
     assert Path(trace.read_text(encoding="utf-8")).resolve() == \
         bound.path.resolve()
 
 
-def _dump_report(tmp_path, cwd, schema_file, prompt):
+def _dump_report(tmp_path, cwd, prompt):
     """Run the dump stub directly to read what the child observed."""
     binary = _fake_binary(tmp_path, name="dokum", mode="dump")
-    argv = cli.build_implementer_argv(binary, schema_path=schema_file,
-                                      budget_usd=1.0)
+    argv = cli.build_implementer_argv(binary, budget_usd=1.0)
     done = subprocess.run(argv, cwd=str(cwd), input=prompt,
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
 
 
-def test_the_prompt_travels_only_on_stdin(tmp_path, stub_cwd,
-                                          schema_file):
+def test_the_prompt_travels_only_on_stdin(tmp_path, stub_cwd):
     """A prompt on a command line is a prompt in `ps` output, in a shell
     history and in any error that echoes the argv."""
     prompt = "KURGU-ISTEM-NOBETCISI-" + "q" * 10
-    report = _dump_report(tmp_path, stub_cwd, schema_file, prompt=prompt)
+    report = _dump_report(tmp_path, stub_cwd, prompt=prompt)
 
     assert report["stdin"] == prompt, "istem stdin'e ulasmadi"
     assert not any(prompt in str(token) for token in report["argv"]), \
@@ -389,23 +386,23 @@ def test_the_prompt_travels_only_on_stdin(tmp_path, stub_cwd,
         "istem ortam degiskenine sizdi"
 
 
-def test_a_missing_binary_argument_is_a_type_error(tmp_path, schema_file):
+def test_a_missing_binary_argument_is_a_type_error(tmp_path):
     with pytest.raises(TypeError):
         execution.run_implementer(                     # noqa: PLE1120
-            **_no_binding(tmp_path), prompt="kurgu", schema_path=schema_file,
+            **_no_binding(tmp_path), prompt="kurgu",
             budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
             max_output_bytes=65536)
 
 
 @pytest.mark.parametrize("bare", ["claude", "codex", "git", "cmd"])
 def test_a_bare_command_name_is_never_resolved_through_the_path(
-        tmp_path, schema_file, only_fake_binaries_may_run, bare):
+        tmp_path, only_fake_binaries_may_run, bare):
     """These exist on PATH. The adapter still refuses them, because it
     executes a path and never searches for one."""
     with pytest.raises(execution.BinaryNotUsable):
         execution.run_implementer(
             bare, **_no_binding(tmp_path), prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0,
+            budget_usd=1.0,
             timeout_seconds=MIN_TIMEOUT, max_output_bytes=65536)
     assert only_fake_binaries_may_run == [], "reddedilen isim yine de calisti"
 
@@ -436,22 +433,20 @@ def test_no_shell_is_ever_involved():
 # THE REPLY: parsed, validated, never repaired
 # =====================================================================
 
-def _run_with_stdout(tmp_path, bound, schema_file, payload_bytes,
+def _run_with_stdout(tmp_path, bound, payload_bytes,
                      **kwargs):
     binary = _fake_binary(tmp_path, mode="raw", hex=payload_bytes.hex(),
                           **{k: v for k, v in kwargs.items()
                              if k in ("code", "stderr")})
-    settings = {"prompt": "kurgu", "schema_path": schema_file,
-                "budget_usd": 1.0, "timeout_seconds": 60,
-                "max_output_bytes": 65536}
+    settings = {"prompt": "kurgu", "budget_usd": 1.0,
+                "timeout_seconds": 60, "max_output_bytes": 65536}
     settings.update({k: v for k, v in kwargs.items() if k in settings})
     return execution.run_implementer(binary, **bound.identity, **settings)
 
 
-def test_a_valid_reply_comes_back_as_structured_data(tmp_path, bound,
-                                                     schema_file):
+def test_a_valid_reply_comes_back_as_structured_data(tmp_path, bound):
     reply = _valid_reply()
-    result = _run_with_stdout(tmp_path, bound, schema_file,
+    result = _run_with_stdout(tmp_path, bound,
                               json.dumps(reply).encode("utf-8"))
     assert result.reply == reply
     assert result.exit_code == 0
@@ -467,11 +462,10 @@ def test_a_valid_reply_comes_back_as_structured_data(tmp_path, bound,
      ("bos", b""),
      ("dizi", b"[1, 2, 3]")],
     ids=["bozuk-json", "duz-metin", "bos-cikti", "nesne-degil"])
-def test_output_that_is_not_a_json_object_is_refused(tmp_path, bound,
-                                                     schema_file, label,
+def test_output_that_is_not_a_json_object_is_refused(tmp_path, bound, label,
                                                      payload):
     with pytest.raises(execution.SchemaViolation):
-        _run_with_stdout(tmp_path, bound, schema_file, payload)
+        _run_with_stdout(tmp_path, bound, payload)
 
 
 @pytest.mark.parametrize(
@@ -486,30 +480,29 @@ def test_output_that_is_not_a_json_object_is_refused(tmp_path, bound,
      ("uydurma-eylem", _valid_reply(next_action="uydurma"))],
     ids=["yanlis-rol", "yanlis-durum", "yanlis-protokol", "eksik-alan",
          "fazla-alan", "asiri-uzun-ozet", "sozluk-disi-eylem"])
-def test_a_reply_outside_the_frozen_schema_is_refused(tmp_path, bound,
-                                                      schema_file, label,
+def test_a_reply_outside_the_frozen_schema_is_refused(tmp_path, bound, label,
                                                       reply):
     """The schema is the contract. Nothing here repairs, coerces or
     guesses -- a model that answered outside the vocabulary is a model
     whose answer nobody can act on."""
     with pytest.raises(execution.SchemaViolation):
-        _run_with_stdout(tmp_path, bound, schema_file,
+        _run_with_stdout(tmp_path, bound,
                          json.dumps(reply).encode("utf-8"))
 
 
-def test_invalid_utf8_is_refused(tmp_path, bound, schema_file):
+def test_invalid_utf8_is_refused(tmp_path, bound):
     """Decoded strictly. A replacement character would turn undecodable
     bytes into a string that might then parse as something."""
     with pytest.raises(execution.SchemaViolation):
-        _run_with_stdout(tmp_path, bound, schema_file,
+        _run_with_stdout(tmp_path, bound,
                          b'{"role": "\xff\xfe implementer"}')
 
 
 def test_a_nonzero_exit_is_a_typed_failure_without_the_stderr(
-        tmp_path, bound, schema_file):
+        tmp_path, bound):
     sentinel = "KURGU-STDERR-NOBETCISI-" + "w" * 8
     with pytest.raises(execution.ProcessFailed) as refusal:
-        _run_with_stdout(tmp_path, bound, schema_file,
+        _run_with_stdout(tmp_path, bound,
                          json.dumps(_valid_reply()).encode("utf-8"),
                          code=7, stderr=sentinel)
     failure = refusal.value
@@ -523,8 +516,7 @@ def test_a_nonzero_exit_is_a_typed_failure_without_the_stderr(
 # BOUNDS: enforced while reading, not after
 # =====================================================================
 
-def test_a_flood_on_stdout_stops_the_process(tmp_path, bound,
-                                             schema_file):
+def test_a_flood_on_stdout_stops_the_process(tmp_path, bound):
     limit = 8192
     binary = _fake_binary(tmp_path, mode="flood", stream="out",
                           bytes=limit * 40)
@@ -532,35 +524,33 @@ def test_a_flood_on_stdout_stops_the_process(tmp_path, bound,
     with pytest.raises(execution.OutputLimitExceeded) as refusal:
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=120,
+            budget_usd=1.0, timeout_seconds=120,
             max_output_bytes=limit)
     assert refusal.value.stream == "stdout"
     assert refusal.value.stdout_bytes <= limit + process_module.READ_CHUNK_BYTES
     assert time.monotonic() - started < 100, "sinir asimi beklenmedi"
 
 
-def test_a_flood_on_stderr_is_bounded_too(tmp_path, bound,
-                                          schema_file):
+def test_a_flood_on_stderr_is_bounded_too(tmp_path, bound):
     limit = 8192
     binary = _fake_binary(tmp_path, mode="flood", stream="err",
                           bytes=limit * 40)
     with pytest.raises(execution.OutputLimitExceeded) as refusal:
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=120,
+            budget_usd=1.0, timeout_seconds=120,
             max_output_bytes=limit)
     assert refusal.value.stream == "stderr"
 
 
-def test_output_of_exactly_the_limit_is_accepted(tmp_path, bound,
-                                                 schema_file):
+def test_output_of_exactly_the_limit_is_accepted(tmp_path, bound):
     """The boundary in the other direction, or the rule above is just
     "refuse large replies"."""
     # padded past the contract's own floor: `max_output_bytes` below
     # 1024 is outside the frozen range and is refused before launch
     padded = _valid_reply(summary="k" * 1200)
     reply = json.dumps(padded).encode("utf-8")
-    result = _run_with_stdout(tmp_path, bound, schema_file, reply,
+    result = _run_with_stdout(tmp_path, bound, reply,
                               max_output_bytes=len(reply))
     assert result.reply["role"] == "implementer"
     assert result.stdout_bytes == len(reply)
@@ -577,8 +567,7 @@ _CHILD = ("import pathlib, time\n"
           "    time.sleep(0.1)\n")
 
 
-def test_a_timeout_kills_the_process_and_its_children(tmp_path, bound,
-                                                      schema_file, fast_clock):
+def test_a_timeout_kills_the_process_and_its_children(tmp_path, bound, fast_clock):
     """A model process that spawned something must not leave it running.
     The child writes a heartbeat; after the kill the heartbeat has to
     stop advancing, which is observable without a process library."""
@@ -588,7 +577,7 @@ def test_a_timeout_kills_the_process_and_its_children(tmp_path, bound,
     with pytest.raises(execution.Timeout) as refusal:
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
+            budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
             max_output_bytes=65536)
     assert refusal.value.timeout_seconds == MIN_TIMEOUT
 
@@ -605,20 +594,19 @@ def test_a_timeout_kills_the_process_and_its_children(tmp_path, bound,
 
 
 def test_a_hanging_process_with_no_children_also_times_out(tmp_path,
-                                                           bound,
-                                                           schema_file, fast_clock):
+                                                           bound, fast_clock):
     binary = _fake_binary(tmp_path, mode="sleep", seconds=120)
     started = time.monotonic()
     with pytest.raises(execution.Timeout):
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
+            budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
             max_output_bytes=65536)
     assert time.monotonic() - started < 60
 
 
 def test_a_cleanup_failure_does_not_replace_the_primary_failure(
-        tmp_path, bound, schema_file, fast_clock, monkeypatch):
+        tmp_path, bound, fast_clock, monkeypatch):
     """The caller needs to know the run timed out. A kill that then
     fails is a second problem, not the headline."""
     binary = _fake_binary(tmp_path, mode="sleep", seconds=60)
@@ -630,7 +618,7 @@ def test_a_cleanup_failure_does_not_replace_the_primary_failure(
     with pytest.raises(execution.Timeout):
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
+            budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
             max_output_bytes=65536)
 
 
@@ -643,7 +631,7 @@ def test_a_cleanup_failure_does_not_replace_the_primary_failure(
     ids=["sifir-int", "sifir", "negatif", "nan", "sonsuz", "eksi-sonsuz",
          "bool"])
 def test_an_unusable_budget_refuses_before_any_process_starts(
-        tmp_path, schema_file, only_fake_binaries_may_run,
+        tmp_path, only_fake_binaries_may_run,
         budget):
     """Counted, not assumed: the refusal is only worth anything if no
     process was started, and "we would have refused later" is what a
@@ -653,32 +641,30 @@ def test_an_unusable_budget_refuses_before_any_process_starts(
     with pytest.raises(execution.BudgetRefused):
         execution.run_implementer(
             binary, **_no_binding(tmp_path), prompt="kurgu",
-            schema_path=schema_file, budget_usd=budget, timeout_seconds=60,
+            budget_usd=budget, timeout_seconds=60,
             max_output_bytes=65536)
     assert only_fake_binaries_may_run == [], \
         "butce reddedildikten sonra yine de bir surec baslatildi"
 
 
 def test_the_exact_remaining_budget_reaches_the_argv(tmp_path, bound,
-                                                     schema_file,
                                                      only_fake_binaries_may_run):
     binary = _fake_binary(tmp_path, mode="raw",
                           hex=json.dumps(_valid_reply()).encode().hex())
     execution.run_implementer(
         binary, **bound.identity, prompt="kurgu",
-        schema_path=schema_file, budget_usd=0.375, timeout_seconds=60,
+        budget_usd=0.375, timeout_seconds=60,
         max_output_bytes=65536)
     argv = only_fake_binaries_may_run[0]
     assert "0.375" in argv[argv.index("--max-budget-usd") + 1]
 
 
 def test_the_adapter_never_claims_to_know_what_was_spent(tmp_path,
-                                                         bound,
-                                                         schema_file):
+                                                         bound):
     """`IMPLEMENTER_RESULT_SCHEMA` carries no cost field, so there is no
     contractual value to report. Reporting zero would be a number the
     caller could subtract from a budget."""
-    result = _run_with_stdout(tmp_path, bound, schema_file,
+    result = _run_with_stdout(tmp_path, bound,
                               json.dumps(_valid_reply()).encode("utf-8"))
     assert not hasattr(result, "spent_usd")
     assert not hasattr(result, "cost_usd")
@@ -689,13 +675,12 @@ def test_the_adapter_never_claims_to_know_what_was_spent(tmp_path,
 # WHAT MAY LEAVE THE ADAPTER
 # =====================================================================
 
-def test_no_raw_model_output_survives_in_the_result(tmp_path, bound,
-                                                    schema_file):
+def test_no_raw_model_output_survives_in_the_result(tmp_path, bound):
     """Byte counts and codes leave; text does not. Raw stdout in a
     result object is raw stdout in whatever log the caller writes."""
     sentinel = "KURGU-CIKTI-NOBETCISI-" + "v" * 8
     reply = _valid_reply(summary=sentinel)
-    result = _run_with_stdout(tmp_path, bound, schema_file,
+    result = _run_with_stdout(tmp_path, bound,
                               json.dumps(reply).encode("utf-8"))
     # the PARSED reply legitimately holds it; nothing else may
     leaked = [name for name, value in vars(result).items()
@@ -705,19 +690,17 @@ def test_no_raw_model_output_survives_in_the_result(tmp_path, bound,
                    for value in vars(result).values())
 
 
-def test_the_adapter_writes_no_files_of_its_own(tmp_path, bound,
-                                                schema_file):
+def test_the_adapter_writes_no_files_of_its_own(tmp_path, bound):
     before = {p for p in bound.path.rglob("*")}
-    _run_with_stdout(tmp_path, bound, schema_file,
+    _run_with_stdout(tmp_path, bound,
                      json.dumps(_valid_reply()).encode("utf-8"))
     assert {p for p in bound.path.rglob("*")} == before, \
         "adapter calisma agacina dosya yazdi"
 
 
 def test_only_closed_codes_and_numbers_leave_the_adapter(tmp_path,
-                                                         bound,
-                                                         schema_file):
-    result = _run_with_stdout(tmp_path, bound, schema_file,
+                                                         bound):
+    result = _run_with_stdout(tmp_path, bound,
                               json.dumps(_valid_reply()).encode("utf-8"))
     assert result.event in contract.ALL_EVENT_CODES
     for name, value in vars(result).items():
@@ -725,6 +708,12 @@ def test_only_closed_codes_and_numbers_leave_the_adapter(tmp_path,
             continue
         assert isinstance(value, (int, str)), f"{name} sayisal/kod degil"
         if isinstance(value, str):
+            if name == "schema_sha256":
+                # a 64-hex code, not free text: the ONE schema fact a
+                # report may carry
+                assert re.fullmatch(r"[0-9a-f]{64}", value), \
+                    "schema_sha256 64-hex bir kod degil"
+                continue
             assert value in contract.ALL_EVENT_CODES, \
                 f"{name} kapali sozluk disinda bir metin tasiyor"
 
@@ -734,7 +723,7 @@ def test_only_closed_codes_and_numbers_leave_the_adapter(tmp_path,
 # =====================================================================
 
 def test_a_child_that_never_reads_stdin_still_times_out(
-        tmp_path, bound, schema_file, fast_clock):
+        tmp_path, bound, fast_clock):
     """THE P0. The prompt used to be written synchronously, before the
     readers and before the deadline loop -- so a child that read nothing
     filled the pipe buffer, the write blocked, and the timeout that was
@@ -748,7 +737,7 @@ def test_a_child_that_never_reads_stdin_still_times_out(
     with pytest.raises(execution.Timeout):
         execution.run_implementer(
             binary, **bound.identity, prompt=prompt,
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
+            budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
             max_output_bytes=65536)
     elapsed = time.monotonic() - started
     assert elapsed < 45, f"sure siniri stdin yaziminda asildi ({elapsed:.1f}s)"
@@ -761,14 +750,14 @@ def test_a_child_that_never_reads_stdin_still_times_out(
      ("tavan-ustu", "P" * (execution.MAX_PROMPT_BYTES + 1))],
     ids=["metin-degil", "bos", "bayt-dizisi", "kodlanamaz", "tavan-ustu"])
 def test_an_unusable_prompt_refuses_before_any_process_starts(
-        tmp_path, schema_file, only_fake_binaries_may_run,
+        tmp_path, only_fake_binaries_may_run,
         label, prompt):
     binary = _fake_binary(tmp_path, mode="raw",
                           hex=json.dumps(_valid_reply()).encode().hex())
     with pytest.raises(execution.LimitRefused):
         execution.run_implementer(
             binary, **_no_binding(tmp_path), prompt=prompt,
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=60,
+            budget_usd=1.0, timeout_seconds=60,
             max_output_bytes=65536)
     assert only_fake_binaries_may_run == [], "reddedilen istem yine de calisti"
 
@@ -782,7 +771,7 @@ def test_an_unusable_prompt_refuses_before_any_process_starts(
     ids=["nan", "sonsuz", "sifir", "negatif", "bool", "metin", "ondalik",
          "taban-alti", "tavan-ustu"])
 def test_an_unusable_timeout_refuses_before_any_process_starts(
-        tmp_path, schema_file, only_fake_binaries_may_run,
+        tmp_path, only_fake_binaries_may_run,
         label, timeout_seconds):
     """`timeout_seconds=NaN` made every deadline comparison false, so a
     hung child ran until something outside stopped it. A bound that
@@ -791,7 +780,7 @@ def test_an_unusable_timeout_refuses_before_any_process_starts(
     with pytest.raises(execution.LimitRefused):
         execution.run_implementer(
             binary, **_no_binding(tmp_path), prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0,
+            budget_usd=1.0,
             timeout_seconds=timeout_seconds, max_output_bytes=65536)
     assert only_fake_binaries_may_run == []
 
@@ -805,7 +794,7 @@ def test_an_unusable_timeout_refuses_before_any_process_starts(
     ids=["nan", "sonsuz", "sifir", "negatif", "bool", "ondalik",
          "taban-alti", "tavan-ustu"])
 def test_an_unusable_output_ceiling_refuses_before_any_process_starts(
-        tmp_path, schema_file, only_fake_binaries_may_run,
+        tmp_path, only_fake_binaries_may_run,
         label, max_output_bytes):
     """`max_output_bytes=NaN` read a megabyte in full and then refused it
     as bad JSON -- a parse error standing in for a ceiling that never
@@ -816,7 +805,7 @@ def test_an_unusable_output_ceiling_refuses_before_any_process_starts(
     with pytest.raises(execution.LimitRefused):
         execution.run_implementer(
             binary, **_no_binding(tmp_path), prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=60,
+            budget_usd=1.0, timeout_seconds=60,
             max_output_bytes=max_output_bytes)
     assert only_fake_binaries_may_run == []
 
@@ -834,7 +823,7 @@ def test_the_contract_range_is_taken_from_the_frozen_schema():
 
 
 def test_the_tree_killer_is_not_located_through_the_environment(
-        tmp_path, bound, schema_file, fast_clock, monkeypatch):
+        tmp_path, bound, fast_clock, monkeypatch):
     """`%SystemRoot%` is an ordinary environment variable: anything that
     set it redirected the only cleanup path this adapter has, and the
     failure was swallowed. The system directory now comes from the
@@ -853,7 +842,7 @@ def test_the_tree_killer_is_not_located_through_the_environment(
     with pytest.raises(execution.Timeout) as refusal:
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
+            budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
             max_output_bytes=65536)
     assert time.monotonic() - started < 45
     assert refusal.value.cleanup_complete is True, \
@@ -861,7 +850,7 @@ def test_the_tree_killer_is_not_located_through_the_environment(
 
 
 def test_a_failed_cleanup_is_reported_and_does_not_hide_the_timeout(
-        tmp_path, bound, schema_file, fast_clock, monkeypatch):
+        tmp_path, bound, fast_clock, monkeypatch):
     """Both halves: the caller still hears "timed out", and the fact
     that a process may still be running does not vanish into an
     `except`."""
@@ -874,7 +863,7 @@ def test_a_failed_cleanup_is_reported_and_does_not_hide_the_timeout(
     with pytest.raises(execution.Timeout) as refusal:
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
+            budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
             max_output_bytes=65536)
     assert refusal.value.cleanup_complete is False, \
         "basarisiz temizlik gorunmez kaldi"
@@ -882,7 +871,7 @@ def test_a_failed_cleanup_is_reported_and_does_not_hide_the_timeout(
 
 
 def test_a_reply_produced_without_reading_the_prompt_is_refused(
-        tmp_path, bound, schema_file):
+        tmp_path, bound):
     """The asynchronous write is what stops a deaf child from blocking
     the deadline -- and it is also why delivery has to be CHECKED. A
     child that writes valid JSON and exits without reading answers a
@@ -897,14 +886,14 @@ def test_a_reply_produced_without_reading_the_prompt_is_refused(
     with pytest.raises(execution.PromptNotDelivered) as refusal:
         execution.run_implementer(
             binary, **bound.identity, prompt="P" * (2 * 1024 * 1024),
-            schema_path=schema_file, budget_usd=1.0, timeout_seconds=60,
+            budget_usd=1.0, timeout_seconds=60,
             max_output_bytes=65536)
     assert refusal.value.reason == contract.StopReason.INTERRUPTED
     assert refusal.value.exit_code == 0, \
         "surec basariyla bitti; reddedilen sey teslimat"
 
 
-def test_a_large_prompt_arrives_whole(tmp_path, stub_cwd, schema_file):
+def test_a_large_prompt_arrives_whole(tmp_path, stub_cwd):
     """End to end: a prompt many times a pipe buffer arrives entire.
 
     Asserted on the BYTES THE CHILD RECEIVED rather than on the writer's
@@ -919,33 +908,31 @@ def test_a_large_prompt_arrives_whole(tmp_path, stub_cwd, schema_file):
     `test_a_reply_produced_without_reading_the_prompt_is_refused`, and
     it only fails on POSIX."""
     prompt = "K" * (2 * 1024 * 1024)
-    report = _dump_report(tmp_path, stub_cwd, schema_file, prompt=prompt)
+    report = _dump_report(tmp_path, stub_cwd, prompt=prompt)
     assert len(report["stdin"]) == len(prompt), \
         f"istem kirpildi: {len(report['stdin'])} / {len(prompt)} bayt"
     assert report["stdin"] == prompt
 
 
-def test_a_delivered_prompt_is_still_accepted(tmp_path, bound,
-                                              schema_file):
+def test_a_delivered_prompt_is_still_accepted(tmp_path, bound):
     """The boundary: the refusal above must not become "reject every
     reply". This child reads its stdin to the end."""
-    report = _dump_report(tmp_path, bound.path, schema_file,
+    report = _dump_report(tmp_path, bound.path,
                           prompt="kurgu istem")
     assert report["stdin"] == "kurgu istem"
-    result = _run_with_stdout(tmp_path, bound, schema_file,
+    result = _run_with_stdout(tmp_path, bound,
                               json.dumps(_valid_reply()).encode("utf-8"))
     assert result.reply["status"] == "implemented"
 
 
 def test_a_failed_process_reports_the_contract_code_for_it(tmp_path,
-                                                           bound,
-                                                           schema_file):
+                                                           bound):
     """Two wrong answers preceded this one: `preflight_failed` named a
     gate that had already succeeded, and `None` left a terminal result
     with no closed reason at all. The contract owner added
     `model_process_failed`."""
     with pytest.raises(execution.ProcessFailed) as refusal:
-        _run_with_stdout(tmp_path, bound, schema_file, b"", code=9)
+        _run_with_stdout(tmp_path, bound, b"", code=9)
     failure = refusal.value
     assert failure.reason == contract.StopReason.MODEL_PROCESS_FAILED
     assert failure.reason in contract.ALL_STOP_REASONS
@@ -954,8 +941,7 @@ def test_a_failed_process_reports_the_contract_code_for_it(tmp_path,
     assert failure.exit_code == 9
 
 
-def test_a_grandchild_never_outlives_a_SUCCESSFUL_call(tmp_path, bound,
-                                                       schema_file):
+def test_a_grandchild_never_outlives_a_SUCCESSFUL_call(tmp_path, bound):
     """THE finding. The model read its prompt, answered correctly and
     exited zero -- leaving a child running for two more minutes, which
     the adapter reported as success. Tracking the `Popen` objects we
@@ -975,7 +961,7 @@ def test_a_grandchild_never_outlives_a_SUCCESSFUL_call(tmp_path, bound,
 
     result = execution.run_implementer(
         binary, **bound.identity, prompt="kurgu",
-        schema_path=schema_file, budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
+        budget_usd=1.0, timeout_seconds=MIN_TIMEOUT,
         max_output_bytes=65536)
     assert result.reply["status"] == "implemented", "senaryo kurulmadi"
 
@@ -990,8 +976,7 @@ def test_a_grandchild_never_outlives_a_SUCCESSFUL_call(tmp_path, bound,
         "basarili cagridan sonra torun surec hala calisiyor"
 
 
-def test_the_cleanup_budget_covers_the_tree_kill_too(tmp_path, bound,
-                                                     schema_file, fast_clock,
+def test_the_cleanup_budget_covers_the_tree_kill_too(tmp_path, bound, fast_clock,
                                                      monkeypatch):
     """`_stop` took a deadline and the tree-kill did not, so the killer
     kept a private thirty-second timeout: a ten-second budget measured
@@ -1009,7 +994,7 @@ def test_the_cleanup_budget_covers_the_tree_kill_too(tmp_path, bound,
     with pytest.raises(execution.Timeout):
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0,
+            budget_usd=1.0,
             timeout_seconds=MIN_TIMEOUT, max_output_bytes=65536)
     elapsed = time.monotonic() - started
     assert seen["deadline"] is not None, "kill ortak butceyi almiyor"
@@ -1017,8 +1002,7 @@ def test_the_cleanup_budget_covers_the_tree_kill_too(tmp_path, bound,
         f"temizlik ortak butceyi asti ({elapsed:.1f}s)"
 
 
-def test_stop_drain_and_join_share_one_deadline(tmp_path, bound,
-                                                schema_file, fast_clock,
+def test_stop_drain_and_join_share_one_deadline(tmp_path, bound, fast_clock,
                                                 monkeypatch):
     """The seams were tested in isolation and the adapter did not use
     them: both `container.drain()` calls were argument-free, so drain
@@ -1053,7 +1037,7 @@ def test_stop_drain_and_join_share_one_deadline(tmp_path, bound,
     with pytest.raises(execution.Timeout):
         execution.run_implementer(
             binary, **bound.identity, prompt="kurgu",
-            schema_path=schema_file, budget_usd=1.0,
+            budget_usd=1.0,
             timeout_seconds=MIN_TIMEOUT, max_output_bytes=65536)
     monkeypatch.undo()
 
@@ -1129,13 +1113,13 @@ def _reply_binary(tmp_path):
                         hex=json.dumps(_valid_reply()).encode().hex())
 
 
-def _binding_refused(binary, schema_file, identity, launched, sentinels):
+def _binding_refused(binary, identity, launched, sentinels):
     """The one shape every negative control must have: the typed
     refusal, zero processes, and an error text that carries no path, no
     repository name, no identity and no record content."""
     with pytest.raises(execution.WorktreeNotBound) as refusal:
         execution.run_implementer(
-            binary, **identity, prompt="kurgu", schema_path=schema_file,
+            binary, **identity, prompt="kurgu",
             budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
     assert launched == [], "reddedilen bag yine de bir surec baslatti"
     text = str(refusal.value) + repr(refusal.value)
@@ -1173,10 +1157,11 @@ def test_the_signature_offers_no_path_parameter_at_all():
     parameters = inspect.signature(execution.run_implementer).parameters
     assert set(parameters) == {
         "binary", "repo", "state_dir", "run_id", "worktree_id",
-        "baseline_sha", "prompt", "schema_path", "budget_usd",
+        "baseline_sha", "prompt", "budget_usd",
         "timeout_seconds", "max_output_bytes", "model"}
     for escape in ("worktree", "cwd", "path", "workdir", "working_dir",
-                   "directory"):
+                   "directory", "schema_path", "schema", "schema_json",
+                   "schema_bytes", "schema_file"):
         assert escape not in parameters, f"kacis parametresi: {escape}"
     for name, parameter in parameters.items():
         if name != "binary":
@@ -1184,7 +1169,7 @@ def test_the_signature_offers_no_path_parameter_at_all():
 
 
 def test_the_model_runs_exactly_in_the_derived_recorded_worktree(
-        tmp_path, bound, schema_file):
+        tmp_path, bound):
     """POSITIVE CONTROL for the whole section: a real repository, a real
     B1 `create()`, a READY record and the correct identities -- and the
     child's own report of its cwd is the derived holder path. Without
@@ -1195,7 +1180,7 @@ def test_the_model_runs_exactly_in_the_derived_recorded_worktree(
                           hex=json.dumps(_valid_reply()).encode().hex(),
                           cwd_record=str(trace))
     result = execution.run_implementer(
-        binary, **bound.identity, prompt="kurgu", schema_path=schema_file,
+        binary, **bound.identity, prompt="kurgu",
         budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
     assert result.reply["status"] == "implemented"
     derived = worktree.holder_for(bound.worktree_id) / \
@@ -1205,7 +1190,7 @@ def test_the_model_runs_exactly_in_the_derived_recorded_worktree(
 
 
 def test_the_main_checkout_is_never_the_model_working_directory(
-        tmp_path, private_worktree_root, schema_file,
+        tmp_path, private_worktree_root,
         only_fake_binaries_may_run):
     """THE R2 P0, rebuilt as far as the new design allows it to exist: a
     repository whose MAIN checkout sits exactly where the id derives to,
@@ -1236,12 +1221,12 @@ def test_the_main_checkout_is_never_the_model_working_directory(
         "senaryo kurulmadi"
     identity = {"repo": main, "state_dir": state_dir, "run_id": RUN,
                 "worktree_id": wid, "baseline_sha": baseline}
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
 def test_the_repository_argument_may_never_be_the_execution_target(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """The record's repo_id rewritten to name the WORKTREE itself, and
     `repo=` handed that same directory: git lists the tree, HEAD
     matches, the path derives correctly -- executing in the repository
@@ -1251,12 +1236,12 @@ def test_the_repository_argument_may_never_be_the_execution_target(
     _rewrite_binding(bound.state_dir,
                      repo_id=state.repo_identity(bound.path))
     identity = dict(bound.identity, repo=bound.path)
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
 def test_a_random_existing_directory_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """A plain `mkdir` at the derived location, with a READY record
     forged around it: existing was the WHOLE former check, and existing
     is no longer enough -- git does not list it."""
@@ -1269,12 +1254,12 @@ def test_a_random_existing_directory_is_refused(
     _rewrite_binding(bound.state_dir, worktree_id=wid)
     assert stray.is_dir(), "senaryo kurulmadi"
     identity = dict(bound.identity, worktree_id=wid)
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
 def test_another_repositorys_worktree_record_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """Repository B's genuinely READY worktree, asked for by repository
     A. The record is real and complete -- it was just never issued to
     A. (Setup proves B's own binding is accepted, so the refusal below
@@ -1303,19 +1288,19 @@ def test_another_repositorys_worktree_record_is_refused(
     identity = {"repo": bound.repo, "state_dir": other_state,
                 "run_id": RUN, "worktree_id": id_b,
                 "baseline_sha": other_baseline}
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
-def test_a_wrong_run_id_is_refused(tmp_path, bound, schema_file,
+def test_a_wrong_run_id_is_refused(tmp_path, bound,
                                    only_fake_binaries_may_run):
     identity = dict(bound.identity, run_id="baska-kosu-1")
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
 def test_a_record_issued_to_a_different_repository_identity_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """ONLY the repository identity is wrong: the tree is real,
     registered in the asking repository, at the right baseline -- but
     the ledger says it was issued to somebody else. The first version of
@@ -1324,19 +1309,19 @@ def test_a_record_issued_to_a_different_repository_identity_is_refused(
     was never the thing refusing."""
     _rewrite_record(bound.state_dir, bound.worktree_id,
                     repo_id=state.repo_identity(tmp_path / "hayalet-depo"))
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
 def test_a_worktree_id_nobody_recorded_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     identity = dict(bound.identity, worktree_id="f" * 32)
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
 def test_a_record_copied_under_another_id_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """A byte-identical record filed under a SECOND, genuinely created
     worktree's name: the directory that id derives to exists, git lists
     it, HEAD answers correctly -- and the record still NAMES the other
@@ -1357,19 +1342,19 @@ def test_a_record_copied_under_another_id_is_refused(
     assert _git(second_path, "rev-parse", "HEAD") == bound.baseline_sha, \
         "senaryo kurulmadi"
     identity = dict(bound.identity, worktree_id=second_id)
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
-def test_a_wrong_baseline_is_refused(tmp_path, bound, schema_file,
+def test_a_wrong_baseline_is_refused(tmp_path, bound,
                                      only_fake_binaries_may_run):
     identity = dict(bound.identity, baseline_sha="1" * 40)
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
 def test_a_record_whose_baseline_was_rewritten_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """The tree IS at the caller's baseline; the RECORD is not. Without
     the record comparison the HEAD check happily agrees with the caller
     and a tampered ledger entry stops meaning anything -- which is
@@ -1378,12 +1363,12 @@ def test_a_record_whose_baseline_was_rewritten_is_refused(
                     baseline_sha="2" * 40)
     assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha, \
         "senaryo kurulmadi"
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
 def test_a_planned_record_is_refused_even_with_the_tree_on_disk(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """Wound back to PLANNED after a full create: the directory exists,
     git registers it, HEAD matches -- ONLY the status refuses. PLANNED
     means `create` never proved the tree it made, and an unproven tree
@@ -1392,27 +1377,27 @@ def test_a_planned_record_is_refused_even_with_the_tree_on_disk(
                     status=worktree.STATUS_PLANNED)
     assert bound.path.is_dir(), "senaryo kurulmadi"
     assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
-def test_a_missing_record_is_refused(tmp_path, bound, schema_file,
+def test_a_missing_record_is_refused(tmp_path, bound,
                                      only_fake_binaries_may_run):
     _record_file(bound.state_dir, bound.worktree_id).unlink()
     assert bound.path.is_dir(), "senaryo kurulmadi: agac yerinde durmali"
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
-def test_a_corrupt_record_is_refused(tmp_path, bound, schema_file,
+def test_a_corrupt_record_is_refused(tmp_path, bound,
                                      only_fake_binaries_may_run):
     _record_file(bound.state_dir, bound.worktree_id).write_bytes(b"{bozuk")
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
 def test_a_copied_tree_that_git_does_not_register_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """A full copy of a real worktree -- `.git` link file included, HEAD
     answering correctly -- under its own READY record. Git's registry is
     what refuses: the bytes being right does not make it the tree git
@@ -1427,34 +1412,34 @@ def test_a_copied_tree_that_git_does_not_register_is_refused(
     assert _git(clone, "rev-parse", "HEAD") == bound.baseline_sha, \
         "senaryo kurulmadi: kopya inandirici degil"
     identity = dict(bound.identity, worktree_id=wid)
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
 def test_a_worktree_whose_head_moved_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """The tree is real and registered; its HEAD is simply not the
     recorded baseline any more. A model dropped into it would diff
     against history nobody froze."""
     _git(bound.path, "commit", "--allow-empty", "-qm", "kurgu-ilerledi")
     assert _git(bound.path, "rev-parse", "HEAD") != bound.baseline_sha, \
         "senaryo kurulmadi"
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
 def test_a_failed_git_query_is_a_refusal_not_an_absence(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """The `.git` directory renamed away: every git question now fails.
     A question that cannot be asked has no answer, and no answer binds
     nothing."""
     os.rename(bound.repo / ".git", bound.repo / "git-yok")
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
 def test_a_link_that_resolves_outside_the_holder_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """The worktree replaced by a link to ANOTHER registered worktree of
     the same repository: registration, HEAD and the main-checkout
     comparison all pass THROUGH the link, so path containment is the
@@ -1467,7 +1452,7 @@ def test_a_link_that_resolves_outside_the_holder_is_refused(
     _plant_link(bound.path, second_path)
     assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha, \
         "senaryo kurulmadi: baglanti uzerinden git cevap vermiyor"
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
@@ -1483,7 +1468,7 @@ def test_a_link_that_resolves_outside_the_holder_is_refused(
 # accepted.
 
 def test_a_second_ready_worktree_the_binding_does_not_name_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """THE evaluator probe, pinned: a second, genuinely READY worktree
     for the SAME repo, run and baseline. Its registry record is beyond
     reproach -- only the run's binding refuses it, because the run is
@@ -1494,63 +1479,63 @@ def test_a_second_ready_worktree_the_binding_does_not_name_is_refused(
     assert _git(second_path, "rev-parse", "HEAD") == bound.baseline_sha, \
         "senaryo kurulmadi"
     identity = dict(bound.identity, worktree_id=second_id)
-    _binding_refused(_reply_binary(tmp_path), schema_file, identity,
+    _binding_refused(_reply_binary(tmp_path), identity,
                      only_fake_binaries_may_run, _sentinels(identity))
 
 
-def test_a_missing_run_binding_is_refused(tmp_path, bound, schema_file,
+def test_a_missing_run_binding_is_refused(tmp_path, bound,
                                           only_fake_binaries_may_run):
     """No binding, no execution -- the registry record alone was the
     whole former check, and it is not enough."""
     (bound.state_dir / state.BINDING_FILENAME).unlink()
     assert bound.path.is_dir(), "senaryo kurulmadi: agac yerinde durmali"
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
-def test_a_corrupt_run_binding_is_refused(tmp_path, bound, schema_file,
+def test_a_corrupt_run_binding_is_refused(tmp_path, bound,
                                           only_fake_binaries_may_run):
     (bound.state_dir / state.BINDING_FILENAME).write_bytes(b"{bozuk")
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
 def test_a_binding_issued_to_a_different_repository_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """Only the binding's repository identity is wrong; the registry
     record agrees with the call completely."""
     _rewrite_binding(bound.state_dir,
                      repo_id=state.repo_identity(tmp_path / "hayalet-depo"))
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
 def test_a_binding_for_a_different_run_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     _rewrite_binding(bound.state_dir, run_id="baska-kosu-1")
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
 def test_a_binding_at_a_different_baseline_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """The tree IS at the caller's baseline; only the binding is not."""
     _rewrite_binding(bound.state_dir, baseline_sha="3" * 40)
     assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha, \
         "senaryo kurulmadi"
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
 def test_a_record_whose_run_was_rewritten_is_refused(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """Only the REGISTRY record's run is wrong -- the binding agrees
     with the call, so the record comparison is the one thing refusing.
     (Isolates the record-side run check now that the binding carries a
     run comparison of its own.)"""
     _rewrite_record(bound.state_dir, bound.worktree_id,
                     run_id="baska-kosu-1")
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
 
 
@@ -1561,7 +1546,7 @@ def _case_sensitive_filesystem(tmp_path):
 
 
 def test_a_case_twin_of_the_worktree_is_refused_on_case_sensitive_fs(
-        tmp_path, bound, schema_file, only_fake_binaries_may_run):
+        tmp_path, bound, only_fake_binaries_may_run):
     """R2A-R1 P1 pinned end to end: a full copy of the real tree in a
     CASE-TWIN directory inside the same holder, with the real name
     replaced by a link to it. Under unconditional casefold the twin
@@ -1577,5 +1562,204 @@ def test_a_case_twin_of_the_worktree_is_refused_on_case_sensitive_fs(
     _plant_link(bound.path, twin)
     assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha, \
         "senaryo kurulmadi: ikiz uzerinden git cevap vermiyor"
-    _binding_refused(_reply_binary(tmp_path), schema_file, bound.identity,
+    _binding_refused(_reply_binary(tmp_path), bound.identity,
                      only_fake_binaries_may_run, _sentinels(bound.identity))
+
+
+# =====================================================================
+# R2B -- the argv schema, the validator and the hash are ONE thing
+# =====================================================================
+#
+# The schema used to travel as a caller-chosen FILE PATH -- to a CLI
+# flag that takes INLINE JSON -- while the validator used a separate
+# live dictionary. A probe rewrote the schema file to garbage after the
+# argv was built and the adapter accepted the reply without noticing:
+# nothing tied what the model received to what judged its answer.
+
+def test_the_argv_schema_is_inline_canonical_and_hashed(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """POSITIVE CONTROL for the section, read off the argv the adapter
+    ACTUALLY launched: exactly one `--json-schema`, inline canonical
+    JSON right after it, equal to the frozen schema, not a path on any
+    disk -- and its exact UTF-8 bytes hash to the `schema_sha256` the
+    result reports."""
+    result = _run_with_stdout(tmp_path, bound,
+                              json.dumps(_valid_reply()).encode("utf-8"))
+    argv = only_fake_binaries_may_run[0]
+    assert argv.count("--json-schema") == 1
+    token = argv[argv.index("--json-schema") + 1]
+    assert json.loads(token) == schemas.IMPLEMENTER_RESULT_SCHEMA
+    # os.path.exists, NOT Path.exists: on Linux a 3KB "filename" makes
+    # pathlib raise ENAMETOOLONG instead of answering False, and the
+    # question here is "is this a path", not "can stat swallow it"
+    assert not os.path.exists(token), "sema hala bir dosya yolu"
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    assert digest == result.schema_sha256 \
+        == schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
+    assert re.fullmatch(r"[0-9a-f]{64}", result.schema_sha256)
+
+
+def test_a_reply_is_judged_by_the_schema_extracted_from_the_argv(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """Both directions of the same-schema claim: the accepted reply
+    validates under the schema pulled OUT of the argv, and a reply that
+    schema rejects is exactly what the adapter refuses -- no separate
+    in-process schema gets a say."""
+    good = _valid_reply()
+    result = _run_with_stdout(tmp_path, bound,
+                              json.dumps(good).encode("utf-8"))
+    argv = only_fake_binaries_may_run[0]
+    extracted = json.loads(argv[argv.index("--json-schema") + 1])
+    Draft202012Validator(extracted).validate(result.reply)
+    bad = dict(good, status="approved")            # implementer may not
+    with pytest.raises(ValidationError):
+        Draft202012Validator(extracted).validate(bad)
+    with pytest.raises(execution.SchemaViolation):
+        _run_with_stdout(tmp_path, bound, json.dumps(bad).encode("utf-8"))
+
+
+def test_a_builder_that_smuggles_a_different_schema_is_refused_before_launch(
+        tmp_path, bound, only_fake_binaries_may_run, monkeypatch):
+    """The deliberate divergence: the builder emits a PERMISSIVE inline
+    schema instead of the frozen one. The hash comparison refuses it
+    with zero processes started -- a schema nobody agreed to must not
+    even cost a launch."""
+    binary = _reply_binary(tmp_path)
+    real_builder = cli.build_implementer_argv
+
+    def smuggling(target, **kwargs):
+        argv = real_builder(target, **kwargs)
+        argv[argv.index("--json-schema") + 1] = "{}"
+        return argv
+
+    monkeypatch.setattr(cli, "build_implementer_argv", smuggling)
+    with pytest.raises(execution.SchemaNotBound):
+        execution.run_implementer(
+            binary, **bound.identity, prompt="kurgu", budget_usd=1.0,
+            timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == [], \
+        "sema uyusmazligina ragmen surec basladi"
+
+
+def test_an_argv_without_exactly_one_inline_schema_is_refused(
+        tmp_path, bound, only_fake_binaries_may_run, monkeypatch):
+    binary = _reply_binary(tmp_path)
+    real_builder = cli.build_implementer_argv
+
+    def stripping(target, **kwargs):
+        argv = real_builder(target, **kwargs)
+        index = argv.index("--json-schema")
+        return argv[:index] + argv[index + 2:]
+
+    monkeypatch.setattr(cli, "build_implementer_argv", stripping)
+    with pytest.raises(execution.SchemaNotBound):
+        execution.run_implementer(
+            binary, **bound.identity, prompt="kurgu", budget_usd=1.0,
+            timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == []
+
+
+def test_a_lying_str_subclass_cannot_impersonate_the_schema(
+        tmp_path, bound, only_fake_binaries_may_run, monkeypatch):
+    """R2B-R1.1: `isinstance` accepts SUBCLASSES, and a subclass
+    answers whatever it likes. This one carries `{}` as its real
+    content while claiming equality with the canonical text and
+    returning the canonical BYTES from `encode()` -- both guards
+    passed, `json.loads` read the real `{}`, and a permissive validator
+    accepted an arbitrary reply. An exact-type check is what closes it:
+    every guard here asks the object a question, and only a real `str`
+    cannot lie about the answer.
+
+    Three assertions, because two of them alone would not notice a
+    validator built from `{}`: the typed refusal, zero processes, and
+    the arbitrary reply never being accepted."""
+    binding = schemas.IMPLEMENTER_SCHEMA_BINDING
+
+    class Taklitci(str):
+        def __eq__(self, other):
+            return other == binding.canonical_json or str.__eq__(self, other)
+
+        def __ne__(self, other):
+            return not self.__eq__(other)
+
+        __hash__ = str.__hash__
+
+        def encode(self, *args, **kwargs):
+            return binding.canonical_bytes
+
+    liar = Taklitci("{}")
+    # the setup is only meaningful if the impersonation really works
+    assert json.loads(str(liar)) == {}, "senaryo kurulmadi"
+    assert liar == binding.canonical_json
+    assert hashlib.sha256(liar.encode("utf-8")).hexdigest() == binding.sha256
+
+    real_builder = cli.build_implementer_argv
+
+    def poisoning(target, **kwargs):
+        argv = real_builder(target, **kwargs)
+        argv[argv.index("--json-schema") + 1] = liar
+        return argv
+
+    monkeypatch.setattr(cli, "build_implementer_argv", poisoning)
+    # a reply NOTHING but an empty schema would accept
+    binary = _fake_binary(
+        tmp_path, mode="raw",
+        hex=json.dumps({"tamamen": "keyfi"}).encode().hex())
+    with pytest.raises(execution.SchemaNotBound):
+        execution.run_implementer(
+            binary, **bound.identity, prompt="kurgu", budget_usd=1.0,
+            timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == [], \
+        "taklit semaya ragmen surec basladi"
+
+
+@pytest.mark.parametrize(
+    "poison", [b"{}", 123, None, "kurgu \ud800"],
+    ids=["bayt", "tamsayi", "bos-deger", "vekil-karakter"])
+def test_a_malformed_schema_token_is_the_same_typed_refusal(
+        tmp_path, bound, only_fake_binaries_may_run, monkeypatch, poison):
+    """R2B-R1: bytes, numbers, None and unencodable strings used to
+    crash as AttributeError or UnicodeEncodeError -- no process
+    started, but the contract says every schema divergence is
+    `SchemaNotBound`, and an untyped crash is not that. Zero processes,
+    same typed refusal, all four shapes."""
+    binary = _reply_binary(tmp_path)
+    real_builder = cli.build_implementer_argv
+
+    def poisoning(target, **kwargs):
+        argv = real_builder(target, **kwargs)
+        argv[argv.index("--json-schema") + 1] = poison
+        return argv
+
+    monkeypatch.setattr(cli, "build_implementer_argv", poisoning)
+    with pytest.raises(execution.SchemaNotBound):
+        execution.run_implementer(
+            binary, **bound.identity, prompt="kurgu", budget_usd=1.0,
+            timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == [], \
+        "bozuk sema degerine ragmen surec basladi"
+
+
+def test_no_file_on_disk_can_influence_the_schema_any_more(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """The old fixture location, recreated as garbage: the call neither
+    reads it nor cares. There is no file in the schema story at all."""
+    (tmp_path / "implementer.schema.json").write_text("{BOZUK",
+                                                      encoding="utf-8")
+    result = _run_with_stdout(tmp_path, bound,
+                              json.dumps(_valid_reply()).encode("utf-8"))
+    assert result.reply["status"] == "implemented"
+    assert result.schema_sha256 == schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
+
+
+def test_the_validator_cannot_be_the_raw_module_dictionary():
+    """Structural: no code path in the adapter touches the mutable
+    schema dictionary -- validating against it is exactly the unbound
+    state R2B removed, so its reappearance must be loud."""
+    import ast
+
+    tree = ast.parse(Path(execution.__file__).read_text(encoding="utf-8"))
+    offenders = [node.lineno for node in ast.walk(tree)
+                 if isinstance(node, ast.Attribute)
+                 and node.attr == "IMPLEMENTER_RESULT_SCHEMA"]
+    assert offenders == [], f"ham sema sozlugu kullanimda: {offenders}"

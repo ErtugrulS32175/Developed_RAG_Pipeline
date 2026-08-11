@@ -249,7 +249,7 @@ def test_both_argv_builders_require_a_binary():
 
 def test_the_implementer_argv_carries_every_required_flag(tmp_path):
     argv = cli.build_implementer_argv(
-        tmp_path / "sahte_claude.py", schema_path=tmp_path / "s.json",
+        tmp_path / "sahte_claude.py",
         budget_usd=1.0, allowed_tools=["Edit", "Read"])
     for flag in contract.CLAUDE_REQUIRED_FLAGS:
         assert flag in argv, f"eksik bayrak: {flag}"
@@ -292,7 +292,6 @@ def test_a_bypass_flag_is_refused_on_the_built_argv(extra):
 def test_an_empty_tool_allowlist_is_refused(tmp_path):
     with pytest.raises(cli.UnsafeInvocation):
         cli.build_implementer_argv(tmp_path / "k.py",
-                                   schema_path=tmp_path / "s.json",
                                    budget_usd=1.0, allowed_tools=[])
 
 
@@ -322,11 +321,8 @@ def test_the_implementer_fake_really_runs_with_schema_budget_and_tools(
     the claim "no real Claude is reachable" rested on argv shape alone.
     Here the fake is EXECUTED, the prompt goes over stdin, and the flags
     the run depends on are read back out of what the process recorded."""
-    schema_file = tmp_path / "sema.json"
-    schema_file.write_text(json.dumps(schemas.IMPLEMENTER_RESULT_SCHEMA),
-                           encoding="utf-8")
     argv = cli.build_implementer_argv(
-        workspace["binaries"]["implementer"], schema_path=schema_file,
+        workspace["binaries"]["implementer"],
         budget_usd=0.25, allowed_tools=["Edit", "Read"])
     done = subprocess.run([sys.executable, *argv], input="kurgu istem",
                           text=True, capture_output=True)
@@ -339,7 +335,11 @@ def test_the_implementer_fake_really_runs_with_schema_budget_and_tools(
     assert recorded, "sahte implementer cagrilmadi"
     seen = recorded[-1]["argv"]
     assert "--print" in seen
-    assert seen[seen.index("--json-schema") + 1] == str(schema_file)
+    # the INLINE canonical schema, byte-identical after a real process
+    # boundary -- the py-fake is executed via sys.executable, so the
+    # token survives argv quoting exactly
+    assert seen[seen.index("--json-schema") + 1] == \
+        schemas.IMPLEMENTER_SCHEMA_BINDING.canonical_json
     assert seen[seen.index("--max-budget-usd") + 1] == "0.25"
     assert seen[seen.index("--allowedTools") + 1] == "Edit"
     # the prompt is nowhere on the command line
@@ -368,7 +368,6 @@ def test_the_implementer_can_never_be_handed_bash_or_an_agent(tools):
     The implementer reads and edits; the RUNNER runs the commands."""
     with pytest.raises(cli.UnsafeInvocation):
         cli.build_implementer_argv("/kurgu/claude",
-                                   schema_path="/kurgu/s.json",
                                    budget_usd=1.0, allowed_tools=tools)
 
 
@@ -379,11 +378,138 @@ def test_the_implementer_tool_list_is_a_contract_constant_not_an_argument():
         assert banned in contract.IMPLEMENTER_FORBIDDEN_TOOLS
         assert banned not in contract.IMPLEMENTER_ALLOWED_TOOLS
     argv = cli.build_implementer_argv("/kurgu/claude",
-                                      schema_path="/kurgu/s.json",
                                       budget_usd=1.0)
     tail = argv[argv.index("--allowedTools") + 1:]
     assert tail[:len(contract.IMPLEMENTER_ALLOWED_TOOLS)] == list(
         contract.IMPLEMENTER_ALLOWED_TOOLS)
+
+
+# =====================================================================
+# R2B -- ONE canonical schema binding: bytes, hash, argv, validator
+# =====================================================================
+#
+# `--json-schema` takes INLINE JSON -- measured against the installed
+# CLI -- and the builder used to pass a caller-chosen FILE PATH there,
+# while the validator used a separate live dictionary. Nothing tied the
+# two. The binding below is the one authority: canonical bytes, their
+# SHA-256, the exact argv value, and the validator, all from the same
+# serialization.
+
+def test_canonical_json_is_order_independent_compact_and_deterministic():
+    import hashlib
+
+    first = schemas.canonical_json(
+        {"b": 1, "a": [1, 2], "c": {"y": 0, "x": 1}})
+    second = schemas.canonical_json(
+        {"c": {"x": 1, "y": 0}, "a": [1, 2], "b": 1})
+    assert first == second, "ekleme sirasi baytlari degistirdi"
+    assert " " not in first and chr(10) not in first, "kompakt degil"
+    assert first.encode("utf-8").isascii()
+    assert hashlib.sha256(first.encode("utf-8")).hexdigest() == \
+        hashlib.sha256(second.encode("utf-8")).hexdigest()
+
+
+def test_canonical_json_refuses_what_json_cannot_carry():
+    for poison in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            schemas.canonical_json({"deger": poison})
+
+
+def test_a_non_schema_document_cannot_become_a_binding():
+    from jsonschema import SchemaError
+
+    with pytest.raises(SchemaError):
+        schemas.SchemaBinding({"type": "boyle-bir-tur-yok"})
+
+
+def test_two_fresh_processes_agree_on_the_binding_hash():
+    """Determinism ACROSS interpreters, not just within one: dict
+    iteration order, environment and platform must not move the bytes,
+    or a hash recorded today stops naming the schema tomorrow."""
+    code = ("from tools.agent_loop import schemas;"
+            "print(schemas.IMPLEMENTER_SCHEMA_BINDING.sha256)")
+    hashes = set()
+    for _ in range(2):
+        done = subprocess.run([sys.executable, "-c", code], cwd=str(REPO),
+                              capture_output=True, text=True, timeout=120)
+        assert done.returncode == 0, done.stderr
+        hashes.add(done.stdout.strip())
+    assert hashes == {schemas.IMPLEMENTER_SCHEMA_BINDING.sha256}
+    assert re.fullmatch(r"[0-9a-f]{64}",
+                        schemas.IMPLEMENTER_SCHEMA_BINDING.sha256)
+
+
+def test_the_binding_outlives_mutation_of_its_source_dictionary():
+    """The mutable source dictionary must not stay a second live
+    authority once the binding exists."""
+    import hashlib
+
+    source = {"type": "object", "properties": {"a": {"type": "string"}}}
+    binding = schemas.SchemaBinding(source)
+    before = (binding.canonical_json, binding.sha256)
+    source["properties"]["a"] = {"type": "integer"}
+    assert (binding.canonical_json, binding.sha256) == before
+    binding.validate({"a": "metin"})        # judged by the OLD schema
+    assert hashlib.sha256(binding.canonical_bytes).hexdigest() == \
+        binding.sha256
+
+
+def test_the_binding_refuses_attribute_rewrites():
+    """R2B-R1: the binding's fields were ordinary writable attributes,
+    and an evaluator probe rewrote the canonical text and the hash
+    TOGETHER -- the substitute entered the argv, the hash comparison
+    agreed with itself, and a permissive validator accepted an
+    arbitrary reply. Assignment and deletion refuse now, on the shared
+    binding AND on a fresh instance, and the values are proven
+    unchanged after every attempt. (`object.__setattr__` remains a
+    language-level bypass; the claim is the NORMAL API, and the
+    docstring says so.)"""
+    fresh = schemas.SchemaBinding({"type": "object"})
+    for target in (schemas.IMPLEMENTER_SCHEMA_BINDING, fresh):
+        witness = (target.canonical_json, target.canonical_bytes,
+                   target.sha256)
+        for field in ("canonical_json", "canonical_bytes", "sha256",
+                      "_validator", "yeni_alan"):
+            with pytest.raises(AttributeError):
+                setattr(target, field, "{}")
+        for field in ("canonical_json", "sha256"):
+            with pytest.raises(AttributeError):
+                delattr(target, field)
+        assert (target.canonical_json, target.canonical_bytes,
+                target.sha256) == witness
+
+
+def test_the_implementer_argv_schema_is_inline_not_a_path(tmp_path):
+    import hashlib
+    import os
+
+    argv = cli.build_implementer_argv(tmp_path / "sahte_claude.py",
+                                      budget_usd=1.0)
+    assert argv.count("--json-schema") == 1
+    token = argv[argv.index("--json-schema") + 1]
+    assert token == schemas.IMPLEMENTER_SCHEMA_BINDING.canonical_json
+    assert json.loads(token) == schemas.IMPLEMENTER_RESULT_SCHEMA
+    # os.path.exists, NOT Path.exists: on Linux a 3KB "filename" makes
+    # pathlib raise ENAMETOOLONG instead of answering False
+    assert not os.path.exists(token), "sema hala bir dosya yolu"
+    assert hashlib.sha256(token.encode("utf-8")).hexdigest() == \
+        schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
+
+
+def test_no_implementer_schema_is_read_from_or_written_to_disk():
+    """Structural: `schema_path` is gone from the implementer builder
+    and no file API appears in the CLI module -- a schema file would
+    reintroduce the read/change/use ambiguity R2B removed. (Evaluator
+    `--output-schema` is B3's business and out of scope.)"""
+    import inspect
+
+    builder = inspect.getsource(cli.build_implementer_argv)
+    assert "schema_path" not in builder
+    body = Path(cli.__file__).read_text(encoding="utf-8")
+    for file_api in (".read_text", ".read_bytes", ".write_text",
+                     ".write_bytes", "open("):
+        assert file_api not in body, f"cli.py dosya APIsi kullaniyor: " \
+            f"{file_api}"
 
 
 def test_a_failed_model_process_has_its_own_closed_stop_reason():

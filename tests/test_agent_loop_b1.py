@@ -1798,7 +1798,7 @@ def test_every_mutation_still_applies_to_the_current_source():
     # already cleared it. The R2A labels are pinned BY NAME too, so a
     # deletion has to show up as a missing name rather than as a
     # count that still happens to pass.
-    assert len(tool.MUTATIONS) >= 51
+    assert len(tool.MUTATIONS) >= 60
     labels = {label for label, *_ in tool.MUTATIONS}
     expected_r2a = {
         "r2a-hazir-kontrolu", "r2a-kayit-depo", "r2a-kayit-kosu",
@@ -1808,6 +1808,13 @@ def test_every_mutation_still_applies_to_the_current_source():
         "r2a-kap-sinirlama", "r2a-bag-cagrisi-yok", "r2a-cagiran-yolu"}
     assert expected_r2a <= labels, \
         f"eksik r2a mutasyonu: {sorted(expected_r2a - labels)}"
+    expected_r2b = {
+        "r2b-yol-degeri", "r2b-kanonik-sirasiz", "r2b-ham-sozluk",
+        "r2b-esitlik-kontrolu", "r2b-yanlis-sha",
+        "r2br1-dondurma", "r2br1-tip-kontrolu", "r2br1-kodlama-sarici",
+        "r2br11-alt-sinif"}
+    assert expected_r2b <= labels, \
+        f"eksik r2b mutasyonu: {sorted(expected_r2b - labels)}"
     root = Path(__file__).resolve().parent.parent
     stale = [label for label, module, old, _, _ in tool.MUTATIONS
              if old not in (root / "tools" / "agent_loop"
@@ -1822,9 +1829,11 @@ def test_every_mutation_names_a_test_that_exists():
     test files are the namespace now."""
     tool = _mutation_tool()
     here = Path(__file__).resolve().parent
-    body = Path(__file__).read_text(encoding="utf-8") + \
-        (here / "test_agent_loop_b2_execution.py").read_text(
-            encoding="utf-8")
+    body = "".join(
+        (here / name).read_text(encoding="utf-8")
+        for name in ("test_agent_loop_b1.py",
+                     "test_agent_loop_b2_execution.py",
+                     "test_agent_loop_contract.py"))
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
     assert missing == [], f"var olmayan hedef test adi: {missing}"
