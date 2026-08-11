@@ -1798,30 +1798,52 @@ def test_every_mutation_still_applies_to_the_current_source():
     # already cleared it. The R2A labels are pinned BY NAME too, so a
     # deletion has to show up as a missing name rather than as a
     # count that still happens to pass.
-    assert len(tool.MUTATIONS) >= 72
+    # EXACT, not a floor. `>= N` stayed green with a whole package's
+    # mutations deleted, because earlier packages already cleared the
+    # number -- and the label set is what says WHICH ones exist. Both
+    # move only when somebody edits this pin on purpose.
+    # EXACT, not a floor. `>= N` stayed green with a whole package's
+    # mutations deleted, because earlier packages already cleared the
+    # number -- and the label set is what says WHICH ones exist. Both
+    # move only when somebody edits this pin on purpose.
+    assert len(tool.MUTATIONS) == 93
     labels = {label for label, *_ in tool.MUTATIONS}
-    expected_r2a = {
-        "r2a-hazir-kontrolu", "r2a-kayit-depo", "r2a-kayit-kosu",
-        "r2a-kayit-taban", "r2a-gomulu-kimlik", "r2a-bag-varligi",
-        "r2a-bag-agac", "r2a-bag-depo", "r2a-bag-kosu", "r2a-bag-taban",
-        "r2a-bas-kontrolu", "r2a-git-kutugu", "r2a-ana-agac",
-        "r2a-kap-sinirlama", "r2a-bag-cagrisi-yok", "r2a-cagiran-yolu"}
-    assert expected_r2a <= labels, \
-        f"eksik r2a mutasyonu: {sorted(expected_r2a - labels)}"
-    expected_r2b = {
-        "r2b-yol-degeri", "r2b-kanonik-sirasiz", "r2b-ham-sozluk",
-        "r2b-esitlik-kontrolu", "r2b-yanlis-sha",
-        "r2br1-dondurma", "r2br1-tip-kontrolu", "r2br1-kodlama-sarici",
-        "r2br11-alt-sinif"}
-    assert expected_r2b <= labels, \
-        f"eksik r2b mutasyonu: {sorted(expected_r2b - labels)}"
-    expected_b2a = {
-        "b2a-arac-tipi", "b2a-ikili-donusu", "b2a-butce-tavani",
-        "b2a-butce-tipi", "b2a-sure-tipi", "b2a-istem-tipi",
-        "b2a-argv-token-tipi", "b2a-model-tipi", "b2a-kimlik-tipi",
-        "b2ar1-builder-butce", "b2ar1-tipli-ret", "b2ar1-arac-yansimasi"}
-    assert expected_b2a <= labels, \
-        f"eksik b2a mutasyonu: {sorted(expected_b2a - labels)}"
+    assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
+    assert labels == {
+        'allowlist-test-ailesi', 'b2a-arac-tipi', 'b2a-argv-token-tipi',
+        'b2a-butce-tavani', 'b2a-butce-tipi', 'b2a-ikili-donusu',
+        'b2a-istem-tipi', 'b2a-kimlik-tipi', 'b2a-model-tipi',
+        'b2a-sure-tipi', 'b2ar1-arac-yansimasi', 'b2ar1-builder-butce',
+        'b2ar1-tipli-ret', 'b2ba-alt-kume', 'b2ba-ana-agac-sonkontrolu',
+        'b2ba-dosya-turu', 'b2ba-finally-yok', 'b2ba-git-rc',
+        'b2ba-gorev-sonkontrolu', 'b2ba-izlenmeyen-korlugu',
+        'b2ba-kirli-agac', 'b2ba-kontrol-glob', 'b2ba-kosu-kimligi',
+        'b2ba-onek-kacisi', 'b2ba-parmak-izi-icerik',
+        'b2ba-yasakli-onceligi', 'b2ba-yineleme', 'b2bar1-indeks-bayragi',
+        'b2bar1-indeks-digesti', 'b2bar1-kanonik-kapsam',
+        'b2bar1-manifest-icerde', 'b2bar1-manifest-taban',
+        'b2bar1-silme-modu', 'b2bar1-snapshot-okuma', 'bitmemis-kosu',
+        'butce-degismezi', 'butce-siniri', 'cift-birakma',
+        'degismez-alanlar', 'dizin-fsync', 'dizin-zinciri',
+        'durum-kosulsuz', 'git-donus-kodu', 'git-kaldirma-kontrolu',
+        'git-kayitli-mi', 'git-stderr-sizintisi', 'handshake-baslatma',
+        'handshake-timeout', 'holder-silindi-mi', 'inspect-tip-kapisi',
+        'kap-dislayici', 'kayit-depo-yetkisi', 'kayit-varligi',
+        'kilit-dislama', 'kilit-ofseti', 'kimlik-deseni',
+        'kontrol-duzlemi-dogrudan', 'kontrol-duzlemi-kapisi',
+        'kontrol-duzlemi-test-ailesi', 'kontrol-duzlemi-yol-listesi',
+        'kurtarma-depo-filtresi', 'r2a-ana-agac', 'r2a-bag-agac',
+        'r2a-bag-cagrisi-yok', 'r2a-bag-depo', 'r2a-bag-kosu',
+        'r2a-bag-taban', 'r2a-bag-varligi', 'r2a-bas-kontrolu',
+        'r2a-cagiran-yolu', 'r2a-git-kutugu', 'r2a-gomulu-kimlik',
+        'r2a-hazir-kontrolu', 'r2a-kap-sinirlama', 'r2a-kayit-depo',
+        'r2a-kayit-kosu', 'r2a-kayit-taban', 'r2b-esitlik-kontrolu',
+        'r2b-ham-sozluk', 'r2b-kanonik-sirasiz', 'r2b-yanlis-sha',
+        'r2b-yol-degeri', 'r2br1-dondurma', 'r2br1-kodlama-sarici',
+        'r2br1-tip-kontrolu', 'r2br11-alt-sinif',
+        'registry-sorgusu-kontrolu', 'run-id-caprazi', 'sonlu-sayi',
+        'yarim-cift', 'yaz-once-kaydi', 'yol-siniri',
+        'zorunlu-worktree-id'}
     root = Path(__file__).resolve().parent.parent
     stale = [label for label, module, old, _, _ in tool.MUTATIONS
              if old not in (root / "tools" / "agent_loop"
@@ -1840,7 +1862,8 @@ def test_every_mutation_names_a_test_that_exists():
         (here / name).read_text(encoding="utf-8")
         for name in ("test_agent_loop_b1.py",
                      "test_agent_loop_b2_execution.py",
-                     "test_agent_loop_contract.py"))
+                     "test_agent_loop_contract.py",
+                     "test_agent_loop_b2_changes.py"))
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
     assert missing == [], f"var olmayan hedef test adi: {missing}"

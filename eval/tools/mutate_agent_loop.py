@@ -30,7 +30,7 @@ from pathlib import Path
 
 SOURCE_REPO = Path(__file__).resolve().parents[2]
 MODULES = ("state", "locking", "worktree", "preflight", "execution",
-           "cli", "schemas")
+           "cli", "schemas", "changes")
 NL = chr(10)
 
 # The execution-binding block in `run_implementer`, verbatim: two R2A
@@ -388,6 +388,139 @@ MUTATIONS = [
      "    except cli.UnsafeInvocation:" + NL
      + "        raise",
      "test_every_cli_refusal_reaches_the_caller_as_an_adapter_error"),
+    # ----------------------------------------------------------------
+    # B2B-A -- the verified change set. Each of these was reproduced as
+    # a self-attack first; two SURVIVED that round and the mechanism
+    # was corrected before they became manifest entries.
+    # ----------------------------------------------------------------
+    ("b2ba-izlenmeyen-korlugu", "changes",
+     '               "--untracked-files=all", "--ignore-submodules=none",',
+     '               "--untracked-files=no", "--ignore-submodules=none",',
+     "test_an_untracked_file_that_git_diff_would_omit_is_still_seen"),
+    ("b2ba-onek-kacisi", "changes",
+     "        if trimmed and (folded == trimmed" + NL
+     + '                        or folded.startswith(trimmed + "/")):',
+     "        if trimmed and folded.startswith(trimmed):",
+     "test_a_prefix_sibling_directory_is_not_covered"),
+    ("b2ba-yasakli-onceligi", "changes",
+     "    if _covered(path, forbidden) or not _covered(path, allowed):",
+     "    if not _covered(path, allowed):",
+     "test_forbidden_beats_allowed"),
+    ("b2ba-kontrol-glob", "changes",
+     "    return any(fnmatch.fnmatchcase(folded, _fold(pattern))" + NL
+     + "               for pattern in contract.CONTROL_PLANE_GLOBS)",
+     "    return False",
+     "test_a_test_file_invented_tomorrow_is_caught_by_the_glob"),
+    ("b2ba-alt-kume", "changes",
+     "    if set(declared) != {change.path for change in actual}:",
+     "    if not set(declared) <= {change.path for change in actual}:",
+     "test_a_change_the_model_omits_is_refused"),
+    ("b2ba-git-rc", "changes",
+     "    if done.returncode != 0:",
+     "    if False:",
+     "test_a_failing_git_query_is_unverifiable_not_clean"),
+    ("b2ba-parmak-izi-icerik", "changes",
+     '        b"' + BS + '0".join((change.path.encode("utf-8"), '
+     'change.kind.encode("ascii"),' + NL
+     + '                    change.mode.encode("ascii"),' + NL
+     + '                    change.sha256.encode("ascii"))) + b"' + BS + 'n"',
+     '        change.path.encode("utf-8") + b"' + BS + 'n"',
+     "test_the_fingerprint_covers_content_not_only_paths"),
+    ("b2ba-gorev-sonkontrolu", "changes",
+     "        if preflight.manifest_changed(task_file, snapshot) or " + BS + NL
+     + "                preflight.snapshot_manifest(task_file).digest != "
+     "task_before:",
+     "        if False:",
+     "test_an_ignored_manifest_inside_the_repository_is_still_re_verified"),
+    ("b2ba-ana-agac-sonkontrolu", "changes",
+     "        if _tree_snapshot(repo_path) != main_before:",
+     "        if False:",
+     "test_an_edit_to_the_operator_checkout_is_caught"),
+    ("b2ba-finally-yok", "changes",
+     "    finally:" + NL
+     + "        # EVERY exit: a call that failed may have edited files first,"
+     + NL
+     + "        # and a safety violation outranks the failure that hid it. The"
+     + NL
+     + "        # original error is chained, never erased." + NL
+     + "        try:" + NL
+     + "            actual = verify_after()" + NL
+     + "        except ChangeSetError as violation:" + NL
+     + "            raise violation from failure",
+     "    actual = verify_after()",
+     "test_a_forbidden_edit_outranks_the_call_failure_and_chains_it"),
+    ("b2ba-dosya-turu", "changes",
+     "    if (not stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode)"
+     + NL + '            or getattr(entry, "st_reparse_tag", 0)):',
+     "    if False:",
+     "test_a_symlink_is_refused"),
+    ("b2ba-kosu-kimligi", "changes",
+     '    if reply.get("run_id") != run_id:',
+     "    if False:",
+     "test_a_reply_naming_another_run_is_refused"),
+    ("b2ba-yineleme", "changes",
+     "    if len(set(declared)) != len(declared):",
+     "    if False:",
+     "test_a_duplicate_declaration_is_refused"),
+    # ----------------------------------------------------------------
+    # B2B-A R1 -- the six audit findings, each as its own mutation
+    # ----------------------------------------------------------------
+    ("b2bar1-indeks-bayragi", "changes",
+     "    blinded = _blinded_entries(cwd)" + NL
+     + "    if blinded:",
+     "    blinded = _blinded_entries(cwd)" + NL
+     + "    if False:",
+     "test_a_pre_existing_index_flag_is_refused_before_the_model_starts"),
+    ("b2bar1-indeks-digesti", "changes",
+     "        if _index_state(tree) != index_before:",
+     "        if False:",
+     "test_a_staged_change_is_refused"),
+    ("b2bar1-manifest-icerde", "changes",
+     "    if relative is None:" + NL
+     + '        raise EvidenceUnavailable("gorev dosyasi depo agacinin '
+     'disinda")',
+     "    if relative is None:" + NL
+     + '        relative = "kurgu-disarida.json"',
+     "test_a_manifest_outside_the_repository_is_refused"),
+    ("b2bar1-manifest-taban", "changes",
+     '    if snapshot.task["baseline_sha"] != baseline_sha:',
+     "    if False:",
+     "test_a_manifest_naming_another_baseline_is_refused"),
+    ("b2bar1-kanonik-kapsam", "changes",
+     '    parts = [part for part in str(text).replace("' + BS + BS + '", "/")'
+     '.split("/")' + NL
+     + '             if part not in ("", ".")]' + NL
+     + '    joined = "/".join(parts)' + NL
+     + '    return joined.casefold() if os.name == "nt" else joined',
+     '    return str(text).replace("' + BS + BS + '", "/").rstrip("/")',
+     "test_a_forbidden_entry_cannot_be_escaped_by_spelling"),
+    ("b2bar1-silme-modu", "changes",
+     "        if mode_head not in _PLAIN_MODES:" + NL
+     + '            raise UnsafeChange("siradan olmayan dosya modu",' + NL
+     + "                               reason=contract.StopReason."
+     "PATH_NOT_ALLOWED)" + NL
+     + "        return _Change(path=path, kind=DELETED, mode=mode_head, "
+     'sha256="")',
+     "        return _Change(path=path, kind=DELETED, mode="
+     '"000000", sha256="")',
+     "test_a_symlink_deletion_is_refused_and_modes_reach_the_fingerprint"),
+    ("b2bar1-snapshot-okuma", "changes",
+     "            except OSError:" + NL
+     + "                # a file git listed but nobody can read is an" + NL
+     + "                # unanswered question, and the operating system's own"
+     + NL
+     + "                # message is not text this module may repeat" + NL
+     + "                raise EvidenceUnavailable(" + NL
+     + '                    "anlik goruntudeki dosya okunamadi") from None',
+     "            except OSError:" + NL
+     + "                raise",
+     "test_an_unreadable_snapshot_file_is_typed_and_silent"),
+    ("b2ba-kirli-agac", "changes",
+     "    records = _status(root)" + NL
+     + "    if records:",
+     "    records = _status(root)" + NL
+     + "    if False:",
+     "test_a_dirty_worktree_is_refused_before_the_model_starts"),
     ("b2ar1-arac-yansimasi", "cli",
      '            f"implementer izinli olmayan {len(forbidden)} arac '
      'istedi; "',
@@ -467,6 +600,7 @@ def _pytest(workdir, extra):
     argv = [sys.executable, "-m", "pytest", "tests/test_agent_loop_b1.py",
             "tests/test_agent_loop_b2_execution.py",
             "tests/test_agent_loop_contract.py",
+            "tests/test_agent_loop_b2_changes.py",
             "-q", "--no-header", "-p", "no:cacheprovider", "-rf"] + extra
     # a temp directory of the HARNESS's own. The battery derives its
     # worktree root from the process temp directory, so a run that
@@ -555,7 +689,7 @@ def main():
         imported = subprocess.run(
             [sys.executable, "-c",
              "from tools.agent_loop import (state, locking, worktree, "
-             "preflight, execution, cli, schemas)"],
+             "preflight, execution, cli, schemas, changes)"],
             cwd=str(workdir), capture_output=True, text=True)
         if imported.returncode != 0:
             path.write_text(original, encoding="utf-8")
