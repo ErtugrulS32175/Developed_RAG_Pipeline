@@ -50,8 +50,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -87,6 +87,16 @@ MAX_TIMEOUT_SECONDS = _TIMEOUT["maximum"]
 # contract's own output ceiling, so neither direction of the call can
 # carry more than the other.
 MAX_PROMPT_BYTES = MAX_OUTPUT_BYTES
+# The task schema caps a whole run; a single call may not authorise
+# more than that. Only "greater than zero" was enforced, so one call
+# could be funded for any amount at all. Re-exported from `cli`, which
+# owns the budget rule for both roads into it -- not recomputed here.
+MAX_BUDGET_USD = cli.MAX_BUDGET_USD
+
+# Identity grammars, read from the modules that already own them.
+_RUN_ID_PATTERN = re.compile(contract.IDENTIFIER_PATTERN)
+_BASELINE_PATTERN = re.compile(
+    worktree.RECORD_SCHEMA["properties"]["baseline_sha"]["pattern"])
 
 
 class AdapterError(RuntimeError):
@@ -190,19 +200,26 @@ class ImplementerRun:
     schema_sha256: str
 
 
-def _assert_budget(budget_usd):
-    """Refused here, before anything is launched.
+def _canonical_budget(budget_usd):
+    """Refused here, before anything is launched -- and RETURNED, so
+    the number that was bounded is the number that gets spelled.
 
-    A budget that is zero, negative or not a finite number cannot fund a
-    call, and finding that out after the process started is finding it
-    out too late."""
-    if isinstance(budget_usd, bool) or not isinstance(budget_usd,
-                                                      (int, float)):
-        raise BudgetRefused("butce sayisal degil")
-    if not math.isfinite(budget_usd):
-        raise BudgetRefused("butce sonlu bir sayi degil")
-    if budget_usd <= 0:
-        raise BudgetRefused("kalan butce bir cagriyi fonlamiyor")
+    Two defects met in this function. A `float` SUBCLASS passed every
+    check as 1.0 and then wrote `999999` onto the command line, because
+    `isinstance` accepts subclasses and argv took `__str__` afterwards.
+    And the only ceiling was zero, so a single call could be authorised
+    for any amount while the task schema capped the whole run at
+    `MAX_BUDGET_USD`.
+
+    ONE authority, in `cli`, because the builder is a public callable
+    too: the rule used to live only here, so calling the builder
+    directly spelled `101`, `0` and `inf` onto a command line. Copying
+    the rule into both modules would leave two places to forget."""
+    try:
+        return cli.exact_budget(budget_usd)
+    except cli.UnsafeInvocation as refused:
+        # the same fixed sentences, re-typed for this package's callers
+        raise BudgetRefused(str(refused)) from None
 
 
 class LimitRefused(AdapterError):
@@ -241,25 +258,25 @@ def _now():
     return time.monotonic()
 
 
-def _assert_limits(timeout_seconds, max_output_bytes):
-    """The bounds are checked BEFORE a process exists.
+def _canonical_limits(timeout_seconds, max_output_bytes):
+    """The bounds are checked BEFORE a process exists, and returned.
 
-    Only the budget was validated. `timeout_seconds=NaN` made every
-    deadline comparison false, so a hung child ran until something
-    outside killed it, and `max_output_bytes=NaN` made every ceiling
-    comparison false, so a megabyte was read in full and then refused
-    for the wrong reason -- a parse error standing in for a limit that
-    never applied. A bound that cannot be compared is not a bound."""
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds,
-                                                           int):
+    `timeout_seconds=NaN` made every deadline comparison false, so a
+    hung child ran until something outside killed it. Then an `int`
+    SUBCLASS whose `__le__` and `__ge__` always agreed passed both
+    ranges while carrying a value nine orders of magnitude outside
+    them -- `isinstance` accepts subclasses, and a bound whose
+    comparisons the value itself defines is not a bound. Exact `int`
+    also excludes `bool` by type."""
+    if type(timeout_seconds) is not int:
         raise LimitRefused("sure siniri tam sayi degil")
     if not MIN_TIMEOUT_SECONDS <= timeout_seconds <= MAX_TIMEOUT_SECONDS:
         raise LimitRefused("sure siniri sozlesme araligi disinda")
-    if isinstance(max_output_bytes, bool) or not isinstance(
-            max_output_bytes, int):
+    if type(max_output_bytes) is not int:
         raise LimitRefused("cikti siniri tam sayi degil")
     if not MIN_OUTPUT_BYTES <= max_output_bytes <= MAX_OUTPUT_BYTES:
         raise LimitRefused("cikti siniri sozlesme araligi disinda")
+    return timeout_seconds, max_output_bytes
 
 
 def _prompt_bytes(prompt):
@@ -270,8 +287,13 @@ def _prompt_bytes(prompt):
     pipe buffer, the write blocked, and the timeout that was supposed to
     cover this had not started. The write is asynchronous now AND the
     payload is bounded, because a call that cannot fit down the pipe is
-    better refused than raced."""
-    if not isinstance(prompt, str):
+    better refused than raced.
+
+    EXACTLY `str`: a subclass checked as "kurgu" returned entirely
+    different bytes from `encode()`, so the instruction that was
+    validated and the instruction the model received were two
+    different questions."""
+    if type(prompt) is not str:
         raise LimitRefused("istem bir metin degil")
     try:
         payload = prompt.encode("utf-8")
@@ -285,16 +307,36 @@ def _prompt_bytes(prompt):
 
 
 def _usable_binary(binary):
-    """An existing regular file, and only that.
+    """An existing regular file, as ONE absolute canonical path.
 
     `Popen` searches PATH for a bare name, which is how a test that
-    meant to run a stub reaches the real, billable CLI."""
-    if not binary:
+    meant to run a stub reaches the real, billable CLI.
+
+    Two conversions used to happen and they could disagree: this
+    function asked `Path(binary)` while the argv builder asked
+    `str(binary)`, so an object whose `__fspath__` named binary A and
+    whose `__str__` named binary B was VERIFIED as A and LAUNCHED as B.
+    There is one conversion now, and its result is returned.
+
+    RESOLVED before it is returned, because the process is launched
+    with the disposable worktree as its working directory: a relative
+    path checked against the current directory and launched against
+    another names two different programs. What this does NOT close is
+    the declared filesystem race -- a same-user process can still
+    replace the file after this check."""
+    try:
+        text = cli.exact_text(binary, what="ikili dosya")
+    except cli.UnsafeInvocation:
+        raise BinaryNotUsable("ikili dosya bir yol degil") from None
+    if not text:
         raise BinaryNotUsable("ikili dosya verilmedi")
-    path = Path(binary)
-    if path.parent == Path("") or not path.is_file():
+    path = Path(text)
+    if path.parent == Path(""):
         raise BinaryNotUsable("ikili dosya bir yol degil ya da mevcut degil")
-    return path
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise BinaryNotUsable("ikili dosya bir yol degil ya da mevcut degil")
+    return resolved
 
 
 class SchemaNotBound(AdapterError):
@@ -355,6 +397,57 @@ def _argv_schema(argv):
             or hashlib.sha256(payload).hexdigest() != binding.sha256:
         raise SchemaNotBound("argv'deki sema kanonik baglamayla eslesmiyor")
     return Draft202012Validator(json.loads(text)), binding.sha256
+
+
+class CallInputRefused(AdapterError):
+    """A call argument the CLI layer refused, re-typed for this
+    package's callers.
+
+    `run_implementer` promises a typed `AdapterError` for every
+    refusal, and a `cli.UnsafeInvocation` escaping through it broke
+    that promise: the runner's closed state machine would have had no
+    reason code to record. The message is the CLI's own fixed sentence,
+    which carries no caller value -- the builder keeps raising
+    `UnsafeInvocation` when it is called directly."""
+
+    def __init__(self, message):
+        super().__init__(message, event=contract.EventCode.PREFLIGHT_FAILED,
+                         reason=contract.StopReason.PREFLIGHT_FAILED)
+
+
+class IdentityRefused(AdapterError):
+    """An identity or path argument that is not exactly what the frozen
+    grammars describe, refused before any process exists.
+
+    A `str` subclass whose `__eq__` returned True for everything
+    satisfied every comparison the worktree binding makes -- so the
+    binding agreed with a record it had never been shown. Identities
+    are exact strings matching their existing patterns before the
+    binding is consulted at all."""
+
+    def __init__(self, message):
+        super().__init__(message, event=contract.EventCode.PREFLIGHT_FAILED,
+                         reason=contract.StopReason.PREFLIGHT_FAILED)
+
+
+def _exact_identity(value, pattern, what):
+    """An exact `str` its frozen pattern accepts. The pattern comes
+    from the module that already owns it; nothing is re-spelled here."""
+    if type(value) is not str or not pattern.fullmatch(value):
+        raise IdentityRefused(f"{what} sozlesme desenine uymuyor")
+    return value
+
+
+def _canonical_path(value, what):
+    """One conversion, one concrete `Path`, and nothing afterwards asks
+    the original object anything."""
+    try:
+        text = cli.exact_text(value, what=what)
+    except cli.UnsafeInvocation:
+        raise IdentityRefused(f"{what} bir yol degil") from None
+    if not text:
+        raise IdentityRefused(f"{what} bos")
+    return Path(text)
 
 
 class WorktreeNotBound(AdapterError):
@@ -427,6 +520,69 @@ def _parse_reply(raw, measurements, validator):
     return payload
 
 
+@dataclass(frozen=True, slots=True)
+class _CanonicalImplementerCall:
+    """Every input, validated once and converted once.
+
+    THE POINT OF THIS CLASS is that after it exists the caller's
+    objects are irrelevant. A validator that only inspects a value and
+    leaves the original alive is not a boundary: the argv builder, the
+    worktree binding, the deadline arithmetic and the stdin writer each
+    asked the caller's object again, and an object is free to answer
+    differently every time. These fields are exact built-in types and
+    concrete paths, and they are the only things anything downstream
+    is allowed to see."""
+
+    binary: Path
+    repo: Path
+    state_dir: Path
+    run_id: str
+    worktree_id: str
+    baseline_sha: str
+    prompt_bytes: bytes
+    budget_usd: object            # exact int or float, bounded
+    timeout_seconds: int
+    max_output_bytes: int
+    model: object                 # exact str or None
+
+
+def _canonical_call(binary, *, repo, state_dir, run_id, worktree_id,
+                    baseline_sha, prompt, budget_usd, timeout_seconds,
+                    max_output_bytes, model):
+    """Validate and convert, in the order the refusals are cheapest.
+
+    Budget, bounds, prompt and binary come before the identities so a
+    caller who got one of those wrong hears about it without a
+    filesystem or git question being asked -- the order existing tests
+    already depend on."""
+    canonical_budget = _canonical_budget(budget_usd)
+    canonical_timeout, canonical_output = _canonical_limits(
+        timeout_seconds, max_output_bytes)
+    # ONE boundary for the CLI layer's refusals. `cli.UnsafeInvocation`
+    # is not an `AdapterError`, and one escaping here broke this
+    # function's own promise -- the runner's closed state machine would
+    # have had no reason code for it. Wrapping the whole construction
+    # rather than a single call keeps that true for every cli helper
+    # reached from here, including ones added later.
+    try:
+        return _CanonicalImplementerCall(
+            binary=_usable_binary(binary),
+            prompt_bytes=_prompt_bytes(prompt),
+            budget_usd=canonical_budget,
+            timeout_seconds=canonical_timeout,
+            max_output_bytes=canonical_output,
+            model=cli.exact_model(model),
+            repo=_canonical_path(repo, "depo yolu"),
+            state_dir=_canonical_path(state_dir, "durum dizini"),
+            run_id=_exact_identity(run_id, _RUN_ID_PATTERN, "kosu kimligi"),
+            worktree_id=_exact_identity(worktree_id, worktree.WORKTREE_ID,
+                                        "calisma agaci kimligi"),
+            baseline_sha=_exact_identity(baseline_sha, _BASELINE_PATTERN,
+                                         "taban surum"))
+    except cli.UnsafeInvocation as refused:
+        raise CallInputRefused(str(refused)) from None
+
+
 def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
                     baseline_sha, prompt, budget_usd,
                     timeout_seconds, max_output_bytes, model=None):
@@ -437,12 +593,21 @@ def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
     canonical binding -- there is no way to pass either one in.
     Raises a typed `AdapterError` for every refusal. Nothing here
     retries, repairs or decides what happens next."""
-    _assert_budget(budget_usd)
-    _assert_limits(timeout_seconds, max_output_bytes)
-    payload = _prompt_bytes(prompt)
-    _usable_binary(binary)
-    argv = cli.build_implementer_argv(binary, budget_usd=budget_usd,
-                                      model=model)
+    call = _canonical_call(
+        binary, repo=repo, state_dir=state_dir, run_id=run_id,
+        worktree_id=worktree_id, baseline_sha=baseline_sha, prompt=prompt,
+        budget_usd=budget_usd, timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes, model=model)
+    # THE RAW ARGUMENTS ARE GONE, and that is the enforcement rather
+    # than a comment asking future readers to be careful: every defect
+    # in this family was a second look at a caller's object after a
+    # check had already agreed with it. Reaching for one now is a
+    # NameError the positive-control tests hit on the first run.
+    del binary, repo, state_dir, run_id, worktree_id, baseline_sha
+    del prompt, budget_usd, timeout_seconds, max_output_bytes, model
+
+    argv = cli.build_implementer_argv(call.binary, budget_usd=call.budget_usd,
+                                      model=call.model)
     # The bytes ACTUALLY on the argv, hashed against the frozen binding
     # before anything runs -- and the validator is parsed from those
     # same bytes, so what the model receives and what judges its reply
@@ -455,8 +620,8 @@ def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
     # kept to the launch itself.
     try:
         cwd = worktree.assert_execution_binding(
-            repo, state_dir=state_dir, run_id=run_id,
-            worktree_id=worktree_id, baseline_sha=baseline_sha)
+            call.repo, state_dir=call.state_dir, run_id=call.run_id,
+            worktree_id=call.worktree_id, baseline_sha=call.baseline_sha)
     except worktree.WorktreeError as refused:
         raise WorktreeNotBound(str(refused)) from None
 
@@ -480,16 +645,16 @@ def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
         # write no deadline covered, because the deadline loop had not
         # been reached.
         tripped = threading.Event()
-        streams = [BoundedStream("stdout", process.stdout, max_output_bytes,
-                                 tripped),
-                   BoundedStream("stderr", process.stderr, max_output_bytes,
-                                 tripped)]
+        streams = [BoundedStream("stdout", process.stdout,
+                                 call.max_output_bytes, tripped),
+                   BoundedStream("stderr", process.stderr,
+                                 call.max_output_bytes, tripped)]
         for stream in streams:
             stream.start()
-        writer = PromptWriter(process.stdin, payload)
+        writer = PromptWriter(process.stdin, call.prompt_bytes)
         writer.start()
 
-        deadline = started + timeout_seconds
+        deadline = started + call.timeout_seconds
         timed_out = False
         while True:
             if tripped.is_set():
@@ -525,7 +690,7 @@ def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
 
         if timed_out:
             raise Timeout("model cagrisi sure sinirini asti",
-                          timeout_seconds=timeout_seconds,
+                          timeout_seconds=call.timeout_seconds,
                           exit_code=process.returncode, **measurements)
         overflowed = [stream for stream in streams if stream.overflowed]
         if overflowed:

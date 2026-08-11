@@ -19,6 +19,9 @@ be proven green before any process exists.
 """
 from __future__ import annotations
 
+import math
+import os
+import re
 from pathlib import Path
 
 from tools.agent_loop import schemas
@@ -30,17 +33,107 @@ from tools.agent_loop.contract import (
     FORBIDDEN_FLAG_VALUES,
 )
 
+# The one permission mode this loop runs the implementer under. NOT a
+# caller's choice: `--permission-mode` is a security control, and a
+# value that merely compares equal to the safe one while stringifying
+# into something else is exactly the class of defect this module now
+# refuses. `bypassPermissions` is separately on the forbidden-value
+# list, but that net only catches the values somebody remembered to
+# name -- an unlisted alternate mode went straight through.
+IMPLEMENTER_PERMISSION_MODE = "acceptEdits"
+
+# Read from the frozen task schema, never re-spelled here: a second
+# model grammar is a second thing to keep in sync.
+_MODEL_RULE = schemas.TASK_SCHEMA["properties"]["implementer"][
+    "properties"]["model"]
+MODEL_PATTERN = re.compile(_MODEL_RULE["pattern"])
+MODEL_MAX_LENGTH = _MODEL_RULE["maxLength"]
+
 
 class UnsafeInvocation(RuntimeError):
     """An argv carrying a flag that would remove the sandbox, the
-    permission checks or the approval gate."""
+    permission checks or the approval gate -- or a value that could
+    still change its meaning between the check and the command line."""
+
+
+def exact_text(value, *, what):
+    """EXACTLY ONE conversion, and the result must be an exact `str`.
+
+    A path-like object is asked once, through `__fspath__`; nothing
+    afterwards consults `__str__`. This is the whole boundary rule in
+    one function: an object that answers `__fspath__` with binary A and
+    `__str__` with binary B used to get verified as A and launched as
+    B, and a subclass can customise equality, ordering, encoding and
+    stringification long after a check has agreed with it."""
+    if isinstance(value, os.PathLike):
+        value = value.__fspath__()
+    if type(value) is not str:
+        raise UnsafeInvocation(f"{what} tam bir metin degil")
+    return value
+
+
+# The whole-run ceiling the frozen task schema sets. Derived, never
+# spelled again: a literal here could drift away from the contract.
+MAX_BUDGET_USD = schemas.TASK_SCHEMA["properties"]["max_budget_usd"]["maximum"]
+
+
+def exact_budget(budget_usd):
+    """THE budget authority, for every caller of this builder.
+
+    It lived in `execution` alone, and the builder is a PUBLIC callable
+    that tests hand straight to a subprocess: called directly it spelled
+    `101`, `0`, `-5`, `nan` and `inf` onto the command line, because the
+    only thing it asked was the exact type. A rule enforced on one of
+    two roads is a rule for people who take that road.
+
+    RETURNED, not merely checked: the number that was bounded has to be
+    the number that gets spelled, or a `float` subclass checked as 1.0
+    writes 999999 into argv.
+
+    `math.isfinite` is asked only of floats -- an exact integer is
+    bounded by comparison, and handing an enormous one to `isfinite`
+    raises `OverflowError` instead of refusing."""
+    if type(budget_usd) not in (int, float):     # excludes bool by type
+        raise UnsafeInvocation("butce tam bir sayi degil")
+    if type(budget_usd) is float and not math.isfinite(budget_usd):
+        raise UnsafeInvocation("butce sonlu bir sayi degil")
+    if budget_usd <= 0:
+        raise UnsafeInvocation("kalan butce bir cagriyi fonlamiyor")
+    if budget_usd > MAX_BUDGET_USD:
+        raise UnsafeInvocation("butce sozlesme tavanini asiyor")
+    return budget_usd
+
+
+def exact_model(model):
+    """`None`, or an exact string the frozen task schema accepts.
+
+    ONE authority for the model grammar, used by the argv builder and
+    by the adapter's canonicalisation alike -- a second grammar is a
+    second thing to keep in sync. The refusal names the FIELD and never
+    the value: this text travels into reports."""
+    if model is None:
+        return None
+    if type(model) is not str or len(model) > MODEL_MAX_LENGTH \
+            or not MODEL_PATTERN.fullmatch(model):
+        raise UnsafeInvocation("model adi sozlesme desenine uymuyor")
+    return model
 
 
 def assert_safe_argv(argv):
     """Refuse the flags that turn a supervised call into an unsupervised
     one. Checked on the BUILT argv rather than on the inputs: a rule
-    that inspects intent misses whatever the builder actually emitted."""
-    tokens = [str(token) for token in argv]
+    that inspects intent misses whatever the builder actually emitted.
+
+    THE LAST NET, and it no longer converts anything. It used to call
+    `str()` on every token, which is a deferred conversion -- the
+    forbidden-value comparison then ran against text that did not exist
+    yet when the caller was checked. By the time an argv reaches here
+    there must be nothing left to convert."""
+    tokens = []
+    for token in argv:
+        if type(token) is not str:
+            raise UnsafeInvocation("argv tam metin olmayan bir oge tasiyor")
+        tokens.append(token)
     for token in tokens:
         bare = token.split("=", 1)[0]
         if bare in FORBIDDEN_FLAGS:
@@ -58,7 +151,7 @@ def assert_safe_argv(argv):
 def build_implementer_argv(binary, *, budget_usd,
                            allowed_tools=IMPLEMENTER_ALLOWED_TOOLS,
                            prompt_is_stdin=True, model=None,
-                           permission_mode="acceptEdits"):
+                           permission_mode=IMPLEMENTER_PERMISSION_MODE):
     """`claude` in non-interactive mode, bounded by schema and budget.
 
     THE SCHEMA IS NOT A PARAMETER. `--json-schema` takes INLINE JSON --
@@ -82,31 +175,54 @@ def build_implementer_argv(binary, *, budget_usd,
     Every flag here was read from `claude --help` on the installed
     build (2.1.220). The prompt is NOT an argument -- it goes over
     stdin, so no model-produced text is ever part of a command line."""
-    requested = tuple(allowed_tools or ())
-    forbidden = [tool for tool in requested
-                 if tool not in IMPLEMENTER_ALLOWED_TOOLS]
-    if forbidden:
+    # `is True`, not truthiness: an object with `__bool__` is not the
+    # caller promising the prompt stays off the command line.
+    if prompt_is_stdin is not True:
         raise UnsafeInvocation(
-            f"implementer bu araclari alamaz: {sorted(forbidden)}; "
-            f"izinli olanlar {list(IMPLEMENTER_ALLOWED_TOOLS)}")
+            "istem yalnizca stdin'den verilir; komut satirina konmaz")
+    if type(permission_mode) is not str \
+            or permission_mode != IMPLEMENTER_PERMISSION_MODE:
+        raise UnsafeInvocation("izin modu anlasilan guvenli deger degil")
+    # EXACT strings before the membership test. The allowlist used to
+    # be asked of arbitrary objects with `==`, and argv then took their
+    # `__str__`: an object equal to "Read" arrived on the command line
+    # as "Bash", which is a Claude that can `git push`.
+    requested = tuple(allowed_tools or ())
     if not requested:
         raise UnsafeInvocation(
             "arac izin listesi bos olamaz: sinirsiz arac erisimi demek")
-    allowed_tools = requested
+    if any(type(tool) is not str for tool in requested):
+        raise UnsafeInvocation("arac adlari tam metin olmalidir")
+    forbidden = [tool for tool in requested
+                 if tool not in IMPLEMENTER_ALLOWED_TOOLS]
+    if forbidden:
+        # A COUNT and the frozen allowlist, never the rejected names:
+        # the refused value is caller input, and this text travels into
+        # reports. Echoing it back put arbitrary caller strings there.
+        raise UnsafeInvocation(
+            f"implementer izinli olmayan {len(forbidden)} arac istedi; "
+            f"izinli olanlar {list(IMPLEMENTER_ALLOWED_TOOLS)}")
+    # Repeating a flag has no agreed meaning here, so a duplicate is a
+    # caller mistake rather than something to guess at.
+    if len(set(requested)) != len(requested):
+        raise UnsafeInvocation("arac izin listesi yinelenen ad tasiyor")
+    # Numbers are stringified into argv, so the value that was BOUNDED
+    # has to be the value that is spelled: a `float` subclass checked
+    # as 1.0 wrote 999999 onto the command line. Bounds AND type come
+    # from the one authority, so the builder cannot be the lenient road.
+    budget_usd = exact_budget(budget_usd)
+    model = exact_model(model)
     argv = [
-        str(binary),
+        exact_text(binary, what="ikili dosya"),
         "--print",
         "--output-format", "json",
         "--json-schema", schemas.IMPLEMENTER_SCHEMA_BINDING.canonical_json,
         "--max-budget-usd", str(budget_usd),
         "--permission-mode", permission_mode,
-        "--allowedTools", *allowed_tools,
+        "--allowedTools", *requested,
     ]
-    if model:
-        argv += ["--model", str(model)]
-    if not prompt_is_stdin:                 # pragma: no cover -- refused
-        raise UnsafeInvocation(
-            "istem yalnizca stdin'den verilir; komut satirina konmaz")
+    if model is not None:
+        argv += ["--model", model]
     return assert_safe_argv(argv)
 
 

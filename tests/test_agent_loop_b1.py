@@ -1798,7 +1798,7 @@ def test_every_mutation_still_applies_to_the_current_source():
     # already cleared it. The R2A labels are pinned BY NAME too, so a
     # deletion has to show up as a missing name rather than as a
     # count that still happens to pass.
-    assert len(tool.MUTATIONS) >= 60
+    assert len(tool.MUTATIONS) >= 72
     labels = {label for label, *_ in tool.MUTATIONS}
     expected_r2a = {
         "r2a-hazir-kontrolu", "r2a-kayit-depo", "r2a-kayit-kosu",
@@ -1815,6 +1815,13 @@ def test_every_mutation_still_applies_to_the_current_source():
         "r2br11-alt-sinif"}
     assert expected_r2b <= labels, \
         f"eksik r2b mutasyonu: {sorted(expected_r2b - labels)}"
+    expected_b2a = {
+        "b2a-arac-tipi", "b2a-ikili-donusu", "b2a-butce-tavani",
+        "b2a-butce-tipi", "b2a-sure-tipi", "b2a-istem-tipi",
+        "b2a-argv-token-tipi", "b2a-model-tipi", "b2a-kimlik-tipi",
+        "b2ar1-builder-butce", "b2ar1-tipli-ret", "b2ar1-arac-yansimasi"}
+    assert expected_b2a <= labels, \
+        f"eksik b2a mutasyonu: {sorted(expected_b2a - labels)}"
     root = Path(__file__).resolve().parent.parent
     stale = [label for label, module, old, _, _ in tool.MUTATIONS
              if old not in (root / "tools" / "agent_loop"

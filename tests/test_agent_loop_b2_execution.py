@@ -439,7 +439,8 @@ def _run_with_stdout(tmp_path, bound, payload_bytes,
                           **{k: v for k, v in kwargs.items()
                              if k in ("code", "stderr")})
     settings = {"prompt": "kurgu", "budget_usd": 1.0,
-                "timeout_seconds": 60, "max_output_bytes": 65536}
+                "timeout_seconds": 60, "max_output_bytes": 65536,
+                "model": None}
     settings.update({k: v for k, v in kwargs.items() if k in settings})
     return execution.run_implementer(binary, **bound.identity, **settings)
 
@@ -1750,6 +1751,400 @@ def test_no_file_on_disk_can_influence_the_schema_any_more(
                               json.dumps(_valid_reply()).encode("utf-8"))
     assert result.reply["status"] == "implemented"
     assert result.schema_sha256 == schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
+
+
+# =====================================================================
+# B2A -- the CALL BOUNDARY: what was checked is what is used
+# =====================================================================
+#
+# Every input to `run_implementer` was validated in one representation
+# and then used in another. A probe drove all of them: the budget was
+# checked as 1.0 and reached argv as 999999, the binary was checked as
+# A and launched as B, the prompt was checked as "kurgu" and a
+# different payload went down stdin. Validation now RETURNS the
+# canonical value and the raw arguments are deleted, so there is
+# nothing left to diverge from.
+
+
+class _IkiYuzluYol:
+    """`__fspath__` names one program; `__str__` names another."""
+
+    def __init__(self, denetlenen, calisan):
+        self.denetlenen, self.calisan = denetlenen, calisan
+
+    def __fspath__(self):
+        return str(self.denetlenen)
+
+    def __str__(self):
+        return str(self.calisan)
+
+
+def _marker_binary(tmp_path, name, marker):
+    """A stub that RECORDS having run, so 'B never started' is observed
+    rather than assumed."""
+    return _fake_binary(tmp_path, name=name, mode="raw",
+                        hex=json.dumps({"hangi": name}).encode().hex(),
+                        cwd_record=str(marker))
+
+
+def test_the_checked_binary_is_the_launched_binary(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """The deception is NEUTRALISED rather than merely refused: the one
+    conversion is `__fspath__`, so the program that was verified is the
+    program that runs, and `__str__` is never consulted again."""
+    izB = tmp_path / "B-calisti.txt"
+    binary_a = _fake_binary(tmp_path, name="ikili_a", mode="raw",
+                            hex=json.dumps(_valid_reply()).encode().hex())
+    binary_b = _marker_binary(tmp_path, "ikili_b", izB)
+    iki_yuzlu = _IkiYuzluYol(binary_a, binary_b)
+    assert os.fspath(iki_yuzlu) != str(iki_yuzlu), "senaryo kurulmadi"
+
+    result = execution.run_implementer(
+        iki_yuzlu, **bound.identity, prompt="kurgu",
+        budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
+    assert result.reply["status"] == "implemented"
+    assert only_fake_binaries_may_run[0][0] == str(binary_a.resolve())
+    time.sleep(0.5)
+    assert not izB.exists(), "denetlenmeyen ikili calistirildi"
+
+
+def test_a_relative_binary_is_resolved_before_the_worktree_becomes_cwd(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """A relative path is checked against the CURRENT directory and
+    then launched with the worktree as cwd -- two different meanings
+    for one string. Resolution happens before the launch, so argv
+    carries an absolute path."""
+    binary = _fake_binary(tmp_path, name="goreli", mode="raw",
+                          hex=json.dumps(_valid_reply()).encode().hex())
+    goreli = os.path.relpath(binary, os.getcwd())
+    assert not os.path.isabs(goreli), "senaryo kurulmadi"
+
+    result = execution.run_implementer(
+        goreli, **bound.identity, prompt="kurgu", budget_usd=1.0,
+        timeout_seconds=60, max_output_bytes=65536)
+    assert result.reply["status"] == "implemented"
+    launched = only_fake_binaries_may_run[0][0]
+    assert os.path.isabs(launched), f"goreli yol firlatildi: {launched}"
+    assert Path(launched) == binary.resolve()
+
+
+def test_a_deceptive_tool_object_starts_no_process(
+        tmp_path, bound, only_fake_binaries_may_run, monkeypatch):
+    """The adapter's half of the allowlist finding: the refusal has to
+    happen before anything is launched, not after."""
+    class Taklitci:
+        def __eq__(self, other):
+            return other == "Read"
+
+        def __hash__(self):
+            return hash("Read")
+
+        def __str__(self):
+            return "Bash"
+
+    real_builder = cli.build_implementer_argv
+
+    def smuggling(target, **kwargs):
+        return real_builder(target, **dict(kwargs, allowed_tools=[Taklitci()]))
+
+    monkeypatch.setattr(cli, "build_implementer_argv", smuggling)
+    with pytest.raises(cli.UnsafeInvocation):
+        execution.run_implementer(
+            _reply_binary(tmp_path), **bound.identity, prompt="kurgu",
+            budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == []
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [101, 100.0001, 1000, 10 ** 400],
+    ids=["tavan-ustu-int", "tavan-ustu-float", "cok-buyuk", "devasa-int"])
+def test_a_budget_above_the_schema_maximum_is_refused(
+        tmp_path, bound, only_fake_binaries_may_run, budget):
+    """The task schema caps a run at 100 USD and the adapter enforced
+    only "greater than zero" -- so a single call could be authorised
+    for any amount. `10 ** 400` is here because an enormous exact
+    integer must be bounded without `math.isfinite` raising."""
+    with pytest.raises(execution.BudgetRefused):
+        execution.run_implementer(
+            _reply_binary(tmp_path), **bound.identity, prompt="kurgu",
+            budget_usd=budget, timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == []
+
+
+def test_a_deceptive_budget_never_reaches_the_argv(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """Checked as 1.0, stringified as 999999 -- an uncapped spend
+    authorised by a gate that had already agreed to one dollar."""
+    class YalanciButce(float):
+        def __str__(self):
+            return "999999"
+
+    with pytest.raises(execution.BudgetRefused):
+        execution.run_implementer(
+            _reply_binary(tmp_path), **bound.identity, prompt="kurgu",
+            budget_usd=YalanciButce(1.0), timeout_seconds=60,
+            max_output_bytes=65536)
+    assert only_fake_binaries_may_run == []
+
+
+@pytest.mark.parametrize("budget", [100, 100.0, 0.375],
+                         ids=["tavan-int", "tavan-float", "kesirli"])
+def test_a_budget_at_or_below_the_maximum_reaches_the_argv_unchanged(
+        tmp_path, bound, only_fake_binaries_may_run, budget):
+    """POSITIVE CONTROL and the boundary in the other direction."""
+    result = _run_with_stdout(tmp_path, bound,
+                              json.dumps(_valid_reply()).encode("utf-8"),
+                              budget_usd=budget)
+    assert result.reply["status"] == "implemented"
+    argv = only_fake_binaries_may_run[0]
+    assert argv[argv.index("--max-budget-usd") + 1] == str(budget)
+
+
+@pytest.mark.parametrize("field", ["timeout_seconds", "max_output_bytes"])
+def test_a_deceptive_integer_bound_is_refused_before_any_process(
+        tmp_path, bound, only_fake_binaries_may_run, field):
+    """An `int` subclass whose comparisons always agree passed both
+    range checks while carrying a value nine orders of magnitude
+    outside them."""
+    class YalanciSayi(int):
+        def __le__(self, other):
+            return True
+
+        def __ge__(self, other):
+            return True
+
+    settings = {"timeout_seconds": 60, "max_output_bytes": 65536}
+    settings[field] = YalanciSayi(10 ** 9)
+    with pytest.raises(execution.LimitRefused):
+        execution.run_implementer(
+            _reply_binary(tmp_path), **bound.identity, prompt="kurgu",
+            budget_usd=1.0, **settings)
+    assert only_fake_binaries_may_run == []
+
+
+def test_the_exact_bounds_are_still_accepted_and_used(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """Both edges of both frozen ranges, so the refusals above cannot
+    become "reject everything"."""
+    reply = json.dumps(_valid_reply(summary="k" * 1200)).encode("utf-8")
+    result = _run_with_stdout(
+        tmp_path, bound, reply,
+        timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
+        max_output_bytes=execution.MAX_OUTPUT_BYTES)
+    assert result.reply["role"] == "implementer"
+
+
+def test_a_deceptive_prompt_never_reaches_stdin(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """Checked as "kurgu", encoded into an entirely different
+    instruction -- a reply to a question nobody asked."""
+    class YalanciIstem(str):
+        def encode(self, *args, **kwargs):
+            return b"TAMAMEN BASKA BIR ISTEM"
+
+    with pytest.raises(execution.LimitRefused):
+        execution.run_implementer(
+            _reply_binary(tmp_path), **bound.identity,
+            prompt=YalanciIstem("kurgu"), budget_usd=1.0, timeout_seconds=60,
+            max_output_bytes=65536)
+    assert only_fake_binaries_may_run == []
+
+
+def test_the_validated_prompt_bytes_are_what_the_child_receives(
+        tmp_path, bound):
+    """The accepted direction, asserted on the bytes the CHILD counted
+    rather than on the adapter's own bookkeeping."""
+    kayit = tmp_path / "alinan.txt"
+    istem = "K" * 5000
+    binary = _fake_binary(
+        tmp_path, name="yutan", mode="consume", record=str(kayit),
+        hex=json.dumps(_valid_reply()).encode().hex())
+    result = execution.run_implementer(
+        binary, **bound.identity, prompt=istem, budget_usd=1.0,
+        timeout_seconds=60, max_output_bytes=65536)
+    assert result.reply["status"] == "implemented"
+    assert kayit.read_text(encoding="ascii") == str(len(istem.encode()))
+
+
+@pytest.mark.parametrize(
+    "model", ["BUYUK-HARF", "-bastan-tire", 5, b"model"],
+    ids=["buyuk-harf", "gecersiz-baslangic", "sayi", "bayt"])
+def test_a_model_outside_the_frozen_schema_starts_no_process(
+        tmp_path, bound, only_fake_binaries_may_run, model):
+    """B2A-R1 STRENGTHENED this: it used to assert
+    `cli.UnsafeInvocation`, which was the package pinning the very leak
+    an audit then called a contract violation -- `run_implementer`
+    promises a typed `AdapterError` and that is not one. The demand is
+    now the promise, plus the same zero-process count."""
+    with pytest.raises(execution.AdapterError) as refusal:
+        execution.run_implementer(
+            _reply_binary(tmp_path), **bound.identity, prompt="kurgu",
+            budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536,
+            model=model)
+    assert not isinstance(refusal.value, cli.UnsafeInvocation)
+    assert only_fake_binaries_may_run == []
+
+
+def test_an_exact_model_string_reaches_the_argv(
+        tmp_path, bound, only_fake_binaries_may_run):
+    result = _run_with_stdout(tmp_path, bound,
+                              json.dumps(_valid_reply()).encode("utf-8"),
+                              model="kurgu-model-1")
+    assert result.reply["status"] == "implemented"
+    argv = only_fake_binaries_may_run[0]
+    assert argv[argv.index("--model") + 1] == "kurgu-model-1"
+
+
+def test_every_cli_refusal_reaches_the_caller_as_an_adapter_error(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """B2A-R1: `run_implementer` promises a typed `AdapterError` for
+    every refusal, and `cli.UnsafeInvocation` is not one -- an invalid
+    model raised it straight through, which the runner's closed state
+    machine would have had no reason code to record.
+
+    The positive control matters here: the same call with a VALID model
+    has to get PAST this gate, or the test would pass against an
+    implementation that refuses everything. It dies later, at the
+    schema/worktree stage, with an AdapterError of its own."""
+    binary = _reply_binary(tmp_path)
+    saglikli = execution.run_implementer(
+        binary, **bound.identity, prompt="kurgu", budget_usd=1.0,
+        timeout_seconds=60, max_output_bytes=65536, model="kurgu-model-1")
+    assert saglikli.reply["status"] == "implemented", "senaryo kurulmadi"
+
+    nobetci = "GECERSIZ MODEL!!"
+    with pytest.raises(execution.AdapterError) as refusal:
+        execution.run_implementer(
+            binary, **bound.identity, prompt="kurgu", budget_usd=1.0,
+            timeout_seconds=60, max_output_bytes=65536, model=nobetci)
+    hata = refusal.value
+    assert not isinstance(hata, cli.UnsafeInvocation)
+    assert hata.reason in contract.ALL_STOP_REASONS
+    assert hata.event in contract.ALL_EVENT_CODES
+    assert nobetci not in str(hata) + repr(hata), \
+        "ret metni reddedilen model adini tasiyor"
+
+
+@pytest.mark.parametrize(
+    "kotu", [0, -1, float("nan"), float("inf"), 101, 100.0001],
+    ids=["sifir", "negatif", "nan", "sonsuz", "tavan-ustu-int",
+         "tavan-ustu"])
+def test_the_adapter_and_the_builder_refuse_the_same_budgets(
+        tmp_path, bound, only_fake_binaries_may_run, kotu):
+    """One authority, two roads: whatever the builder refuses, the
+    adapter refuses -- as its own typed error, before any process."""
+    with pytest.raises(cli.UnsafeInvocation):
+        cli.build_implementer_argv("/kurgu/claude", budget_usd=kotu)
+    with pytest.raises(execution.BudgetRefused):
+        execution.run_implementer(
+            _reply_binary(tmp_path), **bound.identity, prompt="kurgu",
+            budget_usd=kotu, timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == [], \
+        "reddedilen butceye ragmen surec basladi"
+
+
+@pytest.mark.parametrize("field", ["run_id", "worktree_id", "baseline_sha"])
+def test_a_deceptive_identity_never_reaches_the_worktree_binding(
+        tmp_path, bound, only_fake_binaries_may_run, field):
+    """A `str` subclass that claims equality with everything satisfied
+    every comparison the binding makes. The identities are exact
+    strings matching their existing patterns before the binding is
+    even consulted."""
+    class YalanciKimlik(str):
+        def __eq__(self, other):
+            return True
+
+        def __ne__(self, other):
+            return False
+
+        __hash__ = str.__hash__
+
+    identity = dict(bound.identity)
+    identity[field] = YalanciKimlik(identity[field])
+    with pytest.raises(execution.IdentityRefused):
+        execution.run_implementer(
+            _reply_binary(tmp_path), **identity, prompt="kurgu",
+            budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("run_id", "KURGU"), ("run_id", "ab"), ("worktree_id", "z" * 32),
+     ("worktree_id", "a" * 31), ("baseline_sha", "A" * 40),
+     ("baseline_sha", "a" * 39), ("run_id", 5), ("worktree_id", None)],
+    ids=["buyuk-kosu", "kisa-kosu", "hex-disi", "kisa-id", "buyuk-sha",
+         "kisa-sha", "sayi", "bos-deger"])
+def test_an_identity_outside_its_frozen_pattern_is_refused(
+        tmp_path, bound, only_fake_binaries_may_run, field, value):
+    identity = dict(bound.identity)
+    identity[field] = value
+    with pytest.raises(execution.IdentityRefused):
+        execution.run_implementer(
+            _reply_binary(tmp_path), **identity, prompt="kurgu",
+            budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == []
+
+
+def test_path_like_repo_and_state_dir_are_converted_once(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """`__fspath__` is the conversion; a second, different `__str__`
+    must not be able to redirect the binding afterwards."""
+    identity = dict(bound.identity)
+    identity["repo"] = _IkiYuzluYol(bound.repo, tmp_path / "olmayan-depo")
+    identity["state_dir"] = _IkiYuzluYol(bound.state_dir,
+                                         tmp_path / "olmayan-durum")
+    result = execution.run_implementer(
+        _reply_binary(tmp_path), **identity, prompt="kurgu", budget_usd=1.0,
+        timeout_seconds=60, max_output_bytes=65536)
+    assert result.reply["status"] == "implemented"
+
+
+@pytest.mark.parametrize("field", ["repo", "state_dir"])
+def test_a_path_argument_that_is_not_a_path_is_refused(
+        tmp_path, bound, only_fake_binaries_may_run, field):
+    identity = dict(bound.identity)
+    identity[field] = 5
+    with pytest.raises(execution.IdentityRefused):
+        execution.run_implementer(
+            _reply_binary(tmp_path), **identity, prompt="kurgu",
+            budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
+    assert only_fake_binaries_may_run == []
+
+
+def test_every_launched_argv_token_is_an_exact_string(
+        tmp_path, bound, only_fake_binaries_may_run):
+    """Read off what was ACTUALLY launched: by the time argv exists
+    there must be nothing left to convert."""
+    _run_with_stdout(tmp_path, bound,
+                     json.dumps(_valid_reply()).encode("utf-8"),
+                     model="kurgu-model-1")
+    argv = only_fake_binaries_may_run[0]
+    offenders = [token for token in argv if type(token) is not str]
+    assert offenders == [], f"tam metin olmayan argv ogesi: {offenders}"
+
+
+def test_the_adapter_abandons_its_raw_arguments_after_canonicalisation():
+    """Structural, and self-enforcing: the raw parameters are DELETED
+    once the canonical call exists, so any later use of one is a
+    NameError the positive-control tests hit immediately. A validator
+    that leaves the original object alive is the whole defect."""
+    import ast
+
+    tree = ast.parse(Path(execution.__file__).read_text(encoding="utf-8"))
+    function = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "run_implementer")
+    silinen = {target.id for statement in function.body
+               if isinstance(statement, ast.Delete)
+               for target in statement.targets
+               if isinstance(target, ast.Name)}
+    beklenen = {"binary", "repo", "state_dir", "run_id", "worktree_id",
+                "baseline_sha", "prompt", "budget_usd", "timeout_seconds",
+                "max_output_bytes", "model"}
+    assert beklenen <= silinen, f"ham argumanlar birakilmadi: " \
+        f"{sorted(beklenen - silinen)}"
 
 
 def test_the_validator_cannot_be_the_raw_module_dictionary():

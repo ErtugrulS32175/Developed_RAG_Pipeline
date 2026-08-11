@@ -38,8 +38,10 @@ NL = chr(10)
 BINDING_TRY = (
     "    try:" + NL
     + "        cwd = worktree.assert_execution_binding(" + NL
-    + "            repo, state_dir=state_dir, run_id=run_id," + NL
-    + "            worktree_id=worktree_id, baseline_sha=baseline_sha)" + NL
+    + "            call.repo, state_dir=call.state_dir, run_id=call.run_id,"
+    + NL
+    + "            worktree_id=call.worktree_id,"
+    + " baseline_sha=call.baseline_sha)" + NL
     + "    except worktree.WorktreeError as refused:" + NL
     + "        raise WorktreeNotBound(str(refused)) from None")
 BS = chr(92)
@@ -346,6 +348,81 @@ MUTATIONS = [
      "    return Draft202012Validator(json.loads(text)), "
      "binding.sha256[::-1]",
      "test_the_argv_schema_is_inline_canonical_and_hashed"),
+    # ----------------------------------------------------------------
+    # B2A -- the call boundary: validate once, canonicalize once, use
+    # only the canonical value. Each mutation reopens exactly one of
+    # the check/use divergences the package closed.
+    # ----------------------------------------------------------------
+    ("b2a-arac-tipi", "cli",
+     "    if any(type(tool) is not str for tool in requested):" + NL
+     + '        raise UnsafeInvocation("arac adlari tam metin olmalidir")',
+     "    if False:" + NL
+     + '        raise UnsafeInvocation("arac adlari tam metin olmalidir")',
+     "test_a_deceptive_tool_object_can_never_reach_the_argv"),
+    ("b2a-ikili-donusu", "execution",
+     "        binary=_usable_binary(binary),",
+     "        binary=(_usable_binary(binary), Path(str(binary)))[1],",
+     "test_the_checked_binary_is_the_launched_binary"),
+    # B2A-R1 moved the budget rule into `cli`, the one authority both
+    # roads use; these two follow it there.
+    ("b2a-butce-tavani", "cli",
+     "    if budget_usd > MAX_BUDGET_USD:" + NL
+     + '        raise UnsafeInvocation("butce sozlesme tavanini asiyor")',
+     "    if False:" + NL
+     + '        raise UnsafeInvocation("butce sozlesme tavanini asiyor")',
+     "test_a_budget_above_the_schema_maximum_is_refused"),
+    ("b2a-butce-tipi", "cli",
+     "    if type(budget_usd) not in (int, float):",
+     "    if not isinstance(budget_usd, (int, float)):",
+     "test_a_deceptive_budget_never_reaches_the_argv"),
+    # ----------------------------------------------------------------
+    # B2A-R1 -- the three contract gaps
+    # ----------------------------------------------------------------
+    ("b2ar1-builder-butce", "cli",
+     "    budget_usd = exact_budget(budget_usd)",
+     "    exact_budget",
+     "test_the_public_builder_enforces_the_budget_bounds_itself"),
+    ("b2ar1-tipli-ret", "execution",
+     "    except cli.UnsafeInvocation as refused:" + NL
+     + "        raise CallInputRefused(str(refused)) from None",
+     "    except cli.UnsafeInvocation:" + NL
+     + "        raise",
+     "test_every_cli_refusal_reaches_the_caller_as_an_adapter_error"),
+    ("b2ar1-arac-yansimasi", "cli",
+     '            f"implementer izinli olmayan {len(forbidden)} arac '
+     'istedi; "',
+     '            f"implementer bu araclari alamaz: {sorted(forbidden)}; "',
+     "test_a_refused_tool_name_is_never_echoed_back"),
+    ("b2a-sure-tipi", "execution",
+     "    if type(timeout_seconds) is not int:",
+     "    if not isinstance(timeout_seconds, int):",
+     "test_a_deceptive_integer_bound_is_refused_before_any_process"),
+    ("b2a-istem-tipi", "execution",
+     "    if type(prompt) is not str:",
+     "    if not isinstance(prompt, str):",
+     "test_a_deceptive_prompt_never_reaches_stdin"),
+    ("b2a-argv-token-tipi", "cli",
+     "    tokens = []" + NL
+     + "    for token in argv:" + NL
+     + "        if type(token) is not str:" + NL
+     + '            raise UnsafeInvocation("argv tam metin olmayan bir oge '
+     'tasiyor")' + NL
+     + "        tokens.append(token)",
+     "    tokens = [str(token) for token in argv]",
+     "test_assert_safe_argv_refuses_a_token_that_is_not_an_exact_string"),
+    ("b2a-model-tipi", "cli",
+     "    if type(model) is not str or len(model) > MODEL_MAX_LENGTH " + BS
+     + NL + "            or not MODEL_PATTERN.fullmatch(model):" + NL
+     + '        raise UnsafeInvocation("model adi sozlesme desenine uymuyor")',
+     "    if False:" + NL
+     + '        raise UnsafeInvocation("model adi sozlesme desenine uymuyor")',
+     "test_the_builder_refuses_a_model_outside_the_frozen_schema"),
+    ("b2a-kimlik-tipi", "execution",
+     "    if type(value) is not str or not pattern.fullmatch(value):" + NL
+     + '        raise IdentityRefused(f"{what} sozlesme desenine uymuyor")',
+     "    if False:" + NL
+     + '        raise IdentityRefused(f"{what} sozlesme desenine uymuyor")',
+     "test_a_deceptive_identity_never_reaches_the_worktree_binding"),
 ]
 
 

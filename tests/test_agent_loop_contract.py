@@ -496,6 +496,225 @@ def test_the_implementer_argv_schema_is_inline_not_a_path(tmp_path):
         schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
 
 
+# =====================================================================
+# B2A -- the CALL BOUNDARY: validate once, canonicalize once, use only
+# the canonical value
+# =====================================================================
+#
+# ONE mechanism, inventoried across every builder input: a value is
+# CHECKED in one representation and USED in another, and a Python
+# object can make those two disagree. The allowlist compared an object
+# with `==` and the argv then took its `__str__` -- so `Read` passed the
+# gate and `Bash` reached the command line.
+
+
+class _Taklitci:
+    """Equal to a permitted value; converts to a forbidden one."""
+
+    def __init__(self, gorunen, gercek):
+        self.gorunen, self.gercek = gorunen, gercek
+
+    def __eq__(self, other):
+        return other == self.gorunen
+
+    def __hash__(self):
+        return hash(self.gorunen)
+
+    def __str__(self):
+        return self.gercek
+
+
+def test_a_refused_tool_name_is_never_echoed_back(tmp_path):
+    """B2A-R1: the rejected names were formatted straight into the
+    exception text, so arbitrary caller input travelled into whatever a
+    report writes. A count and the FROZEN allowlist may leave; the
+    input may not."""
+    nobetci = "KURGU-GIZLI-ARAC-NOBETCISI-" + "z" * 8
+    with pytest.raises(cli.UnsafeInvocation) as refusal:
+        cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                   allowed_tools=[nobetci])
+    metin = str(refusal.value) + repr(refusal.value)
+    assert nobetci not in metin, "ret metni reddedilen arac adini tasiyor"
+    # the contract's own allowlist is not caller input and may appear
+    assert "Read" in metin
+
+
+@pytest.mark.parametrize("yasak", ["Bash", "Agent", "WebFetch", "WebSearch"])
+def test_a_deceptive_tool_object_can_never_reach_the_argv(yasak, monkeypatch):
+    """THE critical one. A Claude holding Bash can `git push`, install a
+    dependency or reach the network -- every one of them a human gate
+    the runner never sees. The allowlist has to be asked of an exact
+    string, because only an exact string cannot answer differently the
+    second time it is asked.
+
+    TWO layers refuse this today: the allowlist's own exact-type check
+    and the final argv net. So the second half asks the allowlist ALONE
+    -- a mutation run showed the first assertion staying green with the
+    exact-type check deleted, because the net behind it caught the
+    object instead. A layer whose removal changes nothing observable is
+    a layer nobody is testing."""
+    sahte = _Taklitci("Read", yasak)
+    assert sahte == "Read" and str(sahte) == yasak, "senaryo kurulmadi"
+    with pytest.raises(cli.UnsafeInvocation):
+        cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                   allowed_tools=[sahte])
+
+    monkeypatch.setattr(cli, "assert_safe_argv", lambda argv: list(argv))
+    with pytest.raises(cli.UnsafeInvocation):
+        cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                   allowed_tools=[sahte])
+
+
+def test_exact_tool_strings_still_build_an_argv():
+    """POSITIVE CONTROL: a builder that refuses everything would pass
+    every test above."""
+    argv = cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                      allowed_tools=["Edit", "Read"])
+    tail = argv[argv.index("--allowedTools") + 1:]
+    assert tail[:2] == ["Edit", "Read"]
+    assert all(type(token) is str for token in argv)
+
+
+def test_a_repeated_tool_is_refused_rather_than_left_ambiguous():
+    """Repeated flags have no agreed CLI meaning here, so the duplicate
+    is a caller mistake rather than something to guess at."""
+    with pytest.raises(cli.UnsafeInvocation):
+        cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                   allowed_tools=["Read", "Read"])
+
+
+def test_the_stdin_flag_must_be_exactly_true():
+    """Truthiness is not a type check: an object with `__bool__` is not
+    the caller promising the prompt stays off the command line."""
+    class DogruGibi:
+        def __bool__(self):
+            return True
+
+    with pytest.raises(cli.UnsafeInvocation):
+        cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                   prompt_is_stdin=DogruGibi())
+    with pytest.raises(cli.UnsafeInvocation):
+        cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                   prompt_is_stdin=1)
+
+
+def test_the_permission_mode_is_pinned_to_the_agreed_exact_string():
+    """The deceptive object was already caught downstream -- but only
+    because `bypassPermissions` happens to be on the forbidden-value
+    list. An unlisted alternate mode went straight through, so the mode
+    is pinned by exact value here, in front of that net."""
+    sahte = _Taklitci(cli.IMPLEMENTER_PERMISSION_MODE, "plan")
+    for mode in (sahte, "plan", "bypassPermissions", b"acceptEdits", None):
+        with pytest.raises(cli.UnsafeInvocation):
+            cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                       permission_mode=mode)
+    argv = cli.build_implementer_argv(
+        "/kurgu/claude", budget_usd=1.0,
+        permission_mode=cli.IMPLEMENTER_PERMISSION_MODE)
+    assert argv[argv.index("--permission-mode") + 1] == \
+        cli.IMPLEMENTER_PERMISSION_MODE
+
+
+def test_assert_safe_argv_refuses_a_token_that_is_not_an_exact_string():
+    """The final net. It used to `str()` whatever it was handed, which
+    is the deferred conversion this whole package removes: by the time
+    argv exists there must be nothing left to convert."""
+    for token in (_Taklitci("guvenli", "Bash"), 5, None, b"kurgu",
+                  Path("/kurgu")):
+        with pytest.raises(cli.UnsafeInvocation):
+            cli.assert_safe_argv(["kurgu", token])
+    assert cli.assert_safe_argv(["kurgu", "--print"]) == ["kurgu", "--print"]
+
+
+@pytest.mark.parametrize(
+    "kotu", [0, 0.0, -5, -0.001, float("nan"), float("inf"),
+             float("-inf"), 101, 100.0001, True],
+    ids=["sifir-int", "sifir", "negatif-int", "negatif", "nan", "sonsuz",
+         "eksi-sonsuz", "tavan-ustu-int", "tavan-ustu", "bool"])
+def test_the_public_builder_enforces_the_budget_bounds_itself(kotu):
+    """B2A-R1: the bounds lived only in `execution`, and the builder is
+    a PUBLIC callable that tests hand straight to a subprocess -- called
+    directly it spelled `101`, `0`, `-5`, `nan` and `inf` onto the
+    command line. A rule enforced on one of two roads is a rule for
+    people who take that road.
+
+    The refused value never appears in the message: it is caller input
+    and this text travels into reports."""
+    with pytest.raises(cli.UnsafeInvocation) as refusal:
+        cli.build_implementer_argv("/kurgu/claude", budget_usd=kotu)
+    metin = str(refusal.value) + repr(refusal.value)
+    assert str(kotu) not in metin, "ret metni reddedilen degeri tasiyor"
+
+
+@pytest.mark.parametrize("iyi", [0.375, 1, 100, 100.0])
+def test_the_builder_still_spells_an_in_range_budget(iyi):
+    """The boundary in the other direction, including the schema
+    maximum exactly -- or the rule above is just "refuse budgets"."""
+    argv = cli.build_implementer_argv("/kurgu/claude", budget_usd=iyi)
+    assert argv[argv.index("--max-budget-usd") + 1] == str(iyi)
+
+
+def test_one_budget_authority_serves_both_roads():
+    """The rule may not be copied into two modules: a second copy is a
+    second place to forget. Both the builder and the adapter refuse the
+    same value, and the adapter's own ceiling IS the CLI's."""
+    from tools.agent_loop import execution as execution_module
+
+    assert execution_module.MAX_BUDGET_USD is cli.MAX_BUDGET_USD
+    assert cli.MAX_BUDGET_USD == schemas.TASK_SCHEMA["properties"][
+        "max_budget_usd"]["maximum"]
+    assert cli.exact_budget(0.375) == 0.375
+    with pytest.raises(cli.UnsafeInvocation):
+        cli.exact_budget(cli.MAX_BUDGET_USD + 1)
+
+
+def test_the_builder_refuses_a_model_outside_the_frozen_schema():
+    """`model` crosses into argv too. The pattern and the length come
+    from the task schema, not from a second grammar invented here."""
+    rule = schemas.TASK_SCHEMA["properties"]["implementer"]["properties"][
+        "model"]
+    for bad in (_Taklitci("kurgu-model", "; rm -rf /"), "BUYUK-HARF",
+                "-bastan-tire", "a" * (rule["maxLength"] + 1), 5, b"m"):
+        with pytest.raises(cli.UnsafeInvocation):
+            cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                       model=bad)
+    argv = cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0,
+                                      model="kurgu-model-1")
+    assert argv[argv.index("--model") + 1] == "kurgu-model-1"
+    assert "--model" not in cli.build_implementer_argv("/kurgu/claude",
+                                                       budget_usd=1.0)
+
+
+def test_the_builder_refuses_a_budget_that_is_not_an_exact_number():
+    """Defence in depth: the adapter canonicalises the budget, and the
+    builder still refuses anything that could stringify into a
+    different number than the one that was checked."""
+    class YalanciButce(float):
+        def __str__(self):
+            return "999999"
+
+    for bad in (YalanciButce(1.0), True, "1.0", None):
+        with pytest.raises(cli.UnsafeInvocation):
+            cli.build_implementer_argv("/kurgu/claude", budget_usd=bad)
+    argv = cli.build_implementer_argv("/kurgu/claude", budget_usd=0.375)
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.375"
+
+
+def test_the_builder_converts_a_path_like_binary_exactly_once():
+    """`__fspath__` is the one conversion; `__str__` is never consulted
+    afterwards, so the two cannot name different programs."""
+    class IkiYuzlu:
+        def __fspath__(self):
+            return "/kurgu/denetlenen"
+
+        def __str__(self):
+            return "/kurgu/calisan"
+
+    argv = cli.build_implementer_argv(IkiYuzlu(), budget_usd=1.0)
+    assert argv[0] == "/kurgu/denetlenen"
+    assert type(argv[0]) is str
+
+
 def test_no_implementer_schema_is_read_from_or_written_to_disk():
     """Structural: `schema_path` is gone from the implementer builder
     and no file API appears in the CLI module -- a schema file would
