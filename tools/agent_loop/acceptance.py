@@ -42,6 +42,7 @@ operating system's own error text.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
@@ -151,7 +152,20 @@ class AcceptanceCommandResult:
 @dataclass(frozen=True, slots=True)
 class AcceptanceReport:
     """The whole run. `passed` is true only when every command it was
-    given ran and every one of them exited zero."""
+    given ran and every one of them exited zero.
+
+    IT NAMES THE CANDIDATE IT TESTED (B2B-C2). The first version carried
+    the run, the workspace and the baseline -- everything except WHICH
+    BYTES had been in front of the commands. A candidate edited after the
+    gate went green was therefore indistinguishable from the one that
+    passed it, and could travel on this receipt into the operator's
+    checkout. The three digests close that: they say which manifest chose
+    the commands, which command plan was actually resolved, and which
+    change set was on disk while they ran.
+
+    IT IS STILL NOT A FILESYSTEM AUTHORITY. It is a closed receipt, and
+    the only thing it may ever be used for is comparison against evidence
+    derived FRESH at the moment of use."""
 
     run_id: str
     workspace_id: str
@@ -160,6 +174,31 @@ class AcceptanceReport:
     command_results: tuple
     total_duration_ms: int
     event: str
+    manifest_digest: str
+    candidate_fingerprint: str
+    command_plan_digest: str
+
+
+def command_plan_digest(references) -> str:
+    """The deterministic digest of a resolved command PLAN.
+
+    What goes in is what a task is allowed to choose: the order of the
+    commands, each `command_id`, and the repo-relative paths it attached
+    to them, in its own order and in ONE canonical spelling. What stays
+    out is everything a task cannot choose anyway -- the argv, the
+    working directory, the environment -- because a digest over values
+    the registry fixes would be a constant wearing a hash.
+
+    The spelling comes from the change-set module rather than from a
+    local normaliser: `pipeline/a.py` and `./pipeline//a.py` are one
+    path, and two modules deciding that separately is how they stop
+    agreeing."""
+    stream = b"".join(
+        b"\0".join([str(command_id).encode("utf-8")]
+                   + [changes.canonical_path(path).encode("utf-8")
+                      for path in paths]) + b"\n"
+        for command_id, paths in references)
+    return hashlib.sha256(stream).hexdigest()
 
 
 # ---------------------------------------------------------------------
@@ -199,9 +238,13 @@ def _canonical_limits(timeout_seconds, max_output_bytes):
     return timeout_seconds, max_output_bytes
 
 
-def _assert_candidate(verified, candidate, *, run_id, workspace_id,
-                      baseline_sha):
+def assert_candidate(verified, candidate, *, run_id, workspace_id,
+                     baseline_sha):
     """The claim, compared to the re-derivation, field by field.
+
+    PUBLIC since B2B-C2, because the application layer asks exactly this
+    question and a second implementation of it would be a second opinion
+    about what "the same candidate" means.
 
     EXACT TYPE FIRST. A duck-typed stand-in that answered every
     comparison would satisfy each check below while describing nothing,
@@ -569,8 +612,8 @@ def run_acceptance(*, repo, state_dir, task_path, manifest_digest, run_id,
         # would put two gates behind one message.
         raise AcceptanceRefused(str(refused),
                                 reason=refused.reason) from None
-    _assert_candidate(verified_changes, candidate, run_id=run_id,
-                      workspace_id=workspace_id, baseline_sha=baseline_sha)
+    assert_candidate(verified_changes, candidate, run_id=run_id,
+                     workspace_id=workspace_id, baseline_sha=baseline_sha)
     # the bytes read for the derivation, compared to the bytes on disk
     # now: the first read is the one everything above was decided from
     _assert_manifest(task_file, candidate.task_digest)
@@ -618,7 +661,16 @@ def run_acceptance(*, repo, state_dir, task_path, manifest_digest, run_id,
         and len(results) == len(commands),
         command_results=tuple(results),
         total_duration_ms=int((time.monotonic() - started) * 1000),
-        event=contract.EventCode.ACCEPTANCE_FINISHED)
+        event=contract.EventCode.ACCEPTANCE_FINISHED,
+        # FROM THIS RUN'S OWN FRESH DERIVATION, never from the caller's
+        # arguments: `manifest_digest` arrived as a parameter and
+        # `candidate.fingerprint` was computed here, so a receipt cannot
+        # be made to name a candidate this run did not have in front of
+        # it. The plan is digested from the same manifest bytes that
+        # chose the commands actually resolved above.
+        manifest_digest=candidate.task_digest,
+        candidate_fingerprint=candidate.fingerprint,
+        command_plan_digest=command_plan_digest(candidate.acceptance_commands))
 
 
 def _prepare_git(mirror, env, deadline, max_output_bytes) -> None:

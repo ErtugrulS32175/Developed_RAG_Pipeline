@@ -471,6 +471,102 @@ def _main_snapshot(repo: Path, key: bytes, policy) -> _MainSnapshot:
 
 
 # ---------------------------------------------------------------------
+# THE MAIN CHECKOUT, AS SEMANTIC CONTENT (B2B-C2)
+# ---------------------------------------------------------------------
+#
+# `_main_snapshot` answers "did anything move", which is the only
+# question an implementer call has: the answer must be NO. A step that
+# deliberately changes the checkout needs the other question -- WHAT
+# moved -- and that is the semantic projection, which this module already
+# owns for the flat trees. These three names expose that authority
+# instead of letting a second one grow next door; nothing below is a new
+# rule, and every one of them routes into the same walker, the same
+# projection and the same classifier.
+
+Change = _Change
+
+
+@dataclass(frozen=True, slots=True)
+class MainProjection:
+    """The operator's checkout as content, frozen so two of them can be
+    compared and neither can be edited between the comparisons."""
+
+    root_identity: str
+    entries: tuple
+
+
+def freeze_main_policy(repo):
+    """The reduced-evidence policy, decided ONCE for a call.
+
+    Frozen before anything is written, so a root created DURING the call
+    cannot claim the reduction for itself -- it simply is not in the
+    policy, and everything outside the policy is content."""
+    return _main_policy(Path(_exact_text(repo, "depo yolu")))
+
+
+def _project_main(manifest):
+    """Every entry, including the ones a change set cannot carry.
+
+    Unlike the workspace projection this does NOT refuse a link: an
+    operator's checkout is allowed to contain one, and refusing here
+    would make an ordinary repository unusable for no safety gain. What
+    it must not do is let one move invisibly -- so a link is projected by
+    its keyed fingerprint, any movement shows up as a difference, and
+    `_semantic_changes` is what then refuses to describe it as an
+    ordinary file change."""
+    snapshot = {}
+    for entry in manifest.entries:
+        if entry.path in snapshot:
+            raise EvidenceUnavailable("ayni yol iki kez listelendi")
+        fields = _FILE_FIELDS if entry.kind == "file" else _DIR_FIELDS
+        snapshot[entry.path] = _Snap(
+            kind=entry.kind, mode=entry.mode, sha256=entry.sha256,
+            compare=(entry.kind,) + tuple(str(getattr(entry, field))
+                                          for field in fields))
+    return snapshot
+
+
+def main_projection(repo, *, key, policy) -> MainProjection:
+    """One read of the operator's checkout, as comparable content."""
+    repo_path = Path(_exact_text(repo, "depo yolu"))
+    metadata_only, content_always = policy
+    fs_evidence.quiesce()
+    manifest = _scan(repo_path, key, metadata_only=metadata_only,
+                     content_always=content_always)
+    return MainProjection(
+        root_identity=manifest.root_identity,
+        entries=tuple(sorted(_project_main(manifest).items())))
+
+
+def main_difference(before: MainProjection, after: MainProjection) -> tuple:
+    """What changed between two readings of ONE root.
+
+    The root identity is compared first and separately: two projections
+    of two different objects can be diffed perfectly and describe
+    nothing, and a checkout swapped mid-call is exactly that."""
+    if type(before) is not MainProjection or type(after) is not MainProjection:
+        raise EvidenceUnavailable("ana agac izdusumu beklenen turde degil")
+    if before.root_identity != after.root_identity:
+        raise UnsafeChange("ana calisma agaci kokunun kimligi degisti",
+                           reason=contract.StopReason.PATH_NOT_ALLOWED)
+    return _semantic_changes(dict(before.entries), dict(after.entries))
+
+
+def fingerprint(items) -> str:
+    """The change set's own deterministic digest, over path, kind, mode
+    AND content -- so two different edits to one file cannot collide."""
+    return _fingerprint(items)
+
+
+def canonical_path(text) -> str:
+    """ONE spelling for every scope comparison anything in this loop
+    makes. Exposed rather than copied: a second normaliser is a second
+    opinion, and three probes have already walked past a forbidden entry
+    by spelling it differently."""
+    return _fold(text)
+
+
+# ---------------------------------------------------------------------
 # INPUT CANONICALIZATION
 # ---------------------------------------------------------------------
 

@@ -1252,10 +1252,18 @@ def test_every_mutation_still_applies_to_the_current_source():
     # mechanism it exists for -- the claim is re-derived from fresh
     # evidence, the argv comes from the frozen registry, an incomplete
     # read is not an answer, and a container's verdict is consumed.
-    assert len(tool.MUTATIONS) == 67
+    #
+    # B2B-C2: 67 -> 71. The application package adds one per mechanism
+    # it exists for -- the receipt names the candidate it tested, an
+    # ADDED target the operator already has is never overwritten, a
+    # failed operation is rolled back, and the checkout's difference is
+    # proven to BE the candidate before a success is reported.
+    assert len(tool.MUTATIONS) == 71
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
+        'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
+        'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',
         'b2bc1-bosaltma-hukmu', 'b2bc1-kayit-disi-argv', 'b2bc1-okuma-hukmu',
         'b2bc1-taze-dogrulama',
         'allowlist-test-ailesi', 'b2a-arac-tipi', 'b2a-argv-token-tipi',
@@ -1317,7 +1325,10 @@ def test_every_mutation_names_a_test_that_exists():
                      "test_agent_loop_state_binding.py",
                      # B2B-C1: the acceptance battery, named by all four
                      # of that package's mutations.
-                     "test_agent_loop_b2_acceptance.py"))
+                     "test_agent_loop_b2_acceptance.py",
+                     # B2B-C2: the application battery, named by all four
+                     # of that package's mutations.
+                     "test_agent_loop_b2_application.py"))
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
     assert missing == [], f"var olmayan hedef test adi: {missing}"

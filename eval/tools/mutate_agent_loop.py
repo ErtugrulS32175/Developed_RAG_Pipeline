@@ -30,7 +30,7 @@ from pathlib import Path
 
 SOURCE_REPO = Path(__file__).resolve().parents[2]
 MODULES = ("state", "locking", "preflight", "execution",
-           "cli", "schemas", "changes", "acceptance")
+           "cli", "schemas", "changes", "acceptance", "application")
 NL = chr(10)
 
 BS = chr(92)
@@ -478,6 +478,31 @@ MUTATIONS = [
      + "                                              started_streams, grace)",
      "    reclaimed = True",
      "test_a_failure_after_launch_still_proves_the_cleanup"),
+    # B2B-C2: one mutation per mechanism the application package exists
+    # for -- the receipt names the candidate it tested, an ADDED target
+    # the operator already has is never overwritten, a failed operation
+    # is rolled back, and the checkout's difference is proven to BE the
+    # candidate before any success is reported.
+    ("b2bc2-rapor-parmak-izi", "application",
+     "    if report.candidate_fingerprint != candidate.fingerprint:",
+     "    if False:",
+     "test_a_candidate_edited_after_acceptance_never_reaches_the_checkout"),
+    # The condition ALONE, not the raise with it: a comment sits between
+    # the two in the source, and a pattern that spans it goes stale the
+    # moment anybody edits the comment -- which reads as NOT-APPLIED and
+    # turns a missing guard into a quiet pass.
+    ("b2bc2-ekleme-carpismasi", "application",
+     "            if current is not None:", "            if False:",
+     "test_an_added_target_that_already_exists_is_never_overwritten"),
+    ("b2bc2-geri-alma-atlama", "application",
+     "        if payload is not None and slots_tree is not None:",
+     "        if False and slots_tree is not None:",
+     "test_a_failure_at_any_operation_rolls_back_exactly"),
+    ("b2bc2-son-fark-kontrolu", "application",
+     "    if tuple((item.path, item.kind, item.sha256)" + NL
+     + "             for item in observed) != expected:",
+     "    if False:",
+     "test_a_late_change_anywhere_is_not_a_success"),
 ]
 
 
@@ -622,7 +647,8 @@ def main():
         imported = subprocess.run(
             [sys.executable, "-c",
              "from tools.agent_loop import (state, locking, "
-             "preflight, execution, cli, schemas, changes, acceptance)"],
+             "preflight, execution, cli, schemas, changes, acceptance, "
+             "application)"],
             cwd=str(workdir), capture_output=True, text=True)
         if imported.returncode != 0:
             path.write_text(original, encoding="utf-8")

@@ -258,9 +258,18 @@ def test_the_report_and_command_results_are_frozen_and_textless(tmp_path):
     could carry output, a path or a sentence cannot be added quietly."""
     world = build_world(tmp_path)
     report = run(world)
+    # B2B-C2 added the last three. A report that names a run but not the
+    # CANDIDATE it tested lets an edit made after the gate went green
+    # travel on the gate's own receipt, so the fingerprints are part of
+    # the pinned shape now -- and being CLOSED digests, they carry no
+    # more text than the counts beside them.
     assert [field for field in report.__slots__] == [
         "run_id", "workspace_id", "baseline_sha", "passed", "command_results",
-        "total_duration_ms", "event"]
+        "total_duration_ms", "event", "manifest_digest",
+        "candidate_fingerprint", "command_plan_digest"]
+    for digest in (report.manifest_digest, report.candidate_fingerprint,
+                   report.command_plan_digest):
+        assert len(digest) == 64 and set(digest) <= set("0123456789abcdef")
     (result,) = report.command_results
     assert [field for field in result.__slots__] == [
         "command_id", "passed", "exit_code", "duration_ms", "stdout_bytes",
