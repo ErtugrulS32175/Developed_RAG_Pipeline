@@ -25,6 +25,7 @@ would otherwise pass the whole file.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -34,8 +35,9 @@ from pathlib import Path
 
 import pytest
 
-from tools.agent_loop import contract, flat_workspace, git_objects
-from tools.agent_loop import git_transport, state
+from tools.agent_loop import contract, flat_workspace, fs_evidence
+from tools.agent_loop import git_objects, git_transport, state
+from tools.agent_loop import workspace_evidence
 
 # the repository root, for the nested probe's PYTHONPATH
 _DEPO_KOKU = Path(__file__).resolve().parents[1]
@@ -686,9 +688,19 @@ def _kayit_kur(state_dir, repo, status, workspace_id="b" * 32, **ekstra):
              "repo_id": state.repo_identity(repo), "run_id": "kosu-1",
              "baseline_sha": "0" * 40, "status": status,
              "created_at": "2026-01-01T00:00:00Z"}
+    if status == flat_workspace.STATUS_READY:
+        # READY is the status every downstream guard trusts, so the
+        # schema will not let one exist without its whole proof
+        kayit.update(_HAZIR_KANIT)
     kayit.update(ekstra)
     flat_workspace._write_record(state_dir, kayit)
     return workspace_id
+
+
+_HAZIR_KANIT = {"baseline_digest": "0" * 64, "evidence_digest": "1" * 64,
+                "reference_identity": "kurgu-ref",
+                "implementer_identity": "kurgu-imp",
+                "marker_version": flat_workspace.MARKER_VERSION}
 
 
 def test_the_legal_transition_chain_is_accepted(repo, state_dir):
@@ -697,8 +709,7 @@ def test_the_legal_transition_chain_is_accepted(repo, state_dir):
                                flat_workspace.STATUS_MATERIALIZING)
     assert _durum(state_dir, kimlik) == flat_workspace.STATUS_MATERIALIZING
     flat_workspace._set_status(state_dir, kimlik,
-                               flat_workspace.STATUS_READY,
-                               baseline_digest="0" * 64)
+                               flat_workspace.STATUS_READY, **_HAZIR_KANIT)
     assert _durum(state_dir, kimlik) == flat_workspace.STATUS_READY
 
 
@@ -1158,4 +1169,269 @@ def test_the_repository_working_tree_is_never_written_to(repo, state_dir):
                    for p in repo.rglob("*")
                    if p.is_file() and ".git" not in p.parts)
     assert once == sonra, "materyalizasyon ana calisma agacina yazdi"
+
+
+# =====================================================================
+# G. READY IS A CLAIM THE FILESYSTEM HAS TO BACK
+#
+# Two materialisation loops returning says the writes were ISSUED. It
+# says nothing about what is on disk -- and every later comparison
+# between the two trees is meaningless if they did not start equal.
+# =====================================================================
+
+def _baglanti_kurulabiliyor(tmp_path) -> bool:
+    hedef = tmp_path / "baglanti-hedefi"
+    hedef.write_bytes(b"X")
+    deneme = tmp_path / "baglanti-denemesi"
+    try:
+        os.symlink(str(hedef), str(deneme))
+    except OSError:
+        return False
+    deneme.unlink()
+    return True
+
+
+def _materyalizasyondan_sonra(monkeypatch, eylem):
+    """Run `eylem(reference, implementer)` in the window between the
+    writes and the evidence scan -- which is exactly the window this
+    package exists to close."""
+    gercek = flat_workspace._materialise
+    durum = {"ulasildi": False}
+
+    def sarmalayan(repo, holder, girisler, limits):
+        reference, implementer, manifest = gercek(repo, holder, girisler,
+                                                  limits)
+        durum["ulasildi"] = True
+        durum.update(eylem(reference, implementer) or {})
+        return reference, implementer, manifest
+
+    monkeypatch.setattr(flat_workspace, "_materialise", sarmalayan)
+    return durum
+
+
+def test_a_healthy_workspace_stores_evidence_and_two_root_identities(
+        repo, state_dir):
+    baseline = _commit_files(repo, {"a.py": b"A", "alt/b.py": b"B"})
+    ws = _create(repo, state_dir, baseline)
+    kayit = flat_workspace.read_record(state_dir, ws.workspace_id)
+
+    assert kayit["status"] == flat_workspace.STATUS_READY
+    assert re.fullmatch(r"[0-9a-f]{64}", kayit["evidence_digest"])
+    assert kayit["marker_version"] == flat_workspace.MARKER_VERSION
+    assert kayit["reference_identity"] != kayit["implementer_identity"], \
+        "iki kok ayni nesne olarak kaydedilmis"
+
+    isaret = ws.reference_root.parent / flat_workspace.MARKER_NAME
+    assert isaret.is_file(), "sahiplik isareti yok"
+    assert not isaret.is_symlink()
+    metin = isaret.read_text(encoding="utf-8")
+    veri = json.loads(metin)
+    assert veri["workspace_id"] == ws.workspace_id
+    assert veri["run_id"] == "kosu-1"
+    assert veri["baseline_sha"] == baseline
+    # identities, never paths, and never the evidence key
+    assert "/" not in metin and chr(92) not in metin, "isaret yol tasiyor"
+    assert "evidence" not in metin and "digest" not in metin
+    # outside both model-visible roots
+    assert not (ws.reference_root / flat_workspace.MARKER_NAME).exists()
+    assert not (ws.implementer_root / flat_workspace.MARKER_NAME).exists()
+
+
+@pytest.mark.parametrize("hangi", ["reference", "implementer"])
+@pytest.mark.parametrize("nasil", ["ayni-boyut", "farkli-boyut"])
+def test_two_roots_that_do_not_match_are_never_ready(repo, state_dir,
+                                                     monkeypatch, hangi,
+                                                     nasil):
+    """A same-size rewrite is the interesting half: it is invisible to
+    anything that compares sizes, and it is what the content hash is
+    for."""
+    baseline = _commit_files(repo, {"a.py": b"AAAA", "alt/b.py": b"B"})
+
+    def boz(reference, implementer):
+        hedef = (reference if hangi == "reference" else implementer) / "a.py"
+        once = hedef.read_bytes()
+        yeni = b"ZZZZ" if nasil == "ayni-boyut" else once + b"EK"
+        hedef.write_bytes(yeni)
+        return {"degisti": hedef.read_bytes() != once,
+                "boyut_ayni": len(yeni) == len(once)}
+
+    durum = _materyalizasyondan_sonra(monkeypatch, boz)
+    with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+        _create(repo, state_dir, baseline)
+
+    assert durum["ulasildi"] and durum["degisti"], "senaryo kurulmadi"
+    assert durum["boyut_ayni"] is (nasil == "ayni-boyut"), "senaryo kurulmadi"
+    assert "ayni icerikle baslamiyor" in str(ret.value)
+    assert _kalan_holderlar() == [] and _kayitlar(state_dir) == []
+
+
+def test_independent_copies_are_not_a_false_mismatch(repo, state_dir):
+    """The reason a projection exists at all. Two honest copies of one
+    tree have different root identities, different file identities and
+    different timestamps -- comparing the full manifest digest would
+    refuse every healthy workspace there is."""
+    baseline = _commit_files(repo, {"a.py": b"A", "alt/b.py": b"B"})
+    ws = _create(repo, state_dir, baseline)
+    key = b"k" * fs_evidence.KEY_BYTES
+    sol = fs_evidence.scan(ws.reference_root, key=key)
+    sag = fs_evidence.scan(ws.implementer_root, key=key)
+
+    assert sol.root_identity != sag.root_identity, "senaryo kurulmadi"
+    assert sol.digest != sag.digest, \
+        "senaryo kurulmadi: tam ozetler zaten esit, test bir sey kanitlamiyor"
+    sol_kimlik = {e.path: e.file_id for e in sol.entries}
+    sag_kimlik = {e.path: e.file_id for e in sag.entries}
+    assert any(sol_kimlik[yol] != sag_kimlik[yol] for yol in sol_kimlik), \
+        "senaryo kurulmadi: dosya kimlikleri ayni"
+    assert workspace_evidence._projection(sol) == \
+        workspace_evidence._projection(sag)
+
+
+def test_an_unexpected_link_inside_a_root_is_never_ready(repo, state_dir,
+                                                         tmp_path,
+                                                         monkeypatch):
+    """D3A represents ordinary files and directories. A reparse entry is
+    refused rather than given an invented representation."""
+    if not _baglanti_kurulabiliyor(tmp_path):
+        pytest.skip("bu makinede baglanti kurulamiyor")
+    baseline = _commit_files(repo, {"a.py": b"A"})
+    disari = tmp_path / "disarida.txt"
+    disari.write_bytes(b"DISARIDA")
+
+    def baglanti_koy(reference, implementer):
+        os.symlink(str(disari), str(implementer / "baglanti.py"))
+        return {"kuruldu": (implementer / "baglanti.py").is_symlink()}
+
+    durum = _materyalizasyondan_sonra(monkeypatch, baglanti_koy)
+    with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+        _create(repo, state_dir, baseline)
+
+    assert durum["ulasildi"] and durum["kuruldu"], "senaryo kurulmadi"
+    # the walker reports a symlink as `kind == "link"`, so the entry-kind
+    # gate is what fires; the reparse-tag gate behind it is a second line
+    assert str(ret.value) == "calisma alaninda beklenmeyen giris turu"
+    assert _kalan_holderlar() == [] and _kayitlar(state_dir) == []
+    assert disari.read_bytes() == b"DISARIDA", "disaridaki hedefe dokunuldu"
+
+
+def test_a_scan_failure_follows_the_existing_cleanup_policy(repo, state_dir,
+                                                            monkeypatch):
+    """One cleanup implementation, not two: an evidence failure lands in
+    exactly the R1B.2 path every other materialisation failure does."""
+    baseline = _commit_files(repo, {"a.py": b"A"})
+    gorulen = {"evet": False}
+
+    def patlayan(root, **kwargs):
+        gorulen["evet"] = True
+        raise fs_evidence.EvidenceError("kurgu tarama arizasi")
+
+    monkeypatch.setattr(fs_evidence, "scan", patlayan)
+    with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+        _create(repo, state_dir, baseline)
+
+    assert gorulen["evet"], "senaryo kurulmadi: taramaya ulasilmadi"
+    assert "kurgu tarama arizasi" in str(ret.value)
+    assert _kalan_holderlar() == [], "holder kaldi"
+    assert _kayitlar(state_dir) == [], "temizlik kanitlandi ama kayit kaldi"
+    assert flat_workspace.find_orphans(repo, state_dir=state_dir) == ()
+
+
+# =====================================================================
+# H. BINDING IS ANSWERED BY OPEN OBJECTS, NEVER BY A PATH
+#
+# `lstat(path)` followed by `open(path)` is two questions, and the gap
+# between them is the entire D2 vulnerability. Everything below is
+# opened relative to one holder handle.
+# =====================================================================
+
+def _bagla(repo, state_dir, ws, baseline):
+    return flat_workspace.assert_binding(
+        repo, state_dir=state_dir, run_id="kosu-1",
+        workspace_id=ws.workspace_id, baseline_sha=baseline)
+
+
+@pytest.mark.parametrize("nasil", ["icerik", "silinmis", "bozuk", "baglanti"])
+def test_a_marker_that_cannot_answer_refuses_the_binding(repo, state_dir,
+                                                         tmp_path, nasil):
+    baseline = _commit_files(repo, {"a.py": b"A"})
+    ws = _create(repo, state_dir, baseline)
+    holder = ws.reference_root.parent
+    isaret = holder / flat_workspace.MARKER_NAME
+    kanarya = tmp_path / "kanarya.txt"
+    kanarya.write_bytes(b"KANARYA")
+
+    if nasil == "icerik":
+        veri = json.loads(isaret.read_text(encoding="utf-8"))
+        veri["run_id"] = "baska-kosu"
+        isaret.write_text(json.dumps(veri), encoding="utf-8")
+    elif nasil == "silinmis":
+        isaret.unlink()
+    elif nasil == "bozuk":
+        isaret.write_text("{bu json degil", encoding="utf-8")
+    else:
+        if not _baglanti_kurulabiliyor(tmp_path):
+            pytest.skip("bu makinede baglanti kurulamiyor")
+        gecerli = tmp_path / "gecerli-isaret.json"
+        gecerli.write_bytes(isaret.read_bytes())
+        isaret.unlink()
+        os.symlink(str(gecerli), str(isaret))
+        assert isaret.is_symlink(), "senaryo kurulmadi"
+
+    with pytest.raises(flat_workspace.FlatWorkspaceError):
+        _bagla(repo, state_dir, ws, baseline)
+    assert kanarya.read_bytes() == b"KANARYA", "disaridaki hedefe dokunuldu"
+
+
+@pytest.mark.parametrize("hangi", ["reference", "implementer"])
+def test_a_root_replaced_by_an_identical_copy_is_still_refused(
+        repo, state_dir, tmp_path, hangi):
+    """The case a content check cannot see. The replacement holds the
+    same bytes under the same names -- only the OBJECT is different, and
+    identity is what was stored."""
+    baseline = _commit_files(repo, {"a.py": b"A", "alt/b.py": b"B"})
+    ws = _create(repo, state_dir, baseline)
+    assert _bagla(repo, state_dir, ws, baseline) == ws, "senaryo kurulmadi"
+
+    kok = ws.reference_root if hangi == "reference" else ws.implementer_root
+    kenara = kok.parent / f"{kok.name}-eski"
+    kok.rename(kenara)
+    shutil.copytree(kenara, kok)
+    assert (kok / "a.py").read_bytes() == b"A", "senaryo kurulmadi"
+
+    with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+        _bagla(repo, state_dir, ws, baseline)
+    assert "degistirilmis" in str(ret.value)
+
+
+def test_a_holder_replaced_by_a_link_refuses_without_following_it(
+        repo, state_dir, tmp_path):
+    """The holder is opened no-follow, so the swap is refused before a
+    single child is looked at -- and whatever the link pointed at is
+    never read."""
+    baseline = _commit_files(repo, {"a.py": b"A"})
+    ws = _create(repo, state_dir, baseline)
+    holder = ws.reference_root.parent
+    kopya = tmp_path / "sahte-holder"
+    shutil.copytree(holder, kopya)
+    kanarya = kopya / flat_workspace.REFERENCE_DIRNAME / "kanarya.txt"
+    kanarya.write_bytes(b"KANARYA")
+
+    shutil.rmtree(holder)
+    try:
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(kopya), str(holder))
+        elif _baglanti_kurulabiliyor(tmp_path):
+            os.symlink(str(kopya), str(holder), target_is_directory=True)
+        else:
+            pytest.skip("bu makinede baglanti kurulamiyor")
+
+        with pytest.raises(flat_workspace.FlatWorkspaceError):
+            _bagla(repo, state_dir, ws, baseline)
+        assert kanarya.read_bytes() == b"KANARYA", "baglantinin hedefi bozuldu"
+    finally:
+        try:
+            holder.unlink()
+        except (OSError, ValueError):
+            shutil.rmtree(holder, ignore_errors=True)
 

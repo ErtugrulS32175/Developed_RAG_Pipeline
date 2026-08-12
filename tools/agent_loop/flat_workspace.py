@@ -50,6 +50,7 @@ from pathlib import Path
 from tools.agent_loop import contract
 from tools.agent_loop import git_objects
 from tools.agent_loop import state as state_module
+from tools.agent_loop import workspace_evidence
 
 # ONE error class for the package, defined in the lower module so
 # both layers can raise it without an import cycle.
@@ -63,9 +64,14 @@ MODE_TREE = git_objects.MODE_TREE
 
 TEMP_PREFIX = "agent-loop-flat-"
 ROOT_DIRNAME = "agent-loop-flat"
-REFERENCE_DIRNAME = "reference"
-IMPLEMENTER_DIRNAME = "implementer"
 REGISTRY_DIRNAME = "flat-workspaces"
+
+# named where the evidence layer names them, so the walker and the
+# lifecycle can never disagree about which directory is which
+REFERENCE_DIRNAME = workspace_evidence.REFERENCE_DIRNAME
+IMPLEMENTER_DIRNAME = workspace_evidence.IMPLEMENTER_DIRNAME
+MARKER_NAME = workspace_evidence.MARKER_NAME
+MARKER_VERSION = workspace_evidence.MARKER_VERSION
 
 STATUS_REGISTERED = "registered"
 STATUS_MATERIALIZING = "materializing"
@@ -117,7 +123,25 @@ RECORD_SCHEMA = {
         # it: a timestamp a caller supplies is a timestamp a caller can
         # choose, and recovery decisions are made by reading it
         "created_at": {"type": "string", "pattern": _TIMESTAMP},
+        # R1B.3: what the filesystem said, not what the writer intended
+        "evidence_digest": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+        "reference_identity": {"type": "string", "minLength": 1,
+                               "maxLength": 128},
+        "implementer_identity": {"type": "string", "minLength": 1,
+                                 "maxLength": 128},
+        "marker_version": {"const": MARKER_VERSION},
     },
+    # READY is the status every downstream guard trusts, so it is the
+    # one that has to carry the whole proof. A record cannot arrive
+    # there without the evidence digest, both root identities and the
+    # marker version -- the fields `assert_binding` compares against.
+    "allOf": [{
+        "if": {"properties": {"status": {"const": STATUS_READY}},
+               "required": ["status"]},
+        "then": {"required": ["baseline_digest", "evidence_digest",
+                              "reference_identity", "implementer_identity",
+                              "marker_version"]},
+    }],
 }
 
 
@@ -446,11 +470,25 @@ def create(repo, *, state_dir, run_id, baseline_sha) -> FlatWorkspace:
         reference, implementer, manifest = _materialise(
             repo, holder, girisler, limits)
         digest = baseline_digest(manifest)
+        # THE WRITES RETURNING IS NOT EVIDENCE. Both trees are read back
+        # through the handle-bound walker and required to agree, because
+        # every later comparison between them is meaningless if they did
+        # not start equal.
+        kanit, ref_kimlik, imp_kimlik = workspace_evidence.compare_roots(
+            reference, implementer)
+        # the marker exists BEFORE READY, and is read back through a
+        # handle rather than believed because it was just written
+        workspace_evidence.write_marker(holder, record)
+        workspace_evidence.inspect_holder(holder)
     except BaseException as primary:
         _after_failure(state_dir, workspace_id, holder, ours, primary)
         raise
 
-    _set_status(state_dir, workspace_id, STATUS_READY, baseline_digest=digest)
+    _set_status(state_dir, workspace_id, STATUS_READY,
+                baseline_digest=digest, evidence_digest=kanit,
+                reference_identity=ref_kimlik,
+                implementer_identity=imp_kimlik,
+                marker_version=MARKER_VERSION)
     return FlatWorkspace(workspace_id=workspace_id, baseline_sha=baseline_sha,
                          baseline_digest=digest, reference_root=reference,
                          implementer_root=implementer)
@@ -467,11 +505,14 @@ def _roots_of(workspace_id):
 
 def assert_binding(repo, *, state_dir, run_id, workspace_id,
                    baseline_sha) -> FlatWorkspace:
-    """All four identities, or nothing. No git.
+    """All four identities AND the objects themselves, or nothing. No git.
 
     A record alone is not authority: it has to name THIS repository,
-    THIS run, THIS workspace and THIS baseline, and the directories it
-    describes have to actually be there and finished."""
+    THIS run, THIS workspace and THIS baseline. Neither is a path --
+    the holder is opened once and the marker and both roots are opened
+    relative to that OBJECT, so a directory swapped for a link, or for
+    another directory with the same contents, is refused rather than
+    described."""
     record = _authorised_record(repo, state_dir, workspace_id)
     if record["status"] != STATUS_READY:
         raise FlatWorkspaceError("calisma alani hazir degil")
@@ -485,12 +526,20 @@ def assert_binding(repo, *, state_dir, run_id, workspace_id,
         raise FlatWorkspaceError("taban ozeti kayitta yok")
 
     holder, reference, implementer = _roots_of(workspace_id)
-    for yol in (holder, reference, implementer):
-        if not yol.is_dir():
-            raise FlatWorkspaceError("calisma alani dizini yok")
-    for kok in (reference, implementer):
-        if (kok / ".git").exists():
-            raise FlatWorkspaceError("calisma alaninda git denetim duzlemi var")
+    marker, ref_kimlik, imp_kimlik = workspace_evidence.inspect_holder(holder)
+    # the marker is a SECOND statement of the same identities, so it has
+    # to agree with the ledger field by field -- it never replaces it
+    for alan in ("workspace_id", "repo_id", "run_id", "baseline_sha"):
+        if marker.get(alan) != record[alan]:
+            raise FlatWorkspaceError("sahiplik isareti kayitla uyusmuyor")
+    if marker.get("marker_version") != record.get("marker_version"):
+        raise FlatWorkspaceError("sahiplik isareti kayitla uyusmuyor")
+    # identity comes from the OPENED object, never from a second look at
+    # the path that named it
+    if ref_kimlik != record.get("reference_identity") or \
+            imp_kimlik != record.get("implementer_identity"):
+        raise FlatWorkspaceError("calisma alani kokleri degistirilmis",
+                                 reason=contract.StopReason.PATH_NOT_ALLOWED)
     return FlatWorkspace(workspace_id=workspace_id, baseline_sha=baseline_sha,
                          baseline_digest=digest, reference_root=reference,
                          implementer_root=implementer)
