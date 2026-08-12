@@ -1863,7 +1863,13 @@ def test_every_mutation_names_a_test_that_exists():
         for name in ("test_agent_loop_b1.py",
                      "test_agent_loop_b2_execution.py",
                      "test_agent_loop_contract.py",
-                     "test_agent_loop_b2_changes.py"))
+                     "test_agent_loop_b2_changes.py",
+                     # B2B-B2A1: the state binding's execution identity
+                     # moved into its own narrow file, so the namespace
+                     # has to know about it. The check itself is
+                     # unchanged -- a name matching nothing is still a
+                     # failure.
+                     "test_agent_loop_state_binding.py"))
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
     assert missing == [], f"var olmayan hedef test adi: {missing}"

@@ -50,13 +50,13 @@ IMMUTABLE_STATE_FIELDS = ("protocol_version", "run_id", "started_at",
 BINDING_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    # `worktree_id` is REQUIRED. It was optional, and the value
-    # `worktree.create` produced could not satisfy the pattern anyway,
-    # so the binding to a worktree was never established and nothing
-    # reported that. Optional plus unsatisfiable is a field that exists
-    # only in the documentation.
+    # An execution identity is REQUIRED. It was once optional, and the
+    # value `worktree.create` produced could not satisfy the pattern
+    # anyway, so the binding was never established and nothing reported
+    # that. Optional plus unsatisfiable is a field that exists only in
+    # the documentation.
     "required": ["protocol_version", "run_id", "repo_id", "baseline_sha",
-                 "manifest_digest", "worktree_id"],
+                 "manifest_digest"],
     "properties": {
         "protocol_version": {"const": contract.PROTOCOL_VERSION},
         "run_id": {"type": "string", "pattern": contract.IDENTIFIER_PATTERN},
@@ -65,8 +65,22 @@ BINDING_SCHEMA = {
         "repo_id": {"type": "string", "pattern": r"^[0-9a-f]{32}$"},
         "baseline_sha": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "manifest_digest": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-        "worktree_id": {"type": "string", "pattern": r"^[0-9a-f]{32}$"},
+        # TEMPORARY B2B-B BRIDGE. Two execution surfaces exist at once:
+        # the legacy disposable git worktree and the D3A flat workspace.
+        # Both grammars are the contract's opaque id.
+        "worktree_id": {"type": "string",
+                        "pattern": contract.OPAQUE_ID_PATTERN},
+        "workspace_id": {"type": "string",
+                         "pattern": contract.OPAQUE_ID_PATTERN},
     },
+    # EXACTLY ONE, expressed where the schema can enforce it rather than
+    # in a later hand-written check. `oneOf` over the two "required"
+    # branches refuses BOTH shapes that have no answer: a binding
+    # carrying neither identity names no place to run, and one carrying
+    # both leaves the choice to whichever reader looks first.
+    # B2B-B2C drops the worktree branch and this collapses to `required`.
+    "oneOf": [{"required": ["worktree_id"]},
+              {"required": ["workspace_id"]}],
 }
 
 
@@ -303,17 +317,26 @@ def read_binding(state_dir):
 
 
 def assert_binding(state_dir, *, repo_id, baseline_sha, manifest_digest,
-                   worktree_id=None):
+                   worktree_id=None, workspace_id=None):
     """Refuse state that belongs to a different run.
 
-    Four separate ways a state directory can be the wrong one, and each
-    is worth telling apart: a copied checkout, a moved baseline, an
-    edited task, a worktree that is no longer the one this run built."""
+    Several separate ways a state directory can be the wrong one, and
+    each is worth telling apart: a copied checkout, a moved baseline, an
+    edited task, an execution root that is no longer the one this run
+    built.
+
+    The two execution identities are checked the same way and never
+    substituted for each other: a caller asking about a workspace must
+    not be answered by a binding that names a worktree, because the
+    schema lets exactly one of them exist and `get` on the absent one
+    returns `None` -- which would match a caller that passed nothing."""
     binding = read_binding(state_dir)
     checks = [("repo_id", repo_id), ("baseline_sha", baseline_sha),
               ("manifest_digest", manifest_digest)]
     if worktree_id is not None:
         checks.append(("worktree_id", worktree_id))
+    if workspace_id is not None:
+        checks.append(("workspace_id", workspace_id))
     for field, expected in checks:
         if binding.get(field) != expected:
             raise IncompatibleState(

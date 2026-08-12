@@ -96,10 +96,16 @@ MUTATIONS = [
      '    if current["state"] not in contract.TERMINAL_STATES '
      "and not allow_resume:", "    if False:",
      "unfinished_previous_run"),
+    # Retargeted for B2B-B2A1, same intent: a binding with no execution
+    # identity -- or with two -- must be refused. The guard moved out of
+    # `required` and into the `oneOf` gate when the schema learned to
+    # carry either a worktree or a flat workspace. Collapsing that gate
+    # to a single empty branch makes every shape valid again.
     ("zorunlu-worktree-id", "state",
-     '                 "manifest_digest", "worktree_id"],',
-     '                 "manifest_digest"],',
-     "real_worktree_id_can_actually_be_written"),
+     '    "oneOf": [{"required": ["worktree_id"]},' + NL
+     + '              {"required": ["workspace_id"]}],',
+     '    "oneOf": [{}],',
+     "a_binding_without_exactly_one_identity_is_refused"),
     ("dizin-fsync", "state",
      "        fsync_directory(target.parent)", "        pass",
      "atomic_write_flushes_the_directory_entry"),
