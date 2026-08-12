@@ -1806,7 +1806,13 @@ def test_every_mutation_still_applies_to_the_current_source():
     # mutations deleted, because earlier packages already cleared the
     # number -- and the label set is what says WHICH ones exist. Both
     # move only when somebody edits this pin on purpose.
-    assert len(tool.MUTATIONS) == 93
+    # B2B-B2A2: 93 -> 92. `b2bar1-indeks-bayragi` refused a git index
+    # that had been told to stop looking, inside a disposable worktree.
+    # The flat workspace has no index to blind, so the source line is
+    # gone and the entry went with it rather than being aimed at
+    # something it never meant. The P0 itself is still pinned where the
+    # git instrument still lives -- see `b2bar1-indeks-digesti`.
+    assert len(tool.MUTATIONS) == 92
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1819,7 +1825,7 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b2ba-gorev-sonkontrolu', 'b2ba-izlenmeyen-korlugu',
         'b2ba-kirli-agac', 'b2ba-kontrol-glob', 'b2ba-kosu-kimligi',
         'b2ba-onek-kacisi', 'b2ba-parmak-izi-icerik',
-        'b2ba-yasakli-onceligi', 'b2ba-yineleme', 'b2bar1-indeks-bayragi',
+        'b2ba-yasakli-onceligi', 'b2ba-yineleme',
         'b2bar1-indeks-digesti', 'b2bar1-kanonik-kapsam',
         'b2bar1-manifest-icerde', 'b2bar1-manifest-taban',
         'b2bar1-silme-modu', 'b2bar1-snapshot-okuma', 'bitmemis-kosu',
@@ -1869,7 +1875,11 @@ def test_every_mutation_names_a_test_that_exists():
                      # has to know about it. The check itself is
                      # unchanged -- a name matching nothing is still a
                      # failure.
-                     "test_agent_loop_state_binding.py"))
+                     "test_agent_loop_state_binding.py",
+                     # B2B-B2A2: the change set is derived from flat
+                     # workspace evidence in its own narrow file, and
+                     # three retargeted mutations name tests there.
+                     "test_agent_loop_b2_changes_flat.py"))
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
     assert missing == [], f"var olmayan hedef test adi: {missing}"

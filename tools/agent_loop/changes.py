@@ -1,38 +1,47 @@
-"""The verified implementer change set. PACKAGE B2B-A.
+"""The verified implementer change set. PACKAGE B2B-A / B2B-B2A2.
 
-ONE mechanism: run exactly one already-safe B2A implementer call, then
-derive the change set from GIT AND THE FILESYSTEM and prove every part
-of it was allowed. It runs no acceptance command, applies no patch,
-touches no state machine and creates nothing in the main checkout.
+ONE mechanism: run exactly one already-safe B2A implementer call inside
+a D3A FLAT WORKSPACE, then derive the change set from the FILESYSTEM
+DIFFERENCE between the reference tree and the implementer tree and prove
+every part of it was allowed. It runs no acceptance command, applies no
+patch, touches no state machine and creates nothing in the main checkout.
 
 THE MODEL'S `changed_files` IS A CLAIM, NOT EVIDENCE. It is compared
-against what git reports, exactly and in both directions: a file the
-model forgot to declare is as much a mismatch as one it invented.
+against what the filesystem shows, exactly and in both directions: a file
+the model forgot to declare is as much a mismatch as one it invented.
 
-WHY GIT AFTER THE CALL IS NOT ENOUGH BY ITSELF. "Ask git when the model
-returns" answers a different question than "what did this call change":
+WHY THE WORKSPACE'S EVIDENCE IS NOT GIT'S ANYMORE. Git held this job and
+lost it twice, both times to state the model could reach: the
+per-repository index, where `skip-worktree` hid a modified control-plane
+file while `status` came back empty, and shared metadata, where a clean
+filter declared in `.git/config` hid a change AND ran a model-supplied
+command during verification. Neither was a missing check; the authority
+itself was inside the blast radius. A D3A workspace has no `.git` at all,
+so the question is asked of the two trees directly -- through the
+handle-bound walker in `fs_evidence`, which the model cannot answer for.
 
-  * a worktree that was ALREADY dirty makes attribution impossible, so
-    the pristine check happens before a process exists;
-  * `git diff` does not mention untracked files at all, and a new file
-    is the most ordinary thing an implementer writes -- so the
-    inventory is `status --porcelain=v2 --untracked-files=all`;
-  * HEAD, the index or the `.git` link can move during the call, and
-    each of those changes what "changed" even means;
-  * a call that FAILED may still have edited files first, so the
-    verification runs in `finally` on every exit path;
-  * a control-plane edit stays terminal no matter what the task
-    manifest permits -- permission a task writes for itself may not
-    reach the code that supervises it.
+WHY TWO TREES AND NOT A BASELINE DIGEST. "What did this call change" is a
+question about a REFERENCE that never moved. The reference copy is
+therefore read back on both sides of the call as well: if it moved, the
+comparison is against something the model chose, and nothing derived from
+it means anything.
 
-PATH-ONLY EVIDENCE CANNOT SEE CONTENT. Two runs can touch the same file
-with different bytes, so the fingerprint covers path, change kind, mode
-and the SHA-256 of the current bytes.
+WHY A SEMANTIC PROJECTION AND NOT `Manifest.digest`. Two independent
+copies of one tree are SUPPOSED to differ -- different root identity,
+different file identity, different timestamps, different scan counters --
+so comparing the full digest would refuse every healthy workspace. What
+must match is the semantic content, and that is what is compared.
+
+WHERE GIT STILL RUNS, ON PURPOSE. The OPERATOR'S checkout is still
+guarded by `git status` before and after the call. That instrument moves
+to filesystem evidence in B2B-B2B; half-migrating it here would leave the
+main tree guarded by neither. The rule this package enforces is therefore
+not "no git" but "no git ABOUT THE FLAT ROOTS".
 
 WHAT MAY LEAVE. Repo-relative paths that were ALLOWED, counts, closed
 contract codes and hashes. Never file contents, never a patch, never
-git's stderr, never a rejected path -- a refused path is attacker
-influenced text and this travels into reports.
+git's stderr, never a link's target, never a rejected path -- a refused
+path is attacker influenced text and this travels into reports.
 """
 from __future__ import annotations
 
@@ -40,25 +49,37 @@ import fnmatch
 import hashlib
 import os
 import re
+import secrets
 import stat
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from tools.agent_loop import (cli, contract, execution, preflight, schemas,
-                              state as state_module, worktree)
+from tools.agent_loop import (cli, contract, execution, flat_workspace,
+                              fs_evidence, preflight, schemas,
+                              state as state_module)
 
 GIT_TIMEOUT_SECONDS = 120
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _RUN_ID = re.compile(contract.IDENTIFIER_PATTERN)
-# The only blob modes an ordinary source edit produces. Anything else --
-# a symlink (120000), a gitlink (160000) or a type change -- is refused
-# rather than guessed at.
-_PLAIN_MODES = ("100644", "100755")
 ADDED, MODIFIED, DELETED = "added", "modified", "deleted"
+
+# The semantic fields two independent copies of one tree MUST agree on
+# while nothing has changed. `mtime_ns`, `file_id` and the manifest's own
+# root identity are per-copy BY DEFINITION and are deliberately absent:
+# comparing any of them would call every healthy workspace a change.
+_FILE_FIELDS = ("mode", "size", "sha256", "attributes", "reparse_tag",
+                "nlink", "link_target_mac")
+# A directory's size and link count are functions of what is INSIDE it
+# rather than of the directory itself -- on POSIX both move when a file
+# is created under them -- so including either would report one added
+# file twice, once as the file and once as its parent, and refuse
+# ordinary work. What is left still tells an added directory, a removed
+# one, a type change and a permission change apart.
+_DIR_FIELDS = ("mode", "attributes", "reparse_tag", "link_target_mac")
 
 
 class ChangeSetError(RuntimeError):
@@ -81,7 +102,7 @@ class EvidenceUnavailable(ChangeSetError):
 
 
 class UnsafeChange(ChangeSetError):
-    """The worktree, the manifest or the main checkout moved somewhere
+    """The workspace, the manifest or the main checkout moved somewhere
     this run was not allowed to take it."""
 
 
@@ -96,8 +117,18 @@ class DeclarationMismatch(ChangeSetError):
 class _Change:
     path: str        # canonical repo-relative POSIX
     kind: str        # ADDED | MODIFIED | DELETED
-    mode: str        # git blob mode, or "000000" for a deletion
+    mode: str        # the semantic record's own mode
     sha256: str      # of the current bytes; "" when the file is gone
+
+
+@dataclass(frozen=True, slots=True)
+class _Snap:
+    """One projected entry: what it IS, and what it is COMPARED by."""
+
+    kind: str
+    mode: str
+    sha256: str
+    compare: tuple
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +137,7 @@ class VerifiedChangeSet:
     carry: no patch, no contents, no absolute path."""
 
     run_id: str
-    worktree_id: str
+    workspace_id: str
     baseline_sha: str
     status: str
     changed_files: tuple
@@ -123,7 +154,7 @@ class VerifiedChangeSet:
 
 
 # ---------------------------------------------------------------------
-# GIT EVIDENCE -- argv only, checked, NUL-delimited
+# GIT EVIDENCE -- the MAIN CHECKOUT only, argv, checked, NUL-delimited
 # ---------------------------------------------------------------------
 
 def _git(cwd, *args) -> bytes:
@@ -133,7 +164,11 @@ def _git(cwd, *args) -> bytes:
     newlines -- and a filename may contain a newline, which is exactly
     how a path walks out of an inventory unnoticed. The switches pin
     the answer to the repository state rather than to a cache, an
-    external differ or a credential helper's opinion."""
+    external differ or a credential helper's opinion.
+
+    `cwd` is the operator's repository and nothing else: no caller here
+    passes a workspace root, which is what makes the boundary this
+    package draws checkable from the outside."""
     argv = ["git", "-C", str(cwd), "--no-optional-locks",
             "-c", "core.fsmonitor=false", "-c", "core.quotepath=false",
             "-c", "diff.external=", "-c", "core.symlinks=true", *args]
@@ -159,11 +194,9 @@ def _status(cwd):
     """The full inventory, as `(record, rename_source)` pairs.
 
     `--untracked-files=all` because a new file is the most ordinary
-    thing an implementer writes and an ordinary diff never mentions it;
+    thing a process writes and an ordinary diff never mentions it;
     `--ignore-submodules=none` because a silently skipped submodule is
-    a change nobody sees; `--no-renames` so one edit is one record --
-    a rename that git still reports is refused rather than
-    reinterpreted."""
+    a change nobody sees; `--no-renames` so one edit is one record."""
     raw = _git(cwd, "status", "--porcelain=v2", "-z",
                "--untracked-files=all", "--ignore-submodules=none",
                "--no-renames")
@@ -194,50 +227,12 @@ def _index_state(cwd) -> str:
 
     `status` is not the whole truth: an entry marked `skip-worktree` or
     `assume-unchanged` is one git has been TOLD to stop looking at, and
-    a probe used exactly that to rewrite a control-plane file while
-    `status` stayed empty and this gate returned an empty change set.
-    Both listings were measured to be stable across ordinary edits and
+    a probe used exactly that to rewrite a protected file while
+    `status` stayed empty and this gate reported nothing at all. Both
+    listings were measured to be stable across ordinary edits and
     untracked additions, so comparing them costs no false refusals."""
     return hashlib.sha256(_git(cwd, "ls-files", "-s", "-z") + b"\0"
                           + _git(cwd, "ls-files", "-v", "-z")).hexdigest()
-
-
-def _blinded_entries(cwd):
-    """Entries git was told to ignore. `S` is skip-worktree; a
-    LOWERCASE tag is assume-unchanged."""
-    blinded = []
-    for field in _git(cwd, "ls-files", "-v", "-z").split(b"\0"):
-        if len(field) < 2 or field[1:2] != b" ":
-            continue
-        tag = field[:1]
-        if tag == b"S" or (tag.isalpha() and tag.islower()):
-            blinded.append(field)
-    return blinded
-
-
-def _assert_not_blinded(cwd):
-    """A flagged index cannot be inventoried, so it is refused rather
-    than reported as clean. The COUNT may leave; the paths may not."""
-    blinded = _blinded_entries(cwd)
-    if blinded:
-        raise UnsafeChange(
-            f"{len(blinded)} indeks girdisi git'ten gizlenmis",
-            reason=contract.StopReason.PREFLIGHT_FAILED)
-
-
-def _git_identity(cwd) -> str:
-    """A digest of WHICH repository this directory is attached to.
-
-    In a worktree `.git` is a file pointing at the real git directory;
-    replacing it re-aims every later question at another repository."""
-    marker = Path(cwd) / ".git"
-    try:
-        entry = os.lstat(marker)
-        payload = marker.read_bytes() if stat.S_ISREG(entry.st_mode) else b"D"
-    except OSError:
-        raise EvidenceUnavailable("git baglantisi okunamadi") from None
-    payload += _git(cwd, "rev-parse", "--absolute-git-dir")
-    return hashlib.sha256(payload).hexdigest()
 
 
 # ---------------------------------------------------------------------
@@ -253,49 +248,6 @@ def _same_place(left, right) -> bool:
     if os.name == "nt":
         left, right = left.casefold(), right.casefold()
     return left == right
-
-
-def _canonical_relative(raw: bytes, root: Path) -> str:
-    """One spelling for a path git reported, or a refusal.
-
-    Refuses before the value is ever used: an absolute path, a drive
-    letter, a backslash, a `..` segment, an empty segment or a control
-    character. Then the location itself is proven to sit inside this
-    worktree -- resolved through the PARENT, because a deleted file has
-    no node left to resolve."""
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise UnsafeChange("yol UTF-8 degil",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED) from None
-    bad = ("\\" in text or text.startswith("/") or not text
-           or re.match(r"^[A-Za-z]:", text)
-           or any(ord(ch) < 32 for ch in text))
-    parts = PurePosixPath(text).parts if not bad else ()
-    if bad or not parts or any(part in ("", ".", "..") for part in parts):
-        raise UnsafeChange("yol kanonik degil",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED)
-    try:
-        inside = (root / text).parent.resolve(strict=False)
-        base = root.resolve(strict=True)
-    except OSError:
-        raise EvidenceUnavailable("yol cozulemedi") from None
-    if not _contained(inside, base):
-        raise UnsafeChange("yol calisma agacinin disina cikiyor",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED)
-    return "/".join(parts)
-
-
-def _contained(candidate: Path, base: Path) -> bool:
-    """Is `candidate` the base directory or something beneath it?
-
-    Compared as whole SEGMENTS after one resolution each, so a sibling
-    that merely shares an opening prefix is outside."""
-    left = str(candidate).replace("\\", "/").rstrip("/")
-    right = str(base).replace("\\", "/").rstrip("/")
-    if os.name == "nt":
-        left, right = left.casefold(), right.casefold()
-    return left == right or left.startswith(right + "/")
 
 
 def _fold(text) -> str:
@@ -364,108 +316,122 @@ def _authorize(path: str, *, allowed, forbidden, task_relative):
 
 
 # ---------------------------------------------------------------------
-# THE CHANGE SET
+# FILESYSTEM EVIDENCE -- the two trees, projected and compared
 # ---------------------------------------------------------------------
 
-def _plain_file_digest(absolute: Path) -> str:
-    """Refuses anything that is not an ORDINARY regular file.
+def _refuse_evidence(refused):
+    """One boundary for the walker's refusals. Its messages are fixed
+    sentences by that module's contract, so they may be repeated; its
+    REASON says whether this was an unanswered question or a tree this
+    evidence model does not represent."""
+    if refused.reason == contract.StopReason.PATH_NOT_ALLOWED:
+        return UnsafeChange(str(refused), reason=refused.reason)
+    return EvidenceUnavailable(str(refused))
 
-    `lstat`, never `stat`: following the link is what makes a symlink
-    look like the file it points at. A Windows reparse point carries a
-    tag even when it reports as a directory, and both are refused
-    rather than followed."""
+
+def _scan(root, key):
     try:
-        entry = os.lstat(absolute)
-    except OSError:
-        raise EvidenceUnavailable("degisen dosya okunamadi") from None
-    # ONE guard, deliberately: a separate symlink branch in front of
-    # this looked like defence in depth and was not -- a link is never
-    # `S_ISREG`, so the second test already refused everything the
-    # first did, and a self-attack that deleted the first changed
-    # nothing observable. A layer whose removal is invisible is a layer
-    # nobody is testing.
-    if (not stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode)
-            or getattr(entry, "st_reparse_tag", 0)):
-        raise UnsafeChange("siradan olmayan dosya turu desteklenmiyor",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED)
-    digest = hashlib.sha256()
-    try:
-        with open(absolute, "rb") as handle:
-            for block in iter(lambda: handle.read(1 << 20), b""):
-                digest.update(block)
-    except OSError:
-        raise EvidenceUnavailable("degisen dosya okunamadi") from None
-    return digest.hexdigest()
+        return fs_evidence.scan(root, key=key, limits=fs_evidence.Limits())
+    except fs_evidence.EvidenceError as refused:
+        raise _refuse_evidence(refused) from None
 
 
-def _classify(record: bytes, source, root: Path):
-    """One porcelain-v2 record becomes one `_Change`, or a refusal.
+def _project(manifest):
+    """The semantic content of one tree, keyed by canonical path.
 
-    Every unsupported shape is named and refused: a staged entry, an
-    unmerged entry, a submodule, a mode-only change, a rename git still
-    reported, an unknown record type. Guessing how to follow one of
-    those is how an unreviewed edit reaches the main checkout."""
-    kind = record[:1]
-    if kind == b"u":
-        raise UnsafeChange("birlesmemis giris var",
-                           reason=contract.StopReason.STAGED_CHANGES)
-    if kind == b"2":
-        raise UnsafeChange("yeniden adlandirma kaydi desteklenmiyor",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED)
-    if kind == b"?":
-        path = _canonical_relative(record[2:], root)
-        absolute = root / path
-        digest = _plain_file_digest(absolute)
-        # git records an executable bit where the filesystem has one;
-        # calling every untracked file 100644 put a mode in the
-        # fingerprint that the repository would not agree with
-        executable = (os.name != "nt"
-                      and bool(os.lstat(absolute).st_mode & stat.S_IXUSR))
-        return _Change(path=path, kind=ADDED,
-                       mode="100755" if executable else "100644",
-                       sha256=digest)
-    if kind != b"1":
-        raise UnsafeChange("bilinmeyen git kaydi",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED)
-    try:
-        header, raw_path = record.split(b" ", 8)[:8], record.split(b" ", 8)[8]
-        xy, submodule = header[1].decode("ascii"), header[2].decode("ascii")
-        mode_head, mode_work = header[3].decode("ascii"), header[5].decode(
-            "ascii")
-    except (IndexError, ValueError, UnicodeDecodeError):
-        raise UnsafeChange("bilinmeyen git kaydi",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED) from None
-    # NO separate staged branch here. The index gate above already
-    # refuses any staged state -- `git add` moves `ls-files -s`, and a
-    # deleted index shows up there too -- so a second check on `xy[0]`
-    # was a layer whose removal changed nothing observable. One gate,
-    # one mutation, one reason.
-    if submodule != "N...":
-        raise UnsafeChange("alt modul degisikligi desteklenmiyor",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED)
-    path = _canonical_relative(raw_path, root)
-    if xy[1] == "D":
-        # The HEAD mode, not a blank. Recording every deletion as
-        # `000000` accepted the removal of a SYMLINK as if it were an
-        # ordinary file, and erased the one field that told two
-        # otherwise identical deletions apart.
-        if mode_head not in _PLAIN_MODES:
-            raise UnsafeChange("siradan olmayan dosya modu",
+    ONE type gate, deliberately. A separate symlink branch in front of
+    this looked like defence in depth and was not: the walker reports a
+    symlink AND a junction as `kind == "link"` and gives both a keyed
+    link fingerprint, so either test alone already refused everything
+    the other did -- and a layer whose removal is invisible is a layer
+    nobody is testing."""
+    snapshot = {}
+    for entry in manifest.entries:
+        if (entry.kind not in ("file", "dir") or entry.reparse_tag
+                or entry.link_target_mac):
+            raise UnsafeChange("calisma alaninda temsil edilemeyen giris",
                                reason=contract.StopReason.PATH_NOT_ALLOWED)
-        return _Change(path=path, kind=DELETED, mode=mode_head, sha256="")
-    if xy[1] != "M":
-        raise UnsafeChange("desteklenmeyen degisiklik turu",
+        if entry.path in snapshot:
+            # a closed structure, stated rather than assumed: a mapping
+            # would keep the last writer silently
+            raise EvidenceUnavailable("ayni yol iki kez listelendi")
+        alanlar = _FILE_FIELDS if entry.kind == "file" else _DIR_FIELDS
+        snapshot[entry.path] = _Snap(
+            kind=entry.kind, mode=entry.mode, sha256=entry.sha256,
+            compare=(entry.kind,) + tuple(str(getattr(entry, alan))
+                                          for alan in alanlar))
+    return snapshot
+
+
+def _read_pair(workspace, key):
+    """Both trees, quiesced first and read with ONE call-local key.
+
+    The key binds the link fingerprints to this call: the same key must
+    be used for every scan here or two healthy manifests could never
+    compare equal, and no other call can recognise them at all."""
+    fs_evidence.quiesce()
+    reference = _scan(workspace.reference_root, key)
+    implementer = _scan(workspace.implementer_root, key)
+    if reference.root_identity == implementer.root_identity:
+        # the same directory twice is not two independent trees, and a
+        # comparison against yourself always passes
+        raise UnsafeChange("iki kok ayni nesne",
                            reason=contract.StopReason.PATH_NOT_ALLOWED)
-    if mode_work not in _PLAIN_MODES or mode_head not in _PLAIN_MODES:
-        raise UnsafeChange("siradan olmayan dosya modu",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED)
-    if mode_work != mode_head:
-        # content is what a patch carries; a bare permission change is
-        # not something this gate knows how to transfer
-        raise UnsafeChange("yalnizca mod degisikligi desteklenmiyor",
-                           reason=contract.StopReason.PATH_NOT_ALLOWED)
-    return _Change(path=path, kind=MODIFIED, mode=mode_work,
-                   sha256=_plain_file_digest(root / path))
+    return _project(reference), _project(implementer)
+
+
+def _assert_structural(directories, changes):
+    """A directory is the structural PARENT of a file, never a change of
+    its own. One that appears or disappears with no file change under it
+    is something this gate cannot carry into a patch, so it is refused
+    rather than dropped."""
+    for path in directories:
+        prefix = path + "/"
+        if not any(change.path.startswith(prefix) for change in changes):
+            raise UnsafeChange("bos dizin degisikligi desteklenmiyor",
+                               reason=contract.StopReason.PATH_NOT_ALLOWED)
+
+
+def _semantic_changes(before, after):
+    """Two projections become the change set, or a refusal.
+
+    Every unsupported shape is named: a path whose type changed, a bare
+    directory-metadata edit, an empty directory appearing or vanishing.
+    Guessing how to follow one of those is how an unreviewed edit
+    reaches the main checkout."""
+    changes, structural = [], []
+    for path in sorted(set(before) | set(after)):
+        left, right = before.get(path), after.get(path)
+        if left is not None and right is not None \
+                and left.compare == right.compare:
+            continue
+        if left is None:
+            if right.kind == "file":
+                changes.append(_Change(path=path, kind=ADDED,
+                                       mode=right.mode, sha256=right.sha256))
+            else:
+                structural.append(path)
+            continue
+        if right is None:
+            if left.kind == "file":
+                # THE BASELINE MODE, not a blank. Recording every
+                # deletion the same way erased the one field that told
+                # two otherwise identical deletions apart.
+                changes.append(_Change(path=path, kind=DELETED,
+                                       mode=left.mode, sha256=""))
+            else:
+                structural.append(path)
+            continue
+        if left.kind != right.kind:
+            raise UnsafeChange("yol turu degistirildi",
+                               reason=contract.StopReason.PATH_NOT_ALLOWED)
+        if right.kind != "file":
+            raise UnsafeChange("dizin ust verisi degisikligi desteklenmiyor",
+                               reason=contract.StopReason.PATH_NOT_ALLOWED)
+        changes.append(_Change(path=path, kind=MODIFIED, mode=right.mode,
+                               sha256=right.sha256))
+    _assert_structural(structural, changes)
+    return tuple(sorted(changes, key=lambda item: item.path))
 
 
 def _fingerprint(changes) -> str:
@@ -487,9 +453,10 @@ def _fingerprint(changes) -> str:
 # ---------------------------------------------------------------------
 
 def _tree_snapshot(root: Path) -> str:
-    """One digest over everything git can see about a checkout: HEAD,
-    the full inventory, and the bytes of every changed or untracked
-    regular file it lists.
+    """One digest over everything git can see about the OPERATOR'S
+    checkout: HEAD, the index and its per-entry flags, the full
+    inventory, and the bytes of every changed or untracked regular file
+    it lists.
 
     Ignored content is deliberately NOT walked -- `data/` is the
     repository's own guard and the leak scanner's, and traversing a
@@ -519,20 +486,6 @@ def _tree_snapshot(root: Path) -> str:
                     "anlik goruntudeki dosya okunamadi") from None
             digest.update(hashlib.sha256(payload).digest())
     return digest.hexdigest()
-
-
-def _assert_pristine(root: Path, baseline_sha: str):
-    """A disposable worktree that was already dirty makes attribution
-    impossible, so this runs BEFORE a model process exists."""
-    if _head(root) != baseline_sha:
-        raise UnsafeChange("calisma agaci taban surumde degil",
-                           reason=contract.StopReason.BASELINE_MISMATCH)
-    _assert_not_blinded(root)
-    records = _status(root)
-    if records:
-        raise UnsafeChange(f"calisma agacinda {len(records)} onceden var olan "
-                           f"degisiklik",
-                           reason=contract.StopReason.DIRTY_WORKTREE)
 
 
 # ---------------------------------------------------------------------
@@ -601,16 +554,43 @@ def _bind_task(task_path, repo: Path, manifest_digest: str, baseline_sha: str):
 
 
 def _assert_state_binding(state_dir: Path, repo: Path, run_id: str,
-                          baseline_sha: str, manifest_digest: str):
+                          baseline_sha: str, manifest_digest: str,
+                          workspace_id: str):
+    """The recorded run, asked about THIS workspace.
+
+    `workspace_id` is passed rather than left out: the binding schema
+    lets exactly one execution identity exist, and `get` on the absent
+    one answers `None` -- which would match a caller that asked about
+    nothing at all."""
     try:
-        binding = state_module.read_binding(state_dir)
+        binding = state_module.assert_binding(
+            state_dir, repo_id=state_module.repo_identity(repo),
+            baseline_sha=baseline_sha, manifest_digest=manifest_digest,
+            workspace_id=workspace_id)
     except state_module.CorruptState:
         raise EvidenceUnavailable("kosu baglamasi yok ya da bozuk") from None
-    expected = {"run_id": run_id, "baseline_sha": baseline_sha,
-                "manifest_digest": manifest_digest,
-                "repo_id": state_module.repo_identity(repo)}
-    if any(binding.get(field) != value for field, value in expected.items()):
+    except state_module.StateError:
+        raise EvidenceUnavailable("kosu baglamasi bu cagriyla uyusmuyor") \
+            from None
+    if binding.get("run_id") != run_id:
         raise EvidenceUnavailable("kosu baglamasi bu cagriyla uyusmuyor")
+
+
+def _bind_workspace(repo: Path, state_dir: Path, run_id: str,
+                    workspace_id: str, baseline_sha: str):
+    """The workspace, or a typed refusal. No path is accepted and none
+    is derived here: both roots come from the object this returns."""
+    try:
+        return flat_workspace.assert_binding(
+            repo, state_dir=state_dir, run_id=run_id,
+            workspace_id=workspace_id, baseline_sha=baseline_sha)
+    except flat_workspace.FlatWorkspaceError as refused:
+        # the lower layer's sentences are fixed and carry no path; its
+        # REASON is closed and is not re-decided here
+        raise UnsafeChange(str(refused),
+                           reason=getattr(refused, "reason",
+                                          contract.StopReason.PREFLIGHT_FAILED)
+                           ) from None
 
 
 # ---------------------------------------------------------------------
@@ -618,89 +598,80 @@ def _assert_state_binding(state_dir: Path, repo: Path, run_id: str,
 # ---------------------------------------------------------------------
 
 def run_verified_implementation(binary, *, repo, state_dir, task_path,
-                                manifest_digest, run_id, worktree_id,
+                                manifest_digest, run_id, workspace_id,
                                 baseline_sha, prompt, budget_usd,
                                 timeout_seconds, max_output_bytes,
                                 model=None) -> VerifiedChangeSet:
     """One implementer call, then proof of what it changed.
 
-    The caller passes IDENTITIES: no worktree path, no cwd, no
+    The caller passes IDENTITIES: no workspace path, no cwd, no
     allow/forbid list, no diff, no patch and no git result. The
     permissions come from the exact manifest bytes whose digest this
-    run was issued, and the working directory comes from B1's binding
+    run was issued, and the working directory comes from D3A's binding
     seam -- there is nothing here for a caller to substitute."""
     repo_path = Path(_exact_text(repo, "depo yolu"))
     state_path = Path(_exact_text(state_dir, "durum dizini"))
     manifest_digest = _exact_match(manifest_digest, _HEX64, "gorev ozeti")
     run_id = _exact_match(run_id, _RUN_ID, "kosu kimligi")
-    worktree_id = _exact_match(worktree_id, worktree.WORKTREE_ID,
-                               "calisma agaci kimligi")
+    workspace_id = _exact_match(workspace_id, flat_workspace.WORKSPACE_ID,
+                                "calisma alani kimligi")
     baseline_sha = _exact_match(baseline_sha, _SHA1, "taban surum")
 
     task_file, snapshot, task_relative = _bind_task(
         task_path, repo_path, manifest_digest, baseline_sha)
     _assert_state_binding(state_path, repo_path, run_id, baseline_sha,
-                          manifest_digest)
+                          manifest_digest, workspace_id)
     allowed = tuple(snapshot.task["allowed_paths"])
     forbidden = tuple(snapshot.task.get("forbidden_paths", ()))
 
-    try:
-        tree = worktree.assert_execution_binding(
-            repo_path, state_dir=state_path, run_id=run_id,
-            worktree_id=worktree_id, baseline_sha=baseline_sha)
-    except worktree.WorktreeError as refused:
-        raise EvidenceUnavailable(str(refused)) from None
-    identity_before = _git_identity(tree)
-    _assert_pristine(tree, baseline_sha)
-    index_before = _index_state(tree)
+    workspace = _bind_workspace(repo_path, state_path, run_id, workspace_id,
+                                baseline_sha)
+    # ONE key for every scan in this call. It is never written to state,
+    # never returned, never logged and never reused: it exists so the
+    # four manifests can be compared at all, and a key that outlived the
+    # call would be a key somebody could replay.
+    key = secrets.token_bytes(fs_evidence.KEY_BYTES)
+    reference_before, implementer_before = _read_pair(workspace, key)
+    if reference_before != implementer_before:
+        # attribution is impossible when the two trees did not start
+        # equal, so this refusal comes before a model process exists
+        raise UnsafeChange("calisma alani basta ayrisik",
+                           reason=contract.StopReason.DIRTY_WORKTREE)
     main_before = _tree_snapshot(repo_path)
     task_before = snapshot.digest
 
     def verify_after():
         """Everything that must NOT have moved, then the change set."""
-        try:
-            again = worktree.assert_execution_binding(
-                repo_path, state_dir=state_path, run_id=run_id,
-                worktree_id=worktree_id, baseline_sha=baseline_sha)
-        except worktree.WorktreeError as refused:
-            raise EvidenceUnavailable(str(refused)) from None
-        if not _same_place(again, tree) or _git_identity(tree) != \
-                identity_before:
-            raise UnsafeChange("calisma agaci baglantisi degisti",
-                               reason=contract.StopReason.PREFLIGHT_FAILED)
+        again = _bind_workspace(repo_path, state_path, run_id, workspace_id,
+                                baseline_sha)
+        _assert_state_binding(state_path, repo_path, run_id, baseline_sha,
+                              manifest_digest, workspace_id)
         if preflight.manifest_changed(task_file, snapshot) or \
                 preflight.snapshot_manifest(task_file).digest != task_before:
             raise UnsafeChange("gorev dosyasi degistirildi",
                                reason=contract.StopReason.PATH_NOT_ALLOWED)
-        _assert_state_binding(state_path, repo_path, run_id, baseline_sha,
-                              manifest_digest)
         if _tree_snapshot(repo_path) != main_before:
             raise UnsafeChange("ana calisma agaci degistirildi",
                                reason=contract.StopReason.PATH_NOT_ALLOWED)
-        # BEFORE the inventory is trusted, and it is THE index gate: a
-        # flagged index made `status` come back empty while a
-        # control-plane file's bytes had changed on disk, and any
-        # staging moves the same listing. Nothing downstream re-checks
-        # the index, so this refusal is the only one and its removal is
-        # always observable.
-        _assert_not_blinded(tree)
-        if _index_state(tree) != index_before:
-            raise UnsafeChange("calisma agaci indeksi degistirildi",
-                               reason=contract.StopReason.STAGED_CHANGES)
-        changes = []
-        for record, source in _status(tree):
-            change = _classify(record, source, tree)
+        reference_after, implementer_after = _read_pair(again, key)
+        if reference_after != reference_before:
+            # the copy the work is measured against moved, so no
+            # difference derived from it describes this call
+            raise UnsafeChange("referans agac degistirildi",
+                               reason=contract.StopReason.PATH_NOT_ALLOWED)
+        changes = _semantic_changes(reference_after, implementer_after)
+        for change in changes:
             _authorize(change.path, allowed=allowed, forbidden=forbidden,
                        task_relative=task_relative)
-            changes.append(change)
-        return tuple(sorted(changes, key=lambda item: item.path))
+        return changes
 
     failure = None
     try:
         outcome = execution.run_implementer(
             binary, repo=repo_path, state_dir=state_path, run_id=run_id,
-            worktree_id=worktree_id, baseline_sha=baseline_sha, prompt=prompt,
-            budget_usd=budget_usd, timeout_seconds=timeout_seconds,
+            workspace_id=workspace_id, baseline_sha=baseline_sha,
+            prompt=prompt, budget_usd=budget_usd,
+            timeout_seconds=timeout_seconds,
             max_output_bytes=max_output_bytes, model=model)
     except BaseException as raised:
         failure = raised
@@ -714,11 +685,11 @@ def run_verified_implementation(binary, *, repo, state_dir, task_path,
         except ChangeSetError as violation:
             raise violation from failure
 
-    return _accept(outcome, actual, run_id=run_id, worktree_id=worktree_id,
+    return _accept(outcome, actual, run_id=run_id, workspace_id=workspace_id,
                    baseline_sha=baseline_sha)
 
 
-def _accept(outcome, actual, *, run_id, worktree_id, baseline_sha):
+def _accept(outcome, actual, *, run_id, workspace_id, baseline_sha):
     """The declaration is compared to the evidence, exactly."""
     reply = outcome.reply
     if reply.get("run_id") != run_id:
@@ -726,9 +697,13 @@ def _accept(outcome, actual, *, run_id, worktree_id, baseline_sha):
     declared = reply.get("changed_files", [])
     if any(type(item) is not str for item in declared):
         raise DeclarationMismatch("bildirilen dosya listesi tam metin degil")
-    if len(set(declared)) != len(declared):
+    # CANONICAL spellings on both sides. Comparing raw text let the same
+    # path arrive twice as `a/b.py` and `./a//b.py`, which is a duplicate
+    # the set never saw.
+    canonical = [_fold(item) for item in declared]
+    if len(set(canonical)) != len(canonical):
         raise DeclarationMismatch("bildirilen dosya listesi yinelemeli")
-    if set(declared) != {change.path for change in actual}:
+    if set(canonical) != {_fold(change.path) for change in actual}:
         # BOTH directions: a forgotten file is as much a mismatch as an
         # invented one, and a subset comparison sees neither
         raise DeclarationMismatch("bildirilen degisiklikler gerceklesenlerle "
@@ -739,7 +714,7 @@ def _accept(outcome, actual, *, run_id, worktree_id, baseline_sha):
             "tamamlanmamis yanit yine de dosya degistirdi")
     kinds = [change.kind for change in actual]
     return VerifiedChangeSet(
-        run_id=run_id, worktree_id=worktree_id, baseline_sha=baseline_sha,
+        run_id=run_id, workspace_id=workspace_id, baseline_sha=baseline_sha,
         status=status,
         changed_files=tuple(change.path for change in actual),
         added=kinds.count(ADDED), modified=kinds.count(MODIFIED),

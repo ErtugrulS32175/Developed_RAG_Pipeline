@@ -409,10 +409,14 @@ MUTATIONS = [
     # a self-attack first; two SURVIVED that round and the mechanism
     # was corrected before they became manifest entries.
     # ----------------------------------------------------------------
+    # B2B-B2A2 RETARGETED. The inventory this switch belongs to now
+    # serves the MAIN CHECKOUT guard, so the test that proves an
+    # untracked file cannot hide moved with it. The mutation and what it
+    # means are unchanged.
     ("b2ba-izlenmeyen-korlugu", "changes",
      '               "--untracked-files=all", "--ignore-submodules=none",',
      '               "--untracked-files=no", "--ignore-submodules=none",',
-     "test_an_untracked_file_that_git_diff_would_omit_is_still_seen"),
+     "test_an_untracked_edit_to_the_operator_checkout_is_still_seen"),
     ("b2ba-onek-kacisi", "changes",
      "        if trimmed and (folded == trimmed" + NL
      + '                        or folded.startswith(trimmed + "/")):',
@@ -427,9 +431,11 @@ MUTATIONS = [
      + "               for pattern in contract.CONTROL_PLANE_GLOBS)",
      "    return False",
      "test_a_test_file_invented_tomorrow_is_caught_by_the_glob"),
+    # B2B-B2A2: both sides of the comparison are canonical spellings
+    # now. The direction the mutation removes is the same one.
     ("b2ba-alt-kume", "changes",
-     "    if set(declared) != {change.path for change in actual}:",
-     "    if not set(declared) <= {change.path for change in actual}:",
+     "    if set(canonical) != {_fold(change.path) for change in actual}:",
+     "    if not set(canonical) <= {_fold(change.path) for change in actual}:",
      "test_a_change_the_model_omits_is_refused"),
     ("b2ba-git-rc", "changes",
      "    if done.returncode != 0:",
@@ -465,32 +471,41 @@ MUTATIONS = [
      + "            raise violation from failure",
      "    actual = verify_after()",
      "test_a_forbidden_edit_outranks_the_call_failure_and_chains_it"),
+    # B2B-B2A2 RETARGETED. The type gate moved from "the file git named"
+    # to "the entry the walker described", and it is still ONE gate: a
+    # symlink and a junction both arrive as a link carrying a keyed
+    # fingerprint, so a second branch would be invisible to remove.
     ("b2ba-dosya-turu", "changes",
-     "    if (not stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode)"
-     + NL + '            or getattr(entry, "st_reparse_tag", 0)):',
-     "    if False:",
-     "test_a_symlink_is_refused"),
+     '        if (entry.kind not in ("file", "dir") or entry.reparse_tag' + NL
+     + "                or entry.link_target_mac):",
+     "        if False:",
+     "test_an_object_this_evidence_model_cannot_represent_is_refused"),
     ("b2ba-kosu-kimligi", "changes",
      '    if reply.get("run_id") != run_id:',
      "    if False:",
      "test_a_reply_naming_another_run_is_refused"),
     ("b2ba-yineleme", "changes",
-     "    if len(set(declared)) != len(declared):",
+     "    if len(set(canonical)) != len(canonical):",
      "    if False:",
      "test_a_duplicate_declaration_is_refused"),
     # ----------------------------------------------------------------
     # B2B-A R1 -- the six audit findings, each as its own mutation
     # ----------------------------------------------------------------
-    ("b2bar1-indeks-bayragi", "changes",
-     "    blinded = _blinded_entries(cwd)" + NL
-     + "    if blinded:",
-     "    blinded = _blinded_entries(cwd)" + NL
-     + "    if False:",
-     "test_a_pre_existing_index_flag_is_refused_before_the_model_starts"),
+    # B2B-B2A2 RETARGETED. The disposable worktree had two index gates
+    # -- one refusing a blinded index outright, one comparing the index
+    # digest across the call -- and BOTH described an authority the flat
+    # workspace no longer has: its evidence never consults git at all,
+    # which `test_git_never_asks_about_the_flat_roots...` pins directly.
+    # What remains is the index of the OPERATOR'S checkout, still inside
+    # the main-checkout snapshot, and the P0 it was written for survives
+    # there verbatim: `skip-worktree` empties `status` while the bytes on
+    # disk move, and the per-entry flag listing is the only thing that
+    # notices. `b2bar1-indeks-bayragi` has no source left to mutate and
+    # is dropped rather than aimed at something it never meant.
     ("b2bar1-indeks-digesti", "changes",
-     "        if _index_state(tree) != index_before:",
-     "        if False:",
-     "test_a_staged_change_is_refused"),
+     '    digest.update(_index_state(root).encode("ascii"))',
+     '    digest.update(b"")',
+     "test_a_blinded_index_cannot_hide_a_main_checkout_edit"),
     ("b2bar1-manifest-icerde", "changes",
      "    if relative is None:" + NL
      + '        raise EvidenceUnavailable("gorev dosyasi depo agacinin '
@@ -510,16 +525,16 @@ MUTATIONS = [
      + '    return joined.casefold() if os.name == "nt" else joined',
      '    return str(text).replace("' + BS + BS + '", "/").rstrip("/")',
      "test_a_forbidden_entry_cannot_be_escaped_by_spelling"),
+    # B2B-B2A2 RETARGETED. Same finding, same intent, new evidence: a
+    # deletion carries the mode the file HAD, because recording every
+    # deletion the same way erases the one field that tells two
+    # otherwise identical deletions apart in the fingerprint.
     ("b2bar1-silme-modu", "changes",
-     "        if mode_head not in _PLAIN_MODES:" + NL
-     + '            raise UnsafeChange("siradan olmayan dosya modu",' + NL
-     + "                               reason=contract.StopReason."
-     "PATH_NOT_ALLOWED)" + NL
-     + "        return _Change(path=path, kind=DELETED, mode=mode_head, "
-     'sha256="")',
-     "        return _Change(path=path, kind=DELETED, mode="
-     '"000000", sha256="")',
-     "test_a_symlink_deletion_is_refused_and_modes_reach_the_fingerprint"),
+     "                changes.append(_Change(path=path, kind=DELETED," + NL
+     + "                                       mode=left.mode, sha256=\"\"))",
+     "                changes.append(_Change(path=path, kind=DELETED," + NL
+     + "                                       mode=\"000000\", sha256=\"\"))",
+     "test_the_classifier_keeps_modes_and_refuses_empty_directory_changes"),
     ("b2bar1-snapshot-okuma", "changes",
      "            except OSError:" + NL
      + "                # a file git listed but nobody can read is an" + NL
@@ -531,12 +546,15 @@ MUTATIONS = [
      "            except OSError:" + NL
      + "                raise",
      "test_an_unreadable_snapshot_file_is_typed_and_silent"),
+    # B2B-B2A2 RETARGETED. "Already dirty" is now "the two trees did not
+    # start equal" -- the same refusal, before a model process exists,
+    # for the same reason: attribution is impossible otherwise.
     ("b2ba-kirli-agac", "changes",
-     "    records = _status(root)" + NL
-     + "    if records:",
-     "    records = _status(root)" + NL
-     + "    if False:",
-     "test_a_dirty_worktree_is_refused_before_the_model_starts"),
+     "    reference_before, implementer_before = _read_pair(workspace, key)"
+     + NL + "    if reference_before != implementer_before:",
+     "    reference_before, implementer_before = _read_pair(workspace, key)"
+     + NL + "    if False:",
+     "test_a_workspace_that_starts_out_of_step_is_refused_before_the_model"),
     ("b2ar1-arac-yansimasi", "cli",
      '            f"implementer izinli olmayan {len(forbidden)} arac '
      'istedi; "',
@@ -617,6 +635,10 @@ def _pytest(workdir, extra):
             "tests/test_agent_loop_b2_execution.py",
             "tests/test_agent_loop_contract.py",
             "tests/test_agent_loop_b2_changes.py",
+            # B2B-B2A2: the migrated change-set mechanism lives here, and
+            # several manifest targets name it -- a battery that could not
+            # run it would judge every one of them MISDIRECTED.
+            "tests/test_agent_loop_b2_changes_flat.py",
             "-q", "--no-header", "-p", "no:cacheprovider", "-rf"] + extra
     # a temp directory of the HARNESS's own. The battery derives its
     # worktree root from the process temp directory, so a run that
