@@ -33,17 +33,22 @@ MODULES = ("state", "locking", "worktree", "preflight", "execution",
            "cli", "schemas", "changes")
 NL = chr(10)
 
-# The execution-binding block in `run_implementer`, verbatim: two R2A
-# mutations rewrite it and both must keep matching the real source.
+# The LEGACY execution-binding block in `run_implementer`, verbatim: two
+# R2A mutations rewrite it and both must keep matching the real source.
+#
+# Re-indented for B2B-B1, which put this block inside the `else:` arm of
+# the temporary flat-workspace bridge. Nothing about what the two
+# mutations mean changed -- only where the block sits. B2B-B2C deletes
+# the legacy arm, and these two mutations go with it.
 BINDING_TRY = (
-    "    try:" + NL
-    + "        cwd = worktree.assert_execution_binding(" + NL
-    + "            call.repo, state_dir=call.state_dir, run_id=call.run_id,"
-    + NL
-    + "            worktree_id=call.worktree_id,"
+    "        try:" + NL
+    + "            cwd = worktree.assert_execution_binding(" + NL
+    + "                call.repo, state_dir=call.state_dir,"
+    + " run_id=call.run_id," + NL
+    + "                worktree_id=call.worktree_id,"
     + " baseline_sha=call.baseline_sha)" + NL
-    + "    except worktree.WorktreeError as refused:" + NL
-    + "        raise WorktreeNotBound(str(refused)) from None")
+    + "        except worktree.WorktreeError as refused:" + NL
+    + "            raise WorktreeNotBound(str(refused)) from None")
 BS = chr(92)
 
 # (label, module, old, new, expected_test_substring)
@@ -274,15 +279,20 @@ MUTATIONS = [
      'cozuluyor")',
      "        pass",
      "test_a_link_that_resolves_outside_the_holder_is_refused"),
+    # Both replacements carry the SAME indentation as the block they
+    # replace. A mutant that does not parse is not a surviving guard --
+    # it is a mutant nobody could run, and it would be counted red for
+    # the wrong reason.
     ("r2a-bag-cagrisi-yok", "execution",
      BINDING_TRY,
-     "    cwd = worktree.holder_for(worktree_id) / worktree.WORKTREE_DIRNAME",
+     "        cwd = worktree.holder_for(worktree_id)"
+     " / worktree.WORKTREE_DIRNAME",
      "test_a_missing_record_is_refused"),
     ("r2a-cagiran-yolu", "execution",
      BINDING_TRY,
      BINDING_TRY.replace("cwd = worktree.assert_execution_binding(",
                          "worktree.assert_execution_binding(")
-     + NL + "    cwd = Path(repo)",
+     + NL + "        cwd = Path(repo)",
      "test_the_model_runs_exactly_in_the_derived_recorded_worktree"),
     # ----------------------------------------------------------------
     # R2B -- one canonical inline schema: bytes, hash, argv, validator
