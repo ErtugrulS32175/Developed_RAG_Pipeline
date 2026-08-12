@@ -61,7 +61,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from tools.agent_loop import cli, contract, schemas, worktree
+from tools.agent_loop import cli, contract, flat_workspace, schemas, worktree
 from tools.agent_loop.process import (
     BoundedStream, Container, ContainmentError, PromptWriter,
     REAP_SECONDS, READ_CHUNK_BYTES, join_within,
@@ -464,6 +464,13 @@ class WorktreeNotBound(AdapterError):
                          reason=contract.StopReason.PREFLIGHT_FAILED)
 
 
+# The SAME class under the name the flat-workspace branch refuses with.
+# Deliberately an alias and not a second type: two error classes that
+# mean "the identities do not name a place this may run" would let a
+# caller handle one and miss the other.
+WorkspaceNotBound = WorktreeNotBound
+
+
 class ContainmentFailed(AdapterError):
     """The container could not be established, so nothing was run.
 
@@ -537,7 +544,14 @@ class _CanonicalImplementerCall:
     repo: Path
     state_dir: Path
     run_id: str
-    worktree_id: str
+    # EXACTLY ONE of these is a `str`; the other is `None`. Which one
+    # decided the working directory is recorded as a closed kind rather
+    # than re-derived later from "whichever is not None" -- that is a
+    # second question, and this package's whole family of defects was a
+    # second question about an already-checked value.
+    worktree_id: object
+    workspace_id: object
+    execution_kind: str
     baseline_sha: str
     prompt_bytes: bytes
     budget_usd: object            # exact int or float, bounded
@@ -546,9 +560,41 @@ class _CanonicalImplementerCall:
     model: object                 # exact str or None
 
 
+# TEMPORARY B2B-B BRIDGE. Two callers exist at once: `changes.py` still
+# names a disposable git worktree, and the B2B-B2 path names a D3A flat
+# workspace. Removed after `changes.py` switches to `workspace_id`.
+WORKTREE_EXECUTION = "worktree"
+WORKSPACE_EXECUTION = "workspace"
+
+
+def _execution_identity(worktree_id, workspace_id):
+    """EXACTLY ONE identity, chosen here and never re-derived.
+
+    Neither absent and both present are the same defect wearing two
+    faces: in each case the working directory would come from a rule
+    nobody wrote down. Silently preferring one is worse than refusing --
+    a caller that passed both believes something about which one won."""
+    verilen = [ad for ad, deger in (("worktree", worktree_id),
+                                    ("workspace", workspace_id))
+               if deger is not None]
+    if not verilen:
+        # a MISSING required identity is an identity problem, and the
+        # frozen suite already pins `None` in an identity slot to this
+        # refusal -- the bridge's defaults must not quietly re-type it
+        raise IdentityRefused("calisma alani kimligi verilmedi")
+    if len(verilen) != 1:
+        raise CallInputRefused(
+            "cagri tam olarak bir calisma alani kimligi tasimali")
+    if verilen[0] == "workspace":
+        return WORKSPACE_EXECUTION, None, _exact_identity(
+            workspace_id, flat_workspace.WORKSPACE_ID, "calisma alani kimligi")
+    return WORKTREE_EXECUTION, _exact_identity(
+        worktree_id, worktree.WORKTREE_ID, "calisma agaci kimligi"), None
+
+
 def _canonical_call(binary, *, repo, state_dir, run_id, worktree_id,
-                    baseline_sha, prompt, budget_usd, timeout_seconds,
-                    max_output_bytes, model):
+                    workspace_id, baseline_sha, prompt, budget_usd,
+                    timeout_seconds, max_output_bytes, model):
     """Validate and convert, in the order the refusals are cheapest.
 
     Budget, bounds, prompt and binary come before the identities so a
@@ -558,6 +604,10 @@ def _canonical_call(binary, *, repo, state_dir, run_id, worktree_id,
     canonical_budget = _canonical_budget(budget_usd)
     canonical_timeout, canonical_output = _canonical_limits(
         timeout_seconds, max_output_bytes)
+    # decided BEFORE anything touches a filesystem, so a call carrying
+    # both identities or neither never reaches a binding at all
+    kind, worktree_id, workspace_id = _execution_identity(worktree_id,
+                                                          workspace_id)
     # ONE boundary for the CLI layer's refusals. `cli.UnsafeInvocation`
     # is not an `AdapterError`, and one escaping here broke this
     # function's own promise -- the runner's closed state machine would
@@ -575,27 +625,35 @@ def _canonical_call(binary, *, repo, state_dir, run_id, worktree_id,
             repo=_canonical_path(repo, "depo yolu"),
             state_dir=_canonical_path(state_dir, "durum dizini"),
             run_id=_exact_identity(run_id, _RUN_ID_PATTERN, "kosu kimligi"),
-            worktree_id=_exact_identity(worktree_id, worktree.WORKTREE_ID,
-                                        "calisma agaci kimligi"),
+            worktree_id=worktree_id, workspace_id=workspace_id,
+            execution_kind=kind,
             baseline_sha=_exact_identity(baseline_sha, _BASELINE_PATTERN,
                                          "taban surum"))
     except cli.UnsafeInvocation as refused:
         raise CallInputRefused(str(refused)) from None
 
 
-def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
+def run_implementer(binary, *, repo, state_dir, run_id,
                     baseline_sha, prompt, budget_usd,
-                    timeout_seconds, max_output_bytes, model=None):
+                    timeout_seconds, max_output_bytes, model=None,
+                    worktree_id=None, workspace_id=None):
     """Run the implementer once and return its validated reply.
 
-    The working directory is derived from the identities by
-    `worktree.assert_execution_binding`, and the schema is the frozen
-    canonical binding -- there is no way to pass either one in.
-    Raises a typed `AdapterError` for every refusal. Nothing here
-    retries, repairs or decides what happens next."""
+    The working directory is derived from the identities -- by
+    `flat_workspace.assert_binding` for a workspace, by
+    `worktree.assert_execution_binding` for the legacy worktree -- and
+    the schema is the frozen canonical binding. There is no way to pass
+    either one in. Raises a typed `AdapterError` for every refusal.
+    Nothing here retries, repairs or decides what happens next.
+
+    EXACTLY ONE of `worktree_id` and `workspace_id` is required. Both
+    are keyword-only and both default to `None` only so the temporary
+    B2B-B bridge can carry two callers at once; neither omitting both
+    nor supplying both is accepted."""
     call = _canonical_call(
         binary, repo=repo, state_dir=state_dir, run_id=run_id,
-        worktree_id=worktree_id, baseline_sha=baseline_sha, prompt=prompt,
+        worktree_id=worktree_id, workspace_id=workspace_id,
+        baseline_sha=baseline_sha, prompt=prompt,
         budget_usd=budget_usd, timeout_seconds=timeout_seconds,
         max_output_bytes=max_output_bytes, model=model)
     # THE RAW ARGUMENTS ARE GONE, and that is the enforcement rather
@@ -603,7 +661,8 @@ def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
     # in this family was a second look at a caller's object after a
     # check had already agreed with it. Reaching for one now is a
     # NameError the positive-control tests hit on the first run.
-    del binary, repo, state_dir, run_id, worktree_id, baseline_sha
+    del binary, repo, state_dir, run_id, worktree_id, workspace_id
+    del baseline_sha
     del prompt, budget_usd, timeout_seconds, max_output_bytes, model
 
     argv = cli.build_implementer_argv(call.binary, budget_usd=call.budget_usd,
@@ -618,12 +677,26 @@ def run_implementer(binary, *, repo, state_dir, run_id, worktree_id,
     # use of it. The filesystem offers no transaction here -- a hostile
     # same-user process can still race this window -- but the window is
     # kept to the launch itself.
-    try:
-        cwd = worktree.assert_execution_binding(
-            call.repo, state_dir=call.state_dir, run_id=call.run_id,
-            worktree_id=call.worktree_id, baseline_sha=call.baseline_sha)
-    except worktree.WorktreeError as refused:
-        raise WorktreeNotBound(str(refused)) from None
+    if call.execution_kind == WORKSPACE_EXECUTION:
+        try:
+            # the IMPLEMENTER root, never the reference tree: the model
+            # must have no path to the copy it is going to be compared
+            # against
+            cwd = flat_workspace.assert_binding(
+                call.repo, state_dir=call.state_dir, run_id=call.run_id,
+                workspace_id=call.workspace_id,
+                baseline_sha=call.baseline_sha).implementer_root
+        except flat_workspace.FlatWorkspaceError as refused:
+            raise WorkspaceNotBound(str(refused)) from None
+    else:
+        # Temporary B2B-B bridge. Removed after changes.py switches to
+        # workspace_id.
+        try:
+            cwd = worktree.assert_execution_binding(
+                call.repo, state_dir=call.state_dir, run_id=call.run_id,
+                worktree_id=call.worktree_id, baseline_sha=call.baseline_sha)
+        except worktree.WorktreeError as refused:
+            raise WorktreeNotBound(str(refused)) from None
 
     # THE CONTAINER EXISTS BEFORE THE PROGRAM RUNS. Creating the
     # process and containing it afterwards leaves a window in which the

@@ -1158,6 +1158,10 @@ def test_the_signature_offers_no_path_parameter_at_all():
     parameters = inspect.signature(execution.run_implementer).parameters
     assert set(parameters) == {
         "binary", "repo", "state_dir", "run_id", "worktree_id",
+        # B2B-B1 bridge: the flat-workspace identity. An IDENTITY, not a
+        # path -- the escape list below is unchanged and still empty.
+        # `worktree_id` leaves when B2B-B2 removes the legacy branch.
+        "workspace_id",
         "baseline_sha", "prompt", "budget_usd",
         "timeout_seconds", "max_output_bytes", "model"}
     for escape in ("worktree", "cwd", "path", "workdir", "working_dir",
