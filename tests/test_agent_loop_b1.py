@@ -1247,10 +1247,17 @@ def test_every_mutation_still_applies_to_the_current_source():
     # concept to switch off, no exit code to ignore and no index to be
     # blinded, so none of the three has an honest target left; each
     # intent is pinned as behaviour in the main-guard battery instead.
-    assert len(tool.MUTATIONS) == 63
+    #
+    # B2B-C1: 63 -> 67. The acceptance package adds one mutation per
+    # mechanism it exists for -- the claim is re-derived from fresh
+    # evidence, the argv comes from the frozen registry, an incomplete
+    # read is not an answer, and a container's verdict is consumed.
+    assert len(tool.MUTATIONS) == 67
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
+        'b2bc1-bosaltma-hukmu', 'b2bc1-kayit-disi-argv', 'b2bc1-okuma-hukmu',
+        'b2bc1-taze-dogrulama',
         'allowlist-test-ailesi', 'b2a-arac-tipi', 'b2a-argv-token-tipi',
         'b2a-butce-tavani', 'b2a-butce-tipi', 'b2a-ikili-donusu',
         'b2a-istem-tipi', 'b2a-kimlik-tipi', 'b2a-model-tipi',
@@ -1307,7 +1314,10 @@ def test_every_mutation_names_a_test_that_exists():
                      "test_agent_loop_b2_main_guard.py",
                      # B2B-B2C: the state binding battery is where
                      # the required-identity guard is judged now.
-                     "test_agent_loop_state_binding.py"))
+                     "test_agent_loop_state_binding.py",
+                     # B2B-C1: the acceptance battery, named by all four
+                     # of that package's mutations.
+                     "test_agent_loop_b2_acceptance.py"))
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
     assert missing == [], f"var olmayan hedef test adi: {missing}"

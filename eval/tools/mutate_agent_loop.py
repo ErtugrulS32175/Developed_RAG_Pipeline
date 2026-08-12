@@ -30,7 +30,7 @@ from pathlib import Path
 
 SOURCE_REPO = Path(__file__).resolve().parents[2]
 MODULES = ("state", "locking", "preflight", "execution",
-           "cli", "schemas", "changes")
+           "cli", "schemas", "changes", "acceptance")
 NL = chr(10)
 
 BS = chr(92)
@@ -434,6 +434,43 @@ MUTATIONS = [
      "    if False:" + NL
      + '        raise IdentityRefused(f"{what} sozlesme desenine uymuyor")',
      "test_a_deceptive_identity_never_reaches_the_workspace_binding"),
+    # ----------------------------------------------------------------
+    # B2B-C1 -- frozen acceptance commands in a disposable mirror. Four
+    # mutations, one per mechanism the package exists for: the claim is
+    # re-derived, the argv comes from the registry, an incomplete read is
+    # not an answer, and a container's verdict is consumed.
+    # ----------------------------------------------------------------
+    ("b2bc1-taze-dogrulama", "acceptance",
+     "    if (verified.changed_files, verified.added, verified.modified,"
+     + NL + "            verified.deleted, verified.fingerprint) != (" + NL
+     + "            candidate.changed_files, candidate.added, "
+     "candidate.modified," + NL
+     + "            candidate.deleted, candidate.fingerprint):",
+     "    if False:",
+     "test_a_stale_verified_change_set_is_refused_against_fresh_evidence"),
+    ("b2bc1-kayit-disi-argv", "acceptance",
+     "    try:" + NL
+     + "        argv = cli.resolve_registry_command(command_id," + NL
+     + "                                            "
+     "contract.COMMAND_REGISTRY," + NL
+     + "                                            paths=paths)" + NL
+     + "    except cli.UnsafeInvocation:" + NL
+     + '        raise AcceptanceRefused("kabul komutu cozumlenemedi") '
+     "from None",
+     '    argv = list(contract.COMMAND_REGISTRY[command_id]["argv"]) '
+     "+ list(paths)",
+     "test_only_the_registry_decides_what_a_path_argument_may_be"),
+    ("b2bc1-okuma-hukmu", "acceptance",
+     "        if not joined or any(stream.outcome != process.READ_COMPLETED"
+     + NL + "                             for stream in streams):",
+     "        if False:",
+     "test_output_overflow_timeout_and_a_failed_reader_are_all_refusals"),
+    ("b2bc1-bosaltma-hukmu", "acceptance",
+     "        drained = container.drain(grace)" + NL
+     + "        joined = process.join_within(streams, grace)",
+     "        drained = True" + NL
+     + "        joined = process.join_within(streams, grace)",
+     "test_a_successful_parent_may_not_leave_a_living_grandchild"),
 ]
 
 
@@ -486,6 +523,10 @@ def _pytest(workdir, extra):
             # B2B-B2B: the main-checkout guard's own battery, named by
             # the retargeted walker-seam mutation.
             "tests/test_agent_loop_b2_main_guard.py",
+            # B2B-C1: the acceptance battery, named by all four of that
+            # package's mutations -- a battery that could not run it
+            # would judge every one of them MISDIRECTED.
+            "tests/test_agent_loop_b2_acceptance.py",
             "-q", "--no-header", "-p", "no:cacheprovider", "-rf"] + extra
     # a temp directory of the HARNESS's own. The battery derives its
     # worktree root from the process temp directory, so a run that
@@ -574,7 +615,7 @@ def main():
         imported = subprocess.run(
             [sys.executable, "-c",
              "from tools.agent_loop import (state, locking, "
-             "preflight, execution, cli, schemas, changes)"],
+             "preflight, execution, cli, schemas, changes, acceptance)"],
             cwd=str(workdir), capture_output=True, text=True)
         if imported.returncode != 0:
             path.write_text(original, encoding="utf-8")

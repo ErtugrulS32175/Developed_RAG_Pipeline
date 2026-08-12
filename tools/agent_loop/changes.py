@@ -676,6 +676,86 @@ def run_verified_implementation(binary, *, repo, state_dir, task_path,
                    baseline_sha=baseline_sha)
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateChanges:
+    """The candidate, RE-DERIVED from the filesystem AFTER the fact.
+
+    Everything a `VerifiedChangeSet` says about what changed, derived a
+    second time from a fresh read of the same two trees -- plus the
+    per-entry records a later step needs to reproduce the candidate
+    somewhere else, and the acceptance commands the exact manifest bytes
+    name. No path, no bytes, no patch."""
+
+    run_id: str
+    workspace_id: str
+    baseline_sha: str
+    changed_files: tuple
+    added: int
+    modified: int
+    deleted: int
+    fingerprint: str
+    task_digest: str
+    acceptance_commands: tuple
+    changes: tuple
+
+
+def derive_candidate_changes(*, repo, state_dir, task_path, manifest_digest,
+                             run_id, workspace_id, baseline_sha
+                             ) -> CandidateChanges:
+    """The change set, derived AGAIN from fresh filesystem evidence.
+
+    WHY THIS SEAM EXISTS. A `VerifiedChangeSet` is a statement about a
+    moment that has ended: the implementer call returned, and between
+    that return and whatever happens next the workspace is an ordinary
+    directory. Anything that acts on the candidate -- running its tests,
+    copying it somewhere -- has to ask the filesystem again rather than
+    replay a record, and it must ask through the SAME authority, or the
+    two derivations are two different opinions.
+
+    So this is `run_verified_implementation`'s verification half with no
+    model call in front of it: the same manifest binding, the same state
+    and workspace bindings, the same walker, the same classifier and the
+    same authorization order. Nothing here is a second implementation of
+    any of them."""
+    repo_path = Path(_exact_text(repo, "depo yolu"))
+    state_path = Path(_exact_text(state_dir, "durum dizini"))
+    manifest_digest = _exact_match(manifest_digest, _HEX64, "gorev ozeti")
+    run_id = _exact_match(run_id, _RUN_ID, "kosu kimligi")
+    workspace_id = _exact_match(workspace_id, flat_workspace.WORKSPACE_ID,
+                                "calisma alani kimligi")
+    baseline_sha = _exact_match(baseline_sha, _SHA1, "taban surum")
+
+    _, snapshot, task_relative = _bind_task(
+        task_path, repo_path, manifest_digest, baseline_sha)
+    _assert_state_binding(state_path, repo_path, run_id, baseline_sha,
+                          manifest_digest, workspace_id)
+    workspace = _bind_workspace(repo_path, state_path, run_id, workspace_id,
+                                baseline_sha)
+    # ONE call-local key, exactly as the implementer path uses: it exists
+    # so the two manifests can be compared at all, and a key that
+    # outlived the call would be a key somebody could replay.
+    key = secrets.token_bytes(fs_evidence.KEY_BYTES)
+    reference, implementer = _read_pair(workspace, key)
+    actual = _semantic_changes(reference, implementer)
+    allowed = tuple(snapshot.task["allowed_paths"])
+    forbidden = tuple(snapshot.task.get("forbidden_paths", ()))
+    for change in actual:
+        _authorize(change.path, allowed=allowed, forbidden=forbidden,
+                   task_relative=task_relative)
+    kinds = [change.kind for change in actual]
+    return CandidateChanges(
+        run_id=run_id, workspace_id=workspace_id, baseline_sha=baseline_sha,
+        changed_files=tuple(change.path for change in actual),
+        added=kinds.count(ADDED), modified=kinds.count(MODIFIED),
+        deleted=kinds.count(DELETED), fingerprint=_fingerprint(actual),
+        task_digest=snapshot.digest,
+        acceptance_commands=tuple(
+            (reference_item["command_id"],
+             tuple(reference_item.get("paths", ())))
+            for reference_item in snapshot.task["acceptance_commands"]),
+        changes=actual)
+
+
 def _accept(outcome, actual, *, run_id, workspace_id, baseline_sha):
     """The declaration is compared to the evidence, exactly."""
     reply = outcome.reply
