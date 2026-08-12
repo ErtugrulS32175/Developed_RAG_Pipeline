@@ -349,25 +349,31 @@ class Container:
             self._job = None
 
 
-def launch_contained(argv, *, cwd):
+def launch_contained(argv, *, cwd, env=None):
     """Start `argv` inside a container that already exists.
 
     Returns `(process, container)`. Raises `ContainmentError` WITHOUT
     running the program if the container cannot be established -- an
     uncontained model call is a call nobody can stop, and it costs money
-    to discover that afterwards."""
+    to discover that afterwards.
+
+    `env=None` keeps the inherited environment, which is what every
+    existing caller wants. A mapping is passed to `Popen` EXACTLY as
+    given and is never merged with `os.environ` again: a caller that
+    built an isolated environment did so to leave things out, and
+    re-merging would put them back."""
     if os.name != "nt":
         process = subprocess.Popen(
             argv, cwd=str(cwd), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-            shell=False, start_new_session=True)
+            shell=False, start_new_session=True, env=env)
         # `setsid()` ran between fork and exec, so the session existed
         # before the program did: nothing to race with
         return process, Container(process, pgid=process.pid)
 
     process = subprocess.Popen(
         argv, cwd=str(cwd), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, bufsize=0, shell=False,
+        stderr=subprocess.PIPE, bufsize=0, shell=False, env=env,
         creationflags=(_CREATE_SUSPENDED | subprocess.CREATE_NEW_PROCESS_GROUP))
     try:
         job = _attach_job(process.pid)
@@ -412,40 +418,70 @@ def _discard(process):
     return process.poll() is not None
 
 
+# How a reader ENDED. Three outcomes, and the third is the one that was
+# missing: a pipe that broke mid-read used to be indistinguishable from
+# a short answer, so a truncated buffer arrived beside a clean exit code
+# and was treated as the whole output.
+READ_PENDING = "pending"
+READ_COMPLETED = "completed"
+READ_OVERFLOWED = "overflowed"
+READ_FAILED = "read_failed"
+
+
 class BoundedStream(threading.Thread):
     """Reads one pipe in chunks and stops the moment its ceiling is
     crossed. The bytes past the ceiling are never kept: what is over the
-    limit is not evidence, it is the thing being refused."""
+    limit is not evidence, it is the thing being refused.
+
+    A finished reader always carries a closed `outcome`, and that
+    outcome is a CONSTANT -- never the exception, never its text. What
+    a broken pipe has to say about the machine is not something a
+    caller should be able to print."""
 
     def __init__(self, label, stream, limit, tripped):
         super().__init__(daemon=True)
         self.label = label
         self.total = 0
-        self.overflowed = False
+        self.outcome = READ_PENDING
         self.buffer = bytearray()
         self._stream = stream
         self._limit = limit
         self._tripped = tripped
 
+    @property
+    def overflowed(self):
+        """Kept as the name every existing caller already uses, derived
+        from the outcome so the two can never disagree."""
+        return self.outcome == READ_OVERFLOWED
+
     def run(self):
+        # EVERY exit assigns the outcome, and nothing propagates out of
+        # a thread: an uncaught exception here would print a traceback
+        # carrying paths to stderr and still leave the reader looking
+        # like a normal short read.
+        sonuc = READ_FAILED
         try:
             while True:
                 chunk = self._stream.read(READ_CHUNK_BYTES)
                 if not chunk:
+                    sonuc = READ_COMPLETED
                     break
                 self.total += len(chunk)
                 if self.total > self._limit:
-                    self.overflowed = True
+                    sonuc = READ_OVERFLOWED
                     self._tripped.set()
                     break
                 self.buffer.extend(chunk)
-        except (OSError, ValueError):           # pipe closed under us
-            pass
-        finally:
-            try:
-                self._stream.close()
-            except (OSError, ValueError):
-                pass
+        except BaseException:                   # noqa: BLE001 -- recorded
+            sonuc = READ_FAILED
+        try:
+            self._stream.close()
+        except BaseException:                   # noqa: BLE001 -- recorded
+            # a pipe we could not release is not a read we can call done
+            sonuc = READ_FAILED
+        # assigned LAST, so a thread that is no longer alive always has
+        # its final answer visible to whoever joined it
+        self.outcome = sonuc
 
 
 class PromptWriter(threading.Thread):

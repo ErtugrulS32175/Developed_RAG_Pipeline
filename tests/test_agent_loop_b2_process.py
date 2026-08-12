@@ -710,6 +710,78 @@ def test_the_discard_result_is_measured_not_assumed(tmp_path, worktree_dir,
         container.drain(time.monotonic() + 5)
 
 
+# =====================================================================
+# THE ENVIRONMENT SEAM
+#
+# `env` was added for a caller that builds an ISOLATED environment. The
+# whole value of that is what it leaves OUT, so the three cases below
+# are about absence as much as presence.
+# =====================================================================
+
+_YANKICI = "\n".join([
+    "import json, os, sys",
+    "sys.stdout.write(json.dumps(dict(os.environ)))",
+])
+
+_EBEVEYNE_OZEL = "KURGU-EBEVEYN-NOBETCISI-" + "z" * 8
+
+
+@pytest.fixture
+def yankici(tmp_path, monkeypatch):
+    """A child that prints its own environment, and a parent variable
+    that must not follow it in.
+
+    Written as a list of plain lines rather than one embedded literal:
+    this project has lost a newline three times passing source through
+    a generator, and a list of lines has nothing left to lose."""
+    script = tmp_path / "yankici.py"
+    script.write_text(_YANKICI, encoding="utf-8")
+    monkeypatch.setenv("EBEVEYNE_OZEL", _EBEVEYNE_OZEL)
+    return script
+
+
+def _child_environment(script, tmp_path, **kwargs):
+    process, container = process_module.launch_contained(
+        [sys.executable, str(script)], cwd=tmp_path, **kwargs)
+    try:
+        out, _ = process.communicate(timeout=60)
+    finally:
+        container.drain(time.monotonic() + 10)
+    return json.loads(out.decode("utf-8"))
+
+
+def test_an_omitted_env_keeps_the_inherited_environment(yankici, tmp_path):
+    """The default has to stay exactly what every existing caller
+    already depends on."""
+    child = _child_environment(yankici, tmp_path)
+    assert child.get("EBEVEYNE_OZEL") == _EBEVEYNE_OZEL
+
+
+def test_an_explicit_env_reaches_the_child(yankici, tmp_path):
+    child = _child_environment(yankici, tmp_path, env=_minimal_env())
+    assert child.get("KURGU_ANAHTAR") == "kurgu-deger", \
+        "verilen ortam cocuga ulasmadi"
+
+
+def test_a_parent_variable_left_out_of_an_explicit_env_stays_out(yankici,
+                                                                 tmp_path):
+    """The one that matters. Re-merging with `os.environ` would put back
+    exactly what the caller removed on purpose, and the call would still
+    look correct from the outside."""
+    child = _child_environment(yankici, tmp_path, env=_minimal_env())
+    assert "EBEVEYNE_OZEL" not in child, "ebeveyn ortami yeniden birlestirilmis"
+
+
+def _minimal_env():
+    """Enough for a Python child to start, and nothing else. The two
+    Windows variables are not decoration: without them the interpreter
+    fails to initialise, and the test would then be measuring a broken
+    launch rather than an isolated one."""
+    return {"KURGU_ANAHTAR": "kurgu-deger",
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+            "PATH": os.environ.get("PATH", "")}
+
+
 def test_the_transport_module_runs_no_shell():
     import ast
 
