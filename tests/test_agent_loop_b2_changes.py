@@ -74,7 +74,7 @@ BASE_TASK = {
 # in an op is how a scenario reaches the main checkout or the reference
 # tree on purpose.
 _HELPER = '''\
-import json, os, subprocess, sys
+import json, os, shutil, subprocess, sys
 from pathlib import Path
 
 
@@ -85,7 +85,20 @@ def main():
     for op in cfg.get("ops", []):
         kind = op["kind"]
         target = Path(op["path"]) if op.get("path") else None
-        if kind == "write":
+        if kind == "write_keep_mtime":
+            # SAME SIZE, and every metadata field put back exactly: an
+            # in-place rewrite keeps the file identity, and `utime`
+            # restores the timestamp the walker recorded. This is the
+            # shape the metadata-only class is known NOT to see.
+            info = os.stat(str(target))
+            with open(target, "r+", encoding="utf-8") as handle:
+                handle.seek(0)
+                handle.write(op["text"])
+                handle.truncate()
+            os.utime(str(target), ns=(info.st_atime_ns, info.st_mtime_ns))
+        elif kind == "copytree":
+            shutil.copytree(op["src"], str(target))
+        elif kind == "write":
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 # IN PLACE. A file may be read-only or hidden, and
@@ -568,139 +581,20 @@ def test_an_edit_to_the_operator_checkout_is_caught(tmp_path, gate):
         "senaryo kurulmadi: ana agaca yazilmadi"
 
 
-def test_an_untracked_edit_to_the_operator_checkout_is_still_seen(
+def test_no_error_path_carries_the_content_of_a_refused_file(
         tmp_path, gate):
-    """`git diff` is blind to a new file, and a new file is the most
-    ordinary thing a process writes. The inventory is
-    `status --untracked-files=all` for exactly that reason."""
-    hedef = gate.repo / "pipeline" / "ana-agacta-yeni.py"
-    binary = _stub(tmp_path, ops=[_write(hedef)],
-                   reply=_reply(changed_files=[]))
-    with pytest.raises(changes.UnsafeChange) as refusal:
-        _run(binary, gate)
-    assert _git(gate.repo, "diff", "--name-only") == "", \
-        "senaryo kurulmadi: diff bu dosyayi zaten goruyor"
-    assert hedef.exists(), "senaryo kurulmadi: ana agaca yazilmadi"
-    assert refusal.value.reason == contract.StopReason.PATH_NOT_ALLOWED
+    """The CONTENT of a refused file is a channel privacy had not been
+    tested on: it travels into whatever a report writes if a message
+    ever repeats it.
 
-
-def test_a_blinded_index_cannot_hide_a_main_checkout_edit(tmp_path, gate):
-    """THE P0, now aimed where the git instrument still lives. An entry
-    marked `skip-worktree` is one git has been TOLD to stop looking at:
-    `status` comes back empty while the bytes on disk have changed. The
-    per-entry FLAG listing is what notices, and nothing else does."""
-    hedef = gate.repo / "pipeline" / "kurgu.py"
-    binary = _stub(tmp_path, ops=[
-        {"kind": "git", "argv": ["-C", str(gate.repo), "update-index",
-                                 "--skip-worktree", "pipeline/kurgu.py"]},
-        _write(hedef, "SAHIPLENILDI")],
-        reply=_reply(changed_files=[]))
-    with pytest.raises(changes.UnsafeChange) as refusal:
-        _run(binary, gate)
-    assert "kurgu.py" not in _git(gate.repo, "status", "--porcelain"), \
-        "senaryo kurulmadi: git bu degisikligi hala goruyor"
-    assert "SAHIPLENILDI" in hedef.read_text(encoding="utf-8"), \
-        "senaryo kurulmadi: dosya hic degismedi"
-    assert refusal.value.reason == contract.StopReason.PATH_NOT_ALLOWED
-
-
-def test_a_failing_git_query_is_unverifiable_not_clean(tmp_path, gate,
-                                                       monkeypatch):
-    """An empty inventory from a FAILED command reads as "no changes",
-    which is how an unverifiable state becomes a verified one."""
-    real_run = changes.subprocess.run
-    seen = {"count": 0}
-
-    def failing(argv, **kwargs):
-        if "status" in argv:
-            seen["count"] += 1
-            if seen["count"] > 1:                  # let the first snapshot pass
-                return subprocess.CompletedProcess(argv, 1, b"", b"kurgu")
-        return real_run(argv, **kwargs)
-
-    monkeypatch.setattr(changes.subprocess, "run", failing)
-    binary = _stub(tmp_path, ops=[_write("pipeline/kurgu.py")],
-                   reply=_reply(changed_files=["pipeline/kurgu.py"]))
-    with pytest.raises(changes.EvidenceUnavailable):
-        _run(binary, gate)
-    assert seen["count"] > 1, "senaryo kurulmadi: enjeksiyon hic tetiklenmedi"
-
-
-def test_a_git_timeout_is_unverifiable(tmp_path, gate, monkeypatch):
-    real_run = changes.subprocess.run
-    seen = {"count": 0}
-
-    def timing_out(argv, **kwargs):
-        if "status" in argv:
-            seen["count"] += 1
-            if seen["count"] > 1:
-                raise subprocess.TimeoutExpired(argv, 1)
-        return real_run(argv, **kwargs)
-
-    monkeypatch.setattr(changes.subprocess, "run", timing_out)
-    binary = _stub(tmp_path, reply=_reply(changed_files=[]))
-    with pytest.raises(changes.EvidenceUnavailable):
-        _run(binary, gate)
-    assert seen["count"] > 1, "senaryo kurulmadi"
-
-
-def test_an_unreadable_snapshot_file_is_typed_and_silent(tmp_path, gate,
-                                                         monkeypatch):
-    """A file git listed but nobody can read is an unanswered question.
-    It used to escape as a raw `OSError` carrying the operating system's
-    own message -- text this module may not repeat."""
-    stray = gate.repo / "izlenmeyen-not.txt"
-    stray.write_text("K", encoding="utf-8")
-    assert "izlenmeyen-not.txt" in _git(gate.repo, "status", "--porcelain"), \
-        "senaryo kurulmadi: anlik goruntu bu dosyayi gormuyor"
-    real_read = Path.read_bytes
-    seen = {"count": 0}
-
-    def unreadable(self, *args, **kwargs):
-        if self.name == "izlenmeyen-not.txt":
-            seen["count"] += 1
-            raise OSError(SENTINEL)
-        return real_read(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_bytes", unreadable)
-    binary = _stub(tmp_path, reply=_reply(changed_files=[]))
-    with pytest.raises(changes.EvidenceUnavailable) as refusal:
-        _run(binary, gate)
-    assert seen["count"] > 0, "senaryo kurulmadi: enjeksiyon tetiklenmedi"
-    assert SENTINEL not in str(refusal.value) + repr(refusal.value)
-
-
-def test_no_error_path_carries_file_bytes_or_git_stderr(tmp_path, make_gate,
-                                                        monkeypatch):
-    """Two channels privacy had not been tested on: the CONTENT of a
-    refused file, and git's own stderr. Both travel into whatever a
-    report writes if a message ever repeats them."""
-    first = make_gate()
+    The git-stderr half of this test went with the git guard -- there is
+    no stderr to leak now -- and its successor is the scan-failure
+    privacy test in `test_agent_loop_b2_main_guard.py`."""
     binary = _stub(tmp_path, ops=[_write("pipeline/gizli/a.py", SENTINEL)],
                    reply=_reply(changed_files=["pipeline/gizli/a.py"]))
     with pytest.raises(changes.ChangeSetError) as refusal:
-        _run(binary, first)
+        _run(binary, gate)
     assert SENTINEL not in str(refusal.value) + repr(refusal.value)
-
-    gate = make_gate()
-    real_run = changes.subprocess.run
-    seen = {"count": 0}
-
-    def loud_failure(argv, **kwargs):
-        if "status" in argv:
-            seen["count"] += 1
-            if seen["count"] > 1:
-                return subprocess.CompletedProcess(
-                    argv, 128, b"", SENTINEL.encode("ascii"))
-        return real_run(argv, **kwargs)
-
-    monkeypatch.setattr(changes.subprocess, "run", loud_failure)
-    clean = _stub(tmp_path, name="temiz", reply=_reply(changed_files=[]))
-    with pytest.raises(changes.EvidenceUnavailable) as unavailable:
-        _run(clean, gate)
-    assert seen["count"] > 1, "senaryo kurulmadi: enjeksiyon tetiklenmedi"
-    assert SENTINEL not in str(unavailable.value) + repr(unavailable.value), \
-        "ret metni git stderr'ini tasiyor"
 
 
 def test_a_healthy_call_leaves_the_operator_checkout_untouched(
@@ -840,26 +734,28 @@ def test_no_result_or_error_carries_file_bytes(tmp_path, gate):
     assert not any(isinstance(value, (bytes, bytearray)) for value in values)
 
 
-def test_the_module_never_stages_commits_or_applies_anything():
-    """Structural: a write path that appears only on a rare branch
-    would pass every functional test in this file."""
+def test_the_module_asks_no_program_and_writes_no_file():
+    """Structural: a write path or a launched program that appears only
+    on a rare branch would pass every functional test in this file.
+
+    The git assertions here are not about style. Every authority this
+    module used to take from git -- the inventory, the index, HEAD --
+    was answered through configuration the model can reach, which is
+    what made `skip-worktree` a P0 twice. There is nothing left to
+    configure."""
     import ast
 
     source = Path(changes.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
-    # the git SUBCOMMANDS this module can actually reach, read off the
-    # call sites -- scanning raw text matched the word "checkout" in a
-    # comment about the operator's checkout, which is prose, not a
-    # command, and a test that fires on prose stops meaning anything
-    subcommands, writers = set(), set()
+    imports, calls, writers = set(), set(), set()
     for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        if isinstance(node, ast.ImportFrom):
+            imports.add(node.module or "")
         if isinstance(node, ast.Call):
             called = ast.unparse(node.func)
-            if called.endswith("_git"):
-                subcommands.update(
-                    argument.value for argument in node.args[1:]
-                    if isinstance(argument, ast.Constant)
-                    and isinstance(argument.value, str))
+            calls.add(called)
             if called.endswith((".write_text", ".write_bytes", ".unlink",
                                 ".rename", ".mkdir", ".rmtree", ".chmod")):
                 writers.add(called)
@@ -867,13 +763,16 @@ def test_the_module_never_stages_commits_or_applies_anything():
                 assert not (keyword.arg == "shell"
                             and getattr(keyword.value, "value", False)), \
                     "kabuk kullanimi"
-            assert ast.unparse(node.func) not in ("os.system", "os.popen")
-    assert subcommands, "senaryo kurulmadi: hic git cagrisi bulunamadi"
-    forbidden = {"add", "commit", "push", "reset", "checkout", "clean",
-                 "apply", "stash", "restore", "rm", "mv", "worktree"}
-    assert not subcommands & forbidden, \
-        f"yazma komutu: {sorted(subcommands & forbidden)}"
+    assert "subprocess" not in imports, "subprocess yeniden ice aktarildi"
+    assert not [call for call in calls
+                if call.startswith("subprocess.")
+                or call in ("os.system", "os.popen", "os.execv")], \
+        "modul yeniden program calistiriyor"
     assert writers == set(), f"dosya sistemine yazma: {sorted(writers)}"
+    # the positive control: an assertion battery that would also pass on
+    # an empty file is documentation, not a test
+    assert "fs_evidence.scan" in calls, \
+        "senaryo kurulmadi: dosya sistemi taramasi hic cagrilmiyor"
 
 
 def test_scope_matching_follows_the_declared_platform_rule(tmp_path):

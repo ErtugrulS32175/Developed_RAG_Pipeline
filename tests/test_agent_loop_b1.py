@@ -1810,9 +1810,17 @@ def test_every_mutation_still_applies_to_the_current_source():
     # that had been told to stop looking, inside a disposable worktree.
     # The flat workspace has no index to blind, so the source line is
     # gone and the entry went with it rather than being aimed at
-    # something it never meant. The P0 itself is still pinned where the
-    # git instrument still lives -- see `b2bar1-indeks-digesti`.
-    assert len(tool.MUTATIONS) == 92
+    # something it never meant.
+    #
+    # B2B-B2B: 92 -> 89. The main-checkout guard stopped asking git, so
+    # three more mutations lost the mechanism they judged --
+    # `b2ba-izlenmeyen-korlugu` (git's untracked switch),
+    # `b2ba-git-rc` (git's exit code) and `b2bar1-indeks-digesti` (the
+    # per-entry flag listing). A filesystem walk has no untracked
+    # concept to switch off, no exit code to ignore and no index to be
+    # blinded, so none of the three has an honest target left; each
+    # intent is pinned as behaviour in the main-guard battery instead.
+    assert len(tool.MUTATIONS) == 89
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1821,12 +1829,12 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b2a-istem-tipi', 'b2a-kimlik-tipi', 'b2a-model-tipi',
         'b2a-sure-tipi', 'b2ar1-arac-yansimasi', 'b2ar1-builder-butce',
         'b2ar1-tipli-ret', 'b2ba-alt-kume', 'b2ba-ana-agac-sonkontrolu',
-        'b2ba-dosya-turu', 'b2ba-finally-yok', 'b2ba-git-rc',
-        'b2ba-gorev-sonkontrolu', 'b2ba-izlenmeyen-korlugu',
+        'b2ba-dosya-turu', 'b2ba-finally-yok',
+        'b2ba-gorev-sonkontrolu',
         'b2ba-kirli-agac', 'b2ba-kontrol-glob', 'b2ba-kosu-kimligi',
         'b2ba-onek-kacisi', 'b2ba-parmak-izi-icerik',
         'b2ba-yasakli-onceligi', 'b2ba-yineleme',
-        'b2bar1-indeks-digesti', 'b2bar1-kanonik-kapsam',
+        'b2bar1-kanonik-kapsam',
         'b2bar1-manifest-icerde', 'b2bar1-manifest-taban',
         'b2bar1-silme-modu', 'b2bar1-snapshot-okuma', 'bitmemis-kosu',
         'butce-degismezi', 'butce-siniri', 'cift-birakma',
@@ -1879,7 +1887,10 @@ def test_every_mutation_names_a_test_that_exists():
                      # B2B-B2A2: the change set is derived from flat
                      # workspace evidence in its own narrow file, and
                      # three retargeted mutations name tests there.
-                     "test_agent_loop_b2_changes_flat.py"))
+                     "test_agent_loop_b2_changes_flat.py",
+                     # B2B-B2B: the main-checkout guard's battery, named
+                     # by the retargeted walker-seam mutation.
+                     "test_agent_loop_b2_main_guard.py"))
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
     assert missing == [], f"var olmayan hedef test adi: {missing}"

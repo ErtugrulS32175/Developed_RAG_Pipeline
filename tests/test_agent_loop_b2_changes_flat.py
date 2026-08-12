@@ -32,7 +32,7 @@ import pytest
 
 import test_agent_loop_b2_changes as legacy
 from tools.agent_loop import (changes, contract, execution, flat_workspace,
-                              state)
+                              fs_evidence, state)
 
 RUN = legacy.RUN
 SENTINEL = legacy.SENTINEL
@@ -518,35 +518,31 @@ def test_nothing_that_leaves_carries_bytes_or_absolute_paths(tmp_path, gate):
                    for deger in degerler)
 
 
-def test_git_never_asks_about_the_flat_roots_but_still_guards_the_checkout(
-        tmp_path, gate, monkeypatch):
-    """THE LINE THIS PACKAGE DRAWS, measured by CWD rather than by
-    program name. The flat workspace's evidence may not come from git;
-    the operator's checkout is still guarded by it until B2B-B2B."""
-    gercek = changes.subprocess.run
-    cagrilar = []
+def test_no_program_is_ever_run_against_the_flat_roots(
+        tmp_path, gate, monkeypatch, only_fake_models_may_run):
+    """THE LINE THIS PACKAGE DREW, and where B2B-B2B moved it.
 
-    def kaydeden(argv, **kwargs):
-        cagrilar.append([str(parca) for parca in argv])
-        return gercek(argv, **kwargs)
+    B2B-B2A2 could only say "no git ABOUT THE FLAT ROOTS", checked by
+    the `-C` target, because the operator's checkout was still guarded
+    by `git status`. That guard reads the filesystem now, so the claim
+    is no longer scoped: this module launches NOTHING, and the two flat
+    roots are reached only by the handle-bound walker."""
+    gercek = fs_evidence.scan
+    tarananlar = []
 
-    monkeypatch.setattr(changes.subprocess, "run", kaydeden)
+    def izleyen(root, **kwargs):
+        tarananlar.append(os.path.realpath(root))
+        return gercek(root, **kwargs)
+
+    monkeypatch.setattr(fs_evidence, "scan", izleyen)
     binary = _stub(tmp_path, ops=[_write("pipeline/kurgu.py")],
                    reply=_reply(changed_files=["pipeline/kurgu.py"]))
     _run(binary, gate)
 
-    # only the calls THIS module makes: every one of them carries the
-    # switch the module pins its own git invocations with
-    bizim = [argv for argv in cagrilar if "--no-optional-locks" in argv]
-    assert bizim, "senaryo kurulmadi: modul hic git calistirmadi"
-    holder = str(flat_workspace.holder_for(gate.workspace_id))
-    for argv in bizim:
-        hedef = argv[argv.index("-C") + 1]
-        assert os.path.realpath(hedef) == os.path.realpath(gate.repo), \
-            "git cagrisi ana checkout disinda bir dizini hedefliyor"
-        assert not any(holder.casefold() in parca.casefold()
-                       for parca in argv), "git argv'si calisma alanini tasiyor"
-    # and the guard it serves is still live: the inventory really was
-    # taken on both sides of the model call
-    assert len([argv for argv in bizim if "status" in argv]) >= 2, \
-        "ana checkout envanteri iki yanda alinmadi"
+    for kok in (gate.reference, gate.tree):
+        assert tarananlar.count(os.path.realpath(kok)) == 2, \
+            "duz kok modelin iki yaninda taranmadi"
+    assert not hasattr(changes, "subprocess"), \
+        "modul yeniden bir program calistirabiliyor"
+    assert len(only_fake_models_may_run) == 1, \
+        "cagri sirasinda sahte modelden baska program calisti"

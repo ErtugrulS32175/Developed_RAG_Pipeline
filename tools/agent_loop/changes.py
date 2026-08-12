@@ -32,11 +32,19 @@ different file identity, different timestamps, different scan counters --
 so comparing the full digest would refuse every healthy workspace. What
 must match is the semantic content, and that is what is compared.
 
-WHERE GIT STILL RUNS, ON PURPOSE. The OPERATOR'S checkout is still
-guarded by `git status` before and after the call. That instrument moves
-to filesystem evidence in B2B-B2B; half-migrating it here would leave the
-main tree guarded by neither. The rule this package enforces is therefore
-not "no git" but "no git ABOUT THE FLAT ROOTS".
+THE OPERATOR'S CHECKOUT IS READ THE SAME WAY (B2B-B2B). It used to be
+guarded by `git status` on both sides of the call, and that guard had one
+open limit its own tests could not close: an entry marked `skip-worktree`
+or `assume-unchanged` BEFORE the call is one git was told to stop looking
+at, so the inventory came back equally empty on both sides while the
+bytes on disk moved. Nothing in this module asks git anything now.
+
+NO ROOT IS SKIPPED. `.git`, `data`, `output`, `logs`, `uploads`,
+`contracts` and any root nobody has thought of yet are content evidence.
+The only reduction is the in-repository virtual environments, which are
+metadata-only for the cost D2 measured -- and each keeps its `pyvenv.cfg`
+as content, because that file says which interpreter runs. What the
+reduced class cannot see is written down in `_main_policy`.
 
 WHAT MAY LEAVE. Repo-relative paths that were ALLOWED, counts, closed
 contract codes and hashes. Never file contents, never a patch, never
@@ -51,7 +59,6 @@ import os
 import re
 import secrets
 import stat
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,7 +68,6 @@ from tools.agent_loop import (cli, contract, execution, flat_workspace,
                               fs_evidence, preflight, schemas,
                               state as state_module)
 
-GIT_TIMEOUT_SECONDS = 120
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _RUN_ID = re.compile(contract.IDENTIFIER_PATTERN)
@@ -80,6 +86,11 @@ _FILE_FIELDS = ("mode", "size", "sha256", "attributes", "reparse_tag",
 # ordinary work. What is left still tells an added directory, a removed
 # one, a type change and a permission change apart.
 _DIR_FIELDS = ("mode", "attributes", "reparse_tag", "link_target_mac")
+
+# The one reduction the main-checkout policy makes, and the one file it
+# always keeps inside a reduced root.
+_ENV_SUFFIX = "_env"
+_ENV_CONFIG = "pyvenv.cfg"
 
 
 class ChangeSetError(RuntimeError):
@@ -151,88 +162,6 @@ class VerifiedChangeSet:
     stderr_bytes: int
     schema_sha256: str
     event: str
-
-
-# ---------------------------------------------------------------------
-# GIT EVIDENCE -- the MAIN CHECKOUT only, argv, checked, NUL-delimited
-# ---------------------------------------------------------------------
-
-def _git(cwd, *args) -> bytes:
-    """Every git call is checked and every answer is BYTES.
-
-    Text mode would decode with the ambient locale and split on
-    newlines -- and a filename may contain a newline, which is exactly
-    how a path walks out of an inventory unnoticed. The switches pin
-    the answer to the repository state rather than to a cache, an
-    external differ or a credential helper's opinion.
-
-    `cwd` is the operator's repository and nothing else: no caller here
-    passes a workspace root, which is what makes the boundary this
-    package draws checkable from the outside."""
-    argv = ["git", "-C", str(cwd), "--no-optional-locks",
-            "-c", "core.fsmonitor=false", "-c", "core.quotepath=false",
-            "-c", "diff.external=", "-c", "core.symlinks=true", *args]
-    environment = dict(os.environ)
-    environment.update({"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "",
-                        "GCM_INTERACTIVE": "never", "GIT_OPTIONAL_LOCKS": "0"})
-    try:
-        done = subprocess.run(argv, capture_output=True,
-                              stdin=subprocess.DEVNULL, env=environment,
-                              timeout=GIT_TIMEOUT_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        # a timeout is an unanswered question, not an empty answer
-        raise EvidenceUnavailable(f"git {args[0]} calistirilamadi") from None
-    if done.returncode != 0:
-        # the command NAME and the code, never stderr: that text carries
-        # paths, remotes and credential-helper complaints
-        raise EvidenceUnavailable(
-            f"git {args[0]} kanit vermedi (rc={done.returncode})")
-    return done.stdout
-
-
-def _status(cwd):
-    """The full inventory, as `(record, rename_source)` pairs.
-
-    `--untracked-files=all` because a new file is the most ordinary
-    thing a process writes and an ordinary diff never mentions it;
-    `--ignore-submodules=none` because a silently skipped submodule is
-    a change nobody sees; `--no-renames` so one edit is one record."""
-    raw = _git(cwd, "status", "--porcelain=v2", "-z",
-               "--untracked-files=all", "--ignore-submodules=none",
-               "--no-renames")
-    fields = raw.split(b"\0")
-    records, index = [], 0
-    while index < len(fields):
-        field = fields[index]
-        index += 1
-        if not field:
-            continue
-        source = None
-        if field[:2] == b"2 ":
-            # porcelain v2 puts a rename's ORIGINAL path in the next
-            # NUL-separated field; both paths matter, so both are kept
-            if index < len(fields):
-                source = fields[index]
-                index += 1
-        records.append((field, source))
-    return records
-
-
-def _head(cwd) -> str:
-    return _git(cwd, "rev-parse", "HEAD").decode("ascii", "replace").strip()
-
-
-def _index_state(cwd) -> str:
-    """A digest of the index AND of git's per-entry flags.
-
-    `status` is not the whole truth: an entry marked `skip-worktree` or
-    `assume-unchanged` is one git has been TOLD to stop looking at, and
-    a probe used exactly that to rewrite a protected file while
-    `status` stayed empty and this gate reported nothing at all. Both
-    listings were measured to be stable across ordinary edits and
-    untracked additions, so comparing them costs no false refusals."""
-    return hashlib.sha256(_git(cwd, "ls-files", "-s", "-z") + b"\0"
-                          + _git(cwd, "ls-files", "-v", "-z")).hexdigest()
 
 
 # ---------------------------------------------------------------------
@@ -329,11 +258,24 @@ def _refuse_evidence(refused):
     return EvidenceUnavailable(str(refused))
 
 
-def _scan(root, key):
+def _scan(root, key, *, metadata_only=(), content_always=()):
+    """ONE walker seam for every question this module asks a filesystem.
+
+    THE REFUSAL IS RAISED OUTSIDE THE HANDLER, deliberately. `raise ...
+    from None` clears `__cause__` and sets the suppression flag, but
+    `__context__` still holds the original object -- and an `OSError`'s
+    text names absolute paths, which is precisely what must not ride out
+    on an exception a report may print."""
+    refusal = None
     try:
-        return fs_evidence.scan(root, key=key, limits=fs_evidence.Limits())
+        return fs_evidence.scan(root, key=key, metadata_only=metadata_only,
+                                content_always=content_always,
+                                limits=fs_evidence.Limits())
     except fs_evidence.EvidenceError as refused:
-        raise _refuse_evidence(refused) from None
+        refusal = _refuse_evidence(refused)
+    except OSError:
+        refusal = EvidenceUnavailable("dosya sistemi kaniti alinamadi")
+    raise refusal
 
 
 def _project(manifest):
@@ -449,43 +391,83 @@ def _fingerprint(changes) -> str:
 
 
 # ---------------------------------------------------------------------
-# SNAPSHOTS -- what must not have moved
+# THE MAIN CHECKOUT -- one policy, one key, two reads
 # ---------------------------------------------------------------------
 
-def _tree_snapshot(root: Path) -> str:
-    """One digest over everything git can see about the OPERATOR'S
-    checkout: HEAD, the index and its per-entry flags, the full
-    inventory, and the bytes of every changed or untracked regular file
-    it lists.
+def _main_policy(repo: Path):
+    """Which roots of the OPERATOR'S checkout are metadata-only, decided
+    ONCE and frozen for the call.
 
-    Ignored content is deliberately NOT walked -- `data/` is the
-    repository's own guard and the leak scanner's, and traversing a
-    document tree to protect it is the wrong instrument."""
-    digest = hashlib.sha256()
-    digest.update(_head(root).encode("ascii"))
-    digest.update(_index_state(root).encode("ascii"))
-    for record, source in _status(root):
-        digest.update(b"\0" + record + (source or b""))
-        raw = record[2:] if record[:1] == b"?" else record.split(b" ", 8)[-1]
-        if record[:1] not in (b"?", b"1"):
-            continue
-        candidate = root / raw.decode("utf-8", "replace")
-        try:
-            entry = os.lstat(candidate)
-        except OSError:
-            continue                    # a deletion has nothing to hash
-        if stat.S_ISREG(entry.st_mode) and not getattr(
-                entry, "st_reparse_tag", 0):
-            try:
-                payload = candidate.read_bytes()
-            except OSError:
-                # a file git listed but nobody can read is an
-                # unanswered question, and the operating system's own
-                # message is not text this module may repeat
-                raise EvidenceUnavailable(
-                    "anlik goruntudeki dosya okunamadi") from None
-            digest.update(hashlib.sha256(payload).digest())
-    return digest.hexdigest()
+    A top-level directory whose name ends in `_env` is an in-repository
+    virtual environment: 184,678 entries were measured across seven of
+    them, and hashing that is 1.1 minutes warm per pass against 16
+    seconds for the handle-bound metadata walk. Nothing else is reduced,
+    and NO root is skipped -- `.git`, `data`, `output`, `logs`,
+    `uploads`, `contracts` and any root nobody has thought of yet stay
+    content evidence.
+
+    A LINK IS NOT A DIRECTORY, and that is a MEASUREMENT rather than a
+    precaution: on Windows `DirEntry.is_dir(follow_symlinks=False)`
+    answers True for a junction (reparse tag 0x2000000B) and False for a
+    symlink. Asking only `is_dir` would let a junction planted as
+    `something_env` hand an entire outside tree the reduced class, so
+    the reparse tag is checked and that check is doing real work.
+
+    Frozen BEFORE the model runs, so a root created during the call
+    cannot claim the reduction for itself -- it simply is not in the
+    policy, and everything outside the policy is content."""
+    refusal = None
+    metadata_only, content_always = [], []
+    try:
+        with os.scandir(repo) as entries:
+            for entry in entries:
+                if not entry.name.endswith(_ENV_SUFFIX):
+                    continue
+                if not entry.is_dir(follow_symlinks=False) or getattr(
+                        entry.stat(follow_symlinks=False),
+                        "st_reparse_tag", 0):
+                    continue
+                metadata_only.append(entry.name)
+                # EXACT, never a pattern: `pyvenv.cfg.bak` beside it and
+                # a namesake one level down are ordinary environment
+                # files, and `fs_evidence` compares this against the
+                # canonical path it built itself
+                content_always.append(f"{entry.name}/{_ENV_CONFIG}")
+    except OSError:
+        # the name of the directory that refused is not text this module
+        # may repeat, and the refusal leaves the handler before it flies
+        refusal = EvidenceUnavailable("ana calisma agaci envanteri alinamadi")
+    if refusal is not None:
+        raise refusal
+    return tuple(sorted(metadata_only)), tuple(sorted(content_always))
+
+
+@dataclass(frozen=True, slots=True)
+class _MainSnapshot:
+    """What the operator's checkout WAS.
+
+    Both halves matter and neither replaces the other: the identity says
+    the root is still the same OBJECT, and the digest says its contents
+    are still the same. Unlike the two flat trees -- independent copies
+    whose per-copy fields must differ -- this is one root read twice, so
+    the walker's full digest is exactly the right comparison and no
+    semantic projection is wanted here.
+
+    The scan's counters, duration and peak-directory figures are NOT in
+    it: those measure the walk, not the tree."""
+
+    root_identity: str
+    digest: str
+
+
+def _main_snapshot(repo: Path, key: bytes, policy) -> _MainSnapshot:
+    """One read of the operator's checkout, under the call's own key."""
+    metadata_only, content_always = policy
+    fs_evidence.quiesce()
+    manifest = _scan(repo, key, metadata_only=metadata_only,
+                     content_always=content_always)
+    return _MainSnapshot(root_identity=manifest.root_identity,
+                         digest=manifest.digest)
 
 
 # ---------------------------------------------------------------------
@@ -637,7 +619,12 @@ def run_verified_implementation(binary, *, repo, state_dir, task_path,
         # equal, so this refusal comes before a model process exists
         raise UnsafeChange("calisma alani basta ayrisik",
                            reason=contract.StopReason.DIRTY_WORKTREE)
-    main_before = _tree_snapshot(repo_path)
+    # A SECOND call-local key, for a second question. The main checkout
+    # and the flat roots are compared against different things, and one
+    # key that answered for both would be one key worth replaying twice.
+    main_policy = _main_policy(repo_path)
+    main_key = secrets.token_bytes(fs_evidence.KEY_BYTES)
+    main_before = _main_snapshot(repo_path, main_key, main_policy)
     task_before = snapshot.digest
 
     def verify_after():
@@ -650,7 +637,7 @@ def run_verified_implementation(binary, *, repo, state_dir, task_path,
                 preflight.snapshot_manifest(task_file).digest != task_before:
             raise UnsafeChange("gorev dosyasi degistirildi",
                                reason=contract.StopReason.PATH_NOT_ALLOWED)
-        if _tree_snapshot(repo_path) != main_before:
+        if _main_snapshot(repo_path, main_key, main_policy) != main_before:
             raise UnsafeChange("ana calisma agaci degistirildi",
                                reason=contract.StopReason.PATH_NOT_ALLOWED)
         reference_after, implementer_after = _read_pair(again, key)

@@ -409,14 +409,13 @@ MUTATIONS = [
     # a self-attack first; two SURVIVED that round and the mechanism
     # was corrected before they became manifest entries.
     # ----------------------------------------------------------------
-    # B2B-B2A2 RETARGETED. The inventory this switch belongs to now
-    # serves the MAIN CHECKOUT guard, so the test that proves an
-    # untracked file cannot hide moved with it. The mutation and what it
-    # means are unchanged.
-    ("b2ba-izlenmeyen-korlugu", "changes",
-     '               "--untracked-files=all", "--ignore-submodules=none",',
-     '               "--untracked-files=no", "--ignore-submodules=none",',
-     "test_an_untracked_edit_to_the_operator_checkout_is_still_seen"),
+    # B2B-B2B: `b2ba-izlenmeyen-korlugu` is GONE. It mutated the switch
+    # that made git list untracked files, and the main-checkout guard no
+    # longer asks git for an inventory at all -- a filesystem walk has
+    # no "untracked" concept to switch off, so there is no line whose
+    # removal restores the blindness. The intent is pinned as behaviour
+    # instead: `test_an_ignored_path_is_not_invisible` in the main-guard
+    # battery catches both a new and a changed gitignored file.
     ("b2ba-onek-kacisi", "changes",
      "        if trimmed and (folded == trimmed" + NL
      + '                        or folded.startswith(trimmed + "/")):',
@@ -437,10 +436,10 @@ MUTATIONS = [
      "    if set(canonical) != {_fold(change.path) for change in actual}:",
      "    if not set(canonical) <= {_fold(change.path) for change in actual}:",
      "test_a_change_the_model_omits_is_refused"),
-    ("b2ba-git-rc", "changes",
-     "    if done.returncode != 0:",
-     "    if False:",
-     "test_a_failing_git_query_is_unverifiable_not_clean"),
+    # B2B-B2B: `b2ba-git-rc` is GONE with the git call it judged. "A
+    # failed evidence command is not a clean answer" now lives in the
+    # walker seam, and `b2bar1-snapshot-okuma` below mutates exactly
+    # that line -- two labels cannot share one target.
     ("b2ba-parmak-izi-icerik", "changes",
      '        b"' + BS + '0".join((change.path.encode("utf-8"), '
      'change.kind.encode("ascii"),' + NL
@@ -454,8 +453,12 @@ MUTATIONS = [
      "task_before:",
      "        if False:",
      "test_an_ignored_manifest_inside_the_repository_is_still_re_verified"),
+    # B2B-B2B RETARGETED. Same gate, new instrument: the operator's
+    # checkout is compared as a filesystem snapshot now instead of a git
+    # inventory. The test it answers to is unchanged.
     ("b2ba-ana-agac-sonkontrolu", "changes",
-     "        if _tree_snapshot(repo_path) != main_before:",
+     "        if _main_snapshot(repo_path, main_key, main_policy) != "
+     "main_before:",
      "        if False:",
      "test_an_edit_to_the_operator_checkout_is_caught"),
     ("b2ba-finally-yok", "changes",
@@ -491,21 +494,16 @@ MUTATIONS = [
     # ----------------------------------------------------------------
     # B2B-A R1 -- the six audit findings, each as its own mutation
     # ----------------------------------------------------------------
-    # B2B-B2A2 RETARGETED. The disposable worktree had two index gates
-    # -- one refusing a blinded index outright, one comparing the index
-    # digest across the call -- and BOTH described an authority the flat
-    # workspace no longer has: its evidence never consults git at all,
-    # which `test_git_never_asks_about_the_flat_roots...` pins directly.
-    # What remains is the index of the OPERATOR'S checkout, still inside
-    # the main-checkout snapshot, and the P0 it was written for survives
-    # there verbatim: `skip-worktree` empties `status` while the bytes on
-    # disk move, and the per-entry flag listing is the only thing that
-    # notices. `b2bar1-indeks-bayragi` has no source left to mutate and
-    # is dropped rather than aimed at something it never meant.
-    ("b2bar1-indeks-digesti", "changes",
-     '    digest.update(_index_state(root).encode("ascii"))',
-     '    digest.update(b"")',
-     "test_a_blinded_index_cannot_hide_a_main_checkout_edit"),
+    # B2B-B2B: `b2bar1-indeks-digesti` is GONE, and with it the last of
+    # the three index mutations. Both of the gates it and
+    # `b2bar1-indeks-bayragi` described read git's per-entry flags, and
+    # nothing in this module reads them any more -- the blindness they
+    # existed to catch is not reachable, because the filesystem has no
+    # opinion about which of its files git is watching. The P0 is pinned
+    # as behaviour in `test_a_blinded_index_cannot_hide_the_edit`, which
+    # sets the flag BEFORE the call -- the shape the old guard could
+    # never see -- and requires the refusal to come from the filesystem
+    # guard by its exact sentence.
     ("b2bar1-manifest-icerde", "changes",
      "    if relative is None:" + NL
      + '        raise EvidenceUnavailable("gorev dosyasi depo agacinin '
@@ -535,17 +533,20 @@ MUTATIONS = [
      "                changes.append(_Change(path=path, kind=DELETED," + NL
      + "                                       mode=\"000000\", sha256=\"\"))",
      "test_the_classifier_keeps_modes_and_refuses_empty_directory_changes"),
+    # B2B-B2B RETARGETED. The finding is the same one: a filesystem
+    # object nobody can read is an unanswered question, and the
+    # operating system's own message -- which names absolute paths -- is
+    # not text this module may repeat. It used to be caught while
+    # hashing a file git had listed; it is caught in the walker seam now.
     ("b2bar1-snapshot-okuma", "changes",
-     "            except OSError:" + NL
-     + "                # a file git listed but nobody can read is an" + NL
-     + "                # unanswered question, and the operating system's own"
-     + NL
-     + "                # message is not text this module may repeat" + NL
-     + "                raise EvidenceUnavailable(" + NL
-     + '                    "anlik goruntudeki dosya okunamadi") from None',
-     "            except OSError:" + NL
-     + "                raise",
-     "test_an_unreadable_snapshot_file_is_typed_and_silent"),
+     "    except OSError:" + NL
+     + '        refusal = EvidenceUnavailable("dosya sistemi kaniti '
+     'alinamadi")' + NL
+     + "    raise refusal",
+     "    except OSError:" + NL
+     + "        raise" + NL
+     + "    raise refusal",
+     "test_a_failed_scan_after_the_model_refuses_the_result"),
     # B2B-B2A2 RETARGETED. "Already dirty" is now "the two trees did not
     # start equal" -- the same refusal, before a model process exists,
     # for the same reason: attribution is impossible otherwise.
@@ -639,6 +640,9 @@ def _pytest(workdir, extra):
             # several manifest targets name it -- a battery that could not
             # run it would judge every one of them MISDIRECTED.
             "tests/test_agent_loop_b2_changes_flat.py",
+            # B2B-B2B: the main-checkout guard's own battery, named by
+            # the retargeted walker-seam mutation.
+            "tests/test_agent_loop_b2_main_guard.py",
             "-q", "--no-header", "-p", "no:cacheprovider", "-rf"] + extra
     # a temp directory of the HARNESS's own. The battery derives its
     # worktree root from the process temp directory, so a run that
