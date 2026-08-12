@@ -360,6 +360,117 @@ def test_a_replace_ref_does_not_change_the_materialised_baseline(
         _git(repo, "replace", "-d", gercek)
 
 
+# =====================================================================
+# R1B.2 -- RAW TREE POLICY
+#
+# Everything below is about a tree object a hostile repository could
+# actually hand over. `--literally` is what makes that possible: git's
+# own porcelain refuses to build most of these, so a test written with
+# porcelain is a test of git's validation rather than of ours.
+# =====================================================================
+
+@pytest.mark.parametrize("mode_a,mode_b,etiket", [
+    ("100644", "100644", "iki-dosya"),
+    ("100644", "100755", "farkli-modlar"),
+    ("40000", "40000", "iki-dizin"),
+])
+def test_a_repeated_raw_name_in_one_tree_is_refused(repo, state_dir, mode_a,
+                                                    mode_b, etiket):
+    """Defence in depth, not a new hole.
+
+    A repeated LEAF path was already refused downstream by the canonical
+    check. What was not refused is the disagreement itself: two entries
+    in one tree claiming the same stored bytes for a name means git and
+    the materializer would have to pick a winner, and picking quietly is
+    how the second write becomes the answer."""
+    ic = _raw_tree(repo, [("100644", "x", _blob(repo, b"x"))])
+    def giris(mode):
+        return (mode, "ayni", ic if mode == "40000" else _blob(repo, b"v"))
+    tree = _raw_tree(repo, [giris(mode_a), giris(mode_b)])
+    ham = _git(repo, "cat-file", "tree", tree, binary_out=True)
+    assert ham.count(b"ayni\x00") == 2, "senaryo kurulmadi: ad iki kez yok"
+
+    baseline = _commit_of_tree(repo, tree)
+    with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+        _create(repo, state_dir, baseline)
+    assert "ham ad" in str(ret.value)
+
+
+@pytest.mark.parametrize("once,ad_dizin", [
+    ("dosya", "ad"),
+    ("dizin", "ad"),
+    pytest.param("dosya", "AD", marks=pytest.mark.skipif(
+        not _WINDOWS, reason="ayri yazimlar case-sensitive dosya sisteminde "
+                             "gercekten iki ayri yoldur")),
+])
+def test_a_file_and_a_directory_cannot_claim_one_name(repo, state_dir, once,
+                                                      ad_dizin):
+    """Both orders, and both spellings where the platform folds them.
+
+    The identical-name pair is caught by the raw-name rule; the
+    `ad`/`AD` pair is not -- those are two legitimate tree entries whose
+    CANONICAL paths collide, and only the directory-versus-file check
+    sees it. On Windows both would be written to one path, and the
+    answer would be whichever went last."""
+    ic = _raw_tree(repo, [("100644", "b.py", _blob(repo, b"B"))])
+    dosya = ("100644", "ad", _blob(repo, b"A"))
+    dizin = ("40000", ad_dizin, ic)
+    girisler = [dosya, dizin] if once == "dosya" else [dizin, dosya]
+    baseline = _commit_of_tree(repo, _raw_tree(repo, girisler))
+    with pytest.raises(flat_workspace.FlatWorkspaceError):
+        _create(repo, state_dir, baseline)
+
+
+@pytest.mark.parametrize("nerede", ["kok", "alt"])
+def test_an_empty_tree_is_refused(repo, state_dir, nerede):
+    """A directory nothing can be materialised from, at the root or
+    anywhere below it."""
+    bos = _raw_tree(repo, [])
+    assert _git(repo, "cat-file", "tree", bos, binary_out=True) == b"", \
+        "senaryo kurulmadi: agac bos degil"
+    if nerede == "kok":
+        tree = bos
+    else:
+        tree = _raw_tree(repo, [("100644", "a.py", _blob(repo, b"A")),
+                                ("40000", "bos", bos)])
+    baseline = _commit_of_tree(repo, tree)
+    with pytest.raises(flat_workspace.FlatWorkspaceError):
+        _create(repo, state_dir, baseline)
+
+
+@pytest.mark.parametrize("derinlik,kabul", [(4, True), (5, False)])
+def test_the_depth_boundary_accepts_the_limit_and_refuses_one_more(
+        repo, state_dir, monkeypatch, derinlik, kabul):
+    """The ceiling is lowered for the test rather than built out to its
+    real value: 128 nested tree objects would measure subprocess cost,
+    not the boundary. The real constant is pinned separately."""
+    assert git_objects._MAX_TREE_DEPTH == 128, "gercek tavan degismis"
+    monkeypatch.setattr(git_objects, "_MAX_TREE_DEPTH", 4)
+    yol = "/".join(f"d{i}" for i in range(derinlik)) + "/f.py"
+    baseline = _commit_files(repo, {yol: b"F"})
+    if kabul:
+        ws = _create(repo, state_dir, baseline)
+        assert _oku(ws.reference_root, yol) == b"F"
+    else:
+        with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+            _create(repo, state_dir, baseline)
+        assert "derinligi" in str(ret.value)
+
+
+def test_the_baseline_digest_is_order_independent_and_incremental():
+    """Hashed field by field in canonical path order, so the digest is a
+    property of the baseline and not of the order it happened to be
+    walked in. Pinned against a literal so switching to incremental
+    hashing could not have changed the value."""
+    girisler = [("b.py", "100755", "1" * 40, 7),
+                ("a.py", "100644", "0" * 40, 4)]
+    beklenen = hashlib.sha256(
+        b"a.py\x00100644\x00" + b"0" * 40 + b"\x004\n"
+        b"b.py\x00100755\x00" + b"1" * 40 + b"\x007\n").hexdigest()
+    assert git_objects.baseline_digest(girisler) == beklenen
+    assert git_objects.baseline_digest(list(reversed(girisler))) == beklenen
+
+
 def test_this_layer_owns_no_process(tmp_path):
     """Structural pin for the split. This layer says what bytes MEAN;
     the container, the reader threads and the cleanup verdict belong to

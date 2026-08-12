@@ -52,7 +52,10 @@ MODE_FILE = "100644"
 MODE_EXEC = "100755"
 MODE_TREE = "40000"
 _ALLOWED_BLOB_MODES = (MODE_FILE, MODE_EXEC)
-_MAX_TREE_DEPTH = 64
+# Depth is counted in ENCLOSING DIRECTORIES: a file 128 levels down is
+# accepted, 129 is refused. Deep enough that no source tree reaches it,
+# shallow enough that the recursion cannot be turned into a weapon.
+_MAX_TREE_DEPTH = 128
 
 _FORBIDDEN_CATEGORIES = ("Cc", "Cf", "Zl", "Zp")
 _ORDINARY_SPACE = " "
@@ -139,6 +142,7 @@ def _parse_tree(data: bytes):
     through it. The same rule as blob bytes: git's answer is verified,
     not trusted."""
     girisler = []
+    adlar = set()
     i = 0
     while i < len(data):
         bosluk = data.find(b" ", i)
@@ -152,8 +156,23 @@ def _parse_tree(data: bytes):
         oid = data[sifir + 1:sifir + 21].hex()
         if not ad:
             raise FlatWorkspaceError("agac girdisinde bos ad")
+        # THE RAW BYTES, before any canonicalisation. Defence in depth:
+        # the canonical check downstream already refuses a repeated leaf
+        # path, but two entries that differ only in a byte the canonical
+        # form drops are a disagreement between what git stored and what
+        # gets written -- and a disagreement is not something to resolve
+        # quietly.
+        if ad in adlar:
+            raise FlatWorkspaceError(
+                "agac nesnesinde yinelenen ham ad",
+                reason=contract.StopReason.PATH_NOT_ALLOWED)
+        adlar.add(ad)
         girisler.append((mode, ad, oid))
         i = sifir + 21
+    if not girisler:
+        # An empty tree is a directory nothing can be materialised from,
+        # at the root or anywhere below it.
+        raise FlatWorkspaceError("agac nesnesi bos")
     return girisler
 
 def _canonical_component(raw: bytes) -> str:
@@ -208,16 +227,23 @@ def baseline_digest(entries) -> str:
 
     Serialised field by field in canonical path order -- never through
     `repr`, a dict's iteration order or anything locale-dependent, all
-    of which have produced "identical" baselines that were not."""
-    stream = b""
+    of which have produced "identical" baselines that were not.
+
+    Hashed INCREMENTALLY. The bytes fed in are the same either way;
+    what changes is that a baseline near the entry ceiling no longer
+    has to exist twice, once as a growing `bytes` and once as its
+    copy."""
+    digest = hashlib.sha256()
     for path, mode, object_id, length in sorted(entries,
                                                 key=lambda item: item[0]):
-        stream += b"\0".join((path.encode("utf-8"), mode.encode("ascii"),
-                              object_id.encode("ascii"),
-                              str(length).encode("ascii"))) + b"\n"
-    return hashlib.sha256(stream).hexdigest()
+        digest.update(b"\0".join((path.encode("utf-8"),
+                                  mode.encode("ascii"),
+                                  object_id.encode("ascii"),
+                                  str(length).encode("ascii"))) + b"\n")
+    return digest.hexdigest()
 
-def _walk_tree(repo, tree_oid, parents, girisler, gorulen, limits, depth):
+def _walk_tree(repo, tree_oid, parents, girisler, gorulen, dizinler, limits,
+               depth):
     """Depth-first over RAW tree objects, validating as it goes."""
     if depth > _MAX_TREE_DEPTH:
         raise FlatWorkspaceError("agac derinligi sozlesme tavanini asiyor")
@@ -229,18 +255,23 @@ def _walk_tree(repo, tree_oid, parents, girisler, gorulen, limits, depth):
         # entry rather than a nested path
         bilesen = _canonical_component(ad_ham)
         yol = "/".join(parents + (bilesen,))
+        anahtar = yol.casefold() if os.name == "nt" else yol
+        # BOTH directions, files against directories as well as against
+        # each other. One path cannot be a file here and a directory
+        # there: the filesystem has to answer that question eventually,
+        # and the answer it gives is whichever entry was written last.
+        if anahtar in gorulen or anahtar in dizinler:
+            raise FlatWorkspaceError(
+                "agacta yinelenen kanonik yol",
+                reason=contract.StopReason.PATH_NOT_ALLOWED)
         if mode == MODE_TREE:
+            dizinler.add(anahtar)
             _walk_tree(repo, oid, parents + (bilesen,), girisler, gorulen,
-                       limits, depth + 1)
+                       dizinler, limits, depth + 1)
             continue
         if mode not in _ALLOWED_BLOB_MODES:
             raise FlatWorkspaceError(
                 "agac girdisi sozlesme disi bir mod tasiyor",
-                reason=contract.StopReason.PATH_NOT_ALLOWED)
-        anahtar = yol.casefold() if os.name == "nt" else yol
-        if anahtar in gorulen:
-            raise FlatWorkspaceError(
-                "agacta yinelenen kanonik yol",
                 reason=contract.StopReason.PATH_NOT_ALLOWED)
         gorulen.add(anahtar)
         girisler.append((yol, mode, oid))
@@ -248,9 +279,9 @@ def _walk_tree(repo, tree_oid, parents, girisler, gorulen, limits, depth):
             raise FlatWorkspaceError("giris sayisi sozlesme tavanini asiyor")
 
 def _read_tree(repo, baseline_sha: str, limits):
-    girisler, gorulen = [], set()
+    girisler, gorulen, dizinler = [], set(), set()
     _walk_tree(repo, _baseline_tree(repo, baseline_sha), (), girisler,
-               gorulen, limits, 0)
+               gorulen, dizinler, limits, 0)
     if not girisler:
         raise FlatWorkspaceError("taban surumu bos")
     return girisler

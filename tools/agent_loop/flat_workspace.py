@@ -43,6 +43,7 @@ import secrets
 import shutil
 import stat
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,27 +74,35 @@ STATUS_FAILED = "failed"
 _STATUSES = (STATUS_REGISTERED, STATUS_MATERIALIZING, STATUS_READY,
              STATUS_FAILED)
 
+# THE WHOLE LIFECYCLE, written down. Without it every guard downstream
+# was reading a status that could have arrived from anywhere -- a record
+# that jumped straight to READY described a workspace nobody built.
+# READY and FAILED are terminal: a finished run does not change its mind.
+_ALLOWED_TRANSITIONS = {
+    STATUS_REGISTERED: (STATUS_MATERIALIZING,),
+    STATUS_MATERIALIZING: (STATUS_READY, STATUS_FAILED),
+    STATUS_READY: (),
+    STATUS_FAILED: (),
+}
+
+# Who the record belongs to. A status update may never touch these: the
+# one thing a ledger entry is for is saying whose residue this is, and a
+# transition that could rewrite that could hand a holder to another run.
+_OWNERSHIP_FIELDS = ("protocol_version", "workspace_id", "repo_id",
+                     "run_id", "baseline_sha", "created_at")
+
+# The one fixed sentence a cleanup failure may add. Free text next to a
+# filesystem is a path leak, so there is exactly this and nothing else.
+CLEANUP_NOTE = "calisma alani artigi temizlenemedi"
+
 WORKSPACE_ID = re.compile(r"^[0-9a-f]{32}$")
-_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
-
-# The only two blob modes this version represents. A symlink, a gitlink
-# and an unknown mode each mean something different, and inventing a
-# representation for one is how an unreviewed thing gets written to disk.
-MODE_FILE = "100644"
-MODE_EXEC = "100755"
-MODE_TREE = "40000"
-_ALLOWED_BLOB_MODES = (MODE_FILE, MODE_EXEC)
-_MAX_TREE_DEPTH = 64
-
-_GIT_TIMEOUT_SECONDS = 120
-_FORBIDDEN_CATEGORIES = ("Cc", "Cf", "Zl", "Zp")
-_ORDINARY_SPACE = " "
+_TIMESTAMP = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
 
 RECORD_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": ["protocol_version", "workspace_id", "repo_id", "run_id",
-                 "baseline_sha", "status"],
+                 "baseline_sha", "status", "created_at"],
     "properties": {
         "protocol_version": {"const": contract.PROTOCOL_VERSION},
         "workspace_id": {"type": "string", "pattern": r"^[0-9a-f]{32}$"},
@@ -104,7 +113,10 @@ RECORD_SCHEMA = {
         "baseline_sha": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "status": {"enum": list(_STATUSES)},
         "baseline_digest": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-        "created_at": {"type": "string"},
+        # a CLOSED shape, and the runner is the only thing that writes
+        # it: a timestamp a caller supplies is a timestamp a caller can
+        # choose, and recovery decisions are made by reading it
+        "created_at": {"type": "string", "pattern": _TIMESTAMP},
     },
 }
 
@@ -119,7 +131,11 @@ class Limits:
     deliberate -- a ceiling that has to be raised every month stops
     being read."""
 
-    max_entries: int = 50000
+    max_entries: int = 400000
+    # a D3-specific MEASURED decision, not a guess: the largest tracked
+    # blob at the baseline is 98,162 bytes, so this is roughly 680x
+    # headroom -- and it is also the transport's read ceiling, which is
+    # why a blob past it is refused before it reaches memory
     max_file_bytes: int = 64 << 20
     max_total_bytes: int = 1024 << 20
 
@@ -142,6 +158,11 @@ class FlatWorkspace:
 
 def _mint_id() -> str:
     return secrets.token_hex(16)
+
+
+def _now() -> str:
+    """The runner's clock, in one closed shape. Never a caller's."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def runner_temp_root() -> Path:
@@ -221,12 +242,39 @@ def read_record(state_dir, workspace_id):
         return None
 
 
-def _set_status(state_dir, workspace_id, status, **changes):
-    if status not in _STATUSES:
-        raise FlatWorkspaceError("bilinmeyen calisma alani durumu")
+def _load_record(state_dir, workspace_id):
+    """The record, or a refusal that says WHICH kind of nothing it is.
+
+    Absent and malformed are different situations -- one is a workspace
+    that was never registered, the other is a ledger entry somebody or
+    something damaged -- and collapsing them hides the second."""
+    if not _record_path(state_dir, workspace_id).is_file():
+        raise FlatWorkspaceError("calisma alani kaydi yok")
     record = read_record(state_dir, workspace_id)
     if record is None:
-        raise FlatWorkspaceError("calisma alani kaydi yok")
+        raise FlatWorkspaceError("calisma alani kaydi bozuk")
+    return record
+
+
+def _set_status(state_dir, workspace_id, status, **changes):
+    """ONE legal step along the lifecycle, or a refusal.
+
+    Every guard downstream reads this status, so a write that could put
+    any value there is a write that could satisfy any guard: a record
+    that arrived at READY without ever materialising describes a
+    workspace nobody built."""
+    if status not in _STATUSES:
+        raise FlatWorkspaceError("bilinmeyen calisma alani durumu")
+    for alan in changes:
+        if alan in _OWNERSHIP_FIELDS:
+            raise FlatWorkspaceError(
+                "durum degisikligi sahiplik alanina dokunuyor")
+    record = _load_record(state_dir, workspace_id)
+    simdiki = record["status"]
+    if simdiki not in _ALLOWED_TRANSITIONS:
+        raise FlatWorkspaceError("bilinmeyen calisma alani durumu")
+    if status not in _ALLOWED_TRANSITIONS[simdiki]:
+        raise FlatWorkspaceError("izinsiz durum gecisi")
     record.update(changes)
     record["status"] = status
     _write_record(state_dir, record)
@@ -238,9 +286,7 @@ def _authorised_record(repo, state_dir, workspace_id):
 
     An id alone authorising a delete is exactly the hole an earlier
     audit walked through in the worktree module."""
-    record = read_record(state_dir, workspace_id)
-    if record is None:
-        raise FlatWorkspaceError("calisma alani kaydi yok")
+    record = _load_record(state_dir, workspace_id)
     if record["repo_id"] != state_module.repo_identity(repo):
         raise FlatWorkspaceError("kayit bu depoya ait degil")
     return record
@@ -300,6 +346,70 @@ def _remove_tree_quietly(path: Path) -> bool:
         return False
 
 
+def _present(path) -> bool:
+    """Is anything there. `lstat`, not `exists()`: `exists()` follows a
+    link and answers False for a broken one, and a dangling link at the
+    holder path is still residue."""
+    try:
+        os.lstat(path)
+        return True
+    except OSError:
+        return False
+
+
+def _remove_record_quietly(state_dir, workspace_id) -> bool:
+    try:
+        _record_path(state_dir, workspace_id).unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _fail_quietly(state_dir, workspace_id) -> bool:
+    try:
+        _set_status(state_dir, workspace_id, STATUS_FAILED)
+        return True
+    except (FlatWorkspaceError, OSError):
+        return False
+
+
+def _mark(error):
+    """The fixed marker, and only the fixed marker."""
+    try:
+        error.add_note(CLEANUP_NOTE)
+    except AttributeError:                         # pragma: no cover -- <3.11
+        pass
+
+
+def _after_failure(state_dir, workspace_id, holder, ours, primary):
+    """Decide what the ledger says once materialisation has failed.
+
+    THE QUESTION IS NOT "DID WE CREATE IT" BUT "IS ANYTHING THERE NOW".
+    A record was kept unconditionally before, so every failure left a
+    FAILED entry -- including the ones that cleaned up perfectly, which
+    made `find_orphans` report residue that did not exist and trained
+    whoever read it to ignore the answer.
+
+    The holder is removed only when it is OURS: a directory that was
+    already at that path belongs to something else, and this function
+    is not allowed to have an opinion about it.
+
+    Whatever failed first still wins. Cleanup only ever adds the one
+    fixed marker."""
+    cleaned = _remove_tree_quietly(holder) if ours else True
+    if _present(holder):
+        cleaned = False
+    if cleaned:
+        # nothing of ours is on disk, so the record describes nothing
+        if _remove_record_quietly(state_dir, workspace_id):
+            return
+    else:
+        # residue may remain: it has to stay findable, with its
+        # ownership intact, or recovery has no way back to it
+        _fail_quietly(state_dir, workspace_id)
+    _mark(primary)
+
+
 def create(repo, *, state_dir, run_id, baseline_sha) -> FlatWorkspace:
     """Build the two trees. The ONLY function here that runs git.
 
@@ -313,34 +423,31 @@ def create(repo, *, state_dir, run_id, baseline_sha) -> FlatWorkspace:
               "workspace_id": _mint_id(),
               "repo_id": state_module.repo_identity(repo),
               "run_id": run_id, "baseline_sha": baseline_sha,
-              "status": STATUS_REGISTERED}
+              "status": STATUS_REGISTERED, "created_at": _now()}
     _write_record(state_dir, record)
     workspace_id = record["workspace_id"]
-
     holder = holder_for(workspace_id)
-    try:
-        # never `exist_ok`: a collision might BE another run, and the
-        # only safe answer is to refuse rather than to make room
-        holder.mkdir()
-    except FileExistsError:
-        _set_status(state_dir, workspace_id, STATUS_FAILED)
-        raise FlatWorkspaceError("calisma alani dizini zaten var") from None
-    except OSError:
-        _set_status(state_dir, workspace_id, STATUS_FAILED)
-        raise FlatWorkspaceError("calisma alani dizini yaratilamadi") from None
 
-    _set_status(state_dir, workspace_id, STATUS_MATERIALIZING)
+    ours = False
     try:
+        _set_status(state_dir, workspace_id, STATUS_MATERIALIZING)
+        try:
+            # never `exist_ok`: a collision might BE another run, and
+            # the only safe answer is to refuse rather than make room
+            holder.mkdir()
+        except FileExistsError:
+            raise FlatWorkspaceError(
+                "calisma alani dizini zaten var") from None
+        except OSError:
+            raise FlatWorkspaceError(
+                "calisma alani dizini yaratilamadi") from None
+        # only NOW may anything here delete that directory
+        ours = True
         reference, implementer, manifest = _materialise(
             repo, holder, girisler, limits)
         digest = baseline_digest(manifest)
-    except BaseException:
-        # FAILED either way and the record is NEVER dropped: if the
-        # holder could not be removed the residue has to stay findable,
-        # and a cleanup problem must not replace the error that got us
-        # here.
-        _remove_tree_quietly(holder)
-        _set_status(state_dir, workspace_id, STATUS_FAILED)
+    except BaseException as primary:
+        _after_failure(state_dir, workspace_id, holder, ours, primary)
         raise
 
     _set_status(state_dir, workspace_id, STATUS_READY, baseline_digest=digest)
@@ -428,10 +535,16 @@ def remove(repo, *, state_dir, workspace_id) -> None:
         shutil.rmtree(holder, onerror=_clear_readonly_legacy)
     except OSError:
         raise FlatWorkspaceError("calisma alani silinemedi") from None
-    if holder.exists():
+    if _present(holder):
         raise FlatWorkspaceError("calisma alani silinemedi")
-    # the record goes ONLY after the holder is proven gone
-    _record_path(state_dir, workspace_id).unlink(missing_ok=True)
+    # the record goes ONLY after the holder is proven gone, and a
+    # record that cannot be removed is its own refusal rather than a
+    # silent success -- the entry left behind would name a holder that
+    # is not there
+    try:
+        _record_path(state_dir, workspace_id).unlink(missing_ok=True)
+    except OSError:
+        raise FlatWorkspaceError("calisma alani kaydi silinemedi") from None
 
 
 def _clear_readonly(function, path, error):

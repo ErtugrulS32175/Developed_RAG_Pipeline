@@ -34,7 +34,8 @@ from pathlib import Path
 
 import pytest
 
-from tools.agent_loop import flat_workspace, git_objects, git_transport
+from tools.agent_loop import contract, flat_workspace, git_objects
+from tools.agent_loop import git_transport, state
 
 # the repository root, for the nested probe's PYTHONPATH
 _DEPO_KOKU = Path(__file__).resolve().parents[1]
@@ -521,6 +522,12 @@ def test_the_contract_ceilings_refuse_rather_than_truncate(
     monkeypatch.setattr(flat_workspace, "DEFAULT_LIMITS", limits)
     with pytest.raises(flat_workspace.FlatWorkspaceError):
         _create(repo, state_dir, baseline)
+    # refused BEFORE the tree is on disk, not trimmed afterwards: the
+    # entry ceiling stops the walk, and the byte ceilings stop each blob
+    # before the write that would have carried it
+    kalanlar = [p for p in flat_workspace.runner_temp_root().iterdir()
+                if p.name.startswith(flat_workspace.TEMP_PREFIX)]
+    assert kalanlar == [], "tavan asildi ama agac yine de yazildi"
 
 
 # =====================================================================
@@ -578,8 +585,13 @@ def test_a_half_materialised_holder_is_an_orphan(repo, state_dir):
 def test_a_workspace_that_never_reached_ready_is_refused(repo, state_dir):
     baseline = _commit_files(repo, {"a.py": b"A"})
     ws = _create(repo, state_dir, baseline)
-    flat_workspace._set_status(state_dir, ws.workspace_id,
-                               flat_workspace.STATUS_MATERIALIZING)
+    # written through the STORAGE layer, not the transition layer: READY
+    # is terminal now, so this stands in for a process that died while
+    # materialising rather than for a legal step backwards
+    kayit = flat_workspace.read_record(state_dir, ws.workspace_id)
+    kayit["status"] = flat_workspace.STATUS_MATERIALIZING
+    kayit.pop("baseline_digest", None)
+    flat_workspace._write_record(state_dir, kayit)
     with pytest.raises(flat_workspace.FlatWorkspaceError):
         flat_workspace.assert_binding(
             repo, state_dir=state_dir, run_id="kosu-1",
@@ -652,32 +664,249 @@ def test_a_failed_record_write_leaves_the_filesystem_untouched(
     assert not _kayitlar(state_dir)
 
 
-def test_a_failure_midway_leaves_either_nothing_or_a_findable_record(
-        repo, state_dir, monkeypatch):
-    baseline = _commit_files(repo, {"a.py": b"A", "b.py": b"B", "c.py": b"C"})
+# =====================================================================
+# D2. THE LEDGER IS A STATE MACHINE
+#
+# Every guard downstream reads `status`, so a write that could put any
+# value there is a write that could satisfy any guard.
+# =====================================================================
+
+def _durum(state_dir, workspace_id):
+    kayit = flat_workspace.read_record(state_dir, workspace_id)
+    return None if kayit is None else kayit["status"]
+
+
+def _kayit_kur(state_dir, repo, status, workspace_id="b" * 32, **ekstra):
+    """A ledger entry at an arbitrary status, written through the
+    STORAGE layer. That is the only way to stand a crashed run back up:
+    the transition layer refuses to put a record where no legal path
+    leads."""
+    kayit = {"protocol_version": contract.PROTOCOL_VERSION,
+             "workspace_id": workspace_id,
+             "repo_id": state.repo_identity(repo), "run_id": "kosu-1",
+             "baseline_sha": "0" * 40, "status": status,
+             "created_at": "2026-01-01T00:00:00Z"}
+    kayit.update(ekstra)
+    flat_workspace._write_record(state_dir, kayit)
+    return workspace_id
+
+
+def test_the_legal_transition_chain_is_accepted(repo, state_dir):
+    kimlik = _kayit_kur(state_dir, repo, flat_workspace.STATUS_REGISTERED)
+    flat_workspace._set_status(state_dir, kimlik,
+                               flat_workspace.STATUS_MATERIALIZING)
+    assert _durum(state_dir, kimlik) == flat_workspace.STATUS_MATERIALIZING
+    flat_workspace._set_status(state_dir, kimlik,
+                               flat_workspace.STATUS_READY,
+                               baseline_digest="0" * 64)
+    assert _durum(state_dir, kimlik) == flat_workspace.STATUS_READY
+
+
+@pytest.mark.parametrize("nereden,nereye", [
+    ("registered", "ready"),
+    ("registered", "failed"),
+    ("registered", "registered"),
+    ("materializing", "registered"),
+    ("ready", "materializing"),
+    ("ready", "failed"),
+    ("failed", "materializing"),
+    ("failed", "ready"),
+])
+def test_an_illegal_transition_is_refused_and_changes_nothing(
+        repo, state_dir, nereden, nereye):
+    """READY and FAILED are terminal, and nothing walks backwards. The
+    record has to be UNCHANGED afterwards: a refusal that still wrote is
+    not a refusal."""
+    kimlik = _kayit_kur(state_dir, repo, nereden)
+    with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+        flat_workspace._set_status(state_dir, kimlik, nereye)
+    assert "izinsiz durum gecisi" in str(ret.value)
+    assert _durum(state_dir, kimlik) == nereden, "reddedildi ama yazdi"
+
+
+@pytest.mark.parametrize("alan", ["workspace_id", "repo_id", "run_id",
+                                  "baseline_sha", "created_at",
+                                  "protocol_version"])
+def test_a_status_update_can_never_touch_an_ownership_field(repo, state_dir,
+                                                            alan):
+    """The one thing a ledger entry is for is saying whose residue this
+    is. A transition that could rewrite that could hand a holder to
+    another run."""
+    kimlik = _kayit_kur(state_dir, repo, flat_workspace.STATUS_REGISTERED)
+    once = flat_workspace.read_record(state_dir, kimlik)
+    cagri = dict(state_dir=state_dir, status=flat_workspace.STATUS_MATERIALIZING)
+    if alan == "workspace_id":
+        # not a runtime check at all, and stronger than one: the
+        # parameter name already binds it, so the value has no route
+        # into `**changes` in the first place
+        with pytest.raises(TypeError):
+            flat_workspace._set_status(workspace_id=kimlik,
+                                       **{alan: "c" * 32}, **cagri)
+    else:
+        with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+            flat_workspace._set_status(workspace_id=kimlik,
+                                       **{alan: "c" * 32}, **cagri)
+        assert "sahiplik" in str(ret.value)
+    assert flat_workspace.read_record(state_dir, kimlik) == once
+
+
+@pytest.mark.parametrize("nasil", ["bilinmeyen-durum", "kayit-yok",
+                                   "kayit-bozuk"])
+def test_a_status_that_cannot_be_trusted_is_a_typed_refusal(repo, state_dir,
+                                                            nasil):
+    """Absent and malformed are different situations -- never registered
+    versus damaged -- and collapsing them hides the second."""
+    kimlik = "d" * 32
+    if nasil == "bilinmeyen-durum":
+        _kayit_kur(state_dir, repo, flat_workspace.STATUS_REGISTERED,
+                   workspace_id=kimlik)
+        hedef, beklenen = "yepyeni-durum", "bilinmeyen"
+    elif nasil == "kayit-yok":
+        hedef, beklenen = flat_workspace.STATUS_MATERIALIZING, "kaydi yok"
+    else:
+        _kayit_kur(state_dir, repo, flat_workspace.STATUS_REGISTERED,
+                   workspace_id=kimlik)
+        flat_workspace._record_path(state_dir, kimlik).write_text(
+            "{bu json degil", encoding="utf-8")
+        hedef, beklenen = flat_workspace.STATUS_MATERIALIZING, "bozuk"
+
+    with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+        flat_workspace._set_status(state_dir, kimlik, hedef)
+    assert beklenen in str(ret.value)
+
+
+# =====================================================================
+# D3. WHAT A FAILED MATERIALISATION LEAVES BEHIND
+#
+# The question is never "did we create it" but "is anything there now".
+# Keeping a FAILED record unconditionally made `find_orphans` report
+# residue that did not exist, and an answer that is wrong in the safe
+# direction still trains whoever reads it to ignore it.
+# =====================================================================
+
+def _kalan_holderlar():
+    return [p for p in flat_workspace.runner_temp_root().iterdir()
+            if p.name.startswith(flat_workspace.TEMP_PREFIX)]
+
+
+def _patlat(monkeypatch, kacinci, hata):
+    """Blow up on the Nth blob read, and report that it happened."""
     gercek = git_objects._object_bytes
     durum = {"sayi": 0}
 
     def patlayan(*args, **kwargs):
         durum["sayi"] += 1
-        if durum["sayi"] == 2:
-            raise flat_workspace.FlatWorkspaceError("kurgu materyalizasyon")
+        if durum["sayi"] == kacinci:
+            raise hata
         return gercek(*args, **kwargs)
 
     monkeypatch.setattr(git_objects, "_object_bytes", patlayan)
-    with pytest.raises(flat_workspace.FlatWorkspaceError):
-        _create(repo, state_dir, baseline)
-    assert durum["sayi"] >= 2, "senaryo kurulmadi"
+    return durum
 
-    kayitlar = _kayitlar(state_dir)
-    kalanlar = [p for p in flat_workspace.runner_temp_root().iterdir()
-                if p.name.startswith(flat_workspace.TEMP_PREFIX)]
-    if kalanlar:
-        assert kayitlar, "holder kaldi ama kayit dusuruldu -- bulunamaz kalinti"
-        yetimler = flat_workspace.find_orphans(repo, state_dir=state_dir)
-        assert yetimler
+
+@pytest.mark.parametrize("senaryo", ["holder-oncesi", "holder-sonrasi",
+                                     "kismi", "kesinti"])
+def test_a_proven_cleanup_leaves_neither_holder_nor_record(
+        repo, state_dir, monkeypatch, senaryo):
+    """When the filesystem is proven clean the record describes nothing,
+    so it goes too -- and `find_orphans` stays believable."""
+    baseline = _commit_files(repo, {"a.py": b"A", "b.py": b"B", "c.py": b"C"})
+    durum = None
+    beklenen = KeyboardInterrupt if senaryo == "kesinti" \
+        else flat_workspace.FlatWorkspaceError
+
+    if senaryo == "holder-oncesi":
+        gercek_mkdir = Path.mkdir
+        gorulen = {"evet": False}
+
+        def reddeden(self, *args, **kwargs):
+            if self.name.startswith(flat_workspace.TEMP_PREFIX):
+                gorulen["evet"] = True
+                raise PermissionError("kurgu mkdir arizasi")
+            return gercek_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", reddeden)
+    elif senaryo == "kismi":
+        durum = _patlat(monkeypatch, 2,
+                        flat_workspace.FlatWorkspaceError("kurgu yarim"))
+    elif senaryo == "kesinti":
+        durum = _patlat(monkeypatch, 2, KeyboardInterrupt())
+    else:
+        durum = _patlat(monkeypatch, 1,
+                        flat_workspace.FlatWorkspaceError("kurgu ilk blob"))
+
+    with pytest.raises(beklenen):
+        _create(repo, state_dir, baseline)
+
+    if senaryo == "holder-oncesi":
+        assert gorulen["evet"], "senaryo kurulmadi: holder mkdir'ine gelinmedi"
+    else:
+        assert durum["sayi"] >= 1, "senaryo kurulmadi: blob okumasina gelinmedi"
+    assert _kalan_holderlar() == [], "holder kaldi"
+    assert _kayitlar(state_dir) == [], "temizlik kanitlandi ama kayit kaldi"
+    assert flat_workspace.find_orphans(repo, state_dir=state_dir) == ()
+
+
+def test_an_unproven_cleanup_keeps_a_findable_failed_record(
+        repo, state_dir, monkeypatch):
+    """Residue that cannot be removed has to stay findable, with its
+    ownership intact, or recovery has no way back to it."""
+    baseline = _commit_files(repo, {"a.py": b"A", "b.py": b"B"})
+    durum = _patlat(monkeypatch, 2,
+                    flat_workspace.FlatWorkspaceError("kurgu yarim"))
+    gorulen = {"evet": False}
+
+    def silemeyen(path):
+        gorulen["evet"] = True
+        return False                     # the holder stays exactly there
+
+    monkeypatch.setattr(flat_workspace, "_remove_tree_quietly", silemeyen)
+
+    with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+        _create(repo, state_dir, baseline)
+
+    assert durum["sayi"] >= 2 and gorulen["evet"], "senaryo kurulmadi"
+    assert "kurgu yarim" in str(ret.value), "birincil hata degistirildi"
+    assert flat_workspace.CLEANUP_NOTE in (
+        getattr(ret.value, "__notes__", None) or []), "temizlik isareti yok"
+    kalanlar = _kalan_holderlar()
+    assert kalanlar, "senaryo kurulmadi: holder zaten yok"
+    yetimler = flat_workspace.find_orphans(repo, state_dir=state_dir)
+    assert len(yetimler) == 1
+    assert yetimler[0]["status"] == flat_workspace.STATUS_FAILED
+    assert yetimler[0]["run_id"] == "kosu-1"
     for p in kalanlar:
         shutil.rmtree(p, ignore_errors=True)
+
+
+def test_a_record_that_will_not_go_is_marked_and_touches_no_other_holder(
+        repo, state_dir, monkeypatch):
+    """The primary failure still wins and the marker is the only thing
+    cleanup adds. Another run's holder is not part of this at all."""
+    baseline = _commit_files(repo, {"a.py": b"A", "b.py": b"B"})
+    komsu = _create(repo, state_dir, baseline, run_id="kosu-2")
+    komsu_dosya = komsu.reference_root / "a.py"
+    assert komsu_dosya.is_file(), "senaryo kurulmadi"
+
+    durum = _patlat(monkeypatch, 2,
+                    flat_workspace.FlatWorkspaceError("kurgu yarim"))
+    gorulen = {"evet": False}
+
+    def silemeyen(state_dir_, workspace_id):
+        gorulen["evet"] = True
+        return False
+
+    monkeypatch.setattr(flat_workspace, "_remove_record_quietly", silemeyen)
+
+    with pytest.raises(flat_workspace.FlatWorkspaceError) as ret:
+        _create(repo, state_dir, baseline)
+
+    assert durum["sayi"] >= 2 and gorulen["evet"], "senaryo kurulmadi"
+    assert "kurgu yarim" in str(ret.value)
+    assert flat_workspace.CLEANUP_NOTE in (
+        getattr(ret.value, "__notes__", None) or [])
+    assert komsu_dosya.read_bytes() == b"A", "baska bir holder'a dokunuldu"
+    assert komsu.reference_root.is_dir() and komsu.implementer_root.is_dir()
 
 
 def test_recovery_finds_an_orphan_without_being_told_the_identity(
