@@ -50,13 +50,14 @@ IMMUTABLE_STATE_FIELDS = ("protocol_version", "run_id", "started_at",
 BINDING_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    # An execution identity is REQUIRED. It was once optional, and the
-    # value `worktree.create` produced could not satisfy the pattern
-    # anyway, so the binding was never established and nothing reported
-    # that. Optional plus unsatisfiable is a field that exists only in
-    # the documentation.
+    # An execution identity is REQUIRED, and since B2B-B2C there is only
+    # one of them. It was once optional, and the value the old
+    # `worktree.create` produced could not satisfy the pattern anyway, so
+    # the binding was never established and nothing reported that.
+    # Optional plus unsatisfiable is a field that exists only in the
+    # documentation.
     "required": ["protocol_version", "run_id", "repo_id", "baseline_sha",
-                 "manifest_digest"],
+                 "manifest_digest", "workspace_id"],
     "properties": {
         "protocol_version": {"const": contract.PROTOCOL_VERSION},
         "run_id": {"type": "string", "pattern": contract.IDENTIFIER_PATTERN},
@@ -65,22 +66,15 @@ BINDING_SCHEMA = {
         "repo_id": {"type": "string", "pattern": r"^[0-9a-f]{32}$"},
         "baseline_sha": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "manifest_digest": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-        # TEMPORARY B2B-B BRIDGE. Two execution surfaces exist at once:
-        # the legacy disposable git worktree and the D3A flat workspace.
-        # Both grammars are the contract's opaque id.
-        "worktree_id": {"type": "string",
-                        "pattern": contract.OPAQUE_ID_PATTERN},
+        # THE execution identity. B2B-B1 carried two of these at once
+        # while the flat workspace replaced the disposable git worktree,
+        # and B2B-B2C removed the second: `worktree_id` is not an
+        # optional field now, it is an UNKNOWN one, and
+        # `additionalProperties: False` is what refuses a stale document
+        # carrying it. A run has one place it may run in.
         "workspace_id": {"type": "string",
                          "pattern": contract.OPAQUE_ID_PATTERN},
     },
-    # EXACTLY ONE, expressed where the schema can enforce it rather than
-    # in a later hand-written check. `oneOf` over the two "required"
-    # branches refuses BOTH shapes that have no answer: a binding
-    # carrying neither identity names no place to run, and one carrying
-    # both leaves the choice to whichever reader looks first.
-    # B2B-B2C drops the worktree branch and this collapses to `required`.
-    "oneOf": [{"required": ["worktree_id"]},
-              {"required": ["workspace_id"]}],
 }
 
 
@@ -317,7 +311,7 @@ def read_binding(state_dir):
 
 
 def assert_binding(state_dir, *, repo_id, baseline_sha, manifest_digest,
-                   worktree_id=None, workspace_id=None):
+                   workspace_id=None):
     """Refuse state that belongs to a different run.
 
     Several separate ways a state directory can be the wrong one, and
@@ -325,16 +319,17 @@ def assert_binding(state_dir, *, repo_id, baseline_sha, manifest_digest,
     edited task, an execution root that is no longer the one this run
     built.
 
-    The two execution identities are checked the same way and never
-    substituted for each other: a caller asking about a workspace must
-    not be answered by a binding that names a worktree, because the
-    schema lets exactly one of them exist and `get` on the absent one
-    returns `None` -- which would match a caller that passed nothing."""
+    `workspace_id=None` means "do not compare the execution identity",
+    which is what a GENERIC state-directory check wants: it validates the
+    document's shape and the identities the caller actually knows. It
+    does NOT mean the identity is optional -- the schema requires a real
+    `workspace_id` on disk either way, so nothing reaches this comparison
+    without one. Every identity-bound caller (`execution`, `changes`)
+    passes the value explicitly, and a caller that passes nothing is
+    never answered ABOUT an identity it did not name."""
     binding = read_binding(state_dir)
     checks = [("repo_id", repo_id), ("baseline_sha", baseline_sha),
               ("manifest_digest", manifest_digest)]
-    if worktree_id is not None:
-        checks.append(("worktree_id", worktree_id))
     if workspace_id is not None:
         checks.append(("workspace_id", workspace_id))
     for field, expected in checks:

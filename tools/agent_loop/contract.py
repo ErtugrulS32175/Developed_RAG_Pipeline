@@ -272,14 +272,25 @@ CONTROL_PLANE_BLOCKED_PATHS = _with_ancestors(CONTROL_PLANE_PATHS)
 # was given, before and after, and a change is terminal.
 TASK_MANIFEST_IS_IMMUTABLE = True
 
-# PHASE B DESIGN, frozen now so the runner is built against it rather
-# than around it: the implementer runs in a DISPOSABLE GIT WORKTREE
-# created from the baseline, never in the operator's working tree.
-# Hashing after the fact detects damage that has already happened and
-# been left behind; a separate worktree means the main tree is never the
-# thing at risk. Only a verified allowed-path patch is applied back, and
-# a worktree whose control plane moved is discarded rather than merged.
-IMPLEMENTER_RUNS_IN_DISPOSABLE_WORKTREE = True
+# PHASE B DESIGN, frozen so the runner is built against it rather than
+# around it: the implementer runs in a FLAT WORKSPACE, never in the
+# operator's working tree.
+#
+# The baseline commit is materialised from RAW GIT OBJECTS into two
+# independent plain trees that contain no `.git` at all. The model works
+# in the IMPLEMENTER tree; the REFERENCE tree is the unchanging thing its
+# work is measured against, and the model has no path to it. Hashing
+# after the fact detects damage that has already happened and been left
+# behind; a separate workspace means the main tree is never the thing at
+# risk, and only a verified, authorised change may later be applied back.
+#
+# THE DISPOSABLE GIT WORKTREE THIS REPLACED WAS NOT AN AUTHORITY. It
+# carried a `.git` link straight into the model's reach, and git lost the
+# evidence job twice to state reachable through it: the per-repository
+# index, where `skip-worktree` hid a modified control-plane file, and
+# shared configuration, where a clean filter hid a change AND ran a
+# model-supplied command during verification.
+IMPLEMENTER_RUNS_IN_FLAT_WORKSPACE = True
 
 # Hashed before and after every implementer call. Any difference is
 # terminal -- not a finding to repair, because the thing that would

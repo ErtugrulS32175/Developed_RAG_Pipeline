@@ -21,7 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from tools.agent_loop import contract, execution, state, worktree
+from tools.agent_loop import (contract, execution, flat_workspace,
+                              state)
 from tools.agent_loop import process as process_module
 
 # The grandchild: writes a heartbeat immediately, then keeps writing.
@@ -131,19 +132,23 @@ def _kill_for_real(process):
 
 
 @pytest.fixture
-def worktree_dir(tmp_path):
-    path = tmp_path / "kurgu-worktree"
+def cwd_dir(tmp_path):
+    """A PLAIN directory to launch into. It was called `cwd_dir`
+    and never was one: these tests are about containment, and what they
+    need is a working directory that exists."""
+    path = tmp_path / "kurgu-cwd"
     path.mkdir()
     return path
 
 
 @pytest.fixture
 def bound_identity(tmp_path):
-    """R2A MECHANICAL UPDATE: `run_implementer` no longer takes a path,
-    so the four lifecycle tests that reach it hand over the identities
-    of a REAL recorded worktree, built exactly the way B1 builds one --
-    inside a private temp root, so nothing here touches the
-    machine-wide holder directory. No assertion below changed."""
+    """R2A MECHANICAL UPDATE, carried to B2B-B2C: `run_implementer` does
+    not take a path, so the lifecycle tests that reach it hand over the
+    identities of a REAL recorded D3A flat workspace -- inside a private
+    temp root, so nothing here touches the machine-wide holder
+    directory. No containment assertion below changed; only the thing
+    that supplies a bound working directory did."""
     private = tmp_path / "runner-temp"
     private.mkdir()
     isolation = pytest.MonkeyPatch()
@@ -168,18 +173,20 @@ def bound_identity(tmp_path):
     git("commit", "-qm", "kurgu")
     baseline = git("rev-parse", "HEAD")
     state_dir = tmp_path / "durum"
-    _, worktree_id = worktree.create(repo, state_dir=state_dir,
-                                     run_id="kurgu-run-1",
-                                     baseline_sha=baseline)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    workspace = flat_workspace.create(repo, state_dir=state_dir,
+                                      run_id="kurgu-run-1",
+                                      baseline_sha=baseline)
     state.write_binding(state_dir, {
         "protocol_version": contract.PROTOCOL_VERSION,
         "run_id": "kurgu-run-1", "repo_id": state.repo_identity(repo),
         "baseline_sha": baseline, "manifest_digest": "0" * 64,
-        "worktree_id": worktree_id})
+        "workspace_id": workspace.workspace_id})
     yield {"repo": repo, "state_dir": state_dir, "run_id": "kurgu-run-1",
-           "worktree_id": worktree_id, "baseline_sha": baseline}
+           "workspace_id": workspace.workspace_id, "baseline_sha": baseline}
     try:
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
+        flat_workspace.remove(repo, state_dir=state_dir,
+                              workspace_id=workspace.workspace_id)
     except Exception:                                  # noqa: BLE001
         pass
     isolation.undo()
@@ -196,7 +203,7 @@ def _still_writing(beat, seconds=1.5):
 # =====================================================================
 
 def test_the_program_is_frozen_until_it_has_been_contained(tmp_path,
-                                                           worktree_dir,
+                                                           cwd_dir,
                                                            monkeypatch):
     """The race, closed by construction rather than narrowed.
 
@@ -218,7 +225,7 @@ def test_the_program_is_frozen_until_it_has_been_contained(tmp_path,
 
     monkeypatch.setattr(process_module, "_attach_job", refusing_attach)
     with pytest.raises(process_module.ContainmentError):
-        process_module.launch_contained([str(stub)], cwd=worktree_dir)
+        process_module.launch_contained([str(stub)], cwd=cwd_dir)
 
     time.sleep(1.0)
     assert not marker.exists(), \
@@ -426,7 +433,7 @@ class _FakeKernel:
     [("zaten-askida-degildi", 0), ("hala-askida", 2),
      ("hata", 0xFFFFFFFF)],
     ids=["onceki-0", "onceki-2", "hata-kodu"])
-def test_only_a_suspend_count_of_one_counts_as_started(tmp_path, worktree_dir,
+def test_only_a_suspend_count_of_one_counts_as_started(tmp_path, cwd_dir,
                                                        monkeypatch, label,
                                                        previous):
     """`ResumeThread` returns the PREVIOUS suspend count. Only 1 means
@@ -442,7 +449,7 @@ def test_only_a_suspend_count_of_one_counts_as_started(tmp_path, worktree_dir,
     monkeypatch.setattr(process_module, "_kernel32", lambda: fake)
 
     with pytest.raises(process_module.ContainmentError):
-        process_module.launch_contained([str(stub)], cwd=worktree_dir)
+        process_module.launch_contained([str(stub)], cwd=cwd_dir)
     monkeypatch.undo()
     time.sleep(0.8)
     assert not marker.exists(), "reddedilen resume sonrasi program calisti"
@@ -559,7 +566,7 @@ def test_a_truncated_thread_inventory_is_not_a_complete_one(monkeypatch):
      ("degerhatasi", ValueError("kurgu"))],
     ids=["OSError", "KeyboardInterrupt", "ValueError"])
 def test_any_failure_after_the_launch_still_discards_the_process(
-        tmp_path, worktree_dir, monkeypatch, label, failure):
+        tmp_path, cwd_dir, monkeypatch, label, failure):
     """Only `ContainmentError` reached the cleanup, so a Win32 call
     raising `OSError`, or an interrupt landing between the launch and
     the attach, left the suspended process on the machine."""
@@ -578,7 +585,7 @@ def test_any_failure_after_the_launch_still_discards_the_process(
     monkeypatch.setattr(process_module, "_attach_job", exploding_attach)
     monkeypatch.setattr(process_module, "_discard", recording_discard)
     with pytest.raises(type(failure)):
-        process_module.launch_contained([str(stub)], cwd=worktree_dir)
+        process_module.launch_contained([str(stub)], cwd=cwd_dir)
     monkeypatch.undo()
     assert len(discarded) == 1, "temizlik cagrilmadi"
     assert discarded[0].poll() is not None, "askidaki surec hala yasiyor"
@@ -586,7 +593,7 @@ def test_any_failure_after_the_launch_still_discards_the_process(
 
 @pytest.mark.skipif(os.name != "nt", reason="job drain Windows'a ozgu")
 def test_a_job_that_empties_after_a_moment_is_not_a_failure(tmp_path,
-                                                            worktree_dir,
+                                                            cwd_dir,
                                                             monkeypatch):
     """Termination is not instantaneous. Reading the active count once
     turned a job that went 1, 1, 0 into a refusal -- a false red for a
@@ -604,7 +611,7 @@ def test_a_job_that_empties_after_a_moment_is_not_a_failure(tmp_path,
 
     stub = _stub(tmp_path, seconds=0)
     process, container = process_module.launch_contained([str(stub)],
-                                                         cwd=worktree_dir)
+                                                         cwd=cwd_dir)
     monkeypatch.setattr(process_module, "_kernel32",
                         lambda: _FakeKernel(real,
                                             QueryInformationJobObject=staged_query))
@@ -620,7 +627,7 @@ def test_a_job_that_empties_after_a_moment_is_not_a_failure(tmp_path,
     ["terminate", "query", "never-empties"],
     ids=["terminate-reddetti", "sorgu-hatasi", "hic-bosalmadi"])
 def test_a_container_that_cannot_be_proven_empty_is_refused(tmp_path,
-                                                            worktree_dir,
+                                                            cwd_dir,
                                                             monkeypatch,
                                                             failure):
     """Each refusal path separately, and each within the shared deadline
@@ -646,7 +653,7 @@ def test_a_container_that_cannot_be_proven_empty_is_refused(tmp_path,
 
     stub = _stub(tmp_path, seconds=0)
     process, container = process_module.launch_contained([str(stub)],
-                                                         cwd=worktree_dir)
+                                                         cwd=cwd_dir)
     monkeypatch.setattr(process_module, "_kernel32",
                         lambda: _FakeKernel(real, **overrides))
     started = time.monotonic()
@@ -662,7 +669,7 @@ def test_a_container_that_cannot_be_proven_empty_is_refused(tmp_path,
 
 @pytest.mark.skipif(os.name != "nt", reason="attach yolu Windows'a ozgu")
 def test_a_suspended_process_that_cannot_be_discarded_is_reported(
-        tmp_path, worktree_dir, monkeypatch):
+        tmp_path, cwd_dir, monkeypatch):
     """`kill` raising, or `wait` timing out, is exactly the case where
     "it never ran" stops being true. The earlier chain let either of
     them replace the containment error with its own, or propagate while
@@ -675,7 +682,7 @@ def test_a_suspended_process_that_cannot_be_discarded_is_reported(
     monkeypatch.setattr(process_module, "_attach_job", refusing_attach)
     monkeypatch.setattr(process_module, "_discard", lambda process: False)
     with pytest.raises(process_module.ContainmentEscaped) as refusal:
-        process_module.launch_contained([str(stub)], cwd=worktree_dir)
+        process_module.launch_contained([str(stub)], cwd=cwd_dir)
     monkeypatch.undo()
     # the ORIGINAL failure is chained, never replaced
     assert isinstance(refusal.value.__cause__, process_module.ContainmentError)
@@ -685,13 +692,13 @@ def test_a_suspended_process_that_cannot_be_discarded_is_reported(
 @pytest.mark.skipif(os.name != "nt", reason="attach yolu Windows'a ozgu")
 @pytest.mark.parametrize("broken", ["kill", "wait"],
                          ids=["kill-hatasi", "wait-zaman-asimi"])
-def test_the_discard_result_is_measured_not_assumed(tmp_path, worktree_dir,
+def test_the_discard_result_is_measured_not_assumed(tmp_path, cwd_dir,
                                                     monkeypatch, broken):
     """A counter proving `kill` was CALLED is not proof the process is
     gone. `_discard` reports what the operating system says."""
     stub = _stub(tmp_path, seconds=30)
     process, container = process_module.launch_contained([str(stub)],
-                                                         cwd=worktree_dir)
+                                                         cwd=cwd_dir)
     try:
         if broken == "kill":
             monkeypatch.setattr(type(process), "kill",

@@ -20,11 +20,9 @@ refusal.
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,13 +33,17 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
-from tools.agent_loop import cli, contract, execution, schemas, state, worktree
+from tools.agent_loop import (cli, contract, execution, flat_workspace,
+                              schemas, state)
 from tools.agent_loop import process as process_module
 
 RUN = "kurgu-run-1"
 # the contract's own minimum per-call timeout; tests move the
 # CLOCK rather than lowering it
 MIN_TIMEOUT = execution.MIN_TIMEOUT_SECONDS
+# where `_fake_binary` puts its shims; the only programs that count as
+# "the model ran"
+STUB_HOLDER = "sahte-bin"
 
 # Delegating shim: the adapter needs a genuinely launchable file, and the
 # behaviour needs Python. `%*` / `"$@"` forward nothing of ours -- the
@@ -150,10 +152,10 @@ def _git(repo, *args):
 
 
 @pytest.fixture(autouse=True)
-def private_worktree_root(tmp_path):
+def private_runner_root(tmp_path):
     """Every test gets its OWN runner temp root -- B1's lesson, imported
     wholesale: the real root is shared by every process on the machine,
-    and the worktrees this battery now creates must be unable to collide
+    and the workspaces this battery creates must be unable to collide
     with, or sweep away, anybody else's.
 
     Its OWN `MonkeyPatch`, not the shared fixture: one test in this file
@@ -165,7 +167,7 @@ def private_worktree_root(tmp_path):
     isolation.setattr(tempfile, "tempdir", str(private))
     for variable in ("TMPDIR", "TEMP", "TMP"):
         isolation.setenv(variable, str(private))
-    root = worktree.runner_temp_root()
+    root = flat_workspace.runner_temp_root()
     assert root.parent.resolve() == private.resolve(), \
         "gecici kok bu teste ozel degil"
     yield root
@@ -173,11 +175,14 @@ def private_worktree_root(tmp_path):
 
 
 @pytest.fixture
-def bound(tmp_path, private_worktree_root):
-    """A REAL repository, a REAL B1 worktree at its baseline, and the
-    identity tuple that is now the ONLY way to name it. R2A removed the
-    path parameter: execution derives the directory from these or it
-    refuses."""
+def bound(tmp_path, private_runner_root):
+    """A REAL repository, a REAL D3A flat workspace at its baseline, and
+    the identity tuple that is the ONLY way to name it.
+
+    B2B-B2C moved this fixture off the disposable git worktree. What it
+    proves is unchanged and is the reason the general tests below take
+    it: execution DERIVES its working directory from these identities or
+    it refuses -- there is no path parameter to hand it one."""
     repo = tmp_path / "kurgu-depo"
     repo.mkdir()
     for argv in (["init", "-q"],
@@ -189,26 +194,43 @@ def bound(tmp_path, private_worktree_root):
     _git(repo, "commit", "-qm", "kurgu")
     baseline = _git(repo, "rev-parse", "HEAD")
     state_dir = tmp_path / "durum"
-    path, worktree_id = worktree.create(repo, state_dir=state_dir,
-                                        run_id=RUN, baseline_sha=baseline)
-    # the RUN'S binding, pinning exactly this worktree -- R2A-R1: the
+    state_dir.mkdir(parents=True, exist_ok=True)
+    workspace = flat_workspace.create(repo, state_dir=state_dir, run_id=RUN,
+                                      baseline_sha=baseline)
+    # the RUN'S binding, pinning exactly this workspace -- R2A-R1: the
     # first fixture never wrote it, so the seam could not be asked
     # whether it reads the document at all, and it did not
     state.write_binding(state_dir, {
         "protocol_version": contract.PROTOCOL_VERSION, "run_id": RUN,
         "repo_id": state.repo_identity(repo), "baseline_sha": baseline,
-        "manifest_digest": "0" * 64, "worktree_id": worktree_id})
+        "manifest_digest": "0" * 64,
+        "workspace_id": workspace.workspace_id})
     yield types.SimpleNamespace(
-        repo=repo, state_dir=state_dir, run_id=RUN, worktree_id=worktree_id,
-        baseline_sha=baseline, path=path,
+        repo=repo, state_dir=state_dir, run_id=RUN,
+        workspace_id=workspace.workspace_id,
+        baseline_sha=baseline, path=workspace.implementer_root,
+        reference=workspace.reference_root,
         identity={"repo": repo, "state_dir": state_dir, "run_id": RUN,
-                  "worktree_id": worktree_id, "baseline_sha": baseline})
+                  "workspace_id": workspace.workspace_id,
+                  "baseline_sha": baseline})
     try:
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
+        flat_workspace.remove(repo, state_dir=state_dir,
+                              workspace_id=workspace.workspace_id)
     except Exception:                                  # noqa: BLE001
         # negative tests sabotage the repo or the record on purpose;
         # everything lives under tmp_path and is discarded with it
         pass
+
+
+def _reply_binary(tmp_path):
+    """A stub that would SUCCEED if it were ever launched, so a refusal
+    can never be blamed on the binary.
+
+    It lived inside the R2A worktree battery until B2B-B2C removed that
+    section; the later sections and the flat suite both use it, so it
+    moved up here with the rest of the stub machinery."""
+    return _fake_binary(tmp_path, mode="raw",
+                        hex=json.dumps(_valid_reply()).encode().hex())
 
 
 @pytest.fixture
@@ -223,10 +245,10 @@ def stub_cwd(tmp_path):
 def _no_binding(tmp_path):
     """Identities that CANNOT bind, for refusals that must fire BEFORE
     the binding is consulted. If the validation order ever changes,
-    every test using these goes red with `WorktreeNotBound` in place of
+    every test using these goes red with `WorkspaceNotBound` in place of
     the type it asserts -- the order is part of the claim."""
     return {"repo": tmp_path, "state_dir": tmp_path / "durum-yok",
-            "run_id": RUN, "worktree_id": "0" * 32,
+            "run_id": RUN, "workspace_id": "0" * 32,
             "baseline_sha": "0" * 40}
 
 
@@ -239,11 +261,19 @@ def _no_binding(tmp_path):
 def only_fake_binaries_may_run(tmp_path, monkeypatch):
     """THE claim this whole file rests on, enforced rather than repeated.
 
-    Every launch is recorded and its program checked against `tmp_path`.
-    A test that accidentally reached a real `claude` or `codex` would
-    spend money and still look green -- an earlier suite in this project
-    created fake binaries and then never handed them to anything."""
+    Every launch is JUDGED against `tmp_path`. A test that accidentally
+    reached a real `claude` or `codex` would spend money and still look
+    green -- an earlier suite in this project created fake binaries and
+    then never handed them to anything.
+
+    Only the STUB launches are RECORDED, and that changed in B2B-B2C for
+    a measured reason: the fixture now builds a real flat workspace, and
+    `flat_workspace.create()` materialises it through this same
+    contained-launch seam. Recording git too made `launched[0]` a
+    fixture command instead of the model, which quietly broke every
+    assertion about "the argv the adapter launched"."""
     launched = []
+    hepsi = []
     started = []
     real_popen = process_module.subprocess.Popen
 
@@ -257,12 +287,16 @@ def only_fake_binaries_may_run(tmp_path, monkeypatch):
 
         @staticmethod
         def run(argv, **kwargs):
-            launched.append(list(argv))
+            hepsi.append(list(argv))
+            if STUB_HOLDER in str(argv[0]):
+                launched.append(list(argv))
             return subprocess.run(argv, **kwargs)
 
         @staticmethod
         def Popen(argv, **kwargs):                     # noqa: N802 -- stdlib
-            launched.append(list(argv))
+            hepsi.append(list(argv))
+            if STUB_HOLDER in str(argv[0]):
+                launched.append(list(argv))
             process = real_popen(argv, **kwargs)
             started.append(process)
             return process
@@ -279,10 +313,13 @@ def only_fake_binaries_may_run(tmp_path, monkeypatch):
     for process in survivors:
         _kill_tree_for_real(process)
     root = str(tmp_path).casefold()
-    strayed = [argv[0] for argv in launched
+    # judged over EVERY launch, not only the recorded ones: git is
+    # allowed here because the fixture builds a real repository and a
+    # real workspace with it, and nothing else is
+    izinli = ("taskkill.exe", "taskkill", "git", "git.exe")
+    strayed = [argv[0] for argv in hepsi
                if not str(argv[0]).casefold().startswith(root)
-               and Path(argv[0]).name.casefold() not in ("taskkill.exe",
-                                                         "taskkill")]
+               and Path(argv[0]).name.casefold() not in izinli]
     assert strayed == [], f"tmp_path disinda bir program calistirildi: {strayed}"
     alive = [process.pid for process in started if process.poll() is None]
     assert alive == [], f"test bittikten sonra yasayan surec: {alive}"
@@ -345,7 +382,7 @@ def test_the_adapter_launches_exactly_the_argv_the_cli_builds(
         "adapter cli.py'nin urettigi argv'yi degistirdi"
 
 
-def test_the_process_runs_inside_the_derived_worktree(
+def test_the_process_runs_inside_the_derived_workspace(
         tmp_path, bound):
     """WHERE it ran, read from the child itself: `dump` emits a report
     rather than a reply, so the refusal proves the process really
@@ -951,7 +988,7 @@ def test_a_grandchild_never_outlives_a_SUCCESSFUL_call(tmp_path, bound):
 
     A leftover implementer still editing files while the patch is
     verified and carried to the main checkout is precisely what the
-    disposable worktree exists to prevent, so the boundary is now drawn
+    flat workspace exists to prevent, so the boundary is now drawn
     by the operating system and emptiness is asked of it."""
     beat = tmp_path / "torun-kalp.txt"
     child = _CHILD.format(beat=str(beat))
@@ -1071,505 +1108,26 @@ def test_the_adapter_has_no_state_machine_of_its_own():
                       "events.jsonl", "assert_transition"):
         assert forbidden not in source, f"durum makinesi izi: {forbidden}"
 
-
 # =====================================================================
-# R2A -- execution is BOUND to the recorded worktree
+# R2A -- execution is BOUND to a recorded workspace
 # =====================================================================
 #
 # `run_implementer` used to take any directory that existed --
 # `is_dir()` was the whole check -- so the MAIN CHECKOUT was a perfectly
-# acceptable working directory for the model, and B1's write-ahead
+# acceptable working directory for the model, and the write-ahead
 # ownership record sat unread at the one moment it was supposed to
-# matter. Now the caller passes identities and the path is DERIVED; a
-# caller cannot even express "run it over there".
-
-def _record_file(state_dir, worktree_id):
-    return Path(state_dir) / worktree.REGISTRY_DIRNAME / f"{worktree_id}.json"
-
-
-def _rewrite_record(state_dir, worktree_id, **changes):
-    """Forge or adjust an ownership record THROUGH the schema, so every
-    forgery here is one `read_record` cannot tell from a real one."""
-    record = worktree.read_record(state_dir, worktree_id)
-    assert record is not None, "senaryo kurulmadi: kayit okunamadi"
-    state.write_json_atomically(_record_file(state_dir, worktree_id),
-                                dict(record, **changes),
-                                worktree.RECORD_SCHEMA,
-                                "calisma agaci kaydi")
-
-
-def _rewrite_binding(state_dir, **changes):
-    """Adjust the run's binding THROUGH the schema. Negative tests that
-    hand in a non-bound id rewrite the binding to AGREE with the call,
-    so the refusal they assert keeps coming from the one check they
-    isolate rather than from the binding comparison in front of it."""
-    state.write_binding(state_dir,
-                        dict(state.read_binding(state_dir), **changes))
-
-
-def _reply_binary(tmp_path):
-    """A stub that would SUCCEED if it were ever launched, so a refusal
-    can never be blamed on the binary."""
-    return _fake_binary(tmp_path, mode="raw",
-                        hex=json.dumps(_valid_reply()).encode().hex())
-
-
-def _binding_refused(binary, identity, launched, sentinels):
-    """The one shape every negative control must have: the typed
-    refusal, zero processes, and an error text that carries no path, no
-    repository name, no identity and no record content."""
-    with pytest.raises(execution.WorktreeNotBound) as refusal:
-        execution.run_implementer(
-            binary, **identity, prompt="kurgu",
-            budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
-    assert launched == [], "reddedilen bag yine de bir surec baslatti"
-    text = str(refusal.value) + repr(refusal.value)
-    assert "/" not in text and "\\" not in text, "ret metni yol tasiyor"
-    for sentinel in sentinels:
-        assert str(sentinel) not in text, "ret metni kimlik/yol tasiyor"
-    assert refusal.value.reason == contract.StopReason.PREFLIGHT_FAILED
-    assert refusal.value.event == contract.EventCode.PREFLIGHT_FAILED
-    return refusal.value
-
-
-def _sentinels(identity):
-    return (identity["repo"], identity["worktree_id"],
-            identity["baseline_sha"], "kurgu-depo")
-
-
-def _plant_link(link, target):
-    """A directory symlink, or an NTFS junction where symlinks need a
-    privilege this test cannot assume. Proven to resolve, or the test
-    fails as UNBUILT rather than passing around the scenario."""
-    try:
-        os.symlink(str(target), str(link), target_is_directory=True)
-    except OSError:
-        if os.name != "nt":
-            raise
-        import _winapi
-        _winapi.CreateJunction(str(target), str(link))
-    assert Path(link).resolve() == Path(target).resolve(), \
-        "senaryo kurulmadi: baglanti kurulamadi"
-
-
-def test_the_signature_offers_no_path_parameter_at_all():
-    """The fix is structural: there is nothing to validate because
-    there is nothing to pass."""
-    parameters = inspect.signature(execution.run_implementer).parameters
-    assert set(parameters) == {
-        "binary", "repo", "state_dir", "run_id", "worktree_id",
-        # B2B-B1 bridge: the flat-workspace identity. An IDENTITY, not a
-        # path -- the escape list below is unchanged and still empty.
-        # `worktree_id` leaves when B2B-B2 removes the legacy branch.
-        "workspace_id",
-        "baseline_sha", "prompt", "budget_usd",
-        "timeout_seconds", "max_output_bytes", "model"}
-    for escape in ("worktree", "cwd", "path", "workdir", "working_dir",
-                   "directory", "schema_path", "schema", "schema_json",
-                   "schema_bytes", "schema_file"):
-        assert escape not in parameters, f"kacis parametresi: {escape}"
-    for name, parameter in parameters.items():
-        if name != "binary":
-            assert parameter.kind == inspect.Parameter.KEYWORD_ONLY, name
-
-
-def test_the_model_runs_exactly_in_the_derived_recorded_worktree(
-        tmp_path, bound):
-    """POSITIVE CONTROL for the whole section: a real repository, a real
-    B1 `create()`, a READY record and the correct identities -- and the
-    child's own report of its cwd is the derived holder path. Without
-    this, every refusal below could be a binding that refuses
-    everything."""
-    trace = tmp_path / "nerede.txt"
-    binary = _fake_binary(tmp_path, mode="raw",
-                          hex=json.dumps(_valid_reply()).encode().hex(),
-                          cwd_record=str(trace))
-    result = execution.run_implementer(
-        binary, **bound.identity, prompt="kurgu",
-        budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
-    assert result.reply["status"] == "implemented"
-    derived = worktree.holder_for(bound.worktree_id) / \
-        worktree.WORKTREE_DIRNAME
-    observed = Path(trace.read_text(encoding="utf-8")).resolve()
-    assert observed == derived.resolve() == bound.path.resolve()
-
-
-def test_the_main_checkout_is_never_the_model_working_directory(
-        tmp_path, private_worktree_root,
-        only_fake_binaries_may_run):
-    """THE R2 P0, rebuilt as far as the new design allows it to exist: a
-    repository whose MAIN checkout sits exactly where the id derives to,
-    with a READY record forged to match it. The directory is real, git
-    lists it (as the main tree), HEAD is the recorded baseline -- and
-    the main-checkout comparison still refuses."""
-    state_dir = tmp_path / "durum"
-    record = worktree.register(state_dir, repo=tmp_path, run_id=RUN,
-                               baseline_sha="0" * 40)
-    wid = record["worktree_id"]
-    main = worktree.holder_for(wid) / worktree.WORKTREE_DIRNAME
-    main.mkdir(parents=True)
-    for argv in (["init", "-q"],
-                 ["config", "user.email", "k@example.invalid"],
-                 ["config", "user.name", "Kurgu"]):
-        _git(main, *argv)
-    (main / "kurgu.py").write_text("VALUE = 1\n", encoding="utf-8")
-    _git(main, "add", "-A")
-    _git(main, "commit", "-qm", "kurgu")
-    baseline = _git(main, "rev-parse", "HEAD")
-    _rewrite_record(state_dir, wid, repo_id=state.repo_identity(main),
-                    baseline_sha=baseline, status=worktree.STATUS_READY)
-    state.write_binding(state_dir, {
-        "protocol_version": contract.PROTOCOL_VERSION, "run_id": RUN,
-        "repo_id": state.repo_identity(main), "baseline_sha": baseline,
-        "manifest_digest": "0" * 64, "worktree_id": wid})
-    assert main.is_dir() and _git(main, "rev-parse", "HEAD") == baseline, \
-        "senaryo kurulmadi"
-    identity = {"repo": main, "state_dir": state_dir, "run_id": RUN,
-                "worktree_id": wid, "baseline_sha": baseline}
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_the_repository_argument_may_never_be_the_execution_target(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """The record's repo_id rewritten to name the WORKTREE itself, and
-    `repo=` handed that same directory: git lists the tree, HEAD
-    matches, the path derives correctly -- executing in the repository
-    you answer to is what refuses."""
-    _rewrite_record(bound.state_dir, bound.worktree_id,
-                    repo_id=state.repo_identity(bound.path))
-    _rewrite_binding(bound.state_dir,
-                     repo_id=state.repo_identity(bound.path))
-    identity = dict(bound.identity, repo=bound.path)
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_a_random_existing_directory_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """A plain `mkdir` at the derived location, with a READY record
-    forged around it: existing was the WHOLE former check, and existing
-    is no longer enough -- git does not list it."""
-    record = worktree.register(bound.state_dir, repo=bound.repo, run_id=RUN,
-                               baseline_sha=bound.baseline_sha)
-    wid = record["worktree_id"]
-    stray = worktree.holder_for(wid) / worktree.WORKTREE_DIRNAME
-    stray.mkdir(parents=True)
-    _rewrite_record(bound.state_dir, wid, status=worktree.STATUS_READY)
-    _rewrite_binding(bound.state_dir, worktree_id=wid)
-    assert stray.is_dir(), "senaryo kurulmadi"
-    identity = dict(bound.identity, worktree_id=wid)
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_another_repositorys_worktree_record_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """Repository B's genuinely READY worktree, asked for by repository
-    A. The record is real and complete -- it was just never issued to
-    A. (Setup proves B's own binding is accepted, so the refusal below
-    is about the repository and nothing else.)"""
-    other = tmp_path / "baska-depo"
-    other.mkdir()
-    for argv in (["init", "-q"],
-                 ["config", "user.email", "k@example.invalid"],
-                 ["config", "user.name", "Kurgu"]):
-        _git(other, *argv)
-    (other / "kurgu.py").write_text("VALUE = 2\n", encoding="utf-8")
-    _git(other, "add", "-A")
-    _git(other, "commit", "-qm", "kurgu")
-    other_baseline = _git(other, "rev-parse", "HEAD")
-    other_state = tmp_path / "durum-b"
-    path_b, id_b = worktree.create(other, state_dir=other_state,
-                                   run_id=RUN, baseline_sha=other_baseline)
-    state.write_binding(other_state, {
-        "protocol_version": contract.PROTOCOL_VERSION, "run_id": RUN,
-        "repo_id": state.repo_identity(other),
-        "baseline_sha": other_baseline,
-        "manifest_digest": "0" * 64, "worktree_id": id_b})
-    assert worktree.assert_execution_binding(
-        other, state_dir=other_state, run_id=RUN, worktree_id=id_b,
-        baseline_sha=other_baseline) == path_b, "senaryo kurulmadi"
-    identity = {"repo": bound.repo, "state_dir": other_state,
-                "run_id": RUN, "worktree_id": id_b,
-                "baseline_sha": other_baseline}
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_a_wrong_run_id_is_refused(tmp_path, bound,
-                                   only_fake_binaries_may_run):
-    identity = dict(bound.identity, run_id="baska-kosu-1")
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_a_record_issued_to_a_different_repository_identity_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """ONLY the repository identity is wrong: the tree is real,
-    registered in the asking repository, at the right baseline -- but
-    the ledger says it was issued to somebody else. The first version of
-    this scenario asked with another repository and was refused by git's
-    registry instead; a mutation run proved the identity check itself
-    was never the thing refusing."""
-    _rewrite_record(bound.state_dir, bound.worktree_id,
-                    repo_id=state.repo_identity(tmp_path / "hayalet-depo"))
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_worktree_id_nobody_recorded_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    identity = dict(bound.identity, worktree_id="f" * 32)
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_a_record_copied_under_another_id_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """A byte-identical record filed under a SECOND, genuinely created
-    worktree's name: the directory that id derives to exists, git lists
-    it, HEAD answers correctly -- and the record still NAMES the other
-    worktree, which alone refuses. (The first version parked the copy
-    under a fresh id with a bare directory, and git's registry refused
-    before the name comparison ever mattered -- a mutation run caught
-    it.)"""
-    second_path, second_id = worktree.create(
-        bound.repo, state_dir=bound.state_dir, run_id=RUN,
-        baseline_sha=bound.baseline_sha)
-    _record_file(bound.state_dir, second_id).write_bytes(
-        _record_file(bound.state_dir, bound.worktree_id).read_bytes())
-    # the run's binding AGREES with the call, so the one thing refusing
-    # is the record's own name -- without this line the binding
-    # comparison refused first and a mutation run showed the name check
-    # was never the thing being tested
-    _rewrite_binding(bound.state_dir, worktree_id=second_id)
-    assert _git(second_path, "rev-parse", "HEAD") == bound.baseline_sha, \
-        "senaryo kurulmadi"
-    identity = dict(bound.identity, worktree_id=second_id)
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_a_wrong_baseline_is_refused(tmp_path, bound,
-                                     only_fake_binaries_may_run):
-    identity = dict(bound.identity, baseline_sha="1" * 40)
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_a_record_whose_baseline_was_rewritten_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """The tree IS at the caller's baseline; the RECORD is not. Without
-    the record comparison the HEAD check happily agrees with the caller
-    and a tampered ledger entry stops meaning anything -- which is
-    exactly how the first mutation run found this scenario missing."""
-    _rewrite_record(bound.state_dir, bound.worktree_id,
-                    baseline_sha="2" * 40)
-    assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha, \
-        "senaryo kurulmadi"
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_planned_record_is_refused_even_with_the_tree_on_disk(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """Wound back to PLANNED after a full create: the directory exists,
-    git registers it, HEAD matches -- ONLY the status refuses. PLANNED
-    means `create` never proved the tree it made, and an unproven tree
-    is not a place to run a model."""
-    _rewrite_record(bound.state_dir, bound.worktree_id,
-                    status=worktree.STATUS_PLANNED)
-    assert bound.path.is_dir(), "senaryo kurulmadi"
-    assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_missing_record_is_refused(tmp_path, bound,
-                                     only_fake_binaries_may_run):
-    _record_file(bound.state_dir, bound.worktree_id).unlink()
-    assert bound.path.is_dir(), "senaryo kurulmadi: agac yerinde durmali"
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_corrupt_record_is_refused(tmp_path, bound,
-                                     only_fake_binaries_may_run):
-    _record_file(bound.state_dir, bound.worktree_id).write_bytes(b"{bozuk")
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_copied_tree_that_git_does_not_register_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """A full copy of a real worktree -- `.git` link file included, HEAD
-    answering correctly -- under its own READY record. Git's registry is
-    what refuses: the bytes being right does not make it the tree git
-    made."""
-    record = worktree.register(bound.state_dir, repo=bound.repo, run_id=RUN,
-                               baseline_sha=bound.baseline_sha)
-    wid = record["worktree_id"]
-    clone = worktree.holder_for(wid) / worktree.WORKTREE_DIRNAME
-    shutil.copytree(bound.path, clone)
-    _rewrite_record(bound.state_dir, wid, status=worktree.STATUS_READY)
-    _rewrite_binding(bound.state_dir, worktree_id=wid)
-    assert _git(clone, "rev-parse", "HEAD") == bound.baseline_sha, \
-        "senaryo kurulmadi: kopya inandirici degil"
-    identity = dict(bound.identity, worktree_id=wid)
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_a_worktree_whose_head_moved_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """The tree is real and registered; its HEAD is simply not the
-    recorded baseline any more. A model dropped into it would diff
-    against history nobody froze."""
-    _git(bound.path, "commit", "--allow-empty", "-qm", "kurgu-ilerledi")
-    assert _git(bound.path, "rev-parse", "HEAD") != bound.baseline_sha, \
-        "senaryo kurulmadi"
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_failed_git_query_is_a_refusal_not_an_absence(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """The `.git` directory renamed away: every git question now fails.
-    A question that cannot be asked has no answer, and no answer binds
-    nothing."""
-    os.rename(bound.repo / ".git", bound.repo / "git-yok")
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_link_that_resolves_outside_the_holder_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """The worktree replaced by a link to ANOTHER registered worktree of
-    the same repository: registration, HEAD and the main-checkout
-    comparison all pass THROUGH the link, so path containment is the
-    only thing standing -- the resolved location must be exactly where
-    the runner-owned root derives it."""
-    second_path, second_id = worktree.create(
-        bound.repo, state_dir=bound.state_dir, run_id=RUN,
-        baseline_sha=bound.baseline_sha)
-    os.rename(bound.path, bound.path.parent / "wt-asil")
-    _plant_link(bound.path, second_path)
-    assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha, \
-        "senaryo kurulmadi: baglanti uzerinden git cevap vermiyor"
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-# ---------------------------------------------------------------------
-# R2A-R1 -- the RUN'S OWN BINDING is part of the authority
-# ---------------------------------------------------------------------
+# matter. The identities are the only way in now.
 #
-# The registry says a worktree EXISTS and who made it; `binding.json`
-# says which SINGLE tree this run is pinned to. The first version of
-# this seam read only the registry, so any READY sibling of the right
-# repo/run/baseline was executable -- proven by an evaluator probe with
-# two READY worktrees, where the one the binding did NOT name was
-# accepted.
-
-def test_a_second_ready_worktree_the_binding_does_not_name_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """THE evaluator probe, pinned: a second, genuinely READY worktree
-    for the SAME repo, run and baseline. Its registry record is beyond
-    reproach -- only the run's binding refuses it, because the run is
-    bound to one tree, not to a family of them."""
-    second_path, second_id = worktree.create(
-        bound.repo, state_dir=bound.state_dir, run_id=RUN,
-        baseline_sha=bound.baseline_sha)
-    assert _git(second_path, "rev-parse", "HEAD") == bound.baseline_sha, \
-        "senaryo kurulmadi"
-    identity = dict(bound.identity, worktree_id=second_id)
-    _binding_refused(_reply_binary(tmp_path), identity,
-                     only_fake_binaries_may_run, _sentinels(identity))
-
-
-def test_a_missing_run_binding_is_refused(tmp_path, bound,
-                                          only_fake_binaries_may_run):
-    """No binding, no execution -- the registry record alone was the
-    whole former check, and it is not enough."""
-    (bound.state_dir / state.BINDING_FILENAME).unlink()
-    assert bound.path.is_dir(), "senaryo kurulmadi: agac yerinde durmali"
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_corrupt_run_binding_is_refused(tmp_path, bound,
-                                          only_fake_binaries_may_run):
-    (bound.state_dir / state.BINDING_FILENAME).write_bytes(b"{bozuk")
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_binding_issued_to_a_different_repository_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """Only the binding's repository identity is wrong; the registry
-    record agrees with the call completely."""
-    _rewrite_binding(bound.state_dir,
-                     repo_id=state.repo_identity(tmp_path / "hayalet-depo"))
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_binding_for_a_different_run_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    _rewrite_binding(bound.state_dir, run_id="baska-kosu-1")
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_binding_at_a_different_baseline_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """The tree IS at the caller's baseline; only the binding is not."""
-    _rewrite_binding(bound.state_dir, baseline_sha="3" * 40)
-    assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha, \
-        "senaryo kurulmadi"
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def test_a_record_whose_run_was_rewritten_is_refused(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """Only the REGISTRY record's run is wrong -- the binding agrees
-    with the call, so the record comparison is the one thing refusing.
-    (Isolates the record-side run check now that the binding carries a
-    run comparison of its own.)"""
-    _rewrite_record(bound.state_dir, bound.worktree_id,
-                    run_id="baska-kosu-1")
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
-
-def _case_sensitive_filesystem(tmp_path):
-    probe = tmp_path / "kucuk-harf-sondasi.txt"
-    probe.write_text("k", encoding="ascii")
-    return not (tmp_path / "KUCUK-HARF-SONDASI.TXT").exists()
-
-
-def test_a_case_twin_of_the_worktree_is_refused_on_case_sensitive_fs(
-        tmp_path, bound, only_fake_binaries_may_run):
-    """R2A-R1 P1 pinned end to end: a full copy of the real tree in a
-    CASE-TWIN directory inside the same holder, with the real name
-    replaced by a link to it. Under unconditional casefold the twin
-    compared equal to the registered tree everywhere -- containment,
-    registry, all of it -- and an unregistered directory executed. On a
-    case-sensitive filesystem the twin is a DIFFERENT directory and the
-    binding must say so."""
-    if not _case_sensitive_filesystem(tmp_path):
-        pytest.skip("dosya sistemi harfe duyarsiz; ikiz dizin kurulamiyor")
-    twin = bound.path.parent / "WT"
-    shutil.copytree(bound.path, twin)
-    os.rename(bound.path, bound.path.parent / "wt-asil")
-    _plant_link(bound.path, twin)
-    assert _git(bound.path, "rev-parse", "HEAD") == bound.baseline_sha, \
-        "senaryo kurulmadi: ikiz uzerinden git cevap vermiyor"
-    _binding_refused(_reply_binary(tmp_path), bound.identity,
-                     only_fake_binaries_may_run, _sentinels(bound.identity))
-
+# THE BATTERY THAT LIVED HERE WAS ABOUT THE DISPOSABLE GIT WORKTREE:
+# its registry, its holder, its `.git` link, a second READY tree of the
+# same repository, a record copied under another id. B2B-B2C deleted
+# that mechanism, so those tests went with it rather than being
+# rewritten against something they were not describing. The same
+# security intents are carried, per package B2B-B2C's report, by
+# `test_agent_loop_b2_execution_flat.py` (derived cwd, foreign
+# repo/run/baseline, replaced root, malformed identity) and by
+# `test_agent_loop_b2_flat_workspace.py` (ledger lifecycle, ownership
+# marker, orphan recovery, safe removal, root confinement).
 
 # =====================================================================
 # R2B -- the argv schema, the validator and the hash are ONE thing
@@ -1812,10 +1370,10 @@ def test_the_checked_binary_is_the_launched_binary(
     assert not izB.exists(), "denetlenmeyen ikili calistirildi"
 
 
-def test_a_relative_binary_is_resolved_before_the_worktree_becomes_cwd(
+def test_a_relative_binary_is_resolved_before_the_workspace_becomes_cwd(
         tmp_path, bound, only_fake_binaries_may_run):
     """A relative path is checked against the CURRENT directory and
-    then launched with the worktree as cwd -- two different meanings
+    then launched with the workspace as cwd -- two different meanings
     for one string. Resolution happens before the launch, so argv
     carries an absolute path."""
     binary = _fake_binary(tmp_path, name="goreli", mode="raw",
@@ -2010,7 +1568,7 @@ def test_every_cli_refusal_reaches_the_caller_as_an_adapter_error(
     The positive control matters here: the same call with a VALID model
     has to get PAST this gate, or the test would pass against an
     implementation that refuses everything. It dies later, at the
-    schema/worktree stage, with an AdapterError of its own."""
+    schema/workspace stage, with an AdapterError of its own."""
     binary = _reply_binary(tmp_path)
     saglikli = execution.run_implementer(
         binary, **bound.identity, prompt="kurgu", budget_usd=1.0,
@@ -2048,8 +1606,8 @@ def test_the_adapter_and_the_builder_refuse_the_same_budgets(
         "reddedilen butceye ragmen surec basladi"
 
 
-@pytest.mark.parametrize("field", ["run_id", "worktree_id", "baseline_sha"])
-def test_a_deceptive_identity_never_reaches_the_worktree_binding(
+@pytest.mark.parametrize("field", ["run_id", "workspace_id", "baseline_sha"])
+def test_a_deceptive_identity_never_reaches_the_workspace_binding(
         tmp_path, bound, only_fake_binaries_may_run, field):
     """A `str` subclass that claims equality with everything satisfied
     every comparison the binding makes. The identities are exact
@@ -2075,9 +1633,9 @@ def test_a_deceptive_identity_never_reaches_the_worktree_binding(
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("run_id", "KURGU"), ("run_id", "ab"), ("worktree_id", "z" * 32),
-     ("worktree_id", "a" * 31), ("baseline_sha", "A" * 40),
-     ("baseline_sha", "a" * 39), ("run_id", 5), ("worktree_id", None)],
+    [("run_id", "KURGU"), ("run_id", "ab"), ("workspace_id", "z" * 32),
+     ("workspace_id", "a" * 31), ("baseline_sha", "A" * 40),
+     ("baseline_sha", "a" * 39), ("run_id", 5), ("workspace_id", None)],
     ids=["buyuk-kosu", "kisa-kosu", "hex-disi", "kisa-id", "buyuk-sha",
          "kisa-sha", "sayi", "bos-deger"])
 def test_an_identity_outside_its_frozen_pattern_is_refused(
@@ -2144,7 +1702,7 @@ def test_the_adapter_abandons_its_raw_arguments_after_canonicalisation():
                if isinstance(statement, ast.Delete)
                for target in statement.targets
                if isinstance(target, ast.Name)}
-    beklenen = {"binary", "repo", "state_dir", "run_id", "worktree_id",
+    beklenen = {"binary", "repo", "state_dir", "run_id", "workspace_id",
                 "baseline_sha", "prompt", "budget_usd", "timeout_seconds",
                 "max_output_bytes", "model"}
     assert beklenen <= silinen, f"ham argumanlar birakilmadi: " \

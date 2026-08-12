@@ -1,21 +1,26 @@
 """The implementer subprocess adapter. PACKAGE B2A.
 
 ONE primitive: launch the Claude implementer binary the caller supplied,
-inside the disposable worktree B1 RECORDED, and bring back a reply that
-has been validated against the frozen schema. It does not create
-worktrees, read diffs, run acceptance commands, call the evaluator,
-apply patches or advance the run. Those live in B2B and B3, and keeping
-them out is the only reason this file can be read in one sitting.
+inside the IMPLEMENTER tree of the D3A flat workspace the ledger
+RECORDED, and bring back a reply that has been validated against the
+frozen schema. It does not create workspaces, read diffs, run acceptance
+commands, call the evaluator, apply patches or advance the run. Those
+live in B2B and B3, and keeping them out is the only reason this file
+can be read in one sitting.
 
 THE WORKING DIRECTORY IS DERIVED, NEVER RECEIVED. The first version
-took a `worktree` path and checked `is_dir()`, which made the main
-checkout -- or any directory at all -- an acceptable place to run the
-model, with B1's ownership record sitting unread beside it. Now the
-caller passes identities (repository, state directory, run, worktree
-id, baseline) and `worktree.assert_execution_binding` turns them into
-the one directory they may name, refusing everything else before a
-process exists. There is no parameter through which a caller can
-inject a path.
+took a path and checked `is_dir()`, which made the main checkout -- or
+any directory at all -- an acceptable place to run the model, with the
+ownership record sitting unread beside it. Now the caller passes
+identities (repository, state directory, run, workspace id, baseline)
+and `flat_workspace.assert_binding` turns them into the one directory
+they may name, refusing everything else before a process exists. There
+is no parameter through which a caller can inject a path.
+
+ONE EXECUTION IDENTITY. B2B-B1 accepted `worktree_id` beside
+`workspace_id` while the flat workspace replaced the disposable git
+worktree, and B2B-B2C removed the older of the two along with the module
+behind it. A call still naming a worktree is refused by Python itself.
 
 NOTHING IS DISCOVERED. The binary, the identities, the budget, the
 timeout and the output ceiling are all mandatory arguments. A caller
@@ -61,7 +66,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from tools.agent_loop import cli, contract, flat_workspace, schemas, worktree
+from tools.agent_loop import cli, contract, flat_workspace, schemas
 from tools.agent_loop.process import (
     BoundedStream, Container, ContainmentError, PromptWriter,
     REAP_SECONDS, READ_CHUNK_BYTES, join_within,
@@ -96,7 +101,7 @@ MAX_BUDGET_USD = cli.MAX_BUDGET_USD
 # Identity grammars, read from the modules that already own them.
 _RUN_ID_PATTERN = re.compile(contract.IDENTIFIER_PATTERN)
 _BASELINE_PATTERN = re.compile(
-    worktree.RECORD_SCHEMA["properties"]["baseline_sha"]["pattern"])
+    flat_workspace.RECORD_SCHEMA["properties"]["baseline_sha"]["pattern"])
 
 
 class AdapterError(RuntimeError):
@@ -319,9 +324,9 @@ def _usable_binary(binary):
     There is one conversion now, and its result is returned.
 
     RESOLVED before it is returned, because the process is launched
-    with the disposable worktree as its working directory: a relative
-    path checked against the current directory and launched against
-    another names two different programs. What this does NOT close is
+    with the workspace's implementer tree as its working directory: a
+    relative path checked against the current directory and launched
+    against another names two different programs. What this does NOT close is
     the declared filesystem race -- a same-user process can still
     replace the file after this check."""
     try:
@@ -420,7 +425,7 @@ class IdentityRefused(AdapterError):
     grammars describe, refused before any process exists.
 
     A `str` subclass whose `__eq__` returned True for everything
-    satisfied every comparison the worktree binding makes -- so the
+    satisfied every comparison the execution binding makes -- so the
     binding agreed with a record it had never been shown. Identities
     are exact strings matching their existing patterns before the
     binding is consulted at all."""
@@ -450,25 +455,23 @@ def _canonical_path(value, what):
     return Path(text)
 
 
-class WorktreeNotBound(AdapterError):
-    """The identities do not name a recorded, READY, git-verified
-    disposable worktree, so no process was started.
+class WorkspaceNotBound(AdapterError):
+    """The identities do not name a recorded, READY flat workspace, so
+    no process was started.
 
-    The predecessor of this class accepted any existing directory --
-    `is_dir()` was the whole check -- and the main checkout passed it.
+    A distant predecessor of this class accepted any existing directory
+    -- `is_dir()` was the whole check -- and the main checkout passed it.
     The refusal text is the binding's own fixed sentence; it carries no
-    path, no repository name and no record content."""
+    path, no repository name and no record content.
+
+    ONE class, and no alias. B2B-B1 made `WorkspaceNotBound` a second
+    name for the worktree refusal so a caller could not handle one and
+    miss the other while both execution surfaces existed. There is one
+    surface now, so there is one name."""
 
     def __init__(self, message):
         super().__init__(message, event=contract.EventCode.PREFLIGHT_FAILED,
                          reason=contract.StopReason.PREFLIGHT_FAILED)
-
-
-# The SAME class under the name the flat-workspace branch refuses with.
-# Deliberately an alias and not a second type: two error classes that
-# mean "the identities do not name a place this may run" would let a
-# caller handle one and miss the other.
-WorkspaceNotBound = WorktreeNotBound
 
 
 class ContainmentFailed(AdapterError):
@@ -488,7 +491,8 @@ class ProcessTreeSurvived(AdapterError):
     """The call ended but its container could not be emptied.
 
     Not a detail to log and move past: something the model started is
-    still running against the worktree, so the reply is not returned."""
+    still running against the workspace, so the reply is not
+    returned."""
 
     def __init__(self, message, **measurements):
         super().__init__(message,
@@ -534,7 +538,7 @@ class _CanonicalImplementerCall:
     THE POINT OF THIS CLASS is that after it exists the caller's
     objects are irrelevant. A validator that only inspects a value and
     leaves the original alive is not a boundary: the argv builder, the
-    worktree binding, the deadline arithmetic and the stdin writer each
+    workspace binding, the deadline arithmetic and the stdin writer each
     asked the caller's object again, and an object is free to answer
     differently every time. These fields are exact built-in types and
     concrete paths, and they are the only things anything downstream
@@ -544,14 +548,11 @@ class _CanonicalImplementerCall:
     repo: Path
     state_dir: Path
     run_id: str
-    # EXACTLY ONE of these is a `str`; the other is `None`. Which one
-    # decided the working directory is recorded as a closed kind rather
-    # than re-derived later from "whichever is not None" -- that is a
-    # second question, and this package's whole family of defects was a
-    # second question about an already-checked value.
-    worktree_id: object
-    workspace_id: object
-    execution_kind: str
+    # THE execution identity. There is one, so nothing downstream has to
+    # ask which of two fields decided the working directory -- that was a
+    # second question about an already-checked value, and this package's
+    # whole family of defects was exactly that.
+    workspace_id: str
     baseline_sha: str
     prompt_bytes: bytes
     budget_usd: object            # exact int or float, bounded
@@ -560,54 +561,18 @@ class _CanonicalImplementerCall:
     model: object                 # exact str or None
 
 
-# TEMPORARY B2B-B BRIDGE. Two callers exist at once: `changes.py` still
-# names a disposable git worktree, and the B2B-B2 path names a D3A flat
-# workspace. Removed after `changes.py` switches to `workspace_id`.
-WORKTREE_EXECUTION = "worktree"
-WORKSPACE_EXECUTION = "workspace"
-
-
-def _execution_identity(worktree_id, workspace_id):
-    """EXACTLY ONE identity, chosen here and never re-derived.
-
-    Neither absent and both present are the same defect wearing two
-    faces: in each case the working directory would come from a rule
-    nobody wrote down. Silently preferring one is worse than refusing --
-    a caller that passed both believes something about which one won."""
-    verilen = [ad for ad, deger in (("worktree", worktree_id),
-                                    ("workspace", workspace_id))
-               if deger is not None]
-    if not verilen:
-        # a MISSING required identity is an identity problem, and the
-        # frozen suite already pins `None` in an identity slot to this
-        # refusal -- the bridge's defaults must not quietly re-type it
-        raise IdentityRefused("calisma alani kimligi verilmedi")
-    if len(verilen) != 1:
-        raise CallInputRefused(
-            "cagri tam olarak bir calisma alani kimligi tasimali")
-    if verilen[0] == "workspace":
-        return WORKSPACE_EXECUTION, None, _exact_identity(
-            workspace_id, flat_workspace.WORKSPACE_ID, "calisma alani kimligi")
-    return WORKTREE_EXECUTION, _exact_identity(
-        worktree_id, worktree.WORKTREE_ID, "calisma agaci kimligi"), None
-
-
-def _canonical_call(binary, *, repo, state_dir, run_id, worktree_id,
-                    workspace_id, baseline_sha, prompt, budget_usd,
+def _canonical_call(binary, *, repo, state_dir, run_id, workspace_id,
+                    baseline_sha, prompt, budget_usd,
                     timeout_seconds, max_output_bytes, model):
     """Validate and convert, in the order the refusals are cheapest.
 
     Budget, bounds, prompt and binary come before the identities so a
     caller who got one of those wrong hears about it without a
-    filesystem or git question being asked -- the order existing tests
-    already depend on."""
+    filesystem question being asked -- the order existing tests already
+    depend on."""
     canonical_budget = _canonical_budget(budget_usd)
     canonical_timeout, canonical_output = _canonical_limits(
         timeout_seconds, max_output_bytes)
-    # decided BEFORE anything touches a filesystem, so a call carrying
-    # both identities or neither never reaches a binding at all
-    kind, worktree_id, workspace_id = _execution_identity(worktree_id,
-                                                          workspace_id)
     # ONE boundary for the CLI layer's refusals. `cli.UnsafeInvocation`
     # is not an `AdapterError`, and one escaping here broke this
     # function's own promise -- the runner's closed state machine would
@@ -625,34 +590,34 @@ def _canonical_call(binary, *, repo, state_dir, run_id, worktree_id,
             repo=_canonical_path(repo, "depo yolu"),
             state_dir=_canonical_path(state_dir, "durum dizini"),
             run_id=_exact_identity(run_id, _RUN_ID_PATTERN, "kosu kimligi"),
-            worktree_id=worktree_id, workspace_id=workspace_id,
-            execution_kind=kind,
+            workspace_id=_exact_identity(workspace_id,
+                                         flat_workspace.WORKSPACE_ID,
+                                         "calisma alani kimligi"),
             baseline_sha=_exact_identity(baseline_sha, _BASELINE_PATTERN,
                                          "taban surum"))
     except cli.UnsafeInvocation as refused:
         raise CallInputRefused(str(refused)) from None
 
 
-def run_implementer(binary, *, repo, state_dir, run_id,
+def run_implementer(binary, *, repo, state_dir, run_id, workspace_id,
                     baseline_sha, prompt, budget_usd,
-                    timeout_seconds, max_output_bytes, model=None,
-                    worktree_id=None, workspace_id=None):
+                    timeout_seconds, max_output_bytes, model=None):
     """Run the implementer once and return its validated reply.
 
-    The working directory is derived from the identities -- by
-    `flat_workspace.assert_binding` for a workspace, by
-    `worktree.assert_execution_binding` for the legacy worktree -- and
-    the schema is the frozen canonical binding. There is no way to pass
-    either one in. Raises a typed `AdapterError` for every refusal.
-    Nothing here retries, repairs or decides what happens next.
+    The working directory is derived from the identities by
+    `flat_workspace.assert_binding`, and the schema is the frozen
+    canonical binding. There is no way to pass either one in. Raises a
+    typed `AdapterError` for every refusal. Nothing here retries,
+    repairs or decides what happens next.
 
-    EXACTLY ONE of `worktree_id` and `workspace_id` is required. Both
-    are keyword-only and both default to `None` only so the temporary
-    B2B-B bridge can carry two callers at once; neither omitting both
-    nor supplying both is accepted."""
+    `workspace_id` is required and keyword-only. B2B-B1 accepted a
+    second identity beside it while the flat workspace replaced the
+    disposable git worktree; B2B-B2C removed it, so a caller still
+    passing `worktree_id=` fails at the call itself rather than being
+    quietly translated into something else."""
     call = _canonical_call(
         binary, repo=repo, state_dir=state_dir, run_id=run_id,
-        worktree_id=worktree_id, workspace_id=workspace_id,
+        workspace_id=workspace_id,
         baseline_sha=baseline_sha, prompt=prompt,
         budget_usd=budget_usd, timeout_seconds=timeout_seconds,
         max_output_bytes=max_output_bytes, model=model)
@@ -661,7 +626,7 @@ def run_implementer(binary, *, repo, state_dir, run_id,
     # in this family was a second look at a caller's object after a
     # check had already agreed with it. Reaching for one now is a
     # NameError the positive-control tests hit on the first run.
-    del binary, repo, state_dir, run_id, worktree_id, workspace_id
+    del binary, repo, state_dir, run_id, workspace_id
     del baseline_sha
     del prompt, budget_usd, timeout_seconds, max_output_bytes, model
 
@@ -677,26 +642,15 @@ def run_implementer(binary, *, repo, state_dir, run_id,
     # use of it. The filesystem offers no transaction here -- a hostile
     # same-user process can still race this window -- but the window is
     # kept to the launch itself.
-    if call.execution_kind == WORKSPACE_EXECUTION:
-        try:
-            # the IMPLEMENTER root, never the reference tree: the model
-            # must have no path to the copy it is going to be compared
-            # against
-            cwd = flat_workspace.assert_binding(
-                call.repo, state_dir=call.state_dir, run_id=call.run_id,
-                workspace_id=call.workspace_id,
-                baseline_sha=call.baseline_sha).implementer_root
-        except flat_workspace.FlatWorkspaceError as refused:
-            raise WorkspaceNotBound(str(refused)) from None
-    else:
-        # Temporary B2B-B bridge. Removed after changes.py switches to
-        # workspace_id.
-        try:
-            cwd = worktree.assert_execution_binding(
-                call.repo, state_dir=call.state_dir, run_id=call.run_id,
-                worktree_id=call.worktree_id, baseline_sha=call.baseline_sha)
-        except worktree.WorktreeError as refused:
-            raise WorktreeNotBound(str(refused)) from None
+    try:
+        # the IMPLEMENTER root, never the reference tree: the model must
+        # have no path to the copy it is going to be compared against
+        cwd = flat_workspace.assert_binding(
+            call.repo, state_dir=call.state_dir, run_id=call.run_id,
+            workspace_id=call.workspace_id,
+            baseline_sha=call.baseline_sha).implementer_root
+    except flat_workspace.FlatWorkspaceError as refused:
+        raise WorkspaceNotBound(str(refused)) from None
 
     # THE CONTAINER EXISTS BEFORE THE PROGRAM RUNS. Creating the
     # process and containing it afterwards leaves a window in which the

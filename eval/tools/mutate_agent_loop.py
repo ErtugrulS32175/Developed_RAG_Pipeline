@@ -29,26 +29,10 @@ import tempfile
 from pathlib import Path
 
 SOURCE_REPO = Path(__file__).resolve().parents[2]
-MODULES = ("state", "locking", "worktree", "preflight", "execution",
+MODULES = ("state", "locking", "preflight", "execution",
            "cli", "schemas", "changes")
 NL = chr(10)
 
-# The LEGACY execution-binding block in `run_implementer`, verbatim: two
-# R2A mutations rewrite it and both must keep matching the real source.
-#
-# Re-indented for B2B-B1, which put this block inside the `else:` arm of
-# the temporary flat-workspace bridge. Nothing about what the two
-# mutations mean changed -- only where the block sits. B2B-B2C deletes
-# the legacy arm, and these two mutations go with it.
-BINDING_TRY = (
-    "        try:" + NL
-    + "            cwd = worktree.assert_execution_binding(" + NL
-    + "                call.repo, state_dir=call.state_dir,"
-    + " run_id=call.run_id," + NL
-    + "                worktree_id=call.worktree_id,"
-    + " baseline_sha=call.baseline_sha)" + NL
-    + "        except worktree.WorktreeError as refused:" + NL
-    + "            raise WorktreeNotBound(str(refused)) from None")
 BS = chr(92)
 
 # (label, module, old, new, expected_test_substring)
@@ -96,16 +80,18 @@ MUTATIONS = [
      '    if current["state"] not in contract.TERMINAL_STATES '
      "and not allow_resume:", "    if False:",
      "unfinished_previous_run"),
-    # Retargeted for B2B-B2A1, same intent: a binding with no execution
-    # identity -- or with two -- must be refused. The guard moved out of
-    # `required` and into the `oneOf` gate when the schema learned to
-    # carry either a worktree or a flat workspace. Collapsing that gate
-    # to a single empty branch makes every shape valid again.
-    ("zorunlu-worktree-id", "state",
-     '    "oneOf": [{"required": ["worktree_id"]},' + NL
-     + '              {"required": ["workspace_id"]}],',
-     '    "oneOf": [{}],',
-     "a_binding_without_exactly_one_identity_is_refused"),
+    # B2B-B2A1 moved this guard out of `required` and into an `oneOf`
+    # gate, because the schema had to carry either a worktree or a flat
+    # workspace and "exactly one" is not something `required` can say.
+    #
+    # B2B-B2C RETARGETED and RENAMED it back. There is one execution
+    # surface now, so the gate collapsed into the simplest thing that
+    # can express it -- and the intent never moved: a binding with no
+    # execution identity names no place to run.
+    ("zorunlu-workspace-id", "state",
+     '                 "manifest_digest", "workspace_id"],',
+     '                 "manifest_digest"],',
+     "a_binding_without_exactly_this_identity_is_refused"),
     ("dizin-fsync", "state",
      "        fsync_directory(target.parent)", "        pass",
      "atomic_write_flushes_the_directory_entry"),
@@ -156,153 +142,10 @@ MUTATIONS = [
      "                       timeout=HANDSHAKE_TIMEOUT_SECONDS,",
      "                       timeout=None,",
      "binary_that_never_returns"),
-    ("kimlik-deseni", "worktree",
-     "    if not WORKTREE_ID.match(str(worktree_id)):", "    if False:",
-     "id_that_could_name_another_directory"),
-    ("kayit-varligi", "worktree",
-     "    if record is None:" + NL
-     + '        raise WorktreeError("calisma agaci kaydi yok; silinmedi")',
-     "    if record is None:" + NL + "        return None",
-     "record_from_another_state_directory"),
-    ("kayit-depo-yetkisi", "worktree",
-     '    if record["repo_id"] != state_module.repo_identity(repo):',
-     "    if False:",
-     "repository_check_refuses_even_when_git_would_agree"),
-    ("git-kayitli-mi", "worktree",
-     "    if _registered_here(repo, path):", "    if True:",
-     "killed_process_always_leaves_recoverable_residue"),
-    ("git-kaldirma-kontrolu", "worktree",
-     '        _git(repo, "worktree", "remove", "--force", str(path))',
-     '        _git(repo, "worktree", "remove", "--force", str(path),'
-     " check=False)",
-     "failed_git_removal_is_not_stepped_over"),
-    ("kurtarma-depo-filtresi", "worktree",
-     '        if record is None or record["repo_id"] != repo_id:',
-     "        if record is None:",
-     "recovery_does_not_report_another_repositorys"),
-    ("kap-dislayici", "worktree",
-     "        holder.mkdir()", "        holder.mkdir(exist_ok=True)",
-     "existing_holder_is_never_reused"),
-    ("registry-sorgusu-kontrolu", "worktree",
-     '    listing = _git(repo, "worktree", "list", "--porcelain").stdout',
-     '    listing = _git(repo, "worktree", "list", "--porcelain",'
-     " check=False).stdout",
-     "unanswerable_git_query_deletes_nothing"),
-    ("holder-silindi-mi", "worktree",
-     "    if holder.exists():" + NL
-     + '        raise WorktreeError("calisma agaci kabi silinemedi; '
-     'kayit korundu")',
-     "    if False:" + NL
-     + '        raise WorktreeError("calisma agaci kabi silinemedi; '
-     'kayit korundu")',
-     "record_outlives_a_holder_that_could_not_be_removed"),
     ("dizin-zinciri", "state",
      "    ensure_directory(target.parent)",
      "    target.parent.mkdir(parents=True, exist_ok=True)",
      "brand_new_directory_chain_is_made_durable"),
-    ("yaz-once-kaydi", "worktree",
-     "    state_module.write_json_atomically(" + NL
-     + '        _record_path(state_dir, record["worktree_id"]), record,' + NL
-     + '        RECORD_SCHEMA, "calisma agaci kaydi")' + NL
-     + "    return record",
-     "    return record",
-     "record_is_written_before_anything_exists"),
-    # ----------------------------------------------------------------
-    # R2A -- the execution binding. Each mutation deletes exactly one
-    # refusal and its target test must be the one that notices.
-    # ----------------------------------------------------------------
-    ("r2a-hazir-kontrolu", "worktree",
-     '        raise WorktreeError("yurutme bagi: kayit hazir durumda degil")',
-     "        pass",
-     "test_a_planned_record_is_refused_even_with_the_tree_on_disk"),
-    ("r2a-kayit-depo", "worktree",
-     '        raise WorktreeError("yurutme bagi: kayit bu depoya ait degil")',
-     "        pass",
-     "test_a_record_issued_to_a_different_repository_identity_is_refused"),
-    ("r2a-kayit-kosu", "worktree",
-     '        raise WorktreeError("yurutme bagi: kayit bu kosuya ait degil")',
-     "        pass",
-     "test_a_record_whose_run_was_rewritten_is_refused"),
-    ("r2a-kayit-taban", "worktree",
-     '        raise WorktreeError("yurutme bagi: kayit taban surumle '
-     'uyusmuyor")',
-     "        pass",
-     "test_a_record_whose_baseline_was_rewritten_is_refused"),
-    ("r2a-gomulu-kimlik", "worktree",
-     '        raise WorktreeError("yurutme bagi: kayit baska bir kimligi '
-     'adliyor")',
-     "        pass",
-     "test_a_record_copied_under_another_id_is_refused"),
-    ("r2a-bag-varligi", "worktree",
-     "    except state_module.CorruptState:" + NL
-     + "        raise WorktreeError(" + NL
-     + '            "yurutme bagi: kosu baglamasi yok ya da bozuk") from None',
-     "    except state_module.CorruptState:" + NL
-     + '        binding = {"worktree_id": worktree_id, "repo_id": repo_id,'
-     + NL
-     + '                   "run_id": run_id, "baseline_sha": baseline_sha}',
-     "test_a_missing_run_binding_is_refused"),
-    ("r2a-bag-agac", "worktree",
-     "        raise WorktreeError(" + NL
-     + '            "yurutme bagi: kosu bu calisma agacina bagli degil")',
-     "        pass",
-     "test_a_second_ready_worktree_the_binding_does_not_name_is_refused"),
-    ("r2a-bag-depo", "worktree",
-     "        raise WorktreeError(" + NL
-     + '            "yurutme bagi: kosu baglamasi bu depoya ait degil")',
-     "        pass",
-     "test_a_binding_issued_to_a_different_repository_is_refused"),
-    ("r2a-bag-kosu", "worktree",
-     "        raise WorktreeError(" + NL
-     + '            "yurutme bagi: kosu baglamasi bu kosuya ait degil")',
-     "        pass",
-     "test_a_binding_for_a_different_run_is_refused"),
-    ("r2a-bag-taban", "worktree",
-     "        raise WorktreeError(" + NL
-     + '            "yurutme bagi: kosu baglamasi taban surumle uyusmuyor")',
-     "        pass",
-     "test_a_binding_at_a_different_baseline_is_refused"),
-    ("r2a-bas-kontrolu", "worktree",
-     '    head = _git(derived, "rev-parse", "HEAD").stdout.strip()' + NL
-     + "    if head != baseline_sha:" + NL
-     + '        raise WorktreeError("yurutme bagi: calisma agaci taban '
-     'surumde degil")' + NL
-     + "    return derived",
-     "    return derived",
-     "test_a_worktree_whose_head_moved_is_refused"),
-    ("r2a-git-kutugu", "worktree",
-     "        raise WorktreeError(" + NL
-     + '            "yurutme bagi: calisma agaci bu depoda kayitli degil")',
-     "        pass",
-     "test_a_copied_tree_that_git_does_not_register_is_refused"),
-    ("r2a-ana-agac", "worktree",
-     '        raise WorktreeError("yurutme bagi: ana calisma agaci '
-     'yurutulemez")',
-     "        pass",
-     "test_the_repository_argument_may_never_be_the_execution_target"),
-    ("r2a-kap-sinirlama", "worktree",
-     '        raise WorktreeError("yurutme bagi: yol kabin disina '
-     'cozuluyor")',
-     "        pass",
-     "test_a_link_that_resolves_outside_the_holder_is_refused"),
-    # Both replacements carry the SAME indentation as the block they
-    # replace. A mutant that does not parse is not a surviving guard --
-    # it is a mutant nobody could run, and it would be counted red for
-    # the wrong reason.
-    ("r2a-bag-cagrisi-yok", "execution",
-     BINDING_TRY,
-     "        cwd = worktree.holder_for(worktree_id)"
-     " / worktree.WORKTREE_DIRNAME",
-     "test_a_missing_record_is_refused"),
-    ("r2a-cagiran-yolu", "execution",
-     BINDING_TRY,
-     BINDING_TRY.replace("cwd = worktree.assert_execution_binding(",
-                         "worktree.assert_execution_binding(")
-     + NL + "        cwd = Path(repo)",
-     "test_the_model_runs_exactly_in_the_derived_recorded_worktree"),
-    # ----------------------------------------------------------------
-    # R2B -- one canonical inline schema: bytes, hash, argv, validator
-    # ----------------------------------------------------------------
     ("r2b-yol-degeri", "cli",
      '        "--json-schema", schemas.IMPLEMENTER_SCHEMA_BINDING.'
      'canonical_json,',
@@ -590,7 +433,7 @@ MUTATIONS = [
      + '        raise IdentityRefused(f"{what} sozlesme desenine uymuyor")',
      "    if False:" + NL
      + '        raise IdentityRefused(f"{what} sozlesme desenine uymuyor")',
-     "test_a_deceptive_identity_never_reaches_the_worktree_binding"),
+     "test_a_deceptive_identity_never_reaches_the_workspace_binding"),
 ]
 
 
@@ -730,7 +573,7 @@ def main():
         path.write_text(original.replace(old, new, 1), encoding="utf-8")
         imported = subprocess.run(
             [sys.executable, "-c",
-             "from tools.agent_loop import (state, locking, worktree, "
+             "from tools.agent_loop import (state, locking, "
              "preflight, execution, cli, schemas, changes)"],
             cwd=str(workdir), capture_output=True, text=True)
         if imported.returncode != 0:

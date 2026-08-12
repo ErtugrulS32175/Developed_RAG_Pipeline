@@ -21,16 +21,15 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 
 import pytest
 
 # The stub builder, the helper script and the reply payload live in the
-# legacy suite; importing them keeps one definition of "a fake model".
+# general execution suite; importing them keeps one definition of "a
+# fake model".
 import test_agent_loop_b2_execution as legacy
-from tools.agent_loop import contract, execution, flat_workspace, state
+from tools.agent_loop import contract, execution, flat_workspace
 from tools.agent_loop import process as process_module
-from tools.agent_loop import worktree
 
 RUN = legacy.RUN
 SENTINEL = "KURGU-GIZLI-NOBETCI-" + "z" * 8
@@ -223,21 +222,21 @@ def test_a_malformed_workspace_identity_is_refused_before_launch(
     assert launched == [], "reddedilen kimlige ragmen surec basladi"
 
 
-@pytest.mark.parametrize("nasil", ["ikisi-birden", "hicbiri"])
-def test_the_identity_rule_is_decided_before_a_process_exists(tmp_path, flat,
-                                                              launched, nasil):
-    """Neither absent nor both present may pick a working directory by a
-    rule nobody wrote down. They are different mistakes, so they get
-    different refusals -- and neither starts anything."""
+@pytest.mark.parametrize("nasil", ["eski-kimlik", "hicbiri"])
+def test_a_call_that_does_not_name_this_workspace_starts_nothing(
+        tmp_path, flat, launched, nasil):
+    """B2B-B2C made `workspace_id` the only execution identity, so the
+    two ways of failing to name one are now different KINDS of failure:
+    the old keyword is refused by Python itself before the adapter has an
+    opinion, and an omitted identity is a missing required argument.
+    Neither starts a process, which is the part that matters."""
     kimlik = dict(flat["identity"])
-    if nasil == "ikisi-birden":
+    if nasil == "eski-kimlik":
         kimlik["worktree_id"] = "b" * 32
-        beklenen = execution.CallInputRefused
     else:
         kimlik.pop("workspace_id")
-        beklenen = execution.IdentityRefused
 
-    with pytest.raises(beklenen) as ret:
+    with pytest.raises(TypeError) as ret:
         _run(legacy._reply_binary(tmp_path), kimlik)
     assert launched == [], "reddedilen cagriya ragmen surec basladi"
     metin = str(ret.value) + repr(ret.value)
@@ -284,55 +283,20 @@ def test_a_replaced_workspace_root_is_refused_through_the_binding(tmp_path,
 
 
 # =====================================================================
-# THE LEGACY BRANCH, STILL LIVE FOR ONE MORE PACKAGE
+# THE SEAM ITSELF
 # =====================================================================
 
-def test_the_legacy_worktree_call_still_runs_the_model(tmp_path, launched):
-    """`changes.py` has not moved yet. The bridge exists so this keeps
-    working unchanged until B2B-B2 removes it."""
-    repo, baseline = _repo(tmp_path)
-    state_dir = tmp_path / "durum-eski"
-    ozel = tmp_path / "runner-temp"
-    ozel.mkdir()
-    izolasyon = pytest.MonkeyPatch()
-    izolasyon.setattr(tempfile, "tempdir", str(ozel))
-    for degisken in ("TMPDIR", "TEMP", "TMP"):
-        izolasyon.setenv(degisken, str(ozel))
-    try:
-        _, worktree_id = worktree.create(repo, state_dir=state_dir,
-                                         run_id=RUN, baseline_sha=baseline)
-        state.write_binding(state_dir, {
-            "protocol_version": contract.PROTOCOL_VERSION,
-            "run_id": RUN, "repo_id": state.repo_identity(repo),
-            "baseline_sha": baseline, "manifest_digest": "0" * 64,
-            "worktree_id": worktree_id})
-        iz = tmp_path / "eski-cwd.txt"
-        binary = legacy._fake_binary(
-            tmp_path, mode="raw", cwd_record=str(iz),
-            hex=json.dumps(legacy._valid_reply()).encode().hex())
-        outcome = execution.run_implementer(
-            binary, repo=repo, state_dir=state_dir, run_id=RUN,
-            worktree_id=worktree_id, baseline_sha=baseline, prompt="kurgu",
-            budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
-        assert launched, "eski kol hic surec baslatmadi"
-        assert outcome.reply["run_id"] == RUN
-        assert iz.read_text(encoding="utf-8").strip()
-    finally:
-        try:
-            worktree.remove(repo, state_dir=state_dir,
-                            worktree_id=worktree_id)
-        except Exception:                              # noqa: BLE001
-            pass
-        izolasyon.undo()
-
-
-def test_the_bridge_added_an_identity_and_not_a_path():
-    """Structural pin for the seam this package widened. `workspace_id`
-    is an identity; nothing that selects a directory was added."""
+def test_the_seam_takes_one_identity_and_no_path():
+    """Structural pin. `workspace_id` is an identity and it is the ONLY
+    execution identity; nothing that selects a directory was ever added
+    beside it, and the legacy keyword is gone rather than deprecated --
+    a parameter that still exists is a parameter something still
+    passes."""
     import inspect
 
     parametreler = inspect.signature(execution.run_implementer).parameters
-    assert "workspace_id" in parametreler and "worktree_id" in parametreler
+    assert "workspace_id" in parametreler
+    assert "worktree_id" not in parametreler, "eski kimlik hala imzada"
     for kacis in ("cwd", "path", "workdir", "working_dir", "directory",
                   "holder", "implementer_root", "reference_root",
                   "schema_path", "schema"):
@@ -340,6 +304,9 @@ def test_the_bridge_added_an_identity_and_not_a_path():
     for ad, parametre in parametreler.items():
         if ad != "binary":
             assert parametre.kind == inspect.Parameter.KEYWORD_ONLY, ad
-    for ad in ("workspace_id", "worktree_id"):
-        assert parametreler[ad].default is None, ad
-    assert execution.WorkspaceNotBound is execution.WorktreeNotBound
+    # required, not defaulted: an identity with a default is one a caller
+    # can forget to give
+    assert parametreler["workspace_id"].default is inspect.Parameter.empty
+    assert not hasattr(execution, "WorktreeNotBound"), \
+        "eski baglama hatasi hala disa aciliyor"
+    assert issubclass(execution.WorkspaceNotBound, execution.AdapterError)

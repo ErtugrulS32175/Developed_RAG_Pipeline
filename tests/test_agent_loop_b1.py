@@ -1,4 +1,4 @@
-"""PACKAGE B1 -- preflight, state, lock and disposable worktree.
+"""PACKAGE B1 -- preflight, state, lock and the run's own identity.
 
 Every adversarial test here proves its own SETUP was reached before it
 claims the refusal. A test that fails for an unrelated reason is red for
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,8 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from tools.agent_loop import (contract, locking, preflight, schemas,
-                              state, worktree)
+from tools.agent_loop import (contract, flat_workspace, locking, preflight,
+                              schemas, state)
 
 BASE_TASK = {
     "protocol_version": contract.PROTOCOL_VERSION,
@@ -53,7 +52,7 @@ def _git(repo, *args, check=True):
 
 
 @pytest.fixture(autouse=True)
-def private_worktree_root(tmp_path):
+def private_runner_root(tmp_path):
     """Every test gets its OWN runner temp root.
 
     `runner_temp_root()` derives from the system temp directory, which
@@ -80,7 +79,7 @@ def private_worktree_root(tmp_path):
     isolation.setattr(tempfile, "tempdir", str(private))
     for variable in ("TMPDIR", "TEMP", "TMP"):
         isolation.setenv(variable, str(private))
-    root = worktree.runner_temp_root()
+    root = flat_workspace.runner_temp_root()
     assert root.parent.resolve() == private.resolve(), \
         "gecici kok bu teste ozel degil"
     yield root
@@ -185,7 +184,7 @@ def _binding(repo, task_path, **overrides):
         "repo_id": state.repo_identity(repo),
         "baseline_sha": _git(repo, "rev-parse", "HEAD"),
         "manifest_digest": snapshot.digest,
-        "worktree_id": "b" * 32,
+        "workspace_id": "b" * 32,
     }
     payload.update(overrides)
     return payload
@@ -205,22 +204,14 @@ def _pair(repo, task_path, state_dir, **state_overrides):
 # PREFLIGHT -- a failure must cost nothing
 # =====================================================================
 
-def _worktrees(repo):
-    listing = _git(repo, "worktree", "list", "--porcelain", check=False)
-    return [l for l in listing.splitlines() if l.startswith("worktree ")]
+def _execution_roots(runner_root):
+    """Everything the runner owns under its private temp root.
 
-
-def _is_registered(repo, path):
-    """Git reports forward slashes; `str(Path)` on Windows reports
-    backslashes. Comparing them raw made the setup guard in the
-    two-repository test always true, which is a guard that guards
-    nothing -- normalise both sides."""
-    wanted = str(Path(path).resolve()).replace(chr(92), "/").casefold()
-    for line in _worktrees(repo):
-        entry = str(Path(line.split(" ", 1)[1]).resolve())
-        if entry.replace(chr(92), "/").casefold() == wanted:
-            return True
-    return False
+    This used to ask GIT for its worktree list. There are no git
+    worktrees any more, and what the caller actually wants to know is
+    whether an execution root appeared -- so it asks the directory those
+    are built in."""
+    return sorted(p.name for p in Path(runner_root).iterdir())
 
 
 @pytest.mark.parametrize(
@@ -233,12 +224,12 @@ def _is_registered(repo, path):
      ("binary", contract.StopReason.PREFLIGHT_FAILED)],
     ids=["gecersiz-manifest", "kirli-agac", "staged", "korunan-yol",
          "baseline", "eksik-ikili"])
-def test_a_failing_precondition_creates_no_worktree(repo, task, binaries,
-                                                    break_it, expected):
+def test_a_failing_precondition_creates_no_execution_root(
+        repo, task, binaries, break_it, expected, private_runner_root):
     """Each refusal is asserted TWICE: the stop reason, and the fact that
     the filesystem was never touched. A preflight that returned the right
-    verdict after creating a worktree has still failed."""
-    before = _worktrees(repo)
+    verdict after building somewhere to run has still failed."""
+    before = _execution_roots(private_runner_root)
     if break_it == "manifest":
         task.write_text("{bu JSON degil", encoding="utf-8")
     elif break_it == "dirty":
@@ -262,7 +253,8 @@ def test_a_failing_precondition_creates_no_worktree(repo, task, binaries,
 
     assert result.ok is False
     assert result.stop_reason == expected
-    assert _worktrees(repo) == before, "reddedilen preflight worktree kurdu"
+    assert _execution_roots(private_runner_root) == before, \
+        "reddedilen preflight bir yurutme koku kurdu"
 
 
 def test_a_healthy_preflight_passes_and_reports_no_stop_reason(repo, task,
@@ -539,251 +531,30 @@ def test_a_cleanup_failure_does_not_replace_the_primary_error(state_dir):
 
 
 # =====================================================================
-# DISPOSABLE WORKTREE
+# WHAT USED TO BE HERE
 # =====================================================================
-
-def test_the_worktree_is_the_exact_baseline_and_leaves_the_main_tree_alone(
-        repo, state_dir):
-    baseline = _git(repo, "rev-parse", "HEAD")
-    before = sorted((p.relative_to(repo).as_posix(), p.stat().st_size)
-                    for p in repo.rglob("*") if p.is_file()
-                    and ".git" not in p.parts)
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=baseline)
-    try:
-        assert _git(path, "rev-parse", "HEAD") == baseline
-        after = sorted((p.relative_to(repo).as_posix(), p.stat().st_size)
-                       for p in repo.rglob("*") if p.is_file()
-                       and ".git" not in p.parts)
-        assert after == before, "ana calisma agaci degisti"
-    finally:
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-
-
-@pytest.mark.parametrize("private", ["data", "output", "logs", "uploads"])
-def test_private_directories_never_reach_the_worktree(repo, state_dir,
-                                                      private):
-    """`git worktree add` materialises TRACKED content only, and these
-    are gitignored -- so the document tree is absent by construction
-    rather than by a filter somebody has to maintain."""
-    baseline = _git(repo, "rev-parse", "HEAD")
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=baseline)
-    try:
-        assert (repo / private / "ozel.txt").exists(), "senaryo kurulmadi"
-        assert not (path / private).exists(), f"{private}/ worktree'ye sizdi"
-        leaked = [p for p in path.rglob("*") if p.is_file()
-                  and "KURGU_OZEL_ICERIK" in p.read_text(encoding="utf-8",
-                                                         errors="ignore")]
-        assert not leaked
-    finally:
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-
-
-def test_the_worktree_is_created_under_the_runner_owned_temp_root(repo,
-                                                                  state_dir):
-    baseline = _git(repo, "rev-parse", "HEAD")
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=baseline)
-    try:
-        assert worktree.runner_temp_root() in path.resolve().parents
-        assert repo.resolve() not in path.resolve().parents
-    finally:
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-
-
-def test_the_worktree_carries_no_file_of_ours(repo, state_dir):
-    """The tree the implementer works in is the baseline and nothing
-    else. An earlier design wrote an ownership marker INSIDE it, which
-    put an untracked file of ours into the diff the implementer's work
-    would later be read out of."""
-    baseline = _git(repo, "rev-parse", "HEAD")
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=baseline)
-    try:
-        assert _git(path, "status", "--porcelain") == "",             "worktree bizim dosyamizla kirli basliyor"
-    finally:
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-
-
-# ---------------------------------------------------------------------
-# CLEANUP AUTHORITY. Third design; the first two were checks layered
-# over a path the caller supplied, and each was broken by a different
-# argument. There is no path parameter now.
-# ---------------------------------------------------------------------
-
-def test_remove_accepts_no_path_at_all(repo):
-    """`remove` derives its target from an id, so a caller cannot point
-    it at an arbitrary directory. NECESSARY BUT NOT SUFFICIENT: the id
-    names a directory, and directories are shared by every repository on
-    the machine -- which is exactly how an audit made one repository
-    delete another's worktree. Authority is the record; see below."""
-    import inspect as inspect_module
-
-    assert set(inspect_module.signature(worktree.remove).parameters) == {
-        "repo", "state_dir", "worktree_id"}
-    assert set(inspect_module.signature(worktree.create).parameters) == {
-        "repo", "state_dir", "run_id", "baseline_sha"}
-
-
-def test_one_repository_cannot_remove_another_repositorys_worktree(
-        repo, tmp_path, state_dir):
-    """THE critical finding, and the reason ownership stopped being a
-    name. The id was minted by repository B; repository A asked to
-    remove it. A's git removal failed because A had never registered the
-    tree, this module ignored that failure, deleted B's directory
-    anyway, and left stale entries behind in B's registry."""
-    other = tmp_path / "ikinci-depo"
-    (other / "pipeline").mkdir(parents=True)
-    for argv in (["init", "-q"], ["config", "user.email", "k@example.invalid"],
-                 ["config", "user.name", "Kurgu"]):
-        _git(other, *argv)
-    (other / "pipeline" / "k.py").write_text("V = 1\n", encoding="utf-8")
-    _git(other, "add", "-A")
-    _git(other, "commit", "-qm", "kurgu")
-
-    path_b, id_b = worktree.create(other, state_dir=state_dir, run_id=RUN,
-                                   baseline_sha=_git(other, "rev-parse",
-                                                     "HEAD"))
-    (path_b / "ikinci_deponun_isi.txt").write_text("kurgu", encoding="utf-8")
-    try:
-        assert _is_registered(other, path_b), "senaryo kurulmadi"
-        assert not _is_registered(repo, path_b),             "senaryo kurulmadi: ilk depo bu agaci tanimamali"
-
-        with pytest.raises(worktree.WorktreeError):
-            worktree.remove(repo, state_dir=state_dir, worktree_id=id_b)
-
-        assert (path_b / "ikinci_deponun_isi.txt").exists(),             "baska bir deponun calisma agaci silindi"
-        assert _is_registered(other, path_b), "ikinci deponun kaydi bozuldu"
-    finally:
-        worktree.remove(other, state_dir=state_dir, worktree_id=id_b)
-
-
-def test_a_record_from_another_state_directory_is_not_authority(repo,
-                                                                state_dir,
-                                                                tmp_path):
-    """No record, no removal. An id on its own says nothing."""
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=_git(repo, "rev-parse",
-                                                          "HEAD"))
-    try:
-        elsewhere = tmp_path / "baska-durum"
-        elsewhere.mkdir()
-        with pytest.raises(worktree.WorktreeError):
-            worktree.remove(repo, state_dir=elsewhere, worktree_id=worktree_id)
-        assert path.exists()
-    finally:
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-
-
-def test_a_failed_git_removal_is_not_stepped_over(repo, state_dir,
-                                                  monkeypatch):
-    """`git worktree remove` failing used to be ignored, and an
-    unconditional recursive delete ran anyway. The tree stays put.
-
-    Patched at the SUBPROCESS boundary, not at `_git`. Replacing `_git`
-    made the fake raise on its own, so `check=True` was never what
-    refused -- a mutation flipping it to `check=False` left this test
-    green. Now git really returns non-zero and the `check` argument is
-    the only thing that can turn that into a refusal."""
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=_git(repo, "rev-parse",
-                                                          "HEAD"))
-    real_run = worktree.subprocess.run
-
-    class _Shim:
-        @staticmethod
-        def run(argv, **kwargs):
-            if len(argv) > 4 and argv[3:5] == ["worktree", "remove"]:
-                return subprocess.CompletedProcess(args=argv, returncode=128,
-                                                   stdout="", stderr="")
-            return real_run(argv, **kwargs)
-
-    monkeypatch.setattr(worktree, "subprocess", _Shim)
-    with pytest.raises(worktree.WorktreeError):
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-    monkeypatch.undo()
-    assert path.exists(), "git reddetti ama dizin yine de silindi"
-    assert worktree.read_record(state_dir, worktree_id) is not None, \
-        "git reddetti ama kayit silindi"
-    worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-
-
-def test_an_unanswerable_git_query_deletes_nothing(repo, state_dir,
-                                                   monkeypatch):
-    """A question we could not ask has no answer, and no answer is not
-    `False`.
-
-    `git worktree list` ran with `check=False`, so a failure returned an
-    empty listing -- and empty read as "not registered in this
-    repository", which is the branch that goes on to delete. An
-    unverifiable git state became a verified absence."""
-    record = worktree.register(state_dir, repo=repo, run_id=RUN,
-                               baseline_sha=_git(repo, "rev-parse", "HEAD"))
-    holder = worktree.holder_for(record["worktree_id"])
-    holder.mkdir()
-    (holder / "onemli.txt").write_text("kurgu", encoding="utf-8")
-    real_run = worktree.subprocess.run
-
-    class _Shim:
-        @staticmethod
-        def run(argv, **kwargs):
-            if len(argv) > 4 and argv[3:5] == ["worktree", "list"]:
-                return subprocess.CompletedProcess(args=argv, returncode=128,
-                                                   stdout="", stderr="")
-            return real_run(argv, **kwargs)
-
-    monkeypatch.setattr(worktree, "subprocess", _Shim)
-    with pytest.raises(worktree.WorktreeError):
-        worktree.remove(repo, state_dir=state_dir,
-                        worktree_id=record["worktree_id"])
-    monkeypatch.undo()
-    assert (holder / "onemli.txt").exists(), "dogrulanamayan durumda silindi"
-    assert worktree.read_record(state_dir, record["worktree_id"]) is not None
-    worktree.remove(repo, state_dir=state_dir,
-                    worktree_id=record["worktree_id"])
-
-
-def test_the_record_outlives_a_holder_that_could_not_be_removed(repo,
-                                                                state_dir,
-                                                                monkeypatch):
-    """The ledger entry is the only thing that makes residue findable,
-    so it goes last and only once the directory is provably gone.
-
-    `ignore_errors=True` plus an unconditional record deletion was a way
-    to LOSE a directory: on Windows an open handle makes removal fail
-    silently, the holder stayed, and the record naming it was dropped --
-    after which `find_orphans` could never see it again."""
-    record = worktree.register(state_dir, repo=repo, run_id=RUN,
-                               baseline_sha=_git(repo, "rev-parse", "HEAD"))
-    worktree_id = record["worktree_id"]
-    holder = worktree.holder_for(worktree_id)
-    holder.mkdir()
-    (holder / "kalici.txt").write_text("kurgu", encoding="utf-8")
-
-    class _ShutilShim:
-        @staticmethod
-        def rmtree(path, **kwargs):
-            return None                       # silently does nothing
-
-    monkeypatch.setattr(worktree, "shutil", _ShutilShim)
-    with pytest.raises(worktree.WorktreeError):
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-    monkeypatch.undo()
-
-    assert holder.exists(), "senaryo kurulmadi: holder duruyor olmali"
-    assert worktree.read_record(state_dir, worktree_id) is not None, \
-        "silinemeyen dizinin kaydi dusuruldu"
-    assert [r["worktree_id"] for r in worktree.find_orphans(
-        repo, state_dir=state_dir)] == [worktree_id], \
-        "kayit dustugu icin yetim artik bulunamiyor"
-    worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-    assert not holder.exists()
+#
+# A ~600-line battery about the DISPOSABLE GIT WORKTREE: its registry,
+# its holder, its ownership record, crash recovery, safe removal and the
+# containment of the runner-owned temp root. B2B-B2C deleted that
+# mechanism, so the tests went with it rather than being rewritten
+# against something they were not describing.
+#
+# Every security intent it carried is carried now by the D3A flat
+# workspace battery in `test_agent_loop_b2_flat_workspace.py` --
+# write-ahead ledger, holder ownership and marker, orphan recovery and
+# the FAILED lifecycle, repo/run/baseline binding, safe removal, root
+# confinement -- and by `test_agent_loop_b2_execution_flat.py` for the
+# execution seam. The mapping is in package B2B-B2C's report.
+#
+# The two tests below stayed because they were never about worktrees:
+# they are about `state`'s durability guarantees, and that module is
+# still here.
 
 
 def test_a_brand_new_directory_chain_is_made_durable_link_by_link(tmp_path,
                                                                   monkeypatch):
-    """The FIRST record creates `worktrees/` on the way in, and flushing
+    """The FIRST record creates its registry directory on the way in, and flushing
     only the directory the file lands in leaves that new directory's own
     entry -- in its parent -- unflushed."""
     flushed = []
@@ -791,7 +562,7 @@ def test_a_brand_new_directory_chain_is_made_durable_link_by_link(tmp_path,
     monkeypatch.setattr(state, "fsync_directory",
                         lambda d: (flushed.append(Path(d).resolve()),
                                    real(d))[1])
-    deep = tmp_path / "yepyeni" / "durum" / worktree.REGISTRY_DIRNAME
+    deep = tmp_path / "yepyeni" / "durum" / flat_workspace.REGISTRY_DIRNAME
     assert not deep.exists(), "senaryo kurulmadi"
     state.write_json_atomically(deep / "k.json", _valid_state(),
                                 schemas.STATE_SCHEMA, "durum")
@@ -800,264 +571,6 @@ def test_a_brand_new_directory_chain_is_made_durable_link_by_link(tmp_path,
         assert level.parent.resolve() in flushed, \
             f"yeni dizinin ust girdisi flush edilmedi: {level.name}"
     assert deep.resolve() in flushed, "hedef dizin flush edilmedi"
-
-
-def test_the_repository_check_refuses_even_when_git_would_agree(repo,
-                                                                state_dir):
-    """The repository check, ISOLATED.
-
-    In the two-repository test git does not recognise the tree either,
-    so the `_registered_here` guard refuses first and the repository
-    check never runs -- a mutation deleting it changed nothing. Here git
-    DOES list the worktree as this repository's, and only the record's
-    `repo_id` disagrees, so nothing else can say no."""
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=_git(repo, "rev-parse",
-                                                          "HEAD"))
-    record_file = (state_dir / worktree.REGISTRY_DIRNAME
-                   / f"{worktree_id}.json")
-    record = json.loads(record_file.read_text(encoding="utf-8"))
-    assert record["repo_id"] == state.repo_identity(repo), "senaryo kurulmadi"
-    record["repo_id"] = "c" * 32
-    record_file.write_text(json.dumps(record), encoding="utf-8")
-    assert _is_registered(repo, path), \
-        "senaryo kurulmadi: git bu agaci bu depoya ait gostermeli"
-
-    with pytest.raises(worktree.WorktreeError):
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-    assert path.exists(), "kayit baska depoya aitken silindi"
-
-    record["repo_id"] = state.repo_identity(repo)
-    record_file.write_text(json.dumps(record), encoding="utf-8")
-    worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-
-
-@pytest.mark.parametrize(
-    "hostile",
-    ["../../../../etc", "..", "0" * 31, "0" * 33, "G" * 32, "", "0" * 16,
-     "../" + "a" * 29])
-def test_an_id_that_could_name_another_directory_is_refused(repo, state_dir,
-                                                            hostile):
-    """Containment stops being a check and becomes a property of the
-    vocabulary: an id is 32 hex characters, so no id denotes a path
-    outside the runner-owned root. `..` is not an id."""
-    with pytest.raises(worktree.WorktreeError):
-        worktree.holder_for(hostile)
-    with pytest.raises(worktree.WorktreeError):
-        worktree.remove(repo, state_dir=state_dir, worktree_id=hostile)
-
-
-def test_a_directory_under_the_temp_root_that_is_not_ours_is_untouchable(
-        repo, state_dir):
-    """Another run's holder, with real content, next to ours."""
-    other = worktree.runner_temp_root() / f"{worktree.TEMP_PREFIX}{'a' * 32}"
-    other.mkdir(parents=True, exist_ok=True)
-    (other / "baskasinin_isi.txt").write_text("kurgu", encoding="utf-8")
-    baseline = _git(repo, "rev-parse", "HEAD")
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=baseline)
-    try:
-        assert worktree.owns(other, worktree_id=worktree_id) is False
-        assert worktree.owns(path, worktree_id=worktree_id) is True
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-        assert (other / "baskasinin_isi.txt").exists(),             "baska bir kosunun dizini silindi"
-        assert not path.exists()
-    finally:
-        shutil.rmtree(other, ignore_errors=True)
-
-
-def test_a_holder_that_appears_mid_test_is_never_swept(repo, state_dir,
-                                                       private_worktree_root,
-                                                       monkeypatch):
-    """A foreign holder created DURING a test must survive it.
-
-    The battery used to run against the shared system-wide root and one
-    test removed "everything that was not here when I started" -- so a
-    real agent loop that happened to start in another repository while
-    this suite ran could have its holder deleted. An audit measured
-    exactly that, and a race probe reproduced it.
-
-    Two things stop it now, and this asserts both: the root is private
-    to this test, and cleanup names the holders its OWN ledger records
-    rather than sweeping whatever is new."""
-    def refusing_remove(*args, **kwargs):
-        raise worktree.WorktreeError("kurgu temizlik hatasi")
-
-    intruder = private_worktree_root / f"{worktree.TEMP_PREFIX}{'d' * 32}"
-
-    with monkeypatch.context() as sabotage:
-        sabotage.setattr(worktree, "remove", refusing_remove)
-        with pytest.raises(worktree.WorktreeError):
-            worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                            baseline_sha="0" * 40)
-        # another repository's loop starts right here
-        intruder.mkdir()
-        (intruder / "baska_deponun_isi.txt").write_text("ONEMLI",
-                                                        encoding="utf-8")
-
-    ours = worktree.find_orphans(repo, state_dir=state_dir)
-    assert len(ours) == 1, "senaryo kurulmadi: kendi yetimimiz olmali"
-    for record in ours:
-        worktree.remove(repo, state_dir=state_dir,
-                        worktree_id=record["worktree_id"])
-
-    assert (intruder / "baska_deponun_isi.txt").exists(), \
-        "baska bir kosunun dizini temizlik sirasinda silindi"
-    assert worktree.find_orphans(repo, state_dir=state_dir) == []
-    shutil.rmtree(intruder, ignore_errors=True)
-
-
-def test_an_existing_holder_is_never_reused(repo, state_dir, monkeypatch):
-    """`mkdir` is EXCLUSIVE, and that has to be tested by forcing the
-    collision: at 128 bits it never happens by chance, so a mutation
-    turning it into `exist_ok=True` broke no test at all.
-
-    Reuse would mean adopting a directory whose contents were never
-    verified -- and, worse, the run that already owns that id would have
-    its worktree deleted out from under it by the newcomer's cleanup."""
-    collision = "e" * 32
-    monkeypatch.setattr(worktree.secrets, "token_hex", lambda n: collision)
-    squatter = worktree.holder_for(collision)
-    squatter.mkdir(parents=True, exist_ok=True)
-    (squatter / "onceki_kosunun_isi.txt").write_text("kurgu", encoding="utf-8")
-    try:
-        with pytest.raises(worktree.WorktreeError):
-            worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                            baseline_sha=_git(repo, "rev-parse", "HEAD"))
-        assert (squatter / "onceki_kosunun_isi.txt").exists(), \
-            "var olan kap yeniden kullanildi ve icerigi kayboldu"
-    finally:
-        shutil.rmtree(squatter, ignore_errors=True)
-
-
-def test_ownership_needs_no_file_to_be_readable(repo):
-    """The failure the audit injected: the marker write raised, the
-    holder survived unmarked, and the ownership-checked `remove` then
-    refused to clean up a directory this module had just created.
-
-    There is no marker to fail to write. `mkdir` is atomic, so the
-    directory and its ownership come into existence together -- proven
-    here by making EVERY file write fail and showing creation still
-    leaves nothing behind."""
-    root = worktree.runner_temp_root()
-    before = {p.name for p in root.iterdir()}
-    real_write = Path.write_text
-
-    def refusing_write(self, *args, **kwargs):
-        raise OSError("kurgu: hicbir dosya yazilamiyor")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(Path, "write_text", refusing_write)
-    try:
-        with pytest.raises(BaseException):
-            worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                        baseline_sha="0" * 40)
-    finally:
-        monkeypatch.undo()
-    assert real_write is Path.write_text, "yama geri alinmadi"
-    assert {p.name for p in root.iterdir()} == before,         "isaretsiz kap geride kaldi"
-
-
-def test_a_crashed_run_can_find_its_own_worktree_again(repo, state_dir):
-    """Recovery WITHOUT knowing the id.
-
-    The previous design minted the id inside `create` and returned it
-    only on success, and recovery required it as an argument -- so a
-    process that died between `mkdir` and its first write left an orphan
-    whose id existed nowhere but the dead process's memory. The record
-    is written BEFORE anything is created, so the registry is the thing
-    that survives."""
-    baseline = _git(repo, "rev-parse", "HEAD")
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=baseline)
-    del worktree_id                       # the crash: nobody recorded it
-    try:
-        found = worktree.find_orphans(repo, state_dir=state_dir)
-        assert [r["worktree_id"] for r in found] == [path.parent.name.replace(
-            worktree.TEMP_PREFIX, "")]
-        assert found[0]["run_id"] == RUN
-        assert worktree.find_orphans(repo, state_dir=state_dir,
-                                     run_id="baska-kosu") == []
-    finally:
-        for record in worktree.find_orphans(repo, state_dir=state_dir):
-            worktree.remove(repo, state_dir=state_dir,
-                            worktree_id=record["worktree_id"])
-    assert worktree.find_orphans(repo, state_dir=state_dir) == []
-
-
-def test_recovery_does_not_report_another_repositorys_worktrees(repo, tmp_path,
-                                                                state_dir):
-    """The registry is shared; the answer must not be."""
-    other = tmp_path / "ucuncu-depo"
-    (other / "pipeline").mkdir(parents=True)
-    for argv in (["init", "-q"], ["config", "user.email", "k@example.invalid"],
-                 ["config", "user.name", "Kurgu"]):
-        _git(other, *argv)
-    (other / "pipeline" / "k.py").write_text("V = 1\n", encoding="utf-8")
-    _git(other, "add", "-A")
-    _git(other, "commit", "-qm", "kurgu")
-    _, id_other = worktree.create(other, state_dir=state_dir, run_id=RUN,
-                                  baseline_sha=_git(other, "rev-parse", "HEAD"))
-    try:
-        assert worktree.find_orphans(repo, state_dir=state_dir) == []
-        mine = worktree.find_orphans(other, state_dir=state_dir)
-        assert [r["worktree_id"] for r in mine] == [id_other]
-    finally:
-        worktree.remove(other, state_dir=state_dir, worktree_id=id_other)
-
-
-def _crash_at(stage, repo, state_dir, private_temp):
-    """Start the helper, wait for it to reach `stage`, then KILL it.
-
-    `kill()` is SIGKILL on POSIX and TerminateProcess on Windows: no
-    handler, no `finally`, no cleanup. That is the point -- an exception
-    inside `create` is caught and tidied up, so it tests the opposite of
-    what a crash does."""
-    helper = Path(__file__).resolve().parent / "crash_helper_b1.py"
-    victim = subprocess.Popen(
-        [sys.executable, str(helper), stage, str(repo), str(state_dir),
-         _git(repo, "rev-parse", "HEAD"), str(Path(private_temp).parent)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        line = victim.stdout.readline()
-        assert line.startswith("READY "), \
-            f"kurban asamaya ulasmadi ({stage}): {line!r} {victim.stderr.read()}"
-        return line.split()[1]
-    finally:
-        victim.kill()
-        victim.wait(timeout=30)
-
-
-@pytest.mark.parametrize(
-    "stage", ["record_only", "holder_made", "git_added", "ready"])
-def test_a_killed_process_always_leaves_recoverable_residue(
-        repo, state_dir, private_worktree_root, stage):
-    """The four windows a crash can land in, each with a real killed
-    process rather than a raised exception.
-
-    In every one the ledger is what survives and what makes the residue
-    findable: recovery never needs the id, because the id was persisted
-    before the first directory existed."""
-    worktree_id = _crash_at(stage, repo, state_dir,
-                            private_worktree_root)
-
-    orphans = worktree.find_orphans(repo, state_dir=state_dir)
-    assert [r["worktree_id"] for r in orphans] == [worktree_id], \
-        f"{stage}: kayit kurtarilamadi"
-    assert orphans[0]["status"] == (worktree.STATUS_READY if stage == "ready"
-                                    else worktree.STATUS_PLANNED)
-
-    holder = worktree.holder_for(worktree_id)
-    assert holder.exists() is (stage != "record_only")
-    assert _is_registered(repo, holder / worktree.WORKTREE_DIRNAME) is (
-        stage in ("git_added", "ready"))
-
-    worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-    assert worktree.find_orphans(repo, state_dir=state_dir) == []
-    assert not holder.exists()
-    assert not _is_registered(repo, holder / worktree.WORKTREE_DIRNAME)
-    assert _worktrees(repo) == [f"worktree {repo.as_posix()}"] or len(
-        _worktrees(repo)) == 1, "git kaydinda bayat girdi kaldi"
 
 
 def test_the_atomic_write_reports_its_real_durability(state_dir):
@@ -1074,97 +587,6 @@ def test_the_atomic_write_reports_its_real_durability(state_dir):
     else:
         assert level == "power-loss"
     assert state.fsync_directory(state_dir) is (level == "power-loss")
-
-
-def test_the_record_is_written_before_anything_exists_on_disk(repo, state_dir):
-    """Write-ahead, asserted directly: after `register` there is a record
-    and NO directory."""
-    record = worktree.register(state_dir, repo=repo, run_id=RUN,
-                               baseline_sha=_git(repo, "rev-parse", "HEAD"))
-    holder = worktree.holder_for(record["worktree_id"])
-    assert not holder.exists(), "kayittan once dizin olusmus"
-    assert worktree.read_record(state_dir, record["worktree_id"]) == record
-    assert record["repo_id"] == state.repo_identity(repo)
-    assert str(repo) not in json.dumps(record), "kayit mutlak yol tasiyor"
-    assert worktree.find_orphans(repo, state_dir=state_dir) == [record]
-    worktree.remove(repo, state_dir=state_dir,
-                    worktree_id=record["worktree_id"])
-
-
-def test_a_creation_failure_leaves_no_worktree_no_state_and_no_residue(
-        repo, state_dir):
-    """A baseline git cannot check out: nothing accepted, nothing left.
-
-    "Nothing left" includes the EMPTY HOLDER. The holder is a real
-    directory before git is asked for anything, and the first version
-    returned the error without removing it -- ten empty directories
-    accumulated in the runner-owned root during a single session, which
-    is both litter and a broken invariant: if a failed creation can
-    leave a directory, "no residue" is no longer something a test can
-    check."""
-    root = worktree.runner_temp_root()
-    before = sorted(p.name for p in root.iterdir())
-
-    with pytest.raises(worktree.WorktreeError):
-        worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                        baseline_sha="0" * 40)
-
-    assert not (state_dir / state.STATE_FILENAME).exists()
-    assert sorted(p.name for p in root.iterdir()) == before,         "basarisiz kurulum gecici kokta dizin birakti"
-
-
-def test_a_successful_create_and_remove_also_leaves_no_residue(repo,
-                                                               state_dir):
-    """The residue invariant on the ORDINARY path, not just the failing
-    one. Only the failure path was asserted, so a holder surviving a
-    normal cleanup would not have been noticed -- and two empty holders
-    did survive a session, which is what prompted looking."""
-    root = worktree.runner_temp_root()
-    before = sorted(p.name for p in root.iterdir())
-    baseline = _git(repo, "rev-parse", "HEAD")
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=baseline)
-    assert sorted(p.name for p in root.iterdir()) != before,         "senaryo kurulmadi: kurulum gecici kokte iz birakmali"
-    worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
-    assert sorted(p.name for p in root.iterdir()) == before
-    assert worktree.find_orphans(repo, state_dir=state_dir) == []
-
-
-def test_a_cleanup_failure_does_not_replace_the_creation_failure(
-        repo, state_dir, monkeypatch):
-    """`create` cleans up on the way out, and that cleanup used to be
-    able to raise over the top of the real error -- leaving the caller
-    holding a complaint about removal instead of the reason the
-    worktree was refused."""
-    def refusing_remove(*args, **kwargs):
-        raise worktree.WorktreeError("kurgu temizlik hatasi")
-
-    root = worktree.runner_temp_root()
-    before = {p.name for p in root.iterdir()}
-    monkeypatch.setattr(worktree, "remove", refusing_remove)
-    try:
-        with pytest.raises(worktree.WorktreeError) as refusal:
-            worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                        baseline_sha="0" * 40)
-        assert "temizlik" not in str(refusal.value), str(refusal.value)
-    finally:
-        # this test SABOTAGES cleanup, so it owns the litter it caused.
-        # It removes exactly the holders ITS OWN ledger records name --
-        # never "everything that appeared since I started", which is how
-        # a foreign holder created by another repository during the test
-        # window was destroyed.
-        monkeypatch.undo()
-        for record in worktree.find_orphans(repo, state_dir=state_dir):
-            worktree.remove(repo, state_dir=state_dir,
-                            worktree_id=record["worktree_id"])
-
-
-def test_the_worktree_is_created_without_a_shell_or_a_prompt():
-    """argv lists only, and git's interactive prompts disabled -- an
-    unattended run must never park waiting for credentials."""
-    env = worktree._no_prompt_env()             # noqa: SLF001 -- contract
-    assert env["GIT_TERMINAL_PROMPT"] == "0"
-    assert env["GCM_INTERACTIVE"] == "never"
 
 
 # =====================================================================
@@ -1209,44 +631,49 @@ def test_a_missing_manifest_counts_as_changed(task):
 # IDENTITY -- what the audit found unbound
 # =====================================================================
 
-def test_a_real_worktree_id_can_actually_be_written_to_the_binding(repo, task,
-                                                                   state_dir):
-    """The field was optional AND unsatisfiable: `create` derived the id
-    from a temp-directory suffix, which is not 32 hex, so the binding
-    refused it -- and nothing noticed, because the schema did not
-    require the field. "Bound to a worktree" was documentation only.
+def test_a_real_workspace_id_can_actually_be_written_to_the_binding(repo, task,
+                                                                    state_dir):
+    """The field was optional AND unsatisfiable: the old `create` derived
+    the id from a temp-directory suffix, which is not 32 hex, so the
+    binding refused it -- and nothing noticed, because the schema did not
+    require the field. "Bound to an execution root" was documentation
+    only.
 
-    Both halves are checked here: the id `create` really produces is
-    accepted, and a binding WITHOUT one is refused.
+    Both halves are checked here against the surviving mechanism: the id
+    `flat_workspace.create` really produces is accepted, and a binding
+    WITHOUT one is refused.
 
-    The id now carries a second job -- it is also the capability that
-    authorises removing the worktree -- so the two vocabularies have to
+    The id carries a second job -- it is also the capability that
+    authorises removing the workspace -- so the two vocabularies have to
     stay the same one."""
     baseline = _git(repo, "rev-parse", "HEAD")
-    path, produced = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=baseline)
+    workspace = flat_workspace.create(repo, state_dir=state_dir, run_id=RUN,
+                                      baseline_sha=baseline)
+    produced = workspace.workspace_id
     try:
         state.write_binding(state_dir, _binding(repo, task,
-                                                worktree_id=produced))
-        assert state.read_binding(state_dir)["worktree_id"] == produced
-        assert worktree.WORKTREE_ID.match(produced)
+                                                workspace_id=produced))
+        assert state.read_binding(state_dir)["workspace_id"] == produced
+        assert flat_workspace.WORKSPACE_ID.match(produced)
 
         incomplete = _binding(repo, task)
-        incomplete.pop("worktree_id")
+        incomplete.pop("workspace_id")
         with pytest.raises(state.CorruptState):
             state.write_binding(state_dir, incomplete)
     finally:
-        worktree.remove(repo, state_dir=state_dir, worktree_id=produced)
+        flat_workspace.remove(repo, state_dir=state_dir,
+                              workspace_id=produced)
 
 
-def test_a_worktree_id_that_is_not_ours_is_refused(repo, task, state_dir):
-    state.write_binding(state_dir, _binding(repo, task, worktree_id="c" * 32))
+def test_a_workspace_id_that_is_not_ours_is_refused(repo, task, state_dir):
+    state.write_binding(state_dir, _binding(repo, task,
+                                            workspace_id="c" * 32))
     with pytest.raises(state.IncompatibleState):
         state.assert_binding(state_dir, repo_id=state.repo_identity(repo),
                              baseline_sha=_git(repo, "rev-parse", "HEAD"),
                              manifest_digest=preflight.snapshot_manifest(
                                  task).digest,
-                             worktree_id="d" * 32)
+                             workspace_id="d" * 32)
 
 
 @pytest.mark.parametrize("keep", ["state", "binding"])
@@ -1820,7 +1247,7 @@ def test_every_mutation_still_applies_to_the_current_source():
     # concept to switch off, no exit code to ignore and no index to be
     # blinded, so none of the three has an honest target left; each
     # intent is pinned as behaviour in the main-guard battery instead.
-    assert len(tool.MUTATIONS) == 89
+    assert len(tool.MUTATIONS) == 63
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1829,35 +1256,22 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b2a-istem-tipi', 'b2a-kimlik-tipi', 'b2a-model-tipi',
         'b2a-sure-tipi', 'b2ar1-arac-yansimasi', 'b2ar1-builder-butce',
         'b2ar1-tipli-ret', 'b2ba-alt-kume', 'b2ba-ana-agac-sonkontrolu',
-        'b2ba-dosya-turu', 'b2ba-finally-yok',
-        'b2ba-gorev-sonkontrolu',
+        'b2ba-dosya-turu', 'b2ba-finally-yok', 'b2ba-gorev-sonkontrolu',
         'b2ba-kirli-agac', 'b2ba-kontrol-glob', 'b2ba-kosu-kimligi',
-        'b2ba-onek-kacisi', 'b2ba-parmak-izi-icerik',
-        'b2ba-yasakli-onceligi', 'b2ba-yineleme',
-        'b2bar1-kanonik-kapsam',
-        'b2bar1-manifest-icerde', 'b2bar1-manifest-taban',
-        'b2bar1-silme-modu', 'b2bar1-snapshot-okuma', 'bitmemis-kosu',
-        'butce-degismezi', 'butce-siniri', 'cift-birakma',
-        'degismez-alanlar', 'dizin-fsync', 'dizin-zinciri',
-        'durum-kosulsuz', 'git-donus-kodu', 'git-kaldirma-kontrolu',
-        'git-kayitli-mi', 'git-stderr-sizintisi', 'handshake-baslatma',
-        'handshake-timeout', 'holder-silindi-mi', 'inspect-tip-kapisi',
-        'kap-dislayici', 'kayit-depo-yetkisi', 'kayit-varligi',
-        'kilit-dislama', 'kilit-ofseti', 'kimlik-deseni',
-        'kontrol-duzlemi-dogrudan', 'kontrol-duzlemi-kapisi',
+        'b2ba-onek-kacisi', 'b2ba-parmak-izi-icerik', 'b2ba-yasakli-onceligi',
+        'b2ba-yineleme', 'b2bar1-kanonik-kapsam', 'b2bar1-manifest-icerde',
+        'b2bar1-manifest-taban', 'b2bar1-silme-modu', 'b2bar1-snapshot-okuma',
+        'bitmemis-kosu', 'butce-degismezi', 'butce-siniri', 'cift-birakma',
+        'degismez-alanlar', 'dizin-fsync', 'dizin-zinciri', 'durum-kosulsuz',
+        'git-donus-kodu', 'git-stderr-sizintisi', 'handshake-baslatma',
+        'handshake-timeout', 'inspect-tip-kapisi', 'kilit-dislama',
+        'kilit-ofseti', 'kontrol-duzlemi-dogrudan', 'kontrol-duzlemi-kapisi',
         'kontrol-duzlemi-test-ailesi', 'kontrol-duzlemi-yol-listesi',
-        'kurtarma-depo-filtresi', 'r2a-ana-agac', 'r2a-bag-agac',
-        'r2a-bag-cagrisi-yok', 'r2a-bag-depo', 'r2a-bag-kosu',
-        'r2a-bag-taban', 'r2a-bag-varligi', 'r2a-bas-kontrolu',
-        'r2a-cagiran-yolu', 'r2a-git-kutugu', 'r2a-gomulu-kimlik',
-        'r2a-hazir-kontrolu', 'r2a-kap-sinirlama', 'r2a-kayit-depo',
-        'r2a-kayit-kosu', 'r2a-kayit-taban', 'r2b-esitlik-kontrolu',
-        'r2b-ham-sozluk', 'r2b-kanonik-sirasiz', 'r2b-yanlis-sha',
-        'r2b-yol-degeri', 'r2br1-dondurma', 'r2br1-kodlama-sarici',
-        'r2br1-tip-kontrolu', 'r2br11-alt-sinif',
-        'registry-sorgusu-kontrolu', 'run-id-caprazi', 'sonlu-sayi',
-        'yarim-cift', 'yaz-once-kaydi', 'yol-siniri',
-        'zorunlu-worktree-id'}
+        'r2b-esitlik-kontrolu', 'r2b-ham-sozluk', 'r2b-kanonik-sirasiz',
+        'r2b-yanlis-sha', 'r2b-yol-degeri', 'r2br1-dondurma',
+        'r2br1-kodlama-sarici', 'r2br1-tip-kontrolu', 'r2br11-alt-sinif',
+        'run-id-caprazi', 'sonlu-sayi', 'yarim-cift', 'yol-siniri',
+        'zorunlu-workspace-id'}
     root = Path(__file__).resolve().parent.parent
     stale = [label for label, module, old, _, _ in tool.MUTATIONS
              if old not in (root / "tools" / "agent_loop"
@@ -1890,7 +1304,10 @@ def test_every_mutation_names_a_test_that_exists():
                      "test_agent_loop_b2_changes_flat.py",
                      # B2B-B2B: the main-checkout guard's battery, named
                      # by the retargeted walker-seam mutation.
-                     "test_agent_loop_b2_main_guard.py"))
+                     "test_agent_loop_b2_main_guard.py",
+                     # B2B-B2C: the state binding battery is where
+                     # the required-identity guard is judged now.
+                     "test_agent_loop_state_binding.py"))
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
     assert missing == [], f"var olmayan hedef test adi: {missing}"
@@ -1930,7 +1347,7 @@ def test_no_b1_module_runs_a_shell():
     import ast
 
     offenders = []
-    for name in ("state", "locking", "worktree", "preflight"):
+    for name in ("state", "locking", "flat_workspace", "preflight"):
         module = Path(__file__).resolve().parent.parent / "tools" \
             / "agent_loop" / f"{name}.py"
         for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
@@ -1944,75 +1361,67 @@ def test_no_b1_module_runs_a_shell():
     assert not offenders, f"keyfi kabuk: {offenders}"
 
 
-# =====================================================================
-# R2A -- the execution binding seam: identities in, ONE derived path out
-# =====================================================================
+def test_the_legacy_worktree_surface_is_gone():
+    """B2B-B2C, asserted structurally rather than described.
 
-def test_the_execution_binding_returns_only_the_derived_path(repo, state_dir):
-    """The positive face of the seam: a worktree B1 itself created and
-    marked READY binds, and what comes back is the holder-derived path
-    -- the same one `create` returned."""
-    baseline = _git(repo, "rev-parse", "HEAD")
-    path, worktree_id = worktree.create(repo, state_dir=state_dir, run_id=RUN,
-                                        baseline_sha=baseline)
-    state.write_binding(state_dir, {
-        "protocol_version": contract.PROTOCOL_VERSION, "run_id": RUN,
-        "repo_id": state.repo_identity(repo), "baseline_sha": baseline,
-        "manifest_digest": "0" * 64, "worktree_id": worktree_id})
-    try:
-        derived = worktree.assert_execution_binding(
-            repo, state_dir=state_dir, run_id=RUN, worktree_id=worktree_id,
-            baseline_sha=baseline)
-        assert derived == worktree.holder_for(worktree_id) \
-            / worktree.WORKTREE_DIRNAME
-        assert derived.resolve() == path.resolve()
-    finally:
-        worktree.remove(repo, state_dir=state_dir, worktree_id=worktree_id)
+    A removal package's real risk is a leftover: one import, one helper,
+    one `worktree_id=` keyword still accepted somewhere would mean the
+    old execution surface is still reachable while every behaviour test
+    passes. So the production tree is read and the answer has to be
+    nothing.
 
+    `StopReason.DIRTY_WORKTREE` is deliberately NOT part of this scan: it
+    is a closed protocol code, and renaming it would break the contract
+    with everything that has already recorded it."""
+    import ast
+    import importlib.util
 
-def test_the_execution_binding_takes_identities_never_a_path():
-    """No parameter carries a location. The path COMES OUT of the seam;
-    a caller holding a directory has nowhere to put it."""
-    import inspect as inspect_module
+    root = Path(__file__).resolve().parent.parent
+    uretim = root / "tools" / "agent_loop"
+    assert not (uretim / "worktree.py").exists(), "legacy modul hala duruyor"
+    assert importlib.util.find_spec("tools.agent_loop.worktree") is None, \
+        "legacy modul hala ice aktarilabiliyor"
+    assert not (root / "tests" / "crash_helper_b1.py").exists(), \
+        "legacy crash yardimcisi hala duruyor"
 
-    parameters = inspect_module.signature(
-        worktree.assert_execution_binding).parameters
-    assert set(parameters) == {"repo", "state_dir", "run_id",
-                               "worktree_id", "baseline_sha"}
-    for escape in ("path", "cwd", "directory", "worktree"):
-        assert escape not in parameters
+    yasak = {"worktree_id", "worktree", "WorktreeNotBound",
+             "WORKTREE_EXECUTION", "WORKTREE_ID", "assert_execution_binding",
+             "IMPLEMENTER_RUNS_IN_DISPOSABLE_WORKTREE"}
+    izler = []
+    for kaynak in sorted(uretim.glob("*.py")):
+        agac = ast.parse(kaynak.read_text(encoding="utf-8"))
+        # DOCSTRINGS ARE NOT CODE. Scanning raw text made this fire on
+        # the comments that explain why the field is gone -- the same
+        # trap `changes.py`'s AST test already paid for, where the word
+        # "checkout" in prose looked like a git subcommand. What is
+        # scanned here is what executes.
+        belgeler = {id(ast.get_docstring(node, clean=False))
+                    for node in ast.walk(agac)
+                    if isinstance(node, (ast.Module, ast.ClassDef,
+                                         ast.FunctionDef))}
+        for node in ast.walk(agac):
+            gorulen = None
+            if isinstance(node, ast.Name):
+                gorulen = node.id
+            elif isinstance(node, ast.Attribute):
+                gorulen = node.attr
+            elif isinstance(node, ast.arg):
+                gorulen = node.arg
+            elif isinstance(node, ast.keyword):
+                gorulen = node.arg
+            elif isinstance(node, ast.alias):
+                gorulen = node.name.split(".")[-1]
+            elif isinstance(node, ast.Constant) and \
+                    isinstance(node.value, str) and \
+                    id(node.value) not in belgeler:
+                gorulen = node.value
+            if gorulen in yasak:
+                izler.append(f"{kaynak.name}:{gorulen}")
+    assert izler == [], f"uretimde legacy yuzey kalintisi: {izler}"
 
-
-def test_the_execution_binding_error_texts_stay_abstract(repo, state_dir):
-    """Every refusal is a fixed sentence -- no absolute path, no id, no
-    sha, no record content. Checked on a real refusal rather than by
-    reading the source."""
-    baseline = _git(repo, "rev-parse", "HEAD")
-    with pytest.raises(worktree.WorktreeError) as refusal:
-        worktree.assert_execution_binding(
-            repo, state_dir=state_dir, run_id=RUN, worktree_id="e" * 32,
-            baseline_sha=baseline)
-    text = str(refusal.value) + repr(refusal.value)
-    assert "/" not in text and "\\" not in text
-    assert "e" * 32 not in text and baseline not in text
-
-
-def test_case_twin_paths_are_distinct_on_case_sensitive_filesystems(tmp_path):
-    """R2A-R1 P1: unconditional casefold gave two DISTINCT case-twin
-    directories one `_comparable` spelling and two distinct case-twin
-    repositories one `repo_identity` -- an identity two repositories
-    share authorises either against records the other wrote. Folding
-    now happens only where the filesystem folds."""
-    probe = tmp_path / "kucuk-harf-sondasi.txt"
-    probe.write_text("k", encoding="ascii")
-    if (tmp_path / "KUCUK-HARF-SONDASI.TXT").exists():
-        pytest.skip("dosya sistemi harfe duyarsiz; ikiz kurulamiyor")
-    upper = tmp_path / "IKIZ"
-    lower = tmp_path / "ikiz"
-    upper.mkdir()
-    lower.mkdir()
-    assert upper.resolve() != lower.resolve(), "senaryo kurulmadi"
-    assert worktree._comparable(upper) != worktree._comparable(lower), \
-        "case-twin dizinler ayni sayildi"
-    assert state.repo_identity(upper) != state.repo_identity(lower), \
-        "case-twin depolar ayni kimligi aldi"
+    # and the meta-guard no longer claims to mutate a module that is not
+    # there -- `originals()` would raise on it before any battery ran
+    tool = _mutation_tool()
+    assert "worktree" not in tool.MODULES
+    assert not [label for label, module, *_ in tool.MUTATIONS
+                if module == "worktree"]

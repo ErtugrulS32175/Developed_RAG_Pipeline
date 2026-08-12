@@ -781,12 +781,21 @@ def test_the_verification_tools_are_part_of_the_control_plane():
     assert contract.TASK_MANIFEST_IS_IMMUTABLE is True
 
 
-def test_phase_b_is_frozen_to_worktree_isolation():
+def test_phase_b_is_frozen_to_flat_workspace_isolation():
     """Hashing after the fact detects damage that has already happened
-    and been left in the operator's tree. The implementer runs in a
-    disposable worktree built from the baseline; only a verified
-    allowed-path patch comes back."""
-    assert contract.IMPLEMENTER_RUNS_IN_DISPOSABLE_WORKTREE is True
+    and been left in the operator's tree. The implementer runs in a FLAT
+    WORKSPACE materialised from the baseline's raw git objects: two
+    independent trees with no `.git` in either, the model confined to the
+    implementer one, and only a verified allowed-path change coming back.
+
+    The disposable git worktree this replaced is not merely deprecated --
+    it carried a `.git` link into the model's reach, which is how git
+    lost the evidence job twice. The old constant is gone rather than
+    left beside the new one, because two frozen design statements about
+    the same question is one too many."""
+    assert contract.IMPLEMENTER_RUNS_IN_FLAT_WORKSPACE is True
+    assert not hasattr(contract, "IMPLEMENTER_RUNS_IN_DISPOSABLE_WORKTREE"), \
+        "eski normatif sabit hala duruyor"
 
 
 def test_the_control_plane_covers_the_loop_and_its_own_tests():
