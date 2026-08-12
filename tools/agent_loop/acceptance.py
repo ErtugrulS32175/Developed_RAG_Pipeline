@@ -369,6 +369,38 @@ def _assert_programs(commands, env) -> None:
 # one bounded, contained process
 # ---------------------------------------------------------------------
 
+def _reclaim(child, container, started_streams, grace):
+    """Stop, empty, join and reap -- attempting ALL FOUR whatever any of
+    them does, and CONSUMING every answer.
+
+    This is the cleanup for a call that never reached its own. Each step
+    is independent because a sequence that stops at the first failure
+    skips exactly the steps that empty the container and join the
+    readers. A step that raises is a step that proved nothing, which is
+    what `False` means here.
+
+    `started_streams` holds only readers whose `start()` RETURNED:
+    joining a thread that never started is a different bug wearing this
+    one's face, and `join_within` on an empty list is honestly True."""
+    if grace is None:
+        grace = time.monotonic() + process.REAP_SECONDS
+    steps = (lambda: process.stop(child, grace),
+             lambda: container.drain(grace),
+             lambda: process.join_within(started_streams, grace),
+             # THE REAP, asked of the operating system rather than
+             # assumed: a `stop` that returned is not the same as a
+             # process that has been waited for.
+             lambda: child.poll() is not None)
+    proven = True
+    for step in steps:
+        try:
+            answer = step()
+        except BaseException:                   # noqa: BLE001 -- consumed
+            answer = False
+        proven &= bool(answer)
+    return proven
+
+
 def _run_command(argv, *, cwd, env, deadline, max_output_bytes):
     """Start `argv` inside a container that already exists, read both
     pipes to their own ceiling, and prove the container empty.
@@ -377,6 +409,16 @@ def _run_command(argv, *, cwd, env, deadline, max_output_bytes):
     a process still running against the mirror outranks whatever it
     printed; then the reader outcomes; then the wall clock; and only a
     command that survived all three is judged by its exit code.
+
+    FROM THE MOMENT `launch_contained` RETURNS THERE IS EXACTLY ONE WAY
+    OUT. The window between that return and the poll loop -- the reader
+    constructors, either `start()`, the stdin close -- used to sit
+    outside every envelope: a `finally` drained the container WITHOUT
+    reading the answer, never joined a reader that had already started
+    and never reaped the child, so a setup failure could travel out
+    looking like an ordinary refusal while the tree was still running.
+    Nothing is decided in a `finally` here: the primary error and the
+    cleanup verdict are held in named variables and judged afterwards.
 
     Returns `(outcome, exit_code, stdout_bytes, stderr_bytes)` and never
     the bytes themselves."""
@@ -389,8 +431,11 @@ def _run_command(argv, *, cwd, env, deadline, max_output_bytes):
     except OSError:
         raise ContainmentFailed("kabul sureci baslatilamadi") from None
 
-    drained = False
+    started_streams = []
     grace = None
+    settled = False
+    primary = None
+    answer = None
     try:
         tripped = threading.Event()
         streams = [process.BoundedStream("stdout", child.stdout,
@@ -399,6 +444,9 @@ def _run_command(argv, *, cwd, env, deadline, max_output_bytes):
                                          max_output_bytes, tripped)]
         for stream in streams:
             stream.start()
+            # RECORDED ONLY AFTER `start()` RETURNS, so the cleanup can
+            # never be handed a thread that was never started
+            started_streams.append(stream)
         # STDIN IS CLOSED, never written: an acceptance command is not
         # asked anything, and a pipe left open is a command that can wait
         # for an answer nobody is there to give.
@@ -425,30 +473,54 @@ def _run_command(argv, *, cwd, env, deadline, max_output_bytes):
         # the readers alive, so joining first waits out the whole grace
         # period and only then stops anything.
         drained = container.drain(grace)
-        joined = process.join_within(streams, grace)
+        joined = process.join_within(started_streams, grace)
+        # THE CLEANUP HAS NOW HAPPENED, and `drain` closes the job
+        # handle on its way out -- so a second attempt would be trusting
+        # a handle that no longer names anything and would answer False
+        # for a container that is genuinely empty.
+        settled = True
         counts = (streams[0].total, streams[1].total)
         if not drained:
             raise ProcessTreeSurvived(
                 "kabul sureci kapsayicisi bosaltilamadi")
         if timed_out:
-            return (TIMED_OUT, None) + counts
-        if any(stream.overflowed for stream in streams):
-            return (OVERFLOWED, None) + counts
+            answer = (TIMED_OUT, None) + counts
+        elif any(stream.overflowed for stream in streams):
+            answer = (OVERFLOWED, None) + counts
         # A READER THAT FAILED IS NOT A SHORT ANSWER, and neither is one
         # still alive: an answer taken while a reader has not finished is
         # an answer about a moment that has not ended.
-        if not joined or any(stream.outcome != process.READ_COMPLETED
-                             for stream in streams):
-            return (READ_FAILED, None) + counts
-        return (COMPLETED, child.wait()) + counts
-    finally:
-        # EVERY exit, including one raised between the launch and the
-        # drain above: an exception before the cleanup window opened gets
-        # a fresh budget, otherwise the SAME deadline the stop and the
-        # joins used.
-        if not drained:
-            container.drain(grace if grace is not None
-                            else time.monotonic() + process.REAP_SECONDS)
+        elif not joined or any(stream.outcome != process.READ_COMPLETED
+                               for stream in streams):
+            answer = (READ_FAILED, None) + counts
+        else:
+            answer = (COMPLETED, child.wait()) + counts
+    except BaseException as raised:
+        # CAPTURED, not handled here. Every raise below stands OUTSIDE
+        # this handler, because `raise X from None` clears `__cause__`
+        # and the suppression flag but leaves `__context__` holding the
+        # original -- and a raw `OSError`'s text names absolute paths.
+        primary = raised
+
+    if primary is None:
+        return answer
+
+    reclaimed = True if settled else _reclaim(child, container,
+                                              started_streams, grace)
+    if not reclaimed:
+        # STRONGER THAN WHATEVER FAILED FIRST. A gate going red and a
+        # machine with a stray process on it are different events, and
+        # only one of them needs a human -- so the cleanup verdict is
+        # never allowed to hide behind the error that triggered it.
+        raise ProcessTreeSurvived("kabul sureci temizlenemedi")
+    if isinstance(primary, AcceptanceError):
+        raise primary
+    if not isinstance(primary, Exception):
+        # KeyboardInterrupt and SystemExit are the operator's decision
+        # rather than a finding: now that the cleanup is proven, they
+        # travel out exactly as they arrived.
+        raise primary
+    raise AcceptanceRefused("kabul sureci akislari kurulamadi")
 
 
 # ---------------------------------------------------------------------

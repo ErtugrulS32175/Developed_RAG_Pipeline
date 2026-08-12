@@ -670,6 +670,157 @@ def test_a_successful_parent_may_not_leave_a_living_grandchild(
     assert residue(private_roots) == []
 
 
+def _chain(error):
+    """Everything a caller could print: the sentence, the repr, the
+    notes, and every link of the cause/context chain."""
+    parcalar, gorulen = [], set()
+    current = error
+    while current is not None and id(current) not in gorulen:
+        gorulen.add(id(current))
+        parcalar.append(str(current))
+        parcalar.append(repr(current))
+        parcalar.extend(getattr(current, "__notes__", ()) or ())
+        current = current.__cause__ or current.__context__
+    return " ".join(parcalar)
+
+
+@pytest.mark.parametrize("senaryo", ["ikinci-start", "ikinci-start-drain-yok",
+                                     "kurucu-hatasi", "ikinci-start-kesinti"])
+def test_a_failure_after_launch_still_proves_the_cleanup(
+        tmp_path, private_roots, monkeypatch, senaryo):
+    """B2B-C1-R1. The window between `launch_contained` RETURNING and the
+    poll loop was outside every cleanup envelope.
+
+    A reader constructor, either `start()` call, or an interrupt around
+    the stdin close could raise there -- and the old `finally` drained
+    WITHOUT consuming the answer, never joined a reader that had already
+    started, and never reaped the child. So a process tree could outlive
+    the call while the setup error travelled out looking like an ordinary
+    refusal, which is a process escape wearing a red gate's face.
+
+    The command is a REAL child that sleeps for a minute, so "the tree is
+    gone" is measured from its own handle rather than asserted about a
+    mock."""
+    world = build_world(
+        tmp_path,
+        seed=[("pipeline/test_uyku.py",
+               "import time\n\n\ndef test_u():\n    time.sleep(60)\n")],
+        acceptance_commands=_commands(_selected("pipeline/test_uyku.py")))
+
+    gercek_stream = process_module.BoundedStream
+    gercek_stop = process_module.stop
+    gercek_join = process_module.join_within
+    gercek_launch = process_module.launch_contained
+    gercek_run = acceptance._run_command
+    iz = {"kurulan": [], "baslatilan": [], "adimlar": [], "cocuk": None,
+          "join_argv": None}
+    SENTINEL = "KURGU-AKIS-NOBETCISI"
+
+    class _Sayan(gercek_stream):
+        def __init__(self, label, stream, limit, tripped):
+            iz["kurulan"].append(label)
+            if senaryo == "kurucu-hatasi":
+                raise OSError(SENTINEL + " kurulamadi")
+            super().__init__(label, stream, limit, tripped)
+
+        def start(self):
+            if len(iz["baslatilan"]) == 1:
+                if senaryo == "ikinci-start-kesinti":
+                    raise KeyboardInterrupt
+                raise OSError(SENTINEL + " baslatilamadi")
+            super().start()
+            iz["baslatilan"].append(self)
+
+    class _Kapsayici:
+        """The real container, with a REFUSED verdict. The drain still
+        happens -- a test that left a live tree behind would be measuring
+        its own litter -- but the answer it reports is False."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def drain(self, deadline=None):
+            iz["adimlar"].append("drain")
+            sonuc = self._inner.drain(deadline)
+            return False if senaryo == "ikinci-start-drain-yok" else sonuc
+
+    def launch_izle(argv, **kwargs):
+        child, container = gercek_launch(argv, **kwargs)
+        iz["cocuk"] = child
+        return child, _Kapsayici(container)
+
+    def stop_izle(child, deadline):
+        iz["adimlar"].append("stop")
+        return gercek_stop(child, deadline)
+
+    def join_izle(threads, deadline):
+        iz["adimlar"].append("join")
+        iz["join_argv"] = list(threads)
+        return gercek_join(threads, deadline)
+
+    def run_izle(argv, **kwargs):
+        # NARROWED to the acceptance command: the git preparation goes
+        # through this same seam, and breaking its readers would fail the
+        # fixture instead of the mechanism
+        if argv[0] == "git":
+            return gercek_run(argv, **kwargs)
+        for isim, sahte in (("BoundedStream", _Sayan), ("stop", stop_izle),
+                            ("join_within", join_izle),
+                            ("launch_contained", launch_izle)):
+            monkeypatch.setattr(process_module, isim, sahte)
+        try:
+            return gercek_run(argv, **kwargs)
+        finally:
+            for isim, dogru in (("BoundedStream", gercek_stream),
+                                ("stop", gercek_stop),
+                                ("join_within", gercek_join),
+                                ("launch_contained", gercek_launch)):
+                monkeypatch.setattr(process_module, isim, dogru)
+
+    monkeypatch.setattr(acceptance, "_run_command", run_izle)
+
+    beklenen = {"ikinci-start": acceptance.AcceptanceRefused,
+                "ikinci-start-drain-yok": acceptance.ProcessTreeSurvived,
+                "kurucu-hatasi": acceptance.AcceptanceRefused,
+                "ikinci-start-kesinti": KeyboardInterrupt}[senaryo]
+    with pytest.raises(beklenen) as refusal:
+        run(world, timeout_seconds=120)
+
+    # THE ATTACK REALLY LANDED, asserted separately: a scenario that died
+    # at an earlier gate would be red for the wrong reason
+    assert iz["cocuk"] is not None, "senaryo kurulmadi: surec hic baslamadi"
+    if senaryo == "kurucu-hatasi":
+        assert iz["kurulan"] == ["stdout"], "kurucu hic cagrilmadi"
+        assert iz["baslatilan"] == [], "hic akis baslamamaliydi"
+        assert iz["join_argv"] == [], \
+            "hic baslamamis is parcacigi join edildi"
+    else:
+        assert len(iz["baslatilan"]) == 1, "senaryo ikinci start'a ulasmadi"
+        assert iz["join_argv"] == iz["baslatilan"], \
+            "baslamis okuyucu join edilmedi"
+        assert not iz["baslatilan"][0].is_alive(), "okuyucu hala yasiyor"
+
+    # the four steps, all of them, in the one order that is safe
+    assert iz["adimlar"] == ["stop", "drain", "join"], \
+        f"temizlik adimlari eksik ya da sirasiz: {iz['adimlar']}"
+    # THE REAL CHILD, from its own handle: gone AND reaped
+    assert iz["cocuk"].poll() is not None, \
+        "kabul sureci cagriden sonra hala yasiyor"
+
+    if senaryo == "ikinci-start-drain-yok":
+        assert str(refusal.value) == "kabul sureci temizlenemedi", \
+            "bosaltilamayan agac siradan bir ret gibi gorundu"
+    elif senaryo != "ikinci-start-kesinti":
+        assert str(refusal.value) == "kabul sureci akislari kurulamadi"
+        assert refusal.value.__cause__ is None
+        assert refusal.value.__context__ is None, \
+            "ham hata baglam zincirinden disari cikiyor"
+    metin = _chain(refusal.value)
+    assert SENTINEL not in metin, "ham hata metni disari cikti"
+    assert str(tmp_path) not in metin, "ret zinciri mutlak yol tasiyor"
+    assert residue(private_roots) == []
+
+
 def _alive(pid):
     if os.name == "nt":
         done = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],

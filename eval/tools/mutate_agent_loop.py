@@ -460,17 +460,24 @@ MUTATIONS = [
      '    argv = list(contract.COMMAND_REGISTRY[command_id]["argv"]) '
      "+ list(paths)",
      "test_only_the_registry_decides_what_a_path_argument_may_be"),
+    # B2B-C1-R1: the same gate, one keyword along. The outcome chain
+    # became `elif` when the lifecycle stopped returning from inside the
+    # measured block, so the pattern follows it rather than going stale.
     ("b2bc1-okuma-hukmu", "acceptance",
-     "        if not joined or any(stream.outcome != process.READ_COMPLETED"
-     + NL + "                             for stream in streams):",
-     "        if False:",
+     "        elif not joined or any(stream.outcome != process.READ_COMPLETED"
+     + NL + "                               for stream in streams):",
+     "        elif False:",
      "test_output_overflow_timeout_and_a_failed_reader_are_all_refusals"),
+    # B2B-C1-R1 RETARGETED. The intent never moved -- a cleanup result
+    # that is not consumed is a process tree nobody is watching -- but
+    # the authority did: the window between `launch_contained` returning
+    # and the poll loop had no envelope at all, so the mutation now
+    # removes the OUTER lifecycle's verdict instead of the inner drain's.
     ("b2bc1-bosaltma-hukmu", "acceptance",
-     "        drained = container.drain(grace)" + NL
-     + "        joined = process.join_within(streams, grace)",
-     "        drained = True" + NL
-     + "        joined = process.join_within(streams, grace)",
-     "test_a_successful_parent_may_not_leave_a_living_grandchild"),
+     "    reclaimed = True if settled else _reclaim(child, container," + NL
+     + "                                              started_streams, grace)",
+     "    reclaimed = True",
+     "test_a_failure_after_launch_still_proves_the_cleanup"),
 ]
 
 
