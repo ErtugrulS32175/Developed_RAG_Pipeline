@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
-import stat
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,10 +33,16 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
-from tools.agent_loop import cli, contract, schemas
+from tools.agent_loop import cli, contract, flat_workspace, schemas
 
 REPO = Path(__file__).resolve().parent.parent
 BACKSLASH = chr(92)
+
+# What a fake binary is CALLED. `launch_contained` runs argv[0] directly
+# and so does preflight's handshake, so a bare `.py` is not something
+# either can start -- WinError 193 on Windows, and no interpreter named
+# at all on POSIX. The shim shape is B2's, reused rather than reinvented.
+SHIM_SUFFIX = ".cmd" if os.name == "nt" else ".sh"
 
 
 def _runner():
@@ -66,26 +73,125 @@ def _runner():
 
 _FAKE = '''\
 import json, os, sys
-with open(RECORD, "a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"argv": sys.argv[1:]}) + "\\n")
+
+ARGV = sys.argv[1:]
+if ARGV == ["--version"]:
+    # PREFLIGHT'S HANDSHAKE, and it must do nothing at all. It spends no
+    # tokens, so it is not a model call and is deliberately not recorded
+    # -- the tests that assert "no model was called" assert the record
+    # file does not EXIST. It must also touch no tree: the working
+    # directory here is the operator's own checkout.
+    sys.stdout.write("kurgu 0.0\\n")
+    sys.exit(0)
+
+with open(__RECORD__, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"argv": ARGV}) + "\\n")
+
+
+def flag(name):
+    return ARGV[ARGV.index(name) + 1] if name in ARGV else None
+
+
+def round_index():
+    return int(os.environ.get("AGENT_LOOP_ROUND", "0"))
+
+
+def issued(name):
+    return [item for item in os.environ.get(name, "").split(",") if item]
+
+
+def emit(payload):
+    """Answer the way THIS CLI actually answers.
+
+    `codex exec` writes its final message into the file named by
+    `--output-last-message`; `claude --print` answers on stdout. The fake
+    reads its OWN argv to decide, so nothing here invents a stdout road
+    for the evaluator that the real binary does not have.
+
+    The run id is the RUNNER'S, read from the environment it exported
+    for this call. A recording with a hard-coded id describes a run that
+    never happened, and the change-set gate refuses it by name."""
+    payload = dict(payload)
+    run_id = os.environ.get("AGENT_LOOP_RUN_ID")
+    if run_id and payload.get("run_id") == "kurgu-run-1":
+        payload["run_id"] = run_id
+    text = json.dumps(payload)
+    target = flag("--output-last-message")
+    if target is None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    else:
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+
+def in_run():
+    """Is a RUNNER driving this call?
+
+    The implementer fake edits a file, and an edit is relative to
+    whatever directory it was started in. Inside a run that is the
+    candidate tree; outside one -- the two tests that execute a built
+    argv directly -- it would be whatever the test happened to be
+    standing in. So the edit is gated on the runner's own exported
+    identity rather than on the caller remembering a `cwd`."""
+    return bool(os.environ.get("AGENT_LOOP_RUN_ID"))
+
+
+def edit(relative, text):
+    with open(relative, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 try:
     sys.stdin.read()
 except Exception:
     pass
-BODY
+__BODY__
 '''
 
 
 def _write_fake(path: Path, record: Path, body: str) -> Path:
-    path.write_text(
-        _FAKE.replace("RECORD", repr(str(record))).replace("BODY", body),
+    """An executable shim plus the python that does the work.
+
+    `path` is the SHIM -- the thing `binaries` carries and the thing both
+    `launch_contained` and the preflight handshake start -- and the
+    helper is written beside it under the same stem. A test rewriting a
+    fake therefore passes the shim it was given straight back in."""
+    helper = path.with_suffix(".py")
+    helper.write_text(
+        _FAKE.replace("__RECORD__", repr(str(record))).replace(
+            "__BODY__", body),
         encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
+    if os.name == "nt":
+        path.write_text(f'@echo off\r\n"{sys.executable}" "{helper}" %*\r\n',
+                        encoding="ascii")
+    else:
+        path.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{helper}" "$@"\n',
+            encoding="ascii")
+        path.chmod(0o755)
     return path
 
 
-def _prints(payload: dict) -> str:
-    return f"print(json.dumps({payload!r}))"
+def _emits(payload: dict) -> str:
+    return f"emit({payload!r})"
+
+
+def _implementer_body(**overrides) -> str:
+    """What the implementer fake DOES, not merely what it says.
+
+    A reply that declares a changed file while changing nothing is a
+    declaration mismatch -- the change-set gate refusing a lie -- so a
+    fake that only printed would fail every test in this file for one
+    reason that has nothing to do with what the test is about.
+
+    The content carries the ROUND because a repair that rewrites a file
+    with the bytes already in it has an EMPTY delta, and the repair seam
+    refuses a reply declaring a file this call did not move."""
+    return ("if in_run():\n"
+            "    edit('pipeline/kurgu.py',"
+            " 'VALUE = %d\\n' % (round_index() + 2))\n"
+            + _emits(_implementer_reply(**overrides)))
 
 
 def _implementer_reply(**overrides) -> dict:
@@ -165,10 +271,35 @@ def workspace(tmp_path):
     # was written for. Red for the wrong reason still counts as red.
     (repo / "pipeline").mkdir(parents=True)
     for argv in (["init", "-q"], ["config", "user.email", "k@example.invalid"],
-                 ["config", "user.name", "Kurgu"]):
+                 ["config", "user.name", "Kurgu"],
+                 # A REAL CHECKOUT AGREES WITH ITS OWN BLOBS. This one
+                 # is written through `Path.write_text`, which spells
+                 # `\n` as `\r\n` on Windows, and this machine's
+                 # system-level `core.autocrlf` would normalise it back
+                 # out on `git add` -- so every tracked file would differ
+                 # from the baseline the flat workspace materialises from
+                 # raw git objects, and the application layer's drift
+                 # precondition would correctly refuse a candidate for a
+                 # difference the fixture invented. The refusal itself is
+                 # not worked around anywhere.
+                 ["config", "core.autocrlf", "false"]):
         subprocess.run(["git", *argv], cwd=repo, check=True)
     (repo / "pipeline" / "kurgu.py").write_text("VALUE = 1\n",
                                                 encoding="utf-8")
+    # THE ACCEPTANCE GATE HAS TO BE ABLE TO PASS. `run_acceptance` runs
+    # the registry's real argv against a mirror of the candidate, and a
+    # tree with no test in it makes pytest exit 5 -- so every run would
+    # stop at `acceptance_failed` and the happy path could not exist.
+    (repo / "pipeline" / "test_gecer.py").write_text(
+        "def test_kurgu():\n    assert True\n", encoding="utf-8")
+    # THE STATE DIRECTORY IS GIT-IGNORED, which the contract requires of
+    # any repository this loop runs in and which the real checkout is
+    # separately tested for. The lock is the run's first outer boundary,
+    # so `.agent-loop/run.lock` exists before preflight looks at the
+    # tree -- and an un-ignored state directory would make every run
+    # refuse itself as a dirty worktree.
+    (repo / ".gitignore").write_text(f"{contract.STATE_DIR_NAME}/\n",
+                                     encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-qm", "kurgu"], cwd=repo, check=True)
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
@@ -178,10 +309,10 @@ def workspace(tmp_path):
     bin_dir.mkdir()
     record = tmp_path / "cagrilar.jsonl"
     binaries = {
-        "implementer": _write_fake(bin_dir / "sahte_claude.py", record,
-                                   _prints(_implementer_reply())),
-        "evaluator": _write_fake(bin_dir / "sahte_codex.py", record,
-                                 _prints(_code_audit_reply())),
+        "implementer": _write_fake(bin_dir / f"sahte_claude{SHIM_SUFFIX}",
+                                   record, _implementer_body()),
+        "evaluator": _write_fake(bin_dir / f"sahte_codex{SHIM_SUFFIX}",
+                                 record, _emits(_code_audit_reply())),
     }
     task = {
         "protocol_version": contract.PROTOCOL_VERSION,
@@ -189,7 +320,8 @@ def workspace(tmp_path):
         "baseline_sha": head,
         "allowed_paths": ["pipeline/"],
         "forbidden_paths": ["contracts/", "data/"],
-        "acceptance_commands": [{"command_id": "pytest_full"}],
+        "acceptance_commands": [{"command_id": "pytest_selected",
+                                 "paths": ["pipeline/test_gecer.py"]}],
         "acceptance_criteria": ["kurgu olcut"],
         "max_implementation_rounds": 1,
         "max_repair_rounds": 1,
@@ -197,12 +329,32 @@ def workspace(tmp_path):
         "max_budget_usd": 1.0,
         "max_output_bytes": 65536,
         "leak_policy": {"command_id": "leak_scan", "max_hard_findings": 0},
-        "dirty_tree_allowlist": [],
+        # The manifest itself lives in the repository and is written
+        # AFTER the baseline commit, so it is untracked -- and preflight's
+        # dirty-tree gate is what the allowlist exists for. Nothing else
+        # is excused: the dirty-tree test edits a tracked source file and
+        # is still refused.
+        "dirty_tree_allowlist": ["kurgu-task.json"],
     }
     task_path = repo / "kurgu-task.json"
     task_path.write_text(json.dumps(task), encoding="utf-8")
     return {"repo": repo, "head": head, "task": task, "task_path": task_path,
             "binaries": binaries, "record": record, "record_fake": _write_fake}
+
+
+@pytest.fixture(autouse=True)
+def private_runner_root(tmp_path, monkeypatch):
+    """Every test gets its OWN flat-workspace root.
+
+    The runner really builds workspaces now, so a battery pointed at the
+    shared runner-owned temp directory would create, list and delete
+    holders a real agent loop could be using. This is the fixture B2 and
+    B3's other suites already use, for the same reason."""
+    private = tmp_path / "runner-koku"
+    private.mkdir()
+    monkeypatch.setattr(flat_workspace, "runner_temp_root", lambda: private)
+    yield private
+    shutil.rmtree(private, ignore_errors=True)
 
 
 def test_the_base_workspace_task_is_valid(workspace):
@@ -361,14 +513,26 @@ def test_an_empty_tool_allowlist_is_refused(tmp_path):
 def test_a_fake_binary_really_runs_through_the_built_argv(workspace, tmp_path):
     """THE SEAM, end to end and without a runner. The argv the builder
     produces is executed, the fake answers, and the recording proves the
-    call reached the fake rather than anything on PATH."""
+    call reached the fake rather than anything on PATH.
+
+    ARGV[0] IS STARTED DIRECTLY, with no interpreter in front of it,
+    because that is what `launch_contained` and preflight's handshake
+    both do -- prefixing `sys.executable` here would prove a fake nobody
+    launches that way.
+
+    THE ANSWER IS READ FROM THE FILE. `codex exec` writes its final
+    message into `--output-last-message`, the adapter reads it from
+    there, and a fake that printed a reply on stdout instead would be
+    proving a road the real evaluator does not have."""
+    last_message = tmp_path / "o.txt"
     argv = cli.build_evaluator_argv(
         workspace["binaries"]["evaluator"], repo=workspace["repo"],
-        schema_path=tmp_path / "s.json", last_message_path=tmp_path / "o.txt")
-    done = subprocess.run([sys.executable, *argv], input="", text=True,
-                          capture_output=True)
+        schema_path=tmp_path / "s.json", last_message_path=last_message)
+    done = subprocess.run(argv, input="", text=True, capture_output=True,
+                          cwd=tmp_path)
     assert done.returncode == 0, done.stderr
-    reply = json.loads(done.stdout)
+    assert done.stdout == "", "denetci yanitini stdout'a basti"
+    reply = json.loads(last_message.read_text(encoding="utf-8"))
     Draft202012Validator(schemas.CODE_AUDIT_RESULT_SCHEMA).validate(reply)
     recorded = [json.loads(line) for line in
                 workspace["record"].read_text(encoding="utf-8").splitlines()]
@@ -387,8 +551,12 @@ def test_the_implementer_fake_really_runs_with_schema_budget_and_tools(
     argv = cli.build_implementer_argv(
         workspace["binaries"]["implementer"],
         budget_usd=0.25, allowed_tools=["Edit", "Read"])
-    done = subprocess.run([sys.executable, *argv], input="kurgu istem",
-                          text=True, capture_output=True)
+    # STARTED DIRECTLY and in a directory of its own: argv[0] is the
+    # shim, which is what the loop actually launches, and a fake run
+    # anywhere else would edit whatever tree happened to be the working
+    # directory.
+    done = subprocess.run(argv, input="kurgu istem", text=True,
+                          capture_output=True, cwd=tmp_path)
     assert done.returncode == 0, done.stderr
     Draft202012Validator(schemas.IMPLEMENTER_RESULT_SCHEMA).validate(
         json.loads(done.stdout))
@@ -1390,7 +1558,7 @@ def test_an_evaluator_that_modifies_the_workspace_halts_the_loop(workspace):
     workspace["record_fake"](
         workspace["binaries"]["evaluator"], workspace["record"],
         "open('sizdi.txt','w').write('kurgu')\n"
-        + _prints(_code_audit_reply()))
+        + _emits(_code_audit_reply()))
     result = _run(runner, workspace)
     assert result.state == contract.State.FAILED
     assert result.stop_reason == \
@@ -1442,7 +1610,7 @@ def test_the_same_mechanism_failing_twice_blocks_instead_of_patching(
     runner = _runner()
     workspace["record_fake"](
         workspace["binaries"]["evaluator"], workspace["record"],
-        _prints(_code_audit_reply(
+        _emits(_code_audit_reply(
             status=contract.Status.CHANGES_REQUESTED,
             findings=[_code_finding(mechanism_id="kurgu-mekanizma-a")],
             next_action="await_repair")))
@@ -1466,7 +1634,7 @@ def test_exceeding_max_repair_rounds_blocks(workspace):
             status=contract.Status.CHANGES_REQUESTED,
             findings=[_code_finding()], next_action="await_repair")) + "\n"
         "reply['findings'][0]['mechanism_id'] = 'kurgu-mekanizma-%d' % n\n"
-        "print(json.dumps(reply))\n")
+        "emit(reply)\n")
     result = _run(runner, workspace)
     assert result.state == contract.State.BLOCKED
     assert result.stop_reason == contract.StopReason.REPAIR_ROUNDS_EXHAUSTED
@@ -1488,7 +1656,7 @@ def test_an_out_of_scope_finding_blocks_rather_than_widening(workspace):
     runner = _runner()
     workspace["record_fake"](
         workspace["binaries"]["evaluator"], workspace["record"],
-        _prints(_code_audit_reply(
+        _emits(_code_audit_reply(
             status=contract.Status.CHANGES_REQUESTED,
             findings=[_code_finding(file="pipeline/index/db.py",
                                     mechanism_id="kapsam-disi")],
@@ -1523,15 +1691,29 @@ def test_the_loop_never_stages_or_commits_anything(workspace):
 def test_locked_findings_reach_the_implementer_as_counters_only(workspace):
     """The type boundary, checked over what the run actually produced:
     the implementer's prompt and every artefact carry the class and the
-    count, never a case."""
+    count, never a case.
+
+    THE REPLY IS BUILT INSIDE THE FAKE, from the ids the runner minted
+    and exported for this call. It has to be: a locked envelope is
+    TEXTLESS, so its `run_id` and both id fields are opaque, and the
+    per-call schema pins them with `const` and `enum` to exactly what
+    was issued. A recording carrying `kurgu-run-1` and `ffff...` names
+    ids the runner never handed out, which is a schema violation rather
+    than a locked audit -- and the test would then be green about
+    nothing."""
     runner = _runner()
     workspace["record_fake"](
         workspace["binaries"]["evaluator"], workspace["record"],
-        _prints(_code_audit_reply(
-            audit_kind=contract.AuditKind.LOCKED,
+        "reply = " + repr(_locked_audit_reply(
             status=contract.Status.CHANGES_REQUESTED,
-            findings=[_locked_finding()], next_action="await_repair")))
-    _run(runner, workspace)
+            findings=[_locked_finding()], next_action="await_repair")) + "\n"
+        "reply['run_id'] = os.environ['AGENT_LOOP_LOCKED_RUN_ID']\n"
+        "reply['findings'][0]['finding_id'] = "
+        "issued('AGENT_LOOP_FINDING_IDS')[0]\n"
+        "reply['findings'][0]['mechanism_id'] = "
+        "issued('AGENT_LOOP_MECHANISM_IDS')[0]\n"
+        "emit(reply)\n")
+    _run(runner, workspace, audit_kind=contract.AuditKind.LOCKED)
     state_dir = workspace["repo"] / contract.STATE_DIR_NAME
     written = " ".join(p.read_text(encoding="utf-8", errors="ignore")
                        for p in state_dir.rglob("*") if p.is_file())
@@ -1595,7 +1777,7 @@ def test_a_clean_run_walks_implement_audit_fix_audit_and_approves(workspace):
         workspace["binaries"]["evaluator"], workspace["record"],
         "import os\n"
         "n = int(os.environ.get('AGENT_LOOP_ROUND', '0'))\n"
-        f"print(json.dumps({replies!r}[min(n, 1)]))\n")
+        f"emit({replies!r}[min(n, 1)])\n")
     result = _run(runner, workspace)
     assert result.state == contract.State.APPROVED
     assert result.visited == [
@@ -1609,7 +1791,7 @@ def test_a_final_audit_asking_for_more_changes_blocks(workspace):
     runner = _runner()
     workspace["record_fake"](
         workspace["binaries"]["evaluator"], workspace["record"],
-        _prints(_code_audit_reply(
+        _emits(_code_audit_reply(
             status=contract.Status.CHANGES_REQUESTED,
             findings=[_code_finding(mechanism_id="kurgu-mekanizma-c")],
             next_action="await_repair")))
