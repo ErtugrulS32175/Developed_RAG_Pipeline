@@ -546,3 +546,257 @@ def test_no_program_is_ever_run_against_the_flat_roots(
         "modul yeniden bir program calistirabiliyor"
     assert len(only_fake_models_may_run) == 1, \
         "cagri sirasinda sahte modelden baska program calisti"
+
+
+# =====================================================================
+# B3. THE REPAIR SEAM -- one more call against an ALREADY-AUDITED
+#     candidate, bound to the round the evaluator actually saw
+# =====================================================================
+#
+# `run_verified_implementation` opens by requiring the two trees to be
+# EQUAL, which is what makes attribution possible for a first round. A
+# repair round starts from a tree that is deliberately not equal, so it
+# gets its own seam rather than a relaxation of that one -- and the
+# equality gate is replaced by a binding to the previous candidate.
+
+
+def _first(tmp_path, gate_obj, ops, declared, name="sahte_claude"):
+    """Round one: the candidate a repair is later bound to."""
+    binary = _stub(tmp_path, name=name, ops=ops,
+                   reply=_reply(changed_files=declared))
+    return _run(binary, gate_obj)
+
+
+def _repair(binary, gate_obj, previous, **overrides):
+    settings = {"prompt": "kurgu onarim", "budget_usd": 1.0,
+                "timeout_seconds": 60, "max_output_bytes": 65536,
+                "previous_fingerprint": previous.fingerprint,
+                "previous_changed_files": list(previous.changed_files)}
+    settings.update(overrides)
+    return changes.run_verified_repair(binary, **gate_obj.identity, **settings)
+
+
+def _repair_stub(tmp_path, ops, declared):
+    return _stub(tmp_path, name="sahte_onarim", ops=ops,
+                 reply=_reply(changed_files=declared))
+
+
+def test_the_repair_seam_names_a_workspace_and_never_a_path():
+    """Same surface rule as the implementation seam: identities in,
+    nothing that could select a directory."""
+    parameters = inspect.signature(changes.run_verified_repair).parameters
+    assert set(parameters) == {
+        "binary", "repo", "state_dir", "task_path", "manifest_digest",
+        "run_id", "workspace_id", "baseline_sha", "previous_fingerprint",
+        "previous_changed_files", "prompt", "budget_usd", "timeout_seconds",
+        "max_output_bytes", "model"}
+    for escape in ("worktree", "cwd", "path", "root", "reference_root",
+                   "implementer_root", "allowed_paths", "forbidden_paths",
+                   "diff", "patch", "workdir"):
+        assert escape not in parameters, f"kacis parametresi: {escape}"
+    for name, parameter in parameters.items():
+        if name != "binary":
+            assert parameter.kind == inspect.Parameter.KEYWORD_ONLY, name
+
+
+def test_a_repair_returns_the_whole_candidate_not_its_own_delta(
+        tmp_path, gate, only_fake_models_may_run):
+    """POSITIVE CONTROL and the central claim at once. Round one adds one
+    file, the repair adds another, and what comes back describes the
+    REFERENCE-to-final distance -- both files. Returning this call's
+    delta here is how half a candidate reaches the operator."""
+    previous = _first(tmp_path, gate, [_write("pipeline/bir.py")],
+                      ["pipeline/bir.py"])
+    assert previous.changed_files == ("pipeline/bir.py",)
+
+    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+                          ["pipeline/iki.py"])
+    verified = _repair(binary, gate, previous)
+
+    assert len(only_fake_models_may_run) == 2, "onarim modeli calismadi"
+    assert verified.changed_files == ("pipeline/bir.py", "pipeline/iki.py")
+    assert (verified.added, verified.modified, verified.deleted) == (2, 0, 0)
+    assert verified.fingerprint != previous.fingerprint
+    assert verified.workspace_id == gate.workspace_id
+
+
+def test_a_first_round_change_the_repair_never_touched_stays(
+        tmp_path, gate, only_fake_models_may_run):
+    """The repair declares only what IT did; the candidate still carries
+    what round one did. A seam that compared the declaration against the
+    cumulative set would refuse this entirely honest repair."""
+    previous = _first(tmp_path, gate,
+                      [_write("pipeline/kurgu.py"), _write("pipeline/bir.py")],
+                      ["pipeline/kurgu.py", "pipeline/bir.py"])
+    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+                          ["pipeline/iki.py"])
+    verified = _repair(binary, gate, previous)
+
+    assert "pipeline/kurgu.py" in verified.changed_files
+    assert "pipeline/bir.py" in verified.changed_files
+    assert "pipeline/iki.py" in verified.changed_files
+    assert len(only_fake_models_may_run) == 2
+
+
+def test_a_repair_that_undoes_a_first_round_change_drops_it(
+        tmp_path, gate, only_fake_models_may_run):
+    """The other direction, and the one a delta-shaped result gets WRONG.
+    Round one ADDS a file and the repair removes it, so against the
+    reference tree that path is not changed at all any more and must
+    leave the candidate -- otherwise a later step applies a file the
+    repair deliberately took back.
+
+    THE UNDO IS A DELETION rather than a content restore, and that is a
+    platform measurement rather than a preference: the stub writes in
+    text mode, so on Windows a restored `"VALUE = 1\\n"` lands as 11
+    bytes against the reference copy's 10 -- the flat workspace
+    materialises blobs in BINARY from the git object. A content-restore
+    scenario cannot be byte-exact here, and a test that cannot build its
+    own premise proves nothing."""
+    previous = _first(tmp_path, gate,
+                      [_write("pipeline/gecici.py"), _write("pipeline/bir.py")],
+                      ["pipeline/gecici.py", "pipeline/bir.py"])
+    assert "pipeline/gecici.py" in previous.changed_files, "senaryo kurulmadi"
+
+    binary = _repair_stub(
+        tmp_path, [{"kind": "delete", "path": "pipeline/gecici.py"}],
+        ["pipeline/gecici.py"])
+    verified = _repair(binary, gate, previous)
+
+    assert len(only_fake_models_may_run) == 2
+    assert "pipeline/gecici.py" not in verified.changed_files, \
+        "geri alinan dosya hala adayda"
+    assert verified.changed_files == ("pipeline/bir.py",)
+    assert (verified.added, verified.modified, verified.deleted) == (1, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "bozan",
+    [{"previous_fingerprint": "0" * 64},
+     {"previous_changed_files": ["pipeline/baska.py"]}],
+    ids=["parmak-izi", "dosya-kumesi"])
+def test_a_repair_is_bound_to_the_audited_candidate(
+        tmp_path, gate, bozan, only_fake_models_may_run):
+    """TWO gates, and each is asked ALONE. The fingerprint covers path,
+    kind, mode and content, so the file set is implied by it -- which
+    means a single shared message would let either door answer for the
+    other, and a mechanism proven through the wrong door is a mechanism
+    nobody is testing. The file-set case therefore passes a CORRECT
+    fingerprint."""
+    previous = _first(tmp_path, gate, [_write("pipeline/bir.py")],
+                      ["pipeline/bir.py"])
+    onceki = len(only_fake_models_may_run)
+
+    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+                          ["pipeline/iki.py"])
+    with pytest.raises(changes.UnsafeChange) as refusal:
+        _repair(binary, gate, previous, **bozan)
+
+    assert len(only_fake_models_may_run) == onceki, \
+        "baglama tutmadigi halde model calisti"
+    beklenen = ("onarim denetlenen adaya baglanamadi"
+                if "previous_fingerprint" in bozan
+                else "onarim baska bir dosya kumesini adliyor")
+    assert str(refusal.value) == beklenen, "ret yanlis kapidan geldi"
+
+
+def test_a_candidate_edited_since_the_audit_is_refused_before_any_model(
+        tmp_path, gate, only_fake_models_may_run):
+    """The repair is aimed at what the evaluator SAW. A workspace edited
+    between the audit and the repair is something nobody reviewed."""
+    previous = _first(tmp_path, gate, [_write("pipeline/bir.py")],
+                      ["pipeline/bir.py"])
+    onceki = len(only_fake_models_may_run)
+    (gate.tree / "pipeline" / "bir.py").write_text("SONRADAN = 1\n",
+                                                   encoding="utf-8")
+
+    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+                          ["pipeline/iki.py"])
+    with pytest.raises(changes.UnsafeChange):
+        _repair(binary, gate, previous)
+    assert len(only_fake_models_may_run) == onceki, \
+        "aday degistigi halde model calisti"
+
+
+def test_a_moved_reference_tree_is_refused_before_any_model(
+        tmp_path, gate, only_fake_models_may_run):
+    """The reference is what the candidate MEANS. If it moved, the
+    fingerprint that named the audited candidate no longer describes the
+    same distance -- and this is caught at entry, with no process."""
+    previous = _first(tmp_path, gate, [_write("pipeline/bir.py")],
+                      ["pipeline/bir.py"])
+    onceki = len(only_fake_models_may_run)
+    (gate.reference / "pipeline" / "kurgu.py").write_text(
+        "REFERANS = 9\n", encoding="utf-8")
+
+    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+                          ["pipeline/iki.py"])
+    with pytest.raises(changes.UnsafeChange):
+        _repair(binary, gate, previous)
+    assert len(only_fake_models_may_run) == onceki, \
+        "referans degistigi halde model calisti"
+
+
+def test_another_workspaces_candidate_cannot_authorise_a_repair(
+        tmp_path, only_fake_models_may_run):
+    """Two real workspaces, and the result of one may not unlock the
+    other. Each gate owns its state directory, so this is the identity
+    binding rather than a coincidence of contents."""
+    birinci = build_gate(tmp_path, index=0)
+    ikinci = build_gate(tmp_path, index=1)
+    yabanci = _first(tmp_path, ikinci, [_write("pipeline/yabanci.py")],
+                     ["pipeline/yabanci.py"], name="sahte_ikinci")
+    _first(tmp_path, birinci, [_write("pipeline/bir.py")], ["pipeline/bir.py"])
+    onceki = len(only_fake_models_may_run)
+
+    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+                          ["pipeline/iki.py"])
+    with pytest.raises(changes.UnsafeChange):
+        _repair(binary, birinci, yabanci)
+    assert len(only_fake_models_may_run) == onceki, \
+        "baska calisma alaninin adayiyla model calisti"
+
+
+def test_a_repair_that_adds_a_forbidden_path_is_refused(
+        tmp_path, gate, only_fake_models_may_run):
+    """Authorisation is re-run over the WHOLE candidate after the call,
+    so a path the repair introduces is judged exactly like a first-round
+    one."""
+    previous = _first(tmp_path, gate, [_write("pipeline/bir.py")],
+                      ["pipeline/bir.py"])
+    binary = _repair_stub(tmp_path, [_write("pipeline/gizli/a.py")],
+                          ["pipeline/gizli/a.py"])
+    with pytest.raises(changes.UnsafeChange) as refusal:
+        _repair(binary, gate, previous)
+
+    assert len(only_fake_models_may_run) == 2, "senaryo kurulmadi"
+    assert refusal.value.reason == contract.StopReason.PATH_NOT_ALLOWED
+
+
+def test_a_repair_that_touches_the_main_checkout_is_refused(
+        tmp_path, gate, only_fake_models_may_run):
+    """The operator's tree is guarded on both sides of the repair call
+    exactly as it is around the first round."""
+    previous = _first(tmp_path, gate, [_write("pipeline/bir.py")],
+                      ["pipeline/bir.py"])
+    binary = _repair_stub(
+        tmp_path, [_write(gate.repo / "pipeline" / "sizinti.py")],
+        ["pipeline/iki.py"])
+    with pytest.raises(changes.UnsafeChange) as refusal:
+        _repair(binary, gate, previous)
+
+    assert len(only_fake_models_may_run) == 2, "senaryo kurulmadi"
+    assert str(refusal.value) == "ana calisma agaci degistirildi"
+
+
+def test_a_repair_declaration_is_compared_against_its_own_delta(
+        tmp_path, gate, only_fake_models_may_run):
+    """The model reports what THIS call did. A declaration that does not
+    match the delta is a reply about a different piece of work."""
+    previous = _first(tmp_path, gate, [_write("pipeline/bir.py")],
+                      ["pipeline/bir.py"])
+    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+                          ["pipeline/uc.py"])
+    with pytest.raises(changes.DeclarationMismatch):
+        _repair(binary, gate, previous)
+    assert len(only_fake_models_may_run) == 2, "senaryo kurulmadi"

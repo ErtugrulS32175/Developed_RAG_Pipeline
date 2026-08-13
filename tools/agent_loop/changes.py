@@ -772,6 +772,200 @@ def run_verified_implementation(binary, *, repo, state_dir, task_path,
                    baseline_sha=baseline_sha)
 
 
+def _exact_path_set(paths, what: str) -> frozenset:
+    """A caller's declared path list, canonicalised the module's own way.
+
+    Exact `str` on every item: a path list is compared against evidence,
+    and an object that answers `__eq__` generously would agree with a
+    set it had never been shown."""
+    if isinstance(paths, (str, bytes)) or not hasattr(paths, "__iter__"):
+        raise EvidenceUnavailable(f"{what} bir yol listesi degil")
+    items = list(paths)
+    if any(type(item) is not str for item in items):
+        raise EvidenceUnavailable(f"{what} tam metin olmayan bir oge tasiyor")
+    folded = [_fold(item) for item in items]
+    if len(set(folded)) != len(folded):
+        raise EvidenceUnavailable(f"{what} yinelemeli")
+    return frozenset(folded)
+
+
+def _accept_repair(outcome, delta, total, *, run_id, workspace_id,
+                   baseline_sha):
+    """Two different questions, deliberately asked of two different sets.
+
+    THE DECLARATION IS ABOUT THIS CALL. A repair round's model edits some
+    files and says so; it knows nothing about the round before it. So the
+    declaration is compared against the DELTA -- what moved between the
+    tree this call started with and the tree it ended with -- because
+    comparing it against the cumulative set would refuse every honest
+    repair that left an earlier file alone.
+
+    THE RESULT IS ABOUT THE CANDIDATE. What a later step applies is not
+    this call's delta, it is everything that separates the reference tree
+    from the final tree. A repair that reverts a file to its baseline
+    content is a DELETION from the candidate even though the model
+    described it as an edit, and a first-round change the repair never
+    touched is still in the candidate even though this call did not
+    mention it. Returning the delta here is how a partially-applied
+    candidate reaches the operator's checkout."""
+    reply = outcome.reply
+    if reply.get("run_id") != run_id:
+        raise DeclarationMismatch("yanit baska bir kosuyu adliyor")
+    declared = reply.get("changed_files", [])
+    if any(type(item) is not str for item in declared):
+        raise DeclarationMismatch("bildirilen dosya listesi tam metin degil")
+    canonical = [_fold(item) for item in declared]
+    if len(set(canonical)) != len(canonical):
+        raise DeclarationMismatch("bildirilen dosya listesi yinelemeli")
+    if set(canonical) != {_fold(change.path) for change in delta}:
+        raise DeclarationMismatch("bildirilen onarim gerceklesenle "
+                                  "birebir ayni degil")
+    status = reply["status"]
+    if status != contract.Status.IMPLEMENTED and delta:
+        raise DeclarationMismatch(
+            "tamamlanmamis yanit yine de dosya degistirdi")
+    kinds = [change.kind for change in total]
+    return VerifiedChangeSet(
+        run_id=run_id, workspace_id=workspace_id, baseline_sha=baseline_sha,
+        status=status,
+        changed_files=tuple(change.path for change in total),
+        added=kinds.count(ADDED), modified=kinds.count(MODIFIED),
+        deleted=kinds.count(DELETED), fingerprint=_fingerprint(total),
+        exit_code=outcome.exit_code, duration_ms=outcome.duration_ms,
+        stdout_bytes=outcome.stdout_bytes, stderr_bytes=outcome.stderr_bytes,
+        schema_sha256=outcome.schema_sha256, event=outcome.event)
+
+
+def run_verified_repair(binary, *, repo, state_dir, task_path,
+                        manifest_digest, run_id, workspace_id, baseline_sha,
+                        previous_fingerprint, previous_changed_files,
+                        prompt, budget_usd, timeout_seconds,
+                        max_output_bytes, model=None) -> VerifiedChangeSet:
+    """One repair call against an ALREADY-AUDITED candidate.
+
+    WHY THIS IS NOT `run_verified_implementation`. That seam opens by
+    requiring the reference and implementer trees to be EQUAL, which is
+    what makes "attribution is possible" true for a first round: anything
+    that differs afterwards was done by the call. A repair round starts
+    from a tree that is deliberately NOT equal -- the first round's work
+    is sitting in it -- so that gate would refuse every repair, and
+    deleting it from the shared seam would remove the first round's only
+    attribution guarantee. The two rounds ask different questions and get
+    different functions; neither is a relaxation of the other.
+
+    WHAT REPLACES THE EQUALITY GATE. The candidate on disk has to be the
+    candidate the evaluator actually audited. It is re-derived from fresh
+    filesystem evidence -- never replayed from a record -- and bound to
+    the previous round by fingerprint AND by changed-file set, on top of
+    the workspace, state, manifest and baseline identities every other
+    seam here already checks. A repair aimed at a workspace whose
+    contents moved since the audit is a repair of something nobody
+    reviewed.
+
+    WHAT COMES BACK. The FULL change set, reference tree to final tree --
+    not this call's delta. See `_accept_repair` for why those are two
+    different sets and why returning the wrong one applies half a
+    candidate.
+
+    The implementer is reached through `execution.run_implementer` HERE
+    and nowhere else: the runner has no path to it, so every model edit
+    in the loop passes one authorisation."""
+    repo_path = Path(_exact_text(repo, "depo yolu"))
+    state_path = Path(_exact_text(state_dir, "durum dizini"))
+    manifest_digest = _exact_match(manifest_digest, _HEX64, "gorev ozeti")
+    run_id = _exact_match(run_id, _RUN_ID, "kosu kimligi")
+    workspace_id = _exact_match(workspace_id, flat_workspace.WORKSPACE_ID,
+                                "calisma alani kimligi")
+    baseline_sha = _exact_match(baseline_sha, _SHA1, "taban surum")
+    previous_fingerprint = _exact_match(previous_fingerprint, _HEX64,
+                                        "onceki aday parmak izi")
+    expected_paths = _exact_path_set(previous_changed_files,
+                                     "onceki aday dosya listesi")
+
+    task_file, snapshot, task_relative = _bind_task(
+        task_path, repo_path, manifest_digest, baseline_sha)
+    _assert_state_binding(state_path, repo_path, run_id, baseline_sha,
+                          manifest_digest, workspace_id)
+    allowed = tuple(snapshot.task["allowed_paths"])
+    forbidden = tuple(snapshot.task.get("forbidden_paths", ()))
+
+    workspace = _bind_workspace(repo_path, state_path, run_id, workspace_id,
+                                baseline_sha)
+    key = secrets.token_bytes(fs_evidence.KEY_BYTES)
+    reference_before, implementer_before = _read_pair(workspace, key)
+    prior = _semantic_changes(reference_before, implementer_before)
+    # The candidate standing on disk must be authorised in its own right
+    # before it is repaired: a workspace that already holds a forbidden
+    # path is not made acceptable by editing something else in it.
+    for change in prior:
+        _authorize(change.path, allowed=allowed, forbidden=forbidden,
+                   task_relative=task_relative)
+    # TWO gates with DISTINCT sentences, not one asked twice. The
+    # fingerprint covers path, kind, mode and content, so the file set is
+    # implied by it -- but a test that can only see one message cannot
+    # tell which gate refused, and a mechanism proven through the wrong
+    # door is a mechanism nobody is testing.
+    if _fingerprint(prior) != previous_fingerprint:
+        raise UnsafeChange("onarim denetlenen adaya baglanamadi",
+                           reason=contract.StopReason.PATH_NOT_ALLOWED)
+    if {_fold(change.path) for change in prior} != expected_paths:
+        raise UnsafeChange("onarim baska bir dosya kumesini adliyor",
+                           reason=contract.StopReason.PATH_NOT_ALLOWED)
+
+    main_policy = _main_policy(repo_path)
+    main_key = secrets.token_bytes(fs_evidence.KEY_BYTES)
+    main_before = _main_snapshot(repo_path, main_key, main_policy)
+    task_before = snapshot.digest
+
+    def verify_after():
+        """Everything that must NOT have moved, then both change sets."""
+        again = _bind_workspace(repo_path, state_path, run_id, workspace_id,
+                                baseline_sha)
+        _assert_state_binding(state_path, repo_path, run_id, baseline_sha,
+                              manifest_digest, workspace_id)
+        if preflight.manifest_changed(task_file, snapshot) or \
+                preflight.snapshot_manifest(task_file).digest != task_before:
+            raise UnsafeChange("gorev dosyasi degistirildi",
+                               reason=contract.StopReason.PATH_NOT_ALLOWED)
+        if _main_snapshot(repo_path, main_key, main_policy) != main_before:
+            raise UnsafeChange("ana calisma agaci degistirildi",
+                               reason=contract.StopReason.PATH_NOT_ALLOWED)
+        reference_after, implementer_after = _read_pair(again, key)
+        if reference_after != reference_before:
+            # the copy the candidate is measured against moved, so the
+            # cumulative set below would describe something the model
+            # chose rather than what it did
+            raise UnsafeChange("referans agac degistirildi",
+                               reason=contract.StopReason.PATH_NOT_ALLOWED)
+        total = _semantic_changes(reference_after, implementer_after)
+        for change in total:
+            _authorize(change.path, allowed=allowed, forbidden=forbidden,
+                       task_relative=task_relative)
+        return _semantic_changes(implementer_before, implementer_after), total
+
+    failure = None
+    try:
+        outcome = execution.run_implementer(
+            binary, repo=repo_path, state_dir=state_path, run_id=run_id,
+            workspace_id=workspace_id, baseline_sha=baseline_sha,
+            prompt=prompt, budget_usd=budget_usd,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes, model=model)
+    except BaseException as raised:
+        failure = raised
+        raise
+    finally:
+        # EVERY exit: a call that failed may have edited files first, and
+        # a safety violation outranks the failure that hid it.
+        try:
+            delta, total = verify_after()
+        except ChangeSetError as violation:
+            raise violation from failure
+
+    return _accept_repair(outcome, delta, total, run_id=run_id,
+                          workspace_id=workspace_id, baseline_sha=baseline_sha)
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateChanges:
     """The candidate, RE-DERIVED from the filesystem AFTER the fact.

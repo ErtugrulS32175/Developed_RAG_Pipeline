@@ -226,6 +226,29 @@ def build_implementer_argv(binary, *, budget_usd,
     return assert_safe_argv(argv)
 
 
+def exact_launchable_text(value, *, what):
+    """`exact_text`, plus the one question argv actually asks later.
+
+    A string that cannot be encoded is not a token: it passes every type
+    check here and then dies inside `Popen`, where the failure is an
+    `OSError`/`UnicodeEncodeError` carrying the path -- the exact text
+    this package refuses to let into a report. An unpaired surrogate is
+    the shape that reaches this: `type(value) is str` is true of it, so
+    the type gate alone cannot see it.
+
+    Asked in UTF-8 rather than the platform codec on purpose. Windows
+    spells argv in UTF-16 and would accept a lone surrogate, POSIX would
+    not, and a builder whose refusals depend on which machine ran it is
+    a builder nobody can write a test against."""
+    text = exact_text(value, what=what)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # the FIELD, never the value: this text travels into reports
+        raise UnsafeInvocation(f"{what} kodlanabilir bir metin degil") from None
+    return text
+
+
 def build_evaluator_argv(binary, *, repo, schema_path, last_message_path,
                          model=None):
     """`codex exec`, read-only, never asking a human for approval.
@@ -235,17 +258,41 @@ def build_evaluator_argv(binary, *, repo, schema_path, last_message_path,
     exec` rejects it outright (`error: unexpected argument '-a'`).
     Mandating the flag that does not exist would break every evaluator
     call; mandating the one that does keeps an unattended loop from
-    parking on a prompt nobody is there to answer."""
+    parking on a prompt nobody is there to answer.
+
+    EVERY TOKEN IS CONVERTED EXACTLY ONCE (B3). This builder was the last
+    deferred conversion left in the module: it called `str()` on the
+    binary, the repository, both file paths and the model, which is the
+    defect the implementer road was hardened against and this road kept.
+    `str()` is not a check, it is a REQUEST -- an object answers it
+    whenever it is finally asked, so the value that was inspected and the
+    value that reached the command line could be two different things.
+    `bytes` stringified into `b'...'` and became a path with quotes in
+    it; `None` became the literal `None`; a `Path` subclass could answer
+    `__fspath__` with one file and `__str__` with another.
+
+    `--output-schema` names a FILE here, unlike the implementer's inline
+    `--json-schema`: `codex exec` takes one. That is why the caller owns
+    the file's lifetime, and why the token is bound as text exactly once
+    rather than re-derived."""
+    # `exact_model` before anything is spelled: it is the frozen task
+    # schema's own grammar, so the builder cannot be the lenient road
+    # into a flag the contract constrains. `None` stays absent; an empty
+    # string is a caller mistake rather than a silent omission, which is
+    # what a bare truthiness test made it.
+    model = exact_model(model)
     argv = [
-        str(binary), "exec",
+        exact_launchable_text(binary, what="ikili dosya"), "exec",
         "--sandbox", CODEX_SANDBOX_READ_ONLY,
         *CODEX_APPROVAL_OVERRIDE,
-        "--cd", str(Path(repo)),
-        "--output-schema", str(schema_path),
-        "--output-last-message", str(last_message_path),
+        "--cd", exact_launchable_text(repo, what="depo yolu"),
+        "--output-schema", exact_launchable_text(schema_path,
+                                                 what="sema dosyasi yolu"),
+        "--output-last-message", exact_launchable_text(
+            last_message_path, what="son mesaj dosyasi yolu"),
     ]
-    if model:
-        argv += ["--model", str(model)]
+    if model is not None:
+        argv += ["--model", model]
     return assert_safe_argv(argv)
 
 

@@ -275,6 +275,69 @@ def test_the_evaluator_argv_is_read_only_and_never_asks_for_approval(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "alan",
+    ["binary", "repo", "schema_path", "last_message_path"],
+    ids=["ikili", "depo", "sema-yolu", "son-mesaj-yolu"])
+@pytest.mark.parametrize(
+    "kotu",
+    [b"/kurgu/yol", None, 5, True, ["/kurgu/yol"],
+     "/kurgu/" + chr(0xD800)],
+    ids=["bayt", "none", "sayi", "bool", "liste", "yalniz-vekil"])
+def test_the_evaluator_builder_converts_every_token_exactly_once(
+        tmp_path, alan, kotu):
+    """B3: this builder was the LAST deferred `str()` conversion in the
+    module. The implementer road was hardened and this one kept calling
+    `str()` on the binary, the repository and both file paths -- so
+    `b'/x'` became the literal `b'/x'` with quotes in it, `None` became
+    `'None'`, and an object was free to answer differently the second
+    time it was asked.
+
+    The lone-surrogate case is why the type gate alone is not enough:
+    `type(value) is str` is TRUE of it, and the failure would otherwise
+    surface inside `Popen` as an OS error carrying the path."""
+    saglikli = {"repo": tmp_path, "schema_path": tmp_path / "s.json",
+                "last_message_path": tmp_path / "o.txt"}
+    cagri = dict(saglikli, binary=tmp_path / "sahte_codex.py")
+    cagri[alan] = kotu
+    binary = cagri.pop("binary")
+    with pytest.raises(cli.UnsafeInvocation) as refusal:
+        cli.build_evaluator_argv(binary, **cagri)
+    # the refused value is caller input and this text travels into
+    # reports; the FIELD may be named, the value may not
+    metin = str(refusal.value) + repr(refusal.value)
+    assert "kurgu" not in metin, "ret metni reddedilen degeri tasiyor"
+
+
+def test_the_evaluator_builder_still_builds_from_exact_inputs(tmp_path):
+    """POSITIVE CONTROL: a builder that refuses everything would satisfy
+    the rule above. Both `str` and `PathLike` remain acceptable, and the
+    token that lands on argv is the ONE conversion's result."""
+    argv = cli.build_evaluator_argv(
+        str(tmp_path / "sahte_codex.py"), repo=tmp_path,
+        schema_path=tmp_path / "s.json",
+        last_message_path=str(tmp_path / "o.txt"), model="kurgu-model-1")
+    assert all(type(token) is str for token in argv)
+    assert argv[argv.index("--output-schema") + 1] == str(tmp_path / "s.json")
+    assert argv[argv.index("--model") + 1] == "kurgu-model-1"
+
+
+def test_the_evaluator_model_obeys_the_frozen_task_grammar(tmp_path):
+    """`model` reached argv through a bare `str()` behind a truthiness
+    test, so it was the one flag value with no grammar at all -- while
+    the implementer builder next door had enforced the task schema's
+    pattern all along. One grammar, both roads."""
+    saglikli = {"repo": tmp_path, "schema_path": tmp_path / "s.json",
+                "last_message_path": tmp_path / "o.txt"}
+    binary = tmp_path / "sahte_codex.py"
+    for bad in (_Taklitci("kurgu-model", "; rm -rf /"), "BUYUK-HARF",
+                "-bastan-tire", 5, b"m", ""):
+        with pytest.raises(cli.UnsafeInvocation):
+            cli.build_evaluator_argv(binary, model=bad, **saglikli)
+    # absent stays absent rather than becoming the literal "None"
+    assert "--model" not in cli.build_evaluator_argv(binary, **saglikli)
+
+
+@pytest.mark.parametrize(
     "extra",
     [["--dangerously-skip-permissions"],
      ["--dangerously-bypass-approvals-and-sandbox"],
