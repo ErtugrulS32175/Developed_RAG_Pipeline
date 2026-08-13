@@ -157,10 +157,20 @@ def build_implementer_argv(binary, *, budget_usd,
     THE SCHEMA IS NOT A PARAMETER. `--json-schema` takes INLINE JSON --
     measured against the installed CLI's own help -- and this builder
     used to pass a file path there, chosen by the caller and mutable on
-    disk between building the argv and running it. The value is now the
-    frozen canonical text of `IMPLEMENTER_RESULT_SCHEMA`, from the one
-    binding the validator also uses; there is nothing for a caller to
-    substitute.
+    disk between building the argv and running it. The value is the
+    frozen canonical text of a schema binding; there is nothing for a
+    caller to substitute.
+
+    WHICH schema travels changed in B4-R2. It used to be the same
+    `IMPLEMENTER_RESULT_SCHEMA` the validator uses, and the real API
+    refused it: the published structured-output subset does not accept
+    `pattern`, `if`/`then` or the length and numeric constraints this
+    contract is built out of, and two authorized diagnostics both came
+    back as a 4xx client error. What goes on the argv now is
+    `CLAUDE_TRANSPORT_SCHEMA` -- the same document reduced to the
+    supported subset, derived deterministically and hash-pinned on its
+    own. It constrains GENERATION only. The acceptance authority never
+    travels, and `execution` still judges every reply with it.
 
     THE TOOL LIST IS NOT THE CALLER'S TO CHOOSE. `allowed_tools=["Bash"]`
     used to be accepted, and a Claude holding Bash can `git add`,
@@ -216,7 +226,7 @@ def build_implementer_argv(binary, *, budget_usd,
         exact_text(binary, what="ikili dosya"),
         "--print",
         "--output-format", "json",
-        "--json-schema", schemas.IMPLEMENTER_SCHEMA_BINDING.canonical_json,
+        "--json-schema", schemas.IMPLEMENTER_TRANSPORT_BINDING.canonical_json,
         "--max-budget-usd", str(budget_usd),
         "--permission-mode", permission_mode,
         "--allowedTools", *requested,

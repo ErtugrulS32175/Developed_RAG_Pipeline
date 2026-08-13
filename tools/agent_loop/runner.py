@@ -137,6 +137,44 @@ def _terminal_for(reason):
             else contract.State.BLOCKED)
 
 
+# Which closed EVENT code names a failure that arrived WITHOUT one.
+#
+# MEASURED ON THE FIRST REAL RUN. It stopped with `preflight_failed`
+# after `preflight_ok` had already been recorded, and the journal held
+# nothing between `model_call_started` and the transition to `blocked` --
+# so the one artefact built to say what happened said nothing, and the
+# gate that refused had to be found by replaying the whole change-set
+# seam with the model call stubbed out.
+#
+# The cause is a split nobody had noticed: every `execution.AdapterError`
+# fixes its own closed `.event`, while every `changes.ChangeSetError`
+# fixes a closed `.reason` and has no event at all. `_translate` read
+# only `.event`, so the entire change-set family -- which is every
+# evidence gate the loop has -- was invisible.
+#
+# A TABLE, not a judgement at the raising site, and only where an
+# existing code TRULY names the mechanism. Reasons absent from this map
+# get no invented line: the stop reason is persisted in `state.json`
+# either way, and a misleading event code is worse than a missing one.
+_EVENT_FOR_REASON = {
+    contract.StopReason.PREFLIGHT_FAILED:
+        contract.EventCode.PREFLIGHT_FAILED,
+    contract.StopReason.SCHEMA_VIOLATION:
+        contract.EventCode.SCHEMA_VIOLATION,
+    contract.StopReason.MODEL_PROCESS_FAILED:
+        contract.EventCode.MODEL_CALL_FINISHED,
+    contract.StopReason.CONTROL_PLANE_MODIFIED:
+        contract.EventCode.CONTROL_PLANE_MODIFIED,
+    contract.StopReason.EVALUATOR_MODIFIED_WORKSPACE:
+        contract.EventCode.EVALUATOR_MODIFIED_WORKSPACE,
+    # the adapter already spells these two this way, so the journal reads
+    # the same whichever layer refused
+    contract.StopReason.TIMEOUT: contract.EventCode.INTERRUPTED,
+    contract.StopReason.INTERRUPTED: contract.EventCode.INTERRUPTED,
+    contract.StopReason.BUDGET_EXHAUSTED: contract.EventCode.BUDGET_CHECK,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class RunResult:
     """What happened, as identities, counts and closed codes.
@@ -683,7 +721,11 @@ class _Run:
         survived = 0 if getattr(failure, "cleanup_complete", True) else 1
         event = getattr(failure, "event", None)
         if event not in contract.ALL_EVENT_CODES:
-            event = None
+            # A refusal that fixes no event of its own is not an
+            # unclassified one: its REASON is closed, and the table above
+            # turns that into the closed event the journal needs. Only
+            # the failure's own event is preferred over it.
+            event = _EVENT_FOR_REASON.get(reason)
         return _Stop(reason, state=_terminal_for(reason),
                      surviving_children=survived, event=event)
 

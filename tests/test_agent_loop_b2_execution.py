@@ -230,7 +230,7 @@ def _reply_binary(tmp_path):
     section; the later sections and the flat suite both use it, so it
     moved up here with the rest of the stub machinery."""
     return _fake_binary(tmp_path, mode="raw",
-                        hex=json.dumps(_valid_reply()).encode().hex())
+                        hex=_emit(_success_envelope()).hex())
 
 
 @pytest.fixture
@@ -371,7 +371,7 @@ def test_the_adapter_launches_exactly_the_argv_the_cli_builds(
         tmp_path, bound, only_fake_binaries_may_run):
     binary = _fake_binary(tmp_path, stdout_json=None,
                           mode="raw",
-                          hex=json.dumps(_valid_reply()).encode().hex())
+                          hex=_emit(_success_envelope()).hex())
     execution.run_implementer(
         binary, **bound.identity, prompt="kurgu istem",
         budget_usd=1.0, timeout_seconds=60,
@@ -485,7 +485,7 @@ def _run_with_stdout(tmp_path, bound, payload_bytes,
 def test_a_valid_reply_comes_back_as_structured_data(tmp_path, bound):
     reply = _valid_reply()
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(reply).encode("utf-8"))
+                              _emit(_success_envelope(reply)))
     assert result.reply == reply
     assert result.exit_code == 0
     assert result.event == contract.EventCode.MODEL_CALL_FINISHED
@@ -525,7 +525,7 @@ def test_a_reply_outside_the_frozen_schema_is_refused(tmp_path, bound, label,
     whose answer nobody can act on."""
     with pytest.raises(execution.SchemaViolation):
         _run_with_stdout(tmp_path, bound,
-                         json.dumps(reply).encode("utf-8"))
+                         _emit(_success_envelope(reply)))
 
 
 def test_invalid_utf8_is_refused(tmp_path, bound):
@@ -541,7 +541,7 @@ def test_a_nonzero_exit_is_a_typed_failure_without_the_stderr(
     sentinel = "KURGU-STDERR-NOBETCISI-" + "w" * 8
     with pytest.raises(execution.ProcessFailed) as refusal:
         _run_with_stdout(tmp_path, bound,
-                         json.dumps(_valid_reply()).encode("utf-8"),
+                         _emit(_success_envelope()),
                          code=7, stderr=sentinel)
     failure = refusal.value
     assert failure.exit_code == 7
@@ -585,9 +585,11 @@ def test_output_of_exactly_the_limit_is_accepted(tmp_path, bound):
     """The boundary in the other direction, or the rule above is just
     "refuse large replies"."""
     # padded past the contract's own floor: `max_output_bytes` below
-    # 1024 is outside the frozen range and is refused before launch
+    # 1024 is outside the frozen range and is refused before launch.
+    # The ceiling is measured on the ENVELOPE, which is what the stream
+    # actually carries -- the payload is only part of it.
     padded = _valid_reply(summary="k" * 1200)
-    reply = json.dumps(padded).encode("utf-8")
+    reply = _emit(_success_envelope(padded))
     result = _run_with_stdout(tmp_path, bound, reply,
                               max_output_bytes=len(reply))
     assert result.reply["role"] == "implementer"
@@ -675,7 +677,7 @@ def test_an_unusable_budget_refuses_before_any_process_starts(
     process was started, and "we would have refused later" is what a
     paid call looks like in hindsight."""
     binary = _fake_binary(tmp_path, mode="raw",
-                          hex=json.dumps(_valid_reply()).encode().hex())
+                          hex=_emit(_success_envelope()).hex())
     with pytest.raises(execution.BudgetRefused):
         execution.run_implementer(
             binary, **_no_binding(tmp_path), prompt="kurgu",
@@ -688,7 +690,7 @@ def test_an_unusable_budget_refuses_before_any_process_starts(
 def test_the_exact_remaining_budget_reaches_the_argv(tmp_path, bound,
                                                      only_fake_binaries_may_run):
     binary = _fake_binary(tmp_path, mode="raw",
-                          hex=json.dumps(_valid_reply()).encode().hex())
+                          hex=_emit(_success_envelope()).hex())
     execution.run_implementer(
         binary, **bound.identity, prompt="kurgu",
         budget_usd=0.375, timeout_seconds=60,
@@ -703,7 +705,7 @@ def test_the_adapter_never_claims_to_know_what_was_spent(tmp_path,
     contractual value to report. Reporting zero would be a number the
     caller could subtract from a budget."""
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(_valid_reply()).encode("utf-8"))
+                              _emit(_success_envelope()))
     assert not hasattr(result, "spent_usd")
     assert not hasattr(result, "cost_usd")
     assert "spent" not in {field for field in vars(result)}
@@ -719,7 +721,7 @@ def test_no_raw_model_output_survives_in_the_result(tmp_path, bound):
     sentinel = "KURGU-CIKTI-NOBETCISI-" + "v" * 8
     reply = _valid_reply(summary=sentinel)
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(reply).encode("utf-8"))
+                              _emit(_success_envelope(reply)))
     # the PARSED reply legitimately holds it; nothing else may
     leaked = [name for name, value in vars(result).items()
               if name != "reply" and sentinel in str(value)]
@@ -731,7 +733,7 @@ def test_no_raw_model_output_survives_in_the_result(tmp_path, bound):
 def test_the_adapter_writes_no_files_of_its_own(tmp_path, bound):
     before = {p for p in bound.path.rglob("*")}
     _run_with_stdout(tmp_path, bound,
-                     json.dumps(_valid_reply()).encode("utf-8"))
+                     _emit(_success_envelope()))
     assert {p for p in bound.path.rglob("*")} == before, \
         "adapter calisma agacina dosya yazdi"
 
@@ -739,7 +741,7 @@ def test_the_adapter_writes_no_files_of_its_own(tmp_path, bound):
 def test_only_closed_codes_and_numbers_leave_the_adapter(tmp_path,
                                                          bound):
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(_valid_reply()).encode("utf-8"))
+                              _emit(_success_envelope()))
     assert result.event in contract.ALL_EVENT_CODES
     for name, value in vars(result).items():
         if name == "reply":
@@ -791,7 +793,7 @@ def test_an_unusable_prompt_refuses_before_any_process_starts(
         tmp_path, only_fake_binaries_may_run,
         label, prompt):
     binary = _fake_binary(tmp_path, mode="raw",
-                          hex=json.dumps(_valid_reply()).encode().hex())
+                          hex=_emit(_success_envelope()).hex())
     with pytest.raises(execution.LimitRefused):
         execution.run_implementer(
             binary, **_no_binding(tmp_path), prompt=prompt,
@@ -920,7 +922,7 @@ def test_a_reply_produced_without_reading_the_prompt_is_refused(
     "the child exited early" and "the write finished anyway" cannot be
     the same run."""
     binary = _fake_binary(tmp_path, mode="raw",
-                          hex=json.dumps(_valid_reply()).encode().hex())
+                          hex=_emit(_success_envelope()).hex())
     with pytest.raises(execution.PromptNotDelivered) as refusal:
         execution.run_implementer(
             binary, **bound.identity, prompt="P" * (2 * 1024 * 1024),
@@ -959,7 +961,7 @@ def test_a_delivered_prompt_is_still_accepted(tmp_path, bound):
                           prompt="kurgu istem")
     assert report["stdin"] == "kurgu istem"
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(_valid_reply()).encode("utf-8"))
+                              _emit(_success_envelope()))
     assert result.reply["status"] == "implemented"
 
 
@@ -992,7 +994,7 @@ def test_a_grandchild_never_outlives_a_SUCCESSFUL_call(tmp_path, bound):
     by the operating system and emptiness is asked of it."""
     beat = tmp_path / "torun-kalp.txt"
     child = _CHILD.format(beat=str(beat))
-    reply = json.dumps(_valid_reply()).encode("utf-8")
+    reply = _emit(_success_envelope())
     binary = _fake_binary(tmp_path, mode="spawn", seconds=0,
                           child_code=child, stdout_hex=reply.hex(),
                           wait_for=str(beat))
@@ -1130,7 +1132,7 @@ def test_the_adapter_has_no_state_machine_of_its_own():
 # marker, orphan recovery, safe removal, root confinement).
 
 # =====================================================================
-# R2B -- the argv schema, the validator and the hash are ONE thing
+# R2B / B4-R2 -- the argv schema is BOUND, and the authority JUDGES
 # =====================================================================
 #
 # The schema used to travel as a caller-chosen FILE PATH -- to a CLI
@@ -1138,47 +1140,93 @@ def test_the_adapter_has_no_state_machine_of_its_own():
 # live dictionary. A probe rewrote the schema file to garbage after the
 # argv was built and the adapter accepted the reply without noticing:
 # nothing tied what the model received to what judged its answer.
+#
+# R2B answered that by making them the SAME bytes. B4-R2 had to give
+# that up, because it was only ever true while the API accepted the
+# acceptance schema -- and the real API refuses it: `pattern`,
+# `if`/`then` and every length and numeric bound are outside the
+# published structured-output subset, and two authorized diagnostics
+# measured the 4xx. What replaces it is not a weakening but a split with
+# two pinned halves:
+#
+#     argv schema constrains generation;
+#     authoritative local schema decides acceptance;
+#     both exact canonical bindings are independently hash-pinned.
+#
+# So the argv is still verified byte-exactly against ITS binding before
+# launch, and the reply is still judged by the full authority. What no
+# longer holds -- deliberately -- is that the two are one document.
 
 def test_the_argv_schema_is_inline_canonical_and_hashed(
         tmp_path, bound, only_fake_binaries_may_run):
     """POSITIVE CONTROL for the section, read off the argv the adapter
     ACTUALLY launched: exactly one `--json-schema`, inline canonical
-    JSON right after it, equal to the frozen schema, not a path on any
-    disk -- and its exact UTF-8 bytes hash to the `schema_sha256` the
-    result reports."""
+    JSON right after it, not a path on any disk.
+
+    B4-R2 SPLIT THE TWO AUTHORITIES. The argv carries the TRANSPORT
+    schema, because the API refuses the acceptance one; the
+    `schema_sha256` the result reports is the AUTHORITY's, because that
+    is what actually judged the reply. The two hashes are asserted
+    separately here on purpose -- a single equality would hide which
+    schema did which job."""
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(_valid_reply()).encode("utf-8"))
+                              _emit(_success_envelope()))
     argv = only_fake_binaries_may_run[0]
     assert argv.count("--json-schema") == 1
     token = argv[argv.index("--json-schema") + 1]
-    assert json.loads(token) == schemas.IMPLEMENTER_RESULT_SCHEMA
+    assert json.loads(token) == schemas.CLAUDE_TRANSPORT_SCHEMA
     # os.path.exists, NOT Path.exists: on Linux a 3KB "filename" makes
     # pathlib raise ENAMETOOLONG instead of answering False, and the
     # question here is "is this a path", not "can stat swallow it"
     assert not os.path.exists(token), "sema hala bir dosya yolu"
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    assert digest == result.schema_sha256 \
-        == schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
+    assert digest == schemas.IMPLEMENTER_TRANSPORT_BINDING.sha256
+    assert result.schema_sha256 == schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
+    assert digest != result.schema_sha256
     assert re.fullmatch(r"[0-9a-f]{64}", result.schema_sha256)
 
 
-def test_a_reply_is_judged_by_the_schema_extracted_from_the_argv(
+def test_a_reply_is_judged_by_the_authority_not_by_the_argv_schema(
         tmp_path, bound, only_fake_binaries_may_run):
-    """Both directions of the same-schema claim: the accepted reply
-    validates under the schema pulled OUT of the argv, and a reply that
-    schema rejects is exactly what the adapter refuses -- no separate
-    in-process schema gets a say."""
+    """THE SPLIT, proven in the direction that matters.
+
+    The transport schema on the argv is strictly weaker, so there are
+    replies it accepts and the authority does not. Such a reply must be
+    REFUSED: if the adapter validated with the schema pulled out of the
+    argv -- which is exactly what R2B did -- every constraint the API
+    cannot compile would have silently stopped being enforced.
+
+    `run_id` is the cheap witness: its `pattern` cannot travel, so the
+    transport copy accepts any string at all."""
     good = _valid_reply()
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(good).encode("utf-8"))
+                              _emit(_success_envelope(good)))
     argv = only_fake_binaries_may_run[0]
     extracted = json.loads(argv[argv.index("--json-schema") + 1])
+    assert extracted == schemas.CLAUDE_TRANSPORT_SCHEMA
     Draft202012Validator(extracted).validate(result.reply)
+
+    # accepted by what travelled, refused by what decides.
+    #
+    # THE PAYLOAD TRAVELS IN A REAL ENVELOPE, and that detail is the
+    # whole test rather than a formality: sending the bare payload here
+    # made this assertion pass on the ENVELOPE gate instead, so it went
+    # green under a mutant that had made the transport copy the
+    # acceptance authority. The mutation battery caught it; the
+    # assertion had been proving the wrong refusal.
+    smuggled = dict(good, run_id="BUYUK HARF VE BOSLUK")
+    Draft202012Validator(extracted).validate(smuggled)
+    with pytest.raises(ValidationError):
+        schemas.IMPLEMENTER_SCHEMA_BINDING.validate(smuggled)
+    with pytest.raises(execution.SchemaViolation):
+        _run_with_stdout(tmp_path, bound, _emit(_success_envelope(smuggled)))
+
+    # and a value both schemas refuse is still refused
     bad = dict(good, status="approved")            # implementer may not
     with pytest.raises(ValidationError):
         Draft202012Validator(extracted).validate(bad)
     with pytest.raises(execution.SchemaViolation):
-        _run_with_stdout(tmp_path, bound, json.dumps(bad).encode("utf-8"))
+        _run_with_stdout(tmp_path, bound, _emit(_success_envelope(bad)))
 
 
 def test_a_builder_that_smuggles_a_different_schema_is_refused_before_launch(
@@ -1310,7 +1358,7 @@ def test_no_file_on_disk_can_influence_the_schema_any_more(
     (tmp_path / "implementer.schema.json").write_text("{BOZUK",
                                                       encoding="utf-8")
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(_valid_reply()).encode("utf-8"))
+                              _emit(_success_envelope()))
     assert result.reply["status"] == "implemented"
     assert result.schema_sha256 == schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
 
@@ -1356,7 +1404,7 @@ def test_the_checked_binary_is_the_launched_binary(
     program that runs, and `__str__` is never consulted again."""
     izB = tmp_path / "B-calisti.txt"
     binary_a = _fake_binary(tmp_path, name="ikili_a", mode="raw",
-                            hex=json.dumps(_valid_reply()).encode().hex())
+                            hex=_emit(_success_envelope()).hex())
     binary_b = _marker_binary(tmp_path, "ikili_b", izB)
     iki_yuzlu = _IkiYuzluYol(binary_a, binary_b)
     assert os.fspath(iki_yuzlu) != str(iki_yuzlu), "senaryo kurulmadi"
@@ -1377,7 +1425,7 @@ def test_a_relative_binary_is_resolved_before_the_workspace_becomes_cwd(
     for one string. Resolution happens before the launch, so argv
     carries an absolute path."""
     binary = _fake_binary(tmp_path, name="goreli", mode="raw",
-                          hex=json.dumps(_valid_reply()).encode().hex())
+                          hex=_emit(_success_envelope()).hex())
     goreli = os.path.relpath(binary, os.getcwd())
     assert not os.path.isabs(goreli), "senaryo kurulmadi"
 
@@ -1456,7 +1504,7 @@ def test_a_budget_at_or_below_the_maximum_reaches_the_argv_unchanged(
         tmp_path, bound, only_fake_binaries_may_run, budget):
     """POSITIVE CONTROL and the boundary in the other direction."""
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(_valid_reply()).encode("utf-8"),
+                              _emit(_success_envelope()),
                               budget_usd=budget)
     assert result.reply["status"] == "implemented"
     argv = only_fake_binaries_may_run[0]
@@ -1489,7 +1537,7 @@ def test_the_exact_bounds_are_still_accepted_and_used(
         tmp_path, bound, only_fake_binaries_may_run):
     """Both edges of both frozen ranges, so the refusals above cannot
     become "reject everything"."""
-    reply = json.dumps(_valid_reply(summary="k" * 1200)).encode("utf-8")
+    reply = _emit(_success_envelope(_valid_reply(summary="k" * 1200)))
     result = _run_with_stdout(
         tmp_path, bound, reply,
         timeout_seconds=execution.MIN_TIMEOUT_SECONDS,
@@ -1521,7 +1569,7 @@ def test_the_validated_prompt_bytes_are_what_the_child_receives(
     istem = "K" * 5000
     binary = _fake_binary(
         tmp_path, name="yutan", mode="consume", record=str(kayit),
-        hex=json.dumps(_valid_reply()).encode().hex())
+        hex=_emit(_success_envelope()).hex())
     result = execution.run_implementer(
         binary, **bound.identity, prompt=istem, budget_usd=1.0,
         timeout_seconds=60, max_output_bytes=65536)
@@ -1551,7 +1599,7 @@ def test_a_model_outside_the_frozen_schema_starts_no_process(
 def test_an_exact_model_string_reaches_the_argv(
         tmp_path, bound, only_fake_binaries_may_run):
     result = _run_with_stdout(tmp_path, bound,
-                              json.dumps(_valid_reply()).encode("utf-8"),
+                              _emit(_success_envelope()),
                               model="kurgu-model-1")
     assert result.reply["status"] == "implemented"
     argv = only_fake_binaries_may_run[0]
@@ -1680,7 +1728,7 @@ def test_every_launched_argv_token_is_an_exact_string(
     """Read off what was ACTUALLY launched: by the time argv exists
     there must be nothing left to convert."""
     _run_with_stdout(tmp_path, bound,
-                     json.dumps(_valid_reply()).encode("utf-8"),
+                     _emit(_success_envelope()),
                      model="kurgu-model-1")
     argv = only_fake_binaries_may_run[0]
     offenders = [token for token in argv if type(token) is not str]
@@ -1720,3 +1768,202 @@ def test_the_validator_cannot_be_the_raw_module_dictionary():
                  if isinstance(node, ast.Attribute)
                  and node.attr == "IMPLEMENTER_RESULT_SCHEMA"]
     assert offenders == [], f"ham sema sozlugu kullanimda: {offenders}"
+
+
+# =====================================================================
+# B4-R3 -- THE REAL CLAUDE RESULT ENVELOPE
+# =====================================================================
+#
+# MEASURED, on `claude 2.1.220` with the transport schema on the argv:
+#
+#   exit 0, type="result", subtype="success", is_error=False,
+#   terminal_reason="completed", stop_reason="tool_use", num_turns=2,
+#   result: a 205-char STRING that parses to the payload,
+#   structured_output: an OBJECT carrying the same payload,
+#   plus session_id, uuid, usage, modelUsage, total_cost_usd, timings.
+#
+# The adapter used to validate the WHOLE of stdout against the
+# implementer schema, so every real reply -- success included -- was a
+# `schema_violation`. What follows pins the exact measured shape and
+# every way of getting it wrong.
+#
+# TWO FIELDS CARRY A PAYLOAD, so the canonical one has to be chosen
+# rather than guessed: `structured_output` exists BECAUSE of
+# `--json-schema` and is already parsed, while `result` is the generic
+# text rendering every json-format reply carries. `structured_output`
+# is therefore the authority, and `result` is consulted only to refuse
+# a SECOND payload that disagrees with it -- two payloads that agree are
+# what the CLI normally emits, and rejecting those would reject every
+# real reply.
+
+def _success_envelope(payload=None, **overrides):
+    """The measured envelope, byte-shape faithful."""
+    inner = _valid_reply() if payload is None else payload
+    envelope = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "terminal_reason": "completed",
+        "stop_reason": "tool_use",
+        "num_turns": 2,
+        "duration_ms": 7523,
+        "duration_api_ms": 5011,
+        "total_cost_usd": 0.056757,
+        "session_id": "00000000-0000-4000-8000-000000000000",
+        "uuid": "00000000-0000-4000-8000-000000000001",
+        "permission_denials": [],
+        "usage": {"input_tokens": 4, "output_tokens": 5},
+        "modelUsage": {},
+        "result": json.dumps(inner) if inner is not None else "",
+        "structured_output": inner,
+    }
+    envelope.update(overrides)
+    return {name: value for name, value in envelope.items()
+            if value is not _ABSENT}
+
+
+_ABSENT = object()
+
+
+def _emit(envelope):
+    return json.dumps(envelope).encode("utf-8")
+
+
+def test_the_measured_success_envelope_is_accepted(tmp_path, bound):
+    """POSITIVE CONTROL: the exact shape the real CLI returned."""
+    reply = _valid_reply()
+    result = _run_with_stdout(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert result.reply == reply
+    assert result.exit_code == 0
+    assert result.event == contract.EventCode.MODEL_CALL_FINISHED
+    assert result.schema_sha256 == schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
+
+
+def test_a_bare_implementer_payload_is_no_longer_accepted(tmp_path, bound):
+    """The OLD protocol. No production road answers this way, so keeping
+    a fallback would mean the adapter accepting a shape only the test
+    fakes ever produced -- and that fallback is exactly how a fake stops
+    testing the real thing."""
+    with pytest.raises(execution.SchemaViolation):
+        _run_with_stdout(tmp_path, bound,
+                         json.dumps(_valid_reply()).encode("utf-8"))
+
+
+def test_an_error_envelope_is_refused_even_with_a_valid_payload(
+        tmp_path, bound):
+    """`is_error` outranks the payload: a run that failed did not
+    produce work, whatever it managed to serialise on the way out."""
+    for overrides in ({"is_error": True},
+                      {"subtype": "error_max_budget_usd"},
+                      {"type": "assistant"},
+                      {"is_error": _ABSENT},
+                      {"subtype": _ABSENT},
+                      {"type": _ABSENT},
+                      # truthiness is not the test: only exact False
+                      {"is_error": 0},
+                      {"is_error": "false"}):
+        with pytest.raises(execution.SchemaViolation):
+            _run_with_stdout(tmp_path, bound,
+                             _emit(_success_envelope(**overrides)))
+
+
+def test_a_nonzero_exit_is_refused_even_with_a_valid_envelope(
+        tmp_path, bound):
+    """The exit code is judged BEFORE the parse, and stays that way."""
+    with pytest.raises(execution.ProcessFailed):
+        _run_with_stdout(tmp_path, bound, _emit(_success_envelope()), code=3)
+
+
+def test_an_envelope_without_the_canonical_payload_is_refused(
+        tmp_path, bound):
+    """`result` alone is not a payload road: if the canonical field is
+    missing the reply is refused rather than reconstructed from text."""
+    envelope = _success_envelope(structured_output=_ABSENT)
+    assert "result" in envelope, "senaryo kurulmadi"
+    with pytest.raises(execution.SchemaViolation):
+        _run_with_stdout(tmp_path, bound, _emit(envelope))
+
+
+@pytest.mark.parametrize("wrong", ["metin", 5, ["liste"], None, True])
+def test_a_canonical_payload_of_the_wrong_type_is_refused(
+        tmp_path, bound, wrong):
+    with pytest.raises(execution.SchemaViolation):
+        _run_with_stdout(tmp_path, bound,
+                         _emit(_success_envelope(structured_output=wrong)))
+
+
+def test_a_transport_valid_payload_still_faces_the_authority(
+        tmp_path, bound):
+    """The generation schema cannot carry `pattern`, so the API can
+    return a `run_id` it would once have refused. The authority still
+    refuses it."""
+    smuggled = _valid_reply(run_id="BUYUK HARF VE BOSLUK")
+    transport = Draft202012Validator(schemas.CLAUDE_TRANSPORT_SCHEMA)
+    assert transport.is_valid(smuggled), "senaryo kurulmadi"
+    with pytest.raises(execution.SchemaViolation):
+        _run_with_stdout(tmp_path, bound,
+                         _emit(_success_envelope(smuggled)))
+
+
+def test_two_payloads_that_disagree_are_refused(tmp_path, bound):
+    """TWO AUTHORITIES IS NOT A PROTOCOL. Agreement is the normal case
+    and is accepted; disagreement is refused rather than resolved by
+    preferring one, because preferring one silently is how the field
+    nobody watches becomes the field that decides."""
+    inner = _valid_reply()
+    other = _valid_reply(summary="baska bir ozet")
+    assert other != inner
+    with pytest.raises(execution.SchemaViolation):
+        _run_with_stdout(tmp_path, bound, _emit(_success_envelope(
+            inner, result=json.dumps(other))))
+
+    # agreement -- what the CLI actually emits -- is accepted
+    result = _run_with_stdout(tmp_path, bound, _emit(_success_envelope(inner)))
+    assert result.reply == inner
+    # and ordinary prose in `result` is not a competing payload at all
+    result = _run_with_stdout(tmp_path, bound, _emit(_success_envelope(
+        inner, result="Gorevi tamamladim.")))
+    assert result.reply == inner
+
+
+def test_no_envelope_prose_or_identifier_reaches_the_result_or_the_error(
+        tmp_path, bound):
+    """Usage, cost, session id and the model's own text stop at this
+    boundary. The result object carries measurements and the reply; a
+    refusal carries a fixed sentence and numbers."""
+    marker = "GIZLI-MODEL-METNI"
+    inner = _valid_reply()
+    envelope = _success_envelope(
+        inner, result=json.dumps(inner), session_id=marker,
+        total_cost_usd=0.99, usage={"input_tokens": 1, "gizli": marker})
+    result = _run_with_stdout(tmp_path, bound, _emit(envelope))
+    assert result.reply == inner
+    assert marker not in repr(result)
+    assert not hasattr(result, "session_id")
+    assert not hasattr(result, "total_cost_usd")
+    assert not hasattr(result, "usage")
+
+    bad = _success_envelope(_valid_reply(status="approved"),
+                            session_id=marker)
+    with pytest.raises(execution.SchemaViolation) as refused:
+        _run_with_stdout(tmp_path, bound, _emit(bad))
+    assert marker not in str(refused.value)
+    assert marker not in repr(refused.value.__dict__)
+
+
+def test_the_transport_rules_around_the_parse_are_unchanged(tmp_path, bound):
+    """The envelope work must not have loosened anything AROUND it: the
+    output ceiling, the prompt delivery proof and the UTF-8 rule are the
+    same gates they were."""
+    reply = _valid_reply()
+    # the ceiling still trips, and on the ENVELOPE's bytes
+    with pytest.raises(execution.OutputLimitExceeded):
+        _run_with_stdout(tmp_path, bound, _emit(_success_envelope(
+            reply, summary_padding="x" * 4096)), max_output_bytes=1024)
+    # still strict UTF-8
+    with pytest.raises(execution.SchemaViolation):
+        _run_with_stdout(tmp_path, bound, b"\xff\xfe" + _emit(
+            _success_envelope(reply)))
+    # a valid envelope that is not a JSON object at the top level
+    with pytest.raises(execution.SchemaViolation):
+        _run_with_stdout(tmp_path, bound, b'["result"]')

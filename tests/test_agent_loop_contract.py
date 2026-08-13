@@ -104,9 +104,17 @@ def emit(payload):
     """Answer the way THIS CLI actually answers.
 
     `codex exec` writes its final message into the file named by
-    `--output-last-message`; `claude --print` answers on stdout. The fake
-    reads its OWN argv to decide, so nothing here invents a stdout road
-    for the evaluator that the real binary does not have.
+    `--output-last-message`; `claude --print` answers on stdout with a
+    RESULT ENVELOPE. The fake reads its OWN argv to decide, so nothing
+    here invents a stdout road for the evaluator that the real binary
+    does not have.
+
+    THE ENVELOPE IS THE MEASURED ONE (B4-R3), taken from a real
+    `claude 2.1.220` call: `type`/`subtype`/`is_error`, the payload
+    under `structured_output`, the same payload rendered as text under
+    `result`, plus the identifiers and usage the adapter must refuse to
+    carry anywhere. A fake that kept printing a bare payload would be
+    testing a protocol no binary speaks.
 
     The run id is the RUNNER'S, read from the environment it exported
     for this call. A recording with a hard-coded id describes a run that
@@ -118,7 +126,15 @@ def emit(payload):
     text = json.dumps(payload)
     target = flag("--output-last-message")
     if target is None:
-        sys.stdout.write(text)
+        sys.stdout.write(json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "terminal_reason": "completed", "stop_reason": "tool_use",
+            "num_turns": 2, "duration_ms": 7523, "duration_api_ms": 5011,
+            "total_cost_usd": 0.056757, "permission_denials": [],
+            "session_id": "00000000-0000-4000-8000-000000000000",
+            "uuid": "00000000-0000-4000-8000-000000000001",
+            "usage": {"input_tokens": 4, "output_tokens": 5},
+            "modelUsage": {}, "result": text, "structured_output": payload}))
         sys.stdout.flush()
     else:
         with open(target, "w", encoding="utf-8") as handle:
@@ -558,19 +574,29 @@ def test_the_implementer_fake_really_runs_with_schema_budget_and_tools(
     done = subprocess.run(argv, input="kurgu istem", text=True,
                           capture_output=True, cwd=tmp_path)
     assert done.returncode == 0, done.stderr
-    Draft202012Validator(schemas.IMPLEMENTER_RESULT_SCHEMA).validate(
-        json.loads(done.stdout))
+    # The fake answers with the RESULT ENVELOPE the real CLI was
+    # measured to produce (B4-R3), so the payload is unwrapped here
+    # exactly as the adapter unwraps it -- and it is the AUTHORITATIVE
+    # schema that judges the payload, never the transport copy that
+    # travelled on the argv.
+    envelope = json.loads(done.stdout)
+    assert envelope["type"] == "result"
+    assert envelope["subtype"] == "success"
+    assert envelope["is_error"] is False
+    Draft202012Validator(schemas.AUTHORITATIVE_RESULT_SCHEMA).validate(
+        envelope["structured_output"])
 
     recorded = [json.loads(line) for line in
                 workspace["record"].read_text(encoding="utf-8").splitlines()]
     assert recorded, "sahte implementer cagrilmadi"
     seen = recorded[-1]["argv"]
     assert "--print" in seen
-    # the INLINE canonical schema, byte-identical after a real process
-    # boundary -- the py-fake is executed via sys.executable, so the
-    # token survives argv quoting exactly
+    # the INLINE canonical TRANSPORT schema, byte-identical after a real
+    # process boundary -- the py-fake is executed via sys.executable, so
+    # the token survives argv quoting exactly. What travels is the copy
+    # the API can compile; the acceptance authority stays local (B4-R2).
     assert seen[seen.index("--json-schema") + 1] == \
-        schemas.IMPLEMENTER_SCHEMA_BINDING.canonical_json
+        schemas.IMPLEMENTER_TRANSPORT_BINDING.canonical_json
     assert seen[seen.index("--max-budget-usd") + 1] == "0.25"
     assert seen[seen.index("--allowedTools") + 1] == "Edit"
     # the prompt is nowhere on the command line
@@ -718,13 +744,16 @@ def test_the_implementer_argv_schema_is_inline_not_a_path(tmp_path):
                                       budget_usd=1.0)
     assert argv.count("--json-schema") == 1
     token = argv[argv.index("--json-schema") + 1]
-    assert token == schemas.IMPLEMENTER_SCHEMA_BINDING.canonical_json
-    assert json.loads(token) == schemas.IMPLEMENTER_RESULT_SCHEMA
+    # B4-R2: the TRANSPORT binding is what travels. It is still inline,
+    # still canonical and still hash-pinned -- only weaker, and never an
+    # acceptance authority.
+    assert token == schemas.IMPLEMENTER_TRANSPORT_BINDING.canonical_json
+    assert json.loads(token) == schemas.CLAUDE_TRANSPORT_SCHEMA
     # os.path.exists, NOT Path.exists: on Linux a 3KB "filename" makes
     # pathlib raise ENAMETOOLONG instead of answering False
     assert not os.path.exists(token), "sema hala bir dosya yolu"
     assert hashlib.sha256(token.encode("utf-8")).hexdigest() == \
-        schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
+        schemas.IMPLEMENTER_TRANSPORT_BINDING.sha256
 
 
 # =====================================================================
@@ -1798,3 +1827,198 @@ def test_a_final_audit_asking_for_more_changes_blocks(workspace):
     result = _run(runner, workspace)
     assert result.state == contract.State.BLOCKED
     assert result.state != contract.State.APPROVED
+
+
+# =====================================================================
+# B4-R2 -- TWO SCHEMA AUTHORITIES: transport constrains generation,
+# the authoritative schema decides acceptance
+# =====================================================================
+#
+# MEASURED, not assumed. Two authorized diagnostics against the real
+# CLI (2.1.220, authenticated) both ended in a 4xx client error with
+# `terminal_reason: api_error`, and an offline inventory of the frozen
+# schema found the keyword occurrences the published structured-output
+# subset does not accept: `pattern` (5), `if`/`then` (3 each),
+# `minLength`/`maxLength` (5 each), `minimum` (6), `maximum` (1),
+# `maxItems` (3).
+#
+# The OLD invariant was "the schema on the argv and the schema that
+# validates the reply are the same bytes". That invariant assumed the
+# API would accept the same rich schema the acceptance gate needs, and
+# the API refused it. The new invariant is stated rather than hidden:
+#
+#     argv schema constrains generation;
+#     authoritative local schema decides acceptance;
+#     both exact canonical bindings are independently hash-pinned.
+#
+# The transport schema is NOT an acceptance authority. A reply that
+# satisfies it and fails the authoritative schema is refused.
+
+_TRANSPORT_UNSUPPORTED = ("pattern", "if", "then", "minLength", "maxLength",
+                          "minimum", "maximum", "maxItems")
+
+# The vocabulary this test file knows how to recognise. Property NAMES
+# are arbitrary strings and must not be mistaken for keywords, so the
+# subset check is an intersection against this set rather than a claim
+# about every key in the document.
+_KNOWN_KEYWORDS = frozenset({
+    "type", "properties", "items", "required", "additionalProperties",
+    "enum", "const", "allOf", "anyOf", "oneOf", "if", "then", "else",
+    "pattern", "minLength", "maxLength", "minimum", "maximum",
+    "minItems", "maxItems", "uniqueItems", "format", "default",
+    "description", "title", "$comment", "$ref", "$defs", "definitions",
+})
+
+
+def _keywords(node, seen=None):
+    """Every mapping key anywhere in a schema document, with counts."""
+    seen = {} if seen is None else seen
+    if isinstance(node, dict):
+        for key, value in node.items():
+            seen[key] = seen.get(key, 0) + 1
+            _keywords(value, seen)
+    elif isinstance(node, list):
+        for item in node:
+            _keywords(item, seen)
+    return seen
+
+
+def test_the_authoritative_schema_keeps_every_strict_keyword():
+    """The acceptance authority is UNCHANGED by the transport work.
+
+    Its hash is pinned: a transport derivation that reached back and
+    relaxed the real schema would be the whole defect this split exists
+    to avoid."""
+    counts = _keywords(schemas.AUTHORITATIVE_RESULT_SCHEMA)
+    assert counts["pattern"] == 5
+    assert counts["allOf"] == 1
+    assert counts["if"] == 3 and counts["then"] == 3
+    assert counts["const"] == 8 and counts["enum"] == 6
+    assert counts["minLength"] == 5 and counts["maxLength"] == 5
+    assert counts["minimum"] == 6 and counts["maximum"] == 1
+    assert schemas.AUTHORITATIVE_RESULT_SCHEMA is \
+        schemas.IMPLEMENTER_RESULT_SCHEMA
+    assert schemas.IMPLEMENTER_SCHEMA_BINDING.sha256 == \
+        "4241b1100e9a03f706d4d7ede872fe1e7d0522f28a0c8596afc6aea814f0a86d"
+
+
+def test_the_transport_schema_carries_only_the_supported_subset():
+    """Every keyword the published subset refuses is GONE -- proven by
+    walking the whole document, not by checking the top level."""
+    counts = _keywords(schemas.CLAUDE_TRANSPORT_SCHEMA)
+    for keyword in _TRANSPORT_UNSUPPORTED:
+        assert counts.get(keyword, 0) == 0, f"tasima semasi {keyword} tasiyor"
+    used = set(counts) & _KNOWN_KEYWORDS
+    assert used <= set(schemas.CLAUDE_TRANSPORT_KEYWORDS), sorted(
+        used - set(schemas.CLAUDE_TRANSPORT_KEYWORDS))
+
+
+def test_the_transport_schema_keeps_every_closed_field_it_may_keep():
+    """Dropping the unsupported constraints must not quietly open the
+    object: `additionalProperties: false`, the required lists and the
+    closed vocabularies are what still bound the model's generation."""
+    transport = schemas.CLAUDE_TRANSPORT_SCHEMA
+    counts = _keywords(transport)
+    # Every closed object stays closed: 3 of 3 survive.
+    assert counts["additionalProperties"] == 3
+    # 8 -> 3. The five that leave are the ones INSIDE the conditionals:
+    # each of the 3 `if` branches carries `required: [status]`, and 2 of
+    # the 3 `then` branches carry `required: [stop_reason]`. They go
+    # with `allOf`, and the authoritative schema still enforces them.
+    assert counts["required"] == 3
+    # 8 -> 2, for the same reason: 6 of the 8 consts are the status and
+    # next_action pins inside the conditionals. What remains is
+    # `protocol_version` and `role`.
+    assert counts["const"] == 2
+    # every closed vocabulary survives -- none of them lived in a
+    # conditional
+    assert counts["enum"] == 6
+    assert transport["additionalProperties"] is False
+    assert transport["type"] == "object"
+    assert set(transport["required"]) == set(
+        schemas.AUTHORITATIVE_RESULT_SCHEMA["required"])
+    assert transport["properties"]["role"] == {"const": "implementer"}
+    assert transport["properties"]["status"]["enum"] == \
+        schemas.AUTHORITATIVE_RESULT_SCHEMA["properties"]["status"]["enum"]
+
+
+def test_a_transport_valid_reply_still_faces_the_authoritative_schema():
+    """THE POINT OF THE SPLIT. `run_id` loses its pattern on the way to
+    the API, so the API can no longer refuse a malformed one -- and the
+    acceptance gate still does."""
+    reply = {"protocol_version": "1.0", "run_id": "BUYUK HARF VE BOSLUK",
+             "role": "implementer", "status": "blocked",
+             "summary": "kurgu", "next_action": "stop",
+             "stop_reason": "interrupted"}
+    transport = Draft202012Validator(schemas.CLAUDE_TRANSPORT_SCHEMA)
+    assert transport.is_valid(reply), "tasima semasi bunu zaten reddediyor"
+    with pytest.raises(ValidationError):
+        schemas.IMPLEMENTER_SCHEMA_BINDING.validate(reply)
+
+
+def test_the_transport_schema_cannot_relax_the_status_conditionals():
+    """`if/then` is gone from the transport copy, so a `blocked` reply
+    with no `stop_reason` passes it -- and must still be refused by the
+    authority."""
+    reply = {"protocol_version": "1.0", "run_id": "kosu-abc",
+             "role": "implementer", "status": "blocked",
+             "summary": "kurgu", "next_action": "stop"}
+    assert Draft202012Validator(schemas.CLAUDE_TRANSPORT_SCHEMA).is_valid(reply)
+    with pytest.raises(ValidationError):
+        schemas.IMPLEMENTER_SCHEMA_BINDING.validate(reply)
+
+
+def test_the_two_bindings_are_independently_hash_pinned():
+    import hashlib
+
+    authoritative = schemas.IMPLEMENTER_SCHEMA_BINDING
+    transport = schemas.IMPLEMENTER_TRANSPORT_BINDING
+    assert transport.sha256 != authoritative.sha256
+    assert transport.canonical_json != authoritative.canonical_json
+    for binding in (authoritative, transport):
+        assert re.fullmatch(r"[0-9a-f]{64}", binding.sha256)
+        assert hashlib.sha256(
+            binding.canonical_json.encode("utf-8")).hexdigest() == \
+            binding.sha256
+
+
+def test_the_transport_derivation_is_deterministic():
+    """Derived twice from the same source, byte-identical -- and the
+    module-level binding is that same value."""
+    again = schemas.claude_transport_schema(
+        schemas.AUTHORITATIVE_RESULT_SCHEMA)
+    assert schemas.canonical_json(again) == \
+        schemas.IMPLEMENTER_TRANSPORT_BINDING.canonical_json
+
+
+def test_the_derivation_refuses_a_keyword_nobody_classified():
+    """NOT a silent stripper. A keyword that is neither supported nor on
+    the declared drop list is a decision nobody has made, and it raises
+    instead of vanishing -- otherwise a constraint added tomorrow would
+    be dropped in silence and the reply would be judged by less than the
+    author wrote."""
+    with pytest.raises(schemas.TransportSchemaError):
+        schemas.claude_transport_schema(
+            {"type": "object", "properties": {"a": {"type": "string"}},
+             "uniqueItems": True})
+
+
+def test_the_transport_schema_carries_no_constraint_prose():
+    """The SDKs move dropped constraints into `description` text. This
+    one does not: a description is free text on a boundary that exists
+    to keep free text out."""
+    counts = _keywords(schemas.CLAUDE_TRANSPORT_SCHEMA)
+    assert counts.get("description", 0) == 0
+    assert counts.get("title", 0) == 0
+    assert counts.get("$comment", 0) == 0
+
+
+def test_the_argv_carries_the_transport_schema_and_not_the_authority():
+    """What the CLI receives is the schema the API can compile. The
+    acceptance authority never travels."""
+    argv = cli.build_implementer_argv("/kurgu/claude", budget_usd=1.0)
+    token = argv[argv.index("--json-schema") + 1]
+    assert token == schemas.IMPLEMENTER_TRANSPORT_BINDING.canonical_json
+    assert token != schemas.IMPLEMENTER_SCHEMA_BINDING.canonical_json
+    for keyword in _TRANSPORT_UNSUPPORTED:
+        assert f'"{keyword}"' not in token

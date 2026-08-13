@@ -144,7 +144,7 @@ def test_the_model_runs_exactly_in_the_implementer_root(tmp_path, flat,
     iz = tmp_path / "cocugun-cwd.txt"
     binary = legacy._fake_binary(
         tmp_path, mode="raw", cwd_record=str(iz),
-        hex=json.dumps(legacy._valid_reply()).encode().hex())
+        hex=legacy._emit(legacy._success_envelope()).hex())
 
     outcome = _run(binary, flat["identity"])
 
@@ -193,7 +193,7 @@ def test_the_reference_tree_never_reaches_the_child_or_the_result(tmp_path,
     iz = tmp_path / "cocugun-cwd.txt"
     binary = legacy._fake_binary(
         tmp_path, mode="raw", cwd_record=str(iz),
-        hex=json.dumps(legacy._valid_reply()).encode().hex())
+        hex=legacy._emit(legacy._success_envelope()).hex())
 
     outcome = _run(binary, flat["identity"])
 

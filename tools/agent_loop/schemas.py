@@ -507,10 +507,131 @@ class SchemaBinding:
         self._validator.validate(payload)
 
 
-# THE implementer binding. Built once at import, used by the argv
-# builder and the adapter alike, so there is exactly one schema in
-# flight and one hash that names it.
+# THE implementer binding: the ACCEPTANCE authority. Built once at
+# import; every reply is finally judged by this and by nothing else.
 IMPLEMENTER_SCHEMA_BINDING = SchemaBinding(IMPLEMENTER_RESULT_SCHEMA)
+
+# The same object under the name that says what it IS, now that a
+# second schema exists and the difference between them is the point.
+AUTHORITATIVE_RESULT_SCHEMA = IMPLEMENTER_RESULT_SCHEMA
+
+
+# ---------------------------------------------------------------------
+# B4-R2 -- THE TRANSPORT SCHEMA
+# ---------------------------------------------------------------------
+#
+# WHAT CHANGED AND WHY, because this replaces an invariant rather than
+# adding to one. R2B established "the schema on the argv and the schema
+# that validates the reply are the same bytes", and that invariant
+# quietly assumed the API would accept the same rich schema the
+# acceptance gate needs. It does not. Two authorized diagnostics against
+# the real CLI both ended in a 4xx client error with
+# `terminal_reason: api_error`, and the published structured-output
+# contract refuses `pattern`, `if`/`then`, `minLength`/`maxLength`,
+# `minimum`/`maximum` and array constraints beyond `minItems` -- of
+# which this schema uses 28 occurrences.
+#
+# The replacement invariant, stated so nobody has to infer it:
+#
+#     argv schema constrains generation;
+#     authoritative local schema decides acceptance;
+#     both exact canonical bindings are independently hash-pinned.
+#
+# THE TRANSPORT SCHEMA IS NOT AN ACCEPTANCE AUTHORITY. It is strictly
+# weaker, on purpose, and nothing validates a reply with it. A payload
+# that satisfies it and fails `IMPLEMENTER_SCHEMA_BINDING` is refused --
+# there is no road in this package on which the weaker schema decides.
+
+class TransportSchemaError(ValueError):
+    """A schema this package cannot honestly reduce for transport.
+
+    Raised at IMPORT, deliberately: an unrepresentable schema is a
+    defect to learn about when the module loads, not at the first
+    billable call."""
+
+
+# The subset the published structured-output contract accepts, spelled
+# as an EXPLICIT ALLOWLIST rather than discovered by trial.
+CLAUDE_TRANSPORT_KEYWORDS = frozenset({
+    "type", "properties", "items", "required", "additionalProperties",
+    "enum", "const", "allOf", "anyOf",
+})
+
+# The keywords this schema uses that the subset refuses. Named ONE BY
+# ONE. A generic recursive sanitizer would drop whatever it did not
+# recognise, so a constraint added tomorrow would vanish in silence and
+# the model would be generating against less than its author wrote --
+# anything neither supported nor listed here RAISES.
+CLAUDE_TRANSPORT_DROPPED = frozenset({
+    "pattern", "minLength", "maxLength", "minimum", "maximum",
+    "minItems", "maxItems", "if", "then", "else",
+})
+
+
+def _transport_node(node):
+    """One schema node, reduced to the supported subset.
+
+    STRUCTURE-AWARE, not a blind key walk: under `properties` the keys
+    are property NAMES chosen by this contract, and a blind walk would
+    have tried to classify `stop_reason` as a JSON Schema keyword.
+
+    Dropped constraints are NOT restated as `description` prose the way
+    the vendor SDKs do it. This boundary exists to keep free text out,
+    and a description is free text travelling to a model."""
+    if not isinstance(node, dict):
+        raise TransportSchemaError("sema dugumu bir nesne degil")
+    reduced = {}
+    for key, value in node.items():
+        if key in CLAUDE_TRANSPORT_DROPPED:
+            continue
+        if key not in CLAUDE_TRANSPORT_KEYWORDS:
+            # the KEYWORD, which is this package's own vocabulary --
+            # never a value, which could be model-facing content
+            raise TransportSchemaError(f"siniflandirilmamis anahtar: {key}")
+        if key == "properties":
+            reduced[key] = {name: _transport_node(sub)
+                            for name, sub in value.items()}
+        elif key == "items":
+            reduced[key] = _transport_node(value)
+        elif key in ("allOf", "anyOf"):
+            # A branch whose whole content was unsupported becomes an
+            # EMPTY schema, which constrains nothing and would only add
+            # depth for the API to compile. Empty branches are removed,
+            # and a combinator left with none goes with them.
+            branches = [_transport_node(sub) for sub in value]
+            branches = [branch for branch in branches if branch]
+            if branches:
+                reduced[key] = branches
+        elif key == "additionalProperties":
+            # the subset accepts this keyword ONLY as `false`, and
+            # `false` is exactly what closes the object
+            if value is not False:
+                raise TransportSchemaError(
+                    "additionalProperties yalnizca false olabilir")
+            reduced[key] = False
+        elif key == "enum":
+            if any(isinstance(member, (dict, list)) for member in value):
+                raise TransportSchemaError("enum karmasik tur tasiyor")
+            reduced[key] = list(value)
+        elif key == "required":
+            reduced[key] = list(value)
+        else:                                    # type, const
+            reduced[key] = value
+    return reduced
+
+
+def claude_transport_schema(schema):
+    """The API-compatible copy of a schema. Deterministic and pure: the
+    source document is never mutated, and equal sources give equal
+    canonical bytes."""
+    return _transport_node(schema)
+
+
+CLAUDE_TRANSPORT_SCHEMA = claude_transport_schema(AUTHORITATIVE_RESULT_SCHEMA)
+
+# The SECOND binding, hash-pinned independently of the first. It is the
+# only schema that travels on an argv.
+IMPLEMENTER_TRANSPORT_BINDING = SchemaBinding(CLAUDE_TRANSPORT_SCHEMA)
 
 
 def locked_audit_schema(*, run_id, issued_finding_ids, issued_mechanism_ids):

@@ -892,3 +892,101 @@ def test_a_second_runner_is_refused_before_it_builds_anything(world):
             run(world)
     assert model_calls(world) == []
     assert not (world.state_dir / "state.json").exists()
+
+
+# =====================================================================
+# B4-R2 -- THE FAILURE CLASS MUST REACH THE JOURNAL
+# =====================================================================
+#
+# MEASURED ON A REAL RUN. The first controlled task stopped with
+# `stop_reason: preflight_failed` AFTER `preflight_ok` had already been
+# recorded, and the journal held nothing at all between
+# `model_call_started` and the transition to `blocked`. Reconstructing
+# which gate refused took a stubbed replay of the whole change-set seam,
+# because the one artefact built to answer that question was silent.
+#
+# THE MECHANISM. Every `execution.AdapterError` carries a closed
+# `.event`; every `changes.ChangeSetError` carries a closed `.reason`
+# and NO event. `_translate` read only `.event`, so an entire family of
+# refusals -- every evidence gate in the change-set seam -- produced no
+# journal line whatsoever.
+
+def _journal(world_obj):
+    path = runner_events.events_path(world_obj.state_dir)
+    if not path.exists():
+        return []
+    return [json.loads(line) for line
+            in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_an_evidence_refusal_is_recorded_as_a_closed_failure_event(world):
+    """The exact shape of the blocked run, reproduced: a change-set
+    evidence gate refuses, and the journal must say so."""
+    def refuse(*args, **kwargs):
+        raise changes.EvidenceUnavailable("dosya sistemi kaniti alinamadi")
+
+    original = changes.run_verified_implementation
+    changes.run_verified_implementation = refuse
+    try:
+        result = run(world)
+    finally:
+        changes.run_verified_implementation = original
+
+    assert result.state == contract.State.BLOCKED
+    assert result.stop_reason == contract.StopReason.PREFLIGHT_FAILED
+    codes = [entry["event"] for entry in _journal(world)]
+    # the scenario really happened: the call was reached
+    assert contract.EventCode.MODEL_CALL_STARTED in codes
+    # THE REPAIR: the refusal is no longer invisible
+    assert contract.EventCode.PREFLIGHT_FAILED in codes, \
+        "kanit reddi gunluge hic yazilmadi"
+    # and it is DISTINGUISHABLE from the two failures it is not
+    assert contract.EventCode.MODEL_CALL_FINISHED not in codes
+    assert contract.EventCode.SCHEMA_VIOLATION not in codes
+
+
+def test_a_declaration_mismatch_is_recorded_as_a_schema_violation(world):
+    """The same family, a different closed reason: the journal must
+    separate 'the evidence could not be read' from 'the reply did not
+    describe what happened'."""
+    def refuse(*args, **kwargs):
+        raise changes.DeclarationMismatch("bildirim gerceklesenle uyusmuyor")
+
+    original = changes.run_verified_implementation
+    changes.run_verified_implementation = refuse
+    try:
+        result = run(world)
+    finally:
+        changes.run_verified_implementation = original
+
+    assert result.stop_reason == contract.StopReason.SCHEMA_VIOLATION
+    codes = [entry["event"] for entry in _journal(world)]
+    assert contract.EventCode.SCHEMA_VIOLATION in codes
+    assert contract.EventCode.PREFLIGHT_FAILED not in codes
+
+
+def test_the_failure_event_carries_no_free_text_and_no_path(world):
+    """A journal line is a closed record. The refusal's SENTENCE, the
+    exception type and any path must not travel into it -- the event
+    code is the whole payload."""
+    secret = "kanit-alinamadi-gizli-cumle"
+
+    def refuse(*args, **kwargs):
+        raise changes.EvidenceUnavailable(secret)
+
+    original = changes.run_verified_implementation
+    changes.run_verified_implementation = refuse
+    try:
+        run(world)
+    finally:
+        changes.run_verified_implementation = original
+
+    raw = runner_events.events_path(world.state_dir).read_text(
+        encoding="utf-8")
+    assert secret not in raw
+    assert "EvidenceUnavailable" not in raw
+    assert str(world.repo) not in raw
+    allowed = {"ts", "run_id", "event", "state", "command_id", "exit_code",
+               "duration_ms", "bytes_truncated"}
+    for entry in _journal(world):
+        assert set(entry) <= allowed, sorted(set(entry) - allowed)

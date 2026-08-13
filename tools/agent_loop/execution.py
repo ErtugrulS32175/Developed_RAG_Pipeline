@@ -364,17 +364,27 @@ def _argv_schema(argv):
     """The inline schema ACTUALLY on the argv, or a refusal.
 
     Verified, not trusted: exactly one `--json-schema`, its value's
-    exact UTF-8 bytes hashing to the frozen binding's SHA-256. The
-    validator returned is parsed from THOSE bytes, so the schema the
-    model receives and the schema that judges its reply cannot be two
-    things. Never launches anything; never puts schema text in an
-    error."""
+    exact UTF-8 bytes hashing to the TRANSPORT binding's SHA-256.
+
+    TWO AUTHORITIES SINCE B4-R2, and the split is deliberate. The API
+    refuses the acceptance schema outright -- `pattern`, `if`/`then`
+    and every length and numeric bound are outside the published
+    structured-output subset, and two authorized diagnostics measured
+    the resulting 4xx. So the argv carries the reduced TRANSPORT schema,
+    which constrains what the model generates, while the validator
+    returned here is built from the AUTHORITATIVE binding's own bytes,
+    which is what decides whether a reply is acceptable.
+
+    The weaker schema therefore never judges anything: a reply that
+    satisfies the transport copy and fails the authority is refused by
+    `_parse_reply` exactly as before. Never launches anything; never
+    puts schema text in an error."""
     positions = [index for index, token in enumerate(argv)
                  if token == "--json-schema"]
     if len(positions) != 1 or positions[0] + 1 >= len(argv):
         raise SchemaNotBound("argv tam olarak bir inline sema tasimiyor")
     text = argv[positions[0] + 1]
-    binding = schemas.IMPLEMENTER_SCHEMA_BINDING
+    binding = schemas.IMPLEMENTER_TRANSPORT_BINDING
     # EXACTLY `str`, not "a kind of str". `isinstance` accepts
     # SUBCLASSES, and a subclass answers whatever it likes: an audit
     # built one whose real content was `{}` but whose `__eq__` claimed
@@ -401,7 +411,14 @@ def _argv_schema(argv):
     if text != binding.canonical_json \
             or hashlib.sha256(payload).hexdigest() != binding.sha256:
         raise SchemaNotBound("argv'deki sema kanonik baglamayla eslesmiyor")
-    return Draft202012Validator(json.loads(text)), binding.sha256
+    # THE VALIDATOR IS THE AUTHORITY'S, parsed from the authoritative
+    # binding's own canonical bytes -- never from the argv text, which
+    # is the weaker transport copy. Building it from `text` would make
+    # the reduced schema the acceptance gate, which is exactly the
+    # confusion this split exists to prevent.
+    authority = schemas.IMPLEMENTER_SCHEMA_BINDING
+    return Draft202012Validator(
+        json.loads(authority.canonical_json)), authority.sha256
 
 
 class CallInputRefused(AdapterError):
@@ -501,14 +518,79 @@ class ProcessTreeSurvived(AdapterError):
                          **measurements)
 
 
+# The measured success envelope, as three exact values. `claude
+# --print --output-format json` answers with a RESULT ENVELOPE; the
+# implementer payload is one field inside it.
+ENVELOPE_TYPE = "result"
+ENVELOPE_SUBTYPE = "success"
+# THE CANONICAL PAYLOAD FIELD. `structured_output` exists because of
+# `--json-schema` and arrives already parsed; `result` is the generic
+# text rendering every json-format reply carries, payload or not. Two
+# fields that can both hold a payload is two authorities, so one is
+# named here and the other is only ever used to detect disagreement.
+PAYLOAD_FIELD = "structured_output"
+TEXT_FIELD = "result"
+
+
+def _envelope_payload(payload, measurements):
+    """The implementer payload carried by a SUCCESSFUL result envelope.
+
+    MEASURED against `claude 2.1.220` rather than assumed: exit 0,
+    `type="result"`, `subtype="success"`, `is_error=False`, the payload
+    an exact object under `structured_output`, and the same payload
+    rendered as text under `result`.
+
+    Everything is exact. `is_error` is compared to `False` by identity
+    of value rather than truthiness, because `0`, `""` and a missing key
+    are all falsy and none of them is the CLI saying the run succeeded.
+
+    WHAT DOES NOT CROSS: `session_id`, `uuid`, `usage`, `modelUsage`,
+    `total_cost_usd`, the timings and the model's own prose. They stay
+    in this function's local `payload` and are never read out of it --
+    the adapter reports measurements it made itself, and a cost figure
+    from the envelope would be a number a caller could subtract from a
+    budget on the strength of the model's own bookkeeping."""
+    if payload.get("type") != ENVELOPE_TYPE:
+        raise SchemaViolation("cikti bir sonuc zarfi degil", **measurements)
+    if payload.get("subtype") != ENVELOPE_SUBTYPE:
+        raise SchemaViolation("zarf basarili bir sonuc bildirmiyor",
+                              **measurements)
+    if payload.get("is_error") is not False:
+        raise SchemaViolation("zarf hata bayragi tasiyor", **measurements)
+    inner = payload.get(PAYLOAD_FIELD)
+    # EXACTLY `dict`, so a subclass cannot answer the validator's
+    # questions differently from the mapping that gets returned
+    if type(inner) is not dict:
+        raise SchemaViolation("zarf yapisal sonucu tasimiyor", **measurements)
+    # A SECOND payload that DISAGREES is refused. Agreement is the
+    # normal case -- the CLI renders the same object into both fields --
+    # and prose in `result` is not a competing payload at all. Silently
+    # preferring one of two disagreeing objects is how the field nobody
+    # watches becomes the field that decides.
+    text = payload.get(TEXT_FIELD)
+    if type(text) is str:
+        try:
+            rendered = json.loads(text)
+        except ValueError:
+            rendered = None
+        if isinstance(rendered, dict) and rendered != inner:
+            raise SchemaViolation("zarf celisen iki sonuc tasiyor",
+                                  **measurements)
+    return inner
+
+
 def _parse_reply(raw, measurements, validator):
-    """Decode, parse and validate -- refusing at every step.
+    """Decode, parse, UNWRAP and validate -- refusing at every step.
 
     Strict UTF-8: replacement characters would turn undecodable bytes
-    into a string that might then parse into something plausible. The
-    validator ARRIVES here, built from the argv's own inline schema
-    bytes -- validating against a separate in-process schema is exactly
-    the unbound state R2B removed."""
+    into a string that might then parse into something plausible.
+
+    THE VALIDATOR IS THE AUTHORITY'S (B4-R2), not the argv's: the schema
+    that travels is the reduced transport copy, and validating with it
+    would silently stop enforcing every constraint the API cannot
+    compile. THE PAYLOAD IS UNWRAPPED FIRST (B4-R3): the whole of stdout
+    used to be validated against the implementer schema, so every real
+    reply -- including a successful one -- was a schema violation."""
     try:
         text = bytes(raw).decode("utf-8")
     except UnicodeDecodeError:
@@ -520,6 +602,7 @@ def _parse_reply(raw, measurements, validator):
         raise SchemaViolation("cikti JSON degil", **measurements) from None
     if not isinstance(payload, dict):
         raise SchemaViolation("cikti bir JSON nesnesi degil", **measurements)
+    payload = _envelope_payload(payload, measurements)
     try:
         validator.validate(payload)
     except ValidationError as invalid:

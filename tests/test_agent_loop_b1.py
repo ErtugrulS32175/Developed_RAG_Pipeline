@@ -1275,7 +1275,15 @@ def test_every_mutation_still_applies_to_the_current_source():
     # tests naming them accept two legal outcomes each, so no mutation
     # they can kill exists yet. The gap is written down there rather than
     # papered over with an entry that would always pass.
-    assert len(tool.MUTATIONS) == 88
+    # 88 -> 90. Two entries were ADDED:
+    # `b4r2-tasima-semasi-otorite` for the guard that keeps the weaker
+    # transport schema from becoming the acceptance authority, and
+    # `b4r3-zarf-hata-bayragi` for the envelope's success flag, which
+    # must be exactly `False` rather than merely falsy. Two existing
+    # entries (`r2b-yol-degeri`, `r2b-yanlis-sha`) were RETARGETED
+    # rather than retired: their security intents still exist, the lines
+    # carrying them moved.
+    assert len(tool.MUTATIONS) == 90
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1286,7 +1294,8 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b3-kilitli-kimlik-omru', 'b3-kilitli-kimlik-zorunlu',
         'b3-onarim-butcesi', 'b3-onarim-delta-bildirimi',
         'b3-saat-on-kontrolu', 'b3-stdout-tasma-hukmu',
-        'b3-uygulama-once-onay',
+        'b3-uygulama-once-onay', 'b4r2-tasima-semasi-otorite',
+        'b4r3-zarf-hata-bayragi',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

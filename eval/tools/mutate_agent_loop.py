@@ -186,8 +186,12 @@ MUTATIONS = [
      "    ensure_directory(target.parent)",
      "    target.parent.mkdir(parents=True, exist_ok=True)",
      "brand_new_directory_chain_is_made_durable"),
+    # RETARGETED IN B4-R2, not retired: the security intent is "the argv
+    # carries the inline canonical schema, never a path", and B4-R2 moved
+    # which BINDING carries it (authoritative -> transport). Deleting the
+    # label would have dropped the intent along with the old spelling.
     ("r2b-yol-degeri", "cli",
-     '        "--json-schema", schemas.IMPLEMENTER_SCHEMA_BINDING.'
+     '        "--json-schema", schemas.IMPLEMENTER_TRANSPORT_BINDING.'
      'canonical_json,',
      '        "--json-schema", str(binary),',
      "test_the_argv_schema_is_inline_canonical_and_hashed"),
@@ -242,11 +246,33 @@ MUTATIONS = [
      "    except UnicodeEncodeError:" + NL
      + "        raise",
      "test_a_malformed_schema_token_is_the_same_typed_refusal"),
+    # RETARGETED IN B4-R2 for the same reason: the reported
+    # `schema_sha256` must be the real digest of the schema that judged
+    # the reply, which is now the AUTHORITY's rather than the argv's.
     ("r2b-yanlis-sha", "execution",
-     "    return Draft202012Validator(json.loads(text)), binding.sha256",
-     "    return Draft202012Validator(json.loads(text)), "
-     "binding.sha256[::-1]",
+     "        json.loads(authority.canonical_json)), authority.sha256",
+     "        json.loads(authority.canonical_json)), "
+     "authority.sha256[::-1]",
      "test_the_argv_schema_is_inline_canonical_and_hashed"),
+    # THE GUARD B4-R2 CREATED. The transport schema is strictly weaker
+    # than the authority -- it has to be, because the API refuses the
+    # authority -- so a validator built from it would silently stop
+    # enforcing every constraint that cannot travel. This mutant makes
+    # the weaker schema the acceptance gate, which is the exact
+    # regression the split exists to prevent.
+    ("b4r2-tasima-semasi-otorite", "execution",
+     "    authority = schemas.IMPLEMENTER_SCHEMA_BINDING",
+     "    authority = schemas.IMPLEMENTER_TRANSPORT_BINDING",
+     "test_a_reply_is_judged_by_the_authority_not_by_the_argv_schema"),
+    # THE FAIL-OPEN THIS PROJECT KEEPS MEETING, in its newest place. The
+    # envelope's success flag must be EXACTLY `False`; truthiness accepts
+    # `0`, `""` and a missing key alike, and none of those is the CLI
+    # saying the run succeeded. A model that failed can still have
+    # serialised a well-formed payload on the way out.
+    ("b4r3-zarf-hata-bayragi", "execution",
+     '    if payload.get("is_error") is not False:',
+     '    if payload.get("is_error"):',
+     "test_an_error_envelope_is_refused_even_with_a_valid_payload"),
     # ----------------------------------------------------------------
     # B2A -- the call boundary: validate once, canonicalize once, use
     # only the canonical value. Each mutation reopens exactly one of

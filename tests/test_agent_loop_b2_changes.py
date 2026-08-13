@@ -162,6 +162,28 @@ def _reply(**overrides):
     return payload
 
 
+def _envelope(payload):
+    """The RESULT ENVELOPE the real CLI was measured to return (B4-R3).
+
+    `claude --print --output-format json` never answers with a bare
+    implementer payload: it answers with `type`/`subtype`/`is_error`,
+    the payload under `structured_output`, the same payload rendered as
+    text under `result`, and identifiers and usage the adapter must
+    refuse to carry anywhere. A fake still printing the bare payload
+    would be exercising a protocol no binary speaks."""
+    return {
+        "type": "result", "subtype": "success", "is_error": False,
+        "terminal_reason": "completed", "stop_reason": "tool_use",
+        "num_turns": 2, "duration_ms": 7523, "duration_api_ms": 5011,
+        "total_cost_usd": 0.056757, "permission_denials": [],
+        "session_id": "00000000-0000-4000-8000-000000000000",
+        "uuid": "00000000-0000-4000-8000-000000000001",
+        "usage": {"input_tokens": 4, "output_tokens": 5},
+        "modelUsage": {}, "result": json.dumps(payload),
+        "structured_output": payload,
+    }
+
+
 def _stub(tmp_path, name="sahte_claude", ops=(), reply=None, code=0,
           cwd_record=None):
     holder = tmp_path / STUB_HOLDER
@@ -170,7 +192,8 @@ def _stub(tmp_path, name="sahte_claude", ops=(), reply=None, code=0,
     helper.write_text(_HELPER, encoding="utf-8")
     config = {"ops": list(ops), "code": code}
     if reply is not None:
-        config["stdout_hex"] = json.dumps(reply).encode("utf-8").hex()
+        config["stdout_hex"] = json.dumps(
+            _envelope(reply)).encode("utf-8").hex()
     if cwd_record is not None:
         config["cwd_record"] = str(cwd_record)
     settings = holder / f"{name}.json"
