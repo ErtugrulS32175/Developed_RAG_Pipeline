@@ -1265,10 +1265,28 @@ def test_every_mutation_still_applies_to_the_current_source():
     # report built by hand applied a candidate with zero acceptance
     # commands launched. The persisted receipt is the authority now, and
     # this mutation removes it.
-    assert len(tool.MUTATIONS) == 72
+    #
+    # B3: 72 -> 86. The evaluator adapter and the runner, one entry per
+    # mechanism each exists for -- and TWO of them are caught by how far
+    # the run got rather than by the stop reason, because the adapters
+    # refuse a spent budget and an out-of-range timeout with the same
+    # closed codes the runner uses. Three further audit-adapter guards
+    # were tried and SURVIVED, for a reason recorded in the manifest: the
+    # tests naming them accept two legal outcomes each, so no mutation
+    # they can kill exists yet. The gap is written down there rather than
+    # papered over with an entry that would always pass.
+    assert len(tool.MUTATIONS) == 88
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
+        'b3-bulgu-izin-listesi', 'b3-butce-on-kontrolu',
+        'b3-denetci-kok-secimi', 'b3-denetci-yazma-kaniti',
+        'b3-durum-yedegi', 'b3-ikinci-yama-kurali', 'b3-kabul-hukmu',
+        'b3-kapsam-disi-bulgu', 'b3-kilitli-kimlik-baglamasi',
+        'b3-kilitli-kimlik-omru', 'b3-kilitli-kimlik-zorunlu',
+        'b3-onarim-butcesi', 'b3-onarim-delta-bildirimi',
+        'b3-saat-on-kontrolu', 'b3-stdout-tasma-hukmu',
+        'b3-uygulama-once-onay',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',
@@ -1302,44 +1320,27 @@ def test_every_mutation_still_applies_to_the_current_source():
     assert stale == [], f"kaynakta artik bulunmayan mutasyon deseni: {stale}"
 
 
-def test_every_mutation_names_a_test_that_exists():
-    """An expected-target that matches nothing would make every verdict
-    MISDIRECTED, which reads like a finding and is a typo. R2A grew the
-    manifest targets into the B2 execution battery, so both agent-loop
-    test files are the namespace now."""
+def test_every_mutation_names_a_test_the_battery_actually_runs():
+    """An expected-target that matches nothing makes every verdict about
+    it MISDIRECTED or KACIRILDI -- which reads like a missing guard and
+    is really a typo, or worse, a battery that cannot see the guard.
+
+    THE NAMESPACE IS DERIVED FROM THE HARNESS, not maintained beside it.
+    This test used to carry its own list of files, and that list drifted
+    from the one the harness runs TWICE: the four `b2bc2-*` entries named
+    tests in the application battery and the harness never ran that file,
+    and `zorunlu-workspace-id` named one in the state-binding battery
+    with the same result. Both were invisible here, because this file
+    said the name existed -- which was true, and irrelevant. Reading
+    `tool.BATTERY` asks the only question that matters: can the run that
+    judges this mutation execute the test that is supposed to catch it?"""
     tool = _mutation_tool()
-    here = Path(__file__).resolve().parent
-    body = "".join(
-        (here / name).read_text(encoding="utf-8")
-        for name in ("test_agent_loop_b1.py",
-                     "test_agent_loop_b2_execution.py",
-                     "test_agent_loop_contract.py",
-                     "test_agent_loop_b2_changes.py",
-                     # B2B-B2A1: the state binding's execution identity
-                     # moved into its own narrow file, so the namespace
-                     # has to know about it. The check itself is
-                     # unchanged -- a name matching nothing is still a
-                     # failure.
-                     "test_agent_loop_state_binding.py",
-                     # B2B-B2A2: the change set is derived from flat
-                     # workspace evidence in its own narrow file, and
-                     # three retargeted mutations name tests there.
-                     "test_agent_loop_b2_changes_flat.py",
-                     # B2B-B2B: the main-checkout guard's battery, named
-                     # by the retargeted walker-seam mutation.
-                     "test_agent_loop_b2_main_guard.py",
-                     # B2B-B2C: the state binding battery is where
-                     # the required-identity guard is judged now.
-                     "test_agent_loop_state_binding.py",
-                     # B2B-C1: the acceptance battery, named by all four
-                     # of that package's mutations.
-                     "test_agent_loop_b2_acceptance.py",
-                     # B2B-C2: the application battery, named by all four
-                     # of that package's mutations.
-                     "test_agent_loop_b2_application.py"))
+    root = Path(__file__).resolve().parent.parent
+    body = "".join((root / name).read_text(encoding="utf-8")
+                   for name in tool.BATTERY)
     missing = sorted({expected for *_, expected in tool.MUTATIONS
                       if expected not in body})
-    assert missing == [], f"var olmayan hedef test adi: {missing}"
+    assert missing == [], f"bataryanin kosmadigi hedef test adi: {missing}"
 
 
 def test_the_mutation_harness_exit_code_is_fail_closed():

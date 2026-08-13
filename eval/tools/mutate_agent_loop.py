@@ -30,10 +30,50 @@ from pathlib import Path
 
 SOURCE_REPO = Path(__file__).resolve().parents[2]
 MODULES = ("state", "locking", "preflight", "execution",
-           "cli", "schemas", "changes", "acceptance", "application")
+           "cli", "schemas", "changes", "acceptance", "application",
+           # B3: the evaluator adapter and the runner that joins every
+           # phase. A module absent from this tuple cannot be mutated at
+           # all, so its guards would be pinned by nothing here.
+           "audit", "runner", "runner_events")
 NL = chr(10)
 
 BS = chr(92)
+
+# THE BATTERY, as one list the harness runs and the pin reads.
+#
+# EVERY mutation's expected-target has to be reachable inside one of these
+# files. A target that cannot be EXECUTED is not a missing guard: `-k`
+# matches nothing, the run falls through to the full battery and reports
+# KACIRILDI, which reads exactly like the guard being absent.
+#
+# MEASURED THREE TIMES, which is why this is a constant now instead of a
+# literal inside `_pytest` with a hand-maintained twin in the pin. The
+# R2A/B2B batteries drifted apart from the namespace list twice
+# (`b2bc2-*` named the application battery, `zorunlu-workspace-id` named
+# the state-binding battery) and neither file was being run -- and the
+# second cost a full 27-minute battery run per misjudgement before
+# anything said so. The pin derives its namespace from THIS tuple, so the
+# two cannot disagree again.
+BATTERY = (
+    "tests/test_agent_loop_b1.py",
+    "tests/test_agent_loop_b2_execution.py",
+    # R2B targets live in the CONTRACT battery too -- the canonicalization
+    # rules are contract tests.
+    "tests/test_agent_loop_contract.py",
+    "tests/test_agent_loop_b2_changes.py",
+    # B2B-B2A2: the migrated change-set mechanism.
+    "tests/test_agent_loop_b2_changes_flat.py",
+    # B2B-B2B: the main-checkout guard's own battery.
+    "tests/test_agent_loop_b2_main_guard.py",
+    # B2B-B2C: where the required execution identity is judged.
+    "tests/test_agent_loop_state_binding.py",
+    # B2B-C1 and B2B-C2: the acceptance and application batteries.
+    "tests/test_agent_loop_b2_acceptance.py",
+    "tests/test_agent_loop_b2_application.py",
+    # B3: the evaluator adapter and the runner.
+    "tests/test_agent_loop_b3_audit.py",
+    "tests/test_agent_loop_b3_runner.py",
+)
 
 # (label, module, old, new, expected_test_substring)
 MUTATIONS = [
@@ -326,14 +366,37 @@ MUTATIONS = [
      + "                or entry.link_target_mac):",
      "        if False:",
      "test_an_object_this_evidence_model_cannot_represent_is_refused"),
+    # B3 RETARGETED BOTH, and the reason is worth keeping: the repair
+    # seam that arrived with B3 carries its OWN copy of these two guards,
+    # word for word, and it sits EARLIER in the file. `replace(old, new,
+    # 1)` therefore stopped mutating the function these targets exercise
+    # and started mutating the repair one -- so both entries reported a
+    # kill that never happened, and the survivor scan caught them only
+    # because it asks the target test directly. A pattern that is not
+    # unique to the function it means to judge is not a pattern.
     ("b2ba-kosu-kimligi", "changes",
-     '    if reply.get("run_id") != run_id:',
-     "    if False:",
+     '    """The declaration is compared to the evidence, exactly."""' + NL
+     + "    reply = outcome.reply" + NL
+     + '    if reply.get("run_id") != run_id:',
+     '    """The declaration is compared to the evidence, exactly."""' + NL
+     + "    reply = outcome.reply" + NL
+     + "    if False:",
      "test_a_reply_naming_another_run_is_refused"),
     ("b2ba-yineleme", "changes",
-     "    if len(set(canonical)) != len(canonical):",
-     "    if False:",
+     "    # the set never saw." + NL
+     + "    canonical = [_fold(item) for item in declared]" + NL
+     + "    if len(set(canonical)) != len(canonical):",
+     "    # the set never saw." + NL
+     + "    canonical = [_fold(item) for item in declared]" + NL
+     + "    if False:",
      "test_a_duplicate_declaration_is_refused"),
+    # The repair seam's OWN guard, and the one that is genuinely its own:
+    # a repair round's declaration is about THIS call, so it is compared
+    # against the delta rather than against the cumulative candidate.
+    ("b3-onarim-delta-bildirimi", "changes",
+     "    if set(canonical) != {_fold(change.path) for change in delta}:",
+     "    if False:",
+     "test_a_repair_declaration_is_compared_against_its_own_delta"),
     # ----------------------------------------------------------------
     # B2B-A R1 -- the six audit findings, each as its own mutation
     # ----------------------------------------------------------------
@@ -512,6 +575,125 @@ MUTATIONS = [
      "    _assert_receipt(acceptance_report, candidate, state_path, binding)",
      "    pass",
      "test_a_report_built_by_hand_without_a_gate_is_refused"),
+    # ----------------------------------------------------------------
+    # B3 -- the evaluator adapter and the runner. One mutation per
+    # mechanism each package exists for.
+    #
+    # THE ONES THAT ARE NOT HERE ARE A MEASUREMENT, not an oversight.
+    # Three further audit-adapter guards -- the last-message watcher, the
+    # drain verdict and the prompt-delivery check -- were tried as
+    # mutations and SURVIVED, because the tests that name them accept two
+    # legal outcomes each: a file ceiling that trips late still refuses
+    # through the post-exit size check, and a surviving grandchild is
+    # allowed to be either reported or reaped. A mutation those tests
+    # cannot kill is not evidence, and weakening this manifest to include
+    # it would be worse than recording the gap.
+    # ----------------------------------------------------------------
+    # The evaluator runs in the candidate, never in the copy the work is
+    # measured against: a model with a path to the reference tree can
+    # read the answer it is being compared to.
+    ("b3-denetci-kok-secimi", "audit",
+     "            baseline_sha=call.baseline_sha).implementer_root",
+     "            baseline_sha=call.baseline_sha).reference_root",
+     "test_the_evaluator_runs_in_the_candidate_implementer_root"),
+    # A locked call with no issued ids builds an enum of nothing, which
+    # refuses every reply including an honest approval -- a gate that
+    # cannot pass is one nobody can tell from a broken one.
+    ("b3-kilitli-kimlik-zorunlu", "audit",
+     "        if issued_run_id is None or not issued_finding_ids " + BS + NL
+     + "                or not issued_mechanism_ids:",
+     "        if False:",
+     "test_a_locked_audit_without_issued_ids_is_refused_before_launch"),
+    ("b3-stdout-tasma-hukmu", "audit",
+     "        overflowed = [stream for stream in streams if stream.overflowed]",
+     "        overflowed = []",
+     "test_an_oversized_stdout_is_still_refused"),
+    # The ALLOWLIST, not the shape. Any 32 hex characters satisfy the
+    # opaque pattern, including ids the runner never minted -- so the
+    # weakened form here is exactly the version that proved "opaque" was
+    # a promise about a format rather than a binding to a run.
+    ("b3-kilitli-kimlik-baglamasi", "schemas",
+     '    finding["finding_id"] = {"enum": sorted(issued_finding_ids)}',
+     '    finding["finding_id"] = dict(_OPAQUE_ID)',
+     "test_a_locked_audit_is_bound_to_the_ids_the_runner_issued"),
+    # A reviewer that wrote is a broken protocol, and the proof is
+    # before/after evidence over both roots rather than the sandbox flag
+    # on the command line.
+    ("b3-denetci-yazma-kaniti", "runner",
+     "        if moved:", "        if False:",
+     "test_an_evaluator_that_edits_an_allowed_path_blocks_the_application"),
+    # THE RULE THE WHOLE LOOP EXISTS FOR.
+    ("b3-ikinci-yama-kurali", "runner",
+     "        if repeated:", "        if False:",
+     "test_the_same_mechanism_twice_stops_before_the_round_budget_does"),
+    # The round cap is a SECOND limit, and removing it does not merely
+    # allow another repair: `_walk` would carry a rejected final audit
+    # straight into the application.
+    ("b3-onarim-butcesi", "runner",
+     '        if self.rounds["repair"] >= self.max_repair_rounds:',
+     "        if False:",
+     "test_a_final_audit_asking_for_changes_never_starts_a_second_repair"),
+    ("b3-kapsam-disi-bulgu", "runner",
+     "            if changes.canonical_path(cited) not in changed:",
+     "            if False:",
+     "test_a_finding_about_a_file_this_run_did_not_change_blocks"),
+    ("b3-kabul-hukmu", "runner",
+     "        if not report.passed:", "        if False:",
+     "test_a_failing_acceptance_gate_never_reaches_the_audit_or_the_checkout"),
+    # Both of these are caught by the WORKSPACE, not by the stop reason:
+    # the adapters refuse a spent budget and an out-of-range timeout too,
+    # with the same closed codes, so a test that only read the reason
+    # would be green against either mutant. What changes is how far the
+    # run got before it stopped.
+    ("b3-butce-on-kontrolu", "runner",
+     "        if remaining <= 0:", "        if False:",
+     "test_a_zero_budget_starts_no_model_process"),
+    ("b3-saat-on-kontrolu", "runner",
+     "        if self._remaining_seconds() <= 0:", "        if False:",
+     "test_a_spent_deadline_starts_no_model_process"),
+    # The backup is written AFTER a successful move, so it always holds
+    # the last state that was really good. The `_open_state` call writes
+    # the same line, which is why this pattern carries the line that
+    # follows it in `_advance`.
+    ("b3-durum-yedegi", "runner",
+     "        runner_events.save_state_backup(self.state_dir, payload)" + NL
+     + "        self.state = target",
+     "        self.state = target",
+     "test_resume_recovers_the_same_run_from_the_backup"),
+    # `approved` is a claim that the candidate is IN the checkout. Moving
+    # the transition in front of the move makes it a claim about an
+    # intention.
+    ("b3-uygulama-once-onay", "runner",
+     "        with self._guard():" + NL
+     + "            applied = application.apply_accepted_candidate(" + NL
+     + "                **self.identity, verified_changes=verified," + NL
+     + "                acceptance_report=report)" + NL
+     + "        self.applied_files = applied.applied_files" + NL
+     + "        self._advance(contract.State.APPROVED," + NL
+     + "                      stop_reason=contract.StopReason.COMPLETED)",
+     "        self._advance(contract.State.APPROVED," + NL
+     + "                      stop_reason=contract.StopReason.COMPLETED)" + NL
+     + "        with self._guard():" + NL
+     + "            applied = application.apply_accepted_candidate(" + NL
+     + "                **self.identity, verified_changes=verified," + NL
+     + "                acceptance_report=report)" + NL
+     + "        self.applied_files = applied.applied_files",
+     "test_the_state_is_never_approved_without_an_application"),
+    # The run's own record is built from a per-kind ALLOWLIST. Copying
+    # the reply's fields instead puts model-authored prose into the file
+    # that outlives the run.
+    # A mechanism is identified by its id COMPARED ACROSS ROUNDS. Minting
+    # a fresh allowlist per call leaves the evaluator unable to name the
+    # mechanism it named last time, so the second-patch rule becomes a
+    # rule nothing can trip -- and the run reports the round budget
+    # instead, which tells the operator to buy another round.
+    ("b3-kilitli-kimlik-omru", "runner",
+     "        if self.issued_ids is None:", "        if True:",
+     "test_a_locked_finding_crosses_as_a_class_and_a_count_and_nothing_else"),
+    ("b3-bulgu-izin-listesi", "runner_events",
+     "    allowed = RECORD_FIELDS.get(audit_kind)",
+     "    allowed = tuple(finding) if isinstance(finding, dict) else ()",
+     "test_no_model_authored_prose_is_written_into_the_state_directory"),
 ]
 
 
@@ -551,23 +733,7 @@ def originals():
 
 
 def _pytest(workdir, extra):
-    # R2B mutation targets live in the CONTRACT battery too (the
-    # canonicalization rules are contract tests), so it runs here.
-    argv = [sys.executable, "-m", "pytest", "tests/test_agent_loop_b1.py",
-            "tests/test_agent_loop_b2_execution.py",
-            "tests/test_agent_loop_contract.py",
-            "tests/test_agent_loop_b2_changes.py",
-            # B2B-B2A2: the migrated change-set mechanism lives here, and
-            # several manifest targets name it -- a battery that could not
-            # run it would judge every one of them MISDIRECTED.
-            "tests/test_agent_loop_b2_changes_flat.py",
-            # B2B-B2B: the main-checkout guard's own battery, named by
-            # the retargeted walker-seam mutation.
-            "tests/test_agent_loop_b2_main_guard.py",
-            # B2B-C1: the acceptance battery, named by all four of that
-            # package's mutations -- a battery that could not run it
-            # would judge every one of them MISDIRECTED.
-            "tests/test_agent_loop_b2_acceptance.py",
+    argv = [sys.executable, "-m", "pytest", *BATTERY,
             "-q", "--no-header", "-p", "no:cacheprovider", "-rf"] + extra
     # a temp directory of the HARNESS's own. The battery derives its
     # worktree root from the process temp directory, so a run that
@@ -657,7 +823,7 @@ def main():
             [sys.executable, "-c",
              "from tools.agent_loop import (state, locking, "
              "preflight, execution, cli, schemas, changes, acceptance, "
-             "application)"],
+             "application, audit, runner, runner_events)"],
             cwd=str(workdir), capture_output=True, text=True)
         if imported.returncode != 0:
             path.write_text(original, encoding="utf-8")

@@ -458,6 +458,30 @@ def test_a_pending_receipt_never_reaches_the_checkout(world, monkeypatch):
     assert (world.repo / _FIRST).read_text(encoding="utf-8") == before
 
 
+def test_a_failing_acceptance_gate_never_reaches_the_audit_or_the_checkout(
+        world, spy):
+    """A red gate ends the run. It is not a finding for the evaluator to
+    weigh and it is not something a repair round may argue with: the
+    commands the task named are the contract, and a candidate that fails
+    them is not a candidate."""
+    implementer(world, "if in_run():\n"
+                       "    edit('pipeline/test_gecer.py',"
+                       " 'def test_kurgu():\\n    assert False\\n')\n"
+                + base._emits(base._implementer_reply(
+                    changed_files=["pipeline/test_gecer.py"])))
+    before = (world.repo / "pipeline" / "test_gecer.py").read_text(
+        encoding="utf-8")
+    result = run(world)
+
+    assert len(implementer_calls(world)) == 1, "senaryo kurulmadi"
+    assert spy == ["acceptance"], "kabul kapisindan sonrasi kosuldu"
+    assert result.acceptance_passed is False
+    assert result.state == contract.State.BLOCKED
+    assert result.stop_reason == contract.StopReason.ACCEPTANCE_FAILED
+    assert (world.repo / "pipeline" / "test_gecer.py").read_text(
+        encoding="utf-8") == before
+
+
 def test_the_state_is_never_approved_without_an_application(world,
                                                             monkeypatch):
     """`approved` is a claim that the candidate is IN the checkout. A run
@@ -756,10 +780,14 @@ def test_a_locked_finding_crosses_as_a_class_and_a_count_and_nothing_else(
     evaluator(world, _locked_evaluator_body())
     result = run(world, audit_kind=contract.AuditKind.LOCKED)
 
-    assert len(evaluator_calls(world)) >= 1, "kilitli denetim kosulmadi"
-    assert result.stop_reason in (
-        contract.StopReason.REPEATED_MECHANISM_FAILURE,
-        contract.StopReason.REPAIR_ROUNDS_EXHAUSTED)
+    assert len(evaluator_calls(world)) == 2, "ikinci kilitli denetim kosulmadi"
+    # EXACTLY the repeated-mechanism reason, not either terminal code.
+    # The ids are minted ONCE FOR THE RUN, so the second audit can name
+    # the mechanism the first one named -- and if they were minted per
+    # call it could not, the run would report the round budget instead,
+    # and this test would be green about a rule nothing can trip.
+    assert result.stop_reason == \
+        contract.StopReason.REPEATED_MECHANISM_FAILURE
     assert prompts, "onarim istemi hic kurulmadi"
 
     findings = runner_events.read_findings(world.state_dir)

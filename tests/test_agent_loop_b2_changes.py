@@ -647,6 +647,15 @@ def test_an_ignored_manifest_inside_the_repository_is_still_re_verified(
     with pytest.raises(changes.UnsafeChange) as refusal:
         _run(binary, current)
     assert refusal.value.reason == contract.StopReason.PATH_NOT_ALLOWED
+    # THE SENTENCE, not only the reason. B2B-B2B made the main-checkout
+    # guard a filesystem walk, and a filesystem walk DOES see a gitignored
+    # file -- so the manifest gate and the main-tree gate now both catch
+    # this scenario and both close to `path_not_allowed`. Asserting the
+    # reason alone therefore stopped saying anything about the gate this
+    # test is named for: with the digest re-check deleted, the run stayed
+    # green here and the mutation that removes it survived unnoticed.
+    assert str(refusal.value) == "gorev dosyasi degistirildi", \
+        "ret manifest kapisindan gelmedi"
     assert current.task.read_text(encoding="utf-8").strip() == "{}", \
         "senaryo kurulmadi: gorev dosyasi hic degismedi"
 
