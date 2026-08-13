@@ -59,6 +59,27 @@ main()
 '''
 
 
+def _envelope(**overrides):
+    """The RESULT ENVELOPE the real CLI was measured to return (B4-R3),
+    as the JSON TEXT a stub writes to stdout.
+
+    `claude --print --output-format json` never answers with a bare
+    implementer payload, so a stub that printed one would be proving
+    containment against a protocol no binary speaks."""
+    payload = {
+        "protocol_version": "1.0", "run_id": "kurgu-run-1",
+        "role": "implementer", "status": "implemented",
+        "summary": "kurgu", "next_action": "await_acceptance"}
+    payload.update(overrides)
+    return json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "terminal_reason": "completed", "stop_reason": "tool_use",
+        "num_turns": 2, "duration_ms": 7523, "total_cost_usd": 0.056757,
+        "session_id": "00000000-0000-4000-8000-000000000000",
+        "usage": {"input_tokens": 4, "output_tokens": 5},
+        "result": json.dumps(payload), "structured_output": payload})
+
+
 def _stub(tmp_path, name="sahte", **config):
     holder = tmp_path / "sahte-bin"
     holder.mkdir(exist_ok=True)
@@ -302,10 +323,7 @@ def test_a_grandchild_does_not_survive_a_successful_call(tmp_path,
     schema = tmp_path / "s.json"
     schema.write_text("{}", encoding="utf-8")
     beat = tmp_path / "kalp.txt"
-    reply = json.dumps({
-        "protocol_version": "1.0", "run_id": "kurgu-run-1",
-        "role": "implementer", "status": "implemented",
-        "summary": "kurgu", "next_action": "await_acceptance"})
+    reply = _envelope()
     stub = _stub(tmp_path, seconds=0, stdout=reply, wait_for=str(beat),
                  child_code=_CHILD.format(beat=str(beat)))
 
@@ -326,10 +344,7 @@ def test_a_grandchild_holding_the_pipes_does_not_cost_the_grace_period(
     schema = tmp_path / "s.json"
     schema.write_text("{}", encoding="utf-8")
     beat = tmp_path / "kalp.txt"
-    reply = json.dumps({
-        "protocol_version": "1.0", "run_id": "kurgu-run-1",
-        "role": "implementer", "status": "implemented",
-        "summary": "kurgu", "next_action": "await_acceptance"})
+    reply = _envelope()
     stub = _stub(tmp_path, seconds=0, stdout=reply, wait_for=str(beat),
                  child_code=_CHILD.format(beat=str(beat)))
 
