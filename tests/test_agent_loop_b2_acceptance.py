@@ -266,10 +266,32 @@ def test_the_report_and_command_results_are_frozen_and_textless(tmp_path):
     assert [field for field in report.__slots__] == [
         "run_id", "workspace_id", "baseline_sha", "passed", "command_results",
         "total_duration_ms", "event", "manifest_digest",
-        "candidate_fingerprint", "command_plan_digest"]
+        "candidate_fingerprint", "command_plan_digest", "receipt_id"]
     for digest in (report.manifest_digest, report.candidate_fingerprint,
                    report.command_plan_digest):
         assert len(digest) == 64 and set(digest) <= set("0123456789abcdef")
+    # B2B-C2-R1. This object is a TRANSPORT, not an authority: its own
+    # constructor is public, so `receipt_id` is what points at the file
+    # only this lifecycle writes. The persisted receipt carries identity
+    # and closed codes only -- no argv, no cwd, no output, no duration.
+    assert len(report.receipt_id) == 32
+    assert set(report.receipt_id) <= set("0123456789abcdef")
+    persisted = acceptance.read_receipt(world.state_dir)
+    assert persisted["receipt_id"] == report.receipt_id
+    assert persisted["status"] == acceptance.STATUS_PASSED
+    # the EXACT field set, which is what actually pins the shape --
+    # `command_count` and `command_plan_digest` are in it and are closed
+    # (an integer and a digest), so a substring ban on "command" would
+    # only have been noise
+    assert set(persisted) == set(
+        acceptance.RECEIPT_SCHEMA["required"]), "makbuz sekli degisti"
+    for banned in ("argv", "cwd", "env", "stdout", "stderr", "duration",
+                   "path", "detail"):
+        assert not [key for key in persisted if banned in key], \
+            f"makbuz tasimamasi gereken alan tasiyor: {banned}"
+    for value in persisted.values():
+        assert not isinstance(value, str) or "\\" not in value, \
+            "makbuz ham OS yolu tasiyor"
     (result,) = report.command_results
     assert [field for field in result.__slots__] == [
         "command_id", "passed", "exit_code", "duration_ms", "stdout_bytes",

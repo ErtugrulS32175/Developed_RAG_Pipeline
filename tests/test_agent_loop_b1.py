@@ -1258,11 +1258,19 @@ def test_every_mutation_still_applies_to_the_current_source():
     # ADDED target the operator already has is never overwritten, a
     # failed operation is rolled back, and the checkout's difference is
     # proven to BE the candidate before a success is reported.
-    assert len(tool.MUTATIONS) == 71
+    #
+    # B2B-C2-R1: 71 -> 72. The receipt authority. `AcceptanceReport` is
+    # a public dataclass and the application layer treated holding one
+    # as proof that the gate had run -- measured false: an exact-type
+    # report built by hand applied a candidate with zero acceptance
+    # commands launched. The persisted receipt is the authority now, and
+    # this mutation removes it.
+    assert len(tool.MUTATIONS) == 72
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
+        'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',
         'b2bc1-bosaltma-hukmu', 'b2bc1-kayit-disi-argv', 'b2bc1-okuma-hukmu',
         'b2bc1-taze-dogrulama',

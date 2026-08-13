@@ -684,6 +684,52 @@ def _assert_report(report, candidate, *, run_id, workspace_id, baseline_sha,
                 "kabul komut sonuclari plani karsilamiyor")
 
 
+def _assert_receipt(report, candidate, state_dir, binding) -> None:
+    """THE AUTHORITY. Everything above this is a transport object.
+
+    `_assert_report` checks that the receipt object is exactly an
+    `AcceptanceReport` and that its digests agree with fresh evidence.
+    That was measured insufficient on the commit before this one: the
+    class is public, so is its constructor, and a report built by hand
+    with every digest honestly derived applied a candidate to the
+    operator's checkout while ZERO acceptance commands had run and ZERO
+    mirrors had been created. Proving the CLASS proves nothing about the
+    RUN.
+
+    What proves the run is a file only `run_acceptance` writes, in the
+    runner-owned state directory, under a name nobody can choose. It is
+    read back through a handle, validated against its closed schema, and
+    then required to agree -- field by field -- with the identities this
+    call derived for itself. `pending` is refused, which is what makes a
+    crashed or interrupted acceptance fail closed instead of leaving the
+    previous green result standing.
+
+    This runs BEFORE the holder, the journal and the first repository
+    write, so a forged report costs the caller one refusal and nothing
+    else."""
+    try:
+        receipt = acceptance.read_receipt(state_dir)
+    except acceptance.AcceptanceError as refused:
+        # the lower layer's sentences are fixed and carry no path
+        raise CandidateNotAccepted(str(refused)) from None
+    if receipt["status"] != acceptance.STATUS_PASSED:
+        # `pending` is a run that started and never finished; `failed` is
+        # one that finished red. Neither is permission to apply anything.
+        raise CandidateNotAccepted("kabul makbuzu gecmis bir kosuyu adlamiyor")
+    expected = {**binding,
+                "candidate_fingerprint": candidate.fingerprint,
+                "command_plan_digest": acceptance.command_plan_digest(
+                    candidate.acceptance_commands),
+                "command_count": len(candidate.acceptance_commands)}
+    for field, value in expected.items():
+        if receipt[field] != value:
+            raise CandidateNotAccepted("kabul makbuzu bu adayi adlamiyor")
+    if type(report.receipt_id) is not str or \
+            receipt["receipt_id"] != report.receipt_id:
+        # the one field that ties the object in hand to the run on disk
+        raise CandidateNotAccepted("kabul raporu makbuzla eslesmiyor")
+
+
 def _bind_task(task_path, repo: Path, manifest_digest: str, baseline_sha: str):
     """The exact manifest bytes, and the run they were issued for."""
     path = Path(_exact_text(task_path, "gorev dosyasi yolu"))
@@ -1065,6 +1111,11 @@ def apply_accepted_candidate(*, repo, state_dir, task_path, manifest_digest,
     _assert_report(acceptance_report, candidate, run_id=run_id,
                    workspace_id=workspace_id, baseline_sha=baseline_sha,
                    manifest_digest=manifest_digest)
+    binding = {"repo_id": state_module.repo_identity(repo_path),
+               "run_id": run_id, "workspace_id": workspace_id,
+               "baseline_sha": baseline_sha,
+               "manifest_digest": manifest_digest}
+    _assert_receipt(acceptance_report, candidate, state_path, binding)
     if not candidate.changes:
         raise ApplicationRefused("uygulanacak degisiklik yok")
 

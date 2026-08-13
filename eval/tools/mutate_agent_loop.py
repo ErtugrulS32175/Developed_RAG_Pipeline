@@ -503,6 +503,15 @@ MUTATIONS = [
      + "             for item in observed) != expected:",
      "    if False:",
      "test_a_late_change_anywhere_is_not_a_success"),
+    # B2B-C2-R1: the authority itself. Removing this call leaves the
+    # report's own field checks standing -- which is exactly the state
+    # the package shipped in and which a hand-built report walked
+    # straight through, so the mutant has to be caught by the
+    # no-receipt test rather than by any of them.
+    ("b2bc2-makbuz-otoritesi", "application",
+     "    _assert_receipt(acceptance_report, candidate, state_path, binding)",
+     "    pass",
+     "test_a_report_built_by_hand_without_a_gate_is_refused"),
 ]
 
 

@@ -26,6 +26,7 @@ counting it counts main-tree writes exactly.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import secrets
 import shutil
@@ -40,6 +41,7 @@ import test_agent_loop_b2_changes as legacy
 from tools.agent_loop import (acceptance, acceptance_workspace, application,
                               application_transport, changes, contract,
                               flat_workspace, fs_evidence, state)
+from tools.agent_loop import process as process_module
 
 RUN = legacy.RUN
 SENTINEL = "GIZLI-ICERIK-9182-OMEGA"
@@ -106,41 +108,56 @@ def verified_for(world, **overrides):
     return world_module.verified_for(world, **overrides)
 
 
-def report_for(world, candidate=None, **overrides):
-    """The `AcceptanceReport` a passing acceptance run WOULD have
-    produced for the candidate currently on disk.
+def accept(world, **overrides):
+    """THE REAL GATE. Commands actually run, in a real disposable mirror,
+    and the persisted receipt is a side effect of that having happened.
 
-    Built rather than obtained from a real run because the whole point of
-    the fingerprint binding is that the report is compared against a
-    FRESH derivation -- so a test that wants a stale or forged receipt has
-    to be able to spell one. Test 1 proves the real `run_acceptance`
-    fills these fields itself."""
-    if candidate is None:
-        candidate = changes.derive_candidate_changes(**world.identity)
-    results = tuple(
-        acceptance.AcceptanceCommandResult(
-            command_id=command_id, passed=True, exit_code=0, duration_ms=1,
-            stdout_bytes=0, stderr_bytes=0,
-            event=contract.EventCode.ACCEPTANCE_FINISHED)
-        for command_id, _ in candidate.acceptance_commands)
-    fields = {"run_id": candidate.run_id,
-              "workspace_id": candidate.workspace_id,
-              "baseline_sha": candidate.baseline_sha, "passed": True,
-              "command_results": results, "total_duration_ms": 5,
-              "event": contract.EventCode.ACCEPTANCE_FINISHED,
-              "manifest_digest": world.digest,
-              "candidate_fingerprint": candidate.fingerprint,
-              "command_plan_digest": acceptance.command_plan_digest(
-                  candidate.acceptance_commands)}
+    NO TEST IN THIS FILE FABRICATES A PASSING RECEIPT. The previous
+    revision had a helper that built an `AcceptanceReport` with the
+    public constructor and handed it to the apply seam, and every success
+    path here used it -- so the whole battery was green against a
+    candidate no gate had ever seen. That is the defect this revision
+    closes, and a helper that could still spell a receipt would quietly
+    reopen it, which is why there is no such helper and no production
+    seam that writes one."""
+    settings = {"timeout_seconds": 300, "max_output_bytes": 65536}
+    settings.update(overrides)
+    return acceptance.run_acceptance(
+        **world.identity, verified_changes=verified_for(world), **settings)
+
+
+def forged_report(real, **overrides):
+    """A report built with the EXACT public constructor.
+
+    Only ever used on refusal paths, and only to make one field wrong at
+    a time: the point of each such test is that the object is exactly the
+    right type and still is not authority."""
+    fields = {field: getattr(real, field)
+              for field in acceptance.AcceptanceReport.__slots__}
     fields.update(overrides)
     return acceptance.AcceptanceReport(**fields)
 
 
 def apply_it(world, **overrides):
-    settings = {"verified_changes": verified_for(world),
-                "acceptance_report": report_for(world)}
+    settings = {}
+    if "verified_changes" not in overrides:
+        settings["verified_changes"] = verified_for(world)
+    if "acceptance_report" not in overrides:
+        settings["acceptance_report"] = accept(world)
     settings.update(overrides)
     return application.apply_accepted_candidate(**world.identity, **settings)
+
+
+def receipt_of(world):
+    return acceptance.read_receipt(world.state_dir)
+
+
+def overwrite_receipt(world, payload):
+    """Tamper with the persisted receipt, as an attacker would: raw bytes
+    straight onto the file, never through a production seam."""
+    acceptance.receipt_path(world.state_dir).write_bytes(
+        json.dumps(payload).encode("utf-8") if payload is not None
+        else b"{ bozuk")
 
 
 def main_view(repo):
@@ -206,6 +223,27 @@ def writes(monkeypatch):
     return seen
 
 
+@pytest.fixture
+def gate_runs(private_roots, monkeypatch):
+    """Counts processes launched INSIDE the acceptance mirror.
+
+    Narrowed by working directory on purpose: `flat_workspace.create()`
+    runs git through the same seam with the repository as its cwd, so a
+    recorder that counted every launch would make "the gate never ran"
+    measure the fixture instead of the claim."""
+    seen = []
+    real_popen = process_module.subprocess.Popen
+    mirror_root = str(private_roots.mirror).casefold()
+
+    def recorder(argv, **kwargs):
+        if mirror_root in str(kwargs.get("cwd", "")).casefold():
+            seen.append(argv[0])
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(process_module.subprocess, "Popen", recorder)
+    return seen
+
+
 @pytest.fixture(autouse=True)
 def no_apply_residue(tmp_path):
     """Nothing this turn created under the sibling apply root may survive
@@ -234,10 +272,7 @@ def test_the_acceptance_report_binds_the_candidate_it_tested(tmp_path):
     world = build_world(tmp_path)
     edit(world, "pipeline/yeni.py", "VALUE = 7\n")
     candidate = changes.derive_candidate_changes(**world.identity)
-    report = acceptance.run_acceptance(**world.identity,
-                                       verified_changes=verified_for(world),
-                                       timeout_seconds=300,
-                                       max_output_bytes=65536)
+    report = accept(world)
     assert report.passed is True, "kabul kosusu gecmeliydi"
     assert report.manifest_digest == world.digest
     assert report.candidate_fingerprint == candidate.fingerprint
@@ -255,27 +290,31 @@ def test_a_candidate_edited_after_acceptance_never_reaches_the_checkout(
     between the gate and the apply is a DIFFERENT candidate, and the
     fresh derivation is what says so.
 
-    THE VERIFIED CHANGE SET IS DELIBERATELY FRESH. Making it stale too
-    would be the realistic shape and a USELESS test: the change-set
-    comparison would refuse first, this gate would never run, and
-    deleting it would leave the test green. So only the RECEIPT is stale,
-    which leaves exactly one gate that can answer -- and the sentence is
-    asserted, because both gates raise the same type."""
+    EVERY OTHER GATE IS DELIBERATELY SATISFIED. The realistic shape --
+    a stale change set AND a stale receipt AND a stale report -- would be
+    a USELESS test: three gates would answer, the earliest would win, and
+    deleting this one would leave it green. So acceptance is run TWICE,
+    the second time on the candidate actually on disk, and only the
+    report's own fingerprint is rolled back to the first run's. The
+    sentence is asserted, because several gates raise this type."""
     world = build_world(tmp_path)
     edit(world, "pipeline/yeni.py", "VALUE = 7\n")
-    report = report_for(world)
-    # the edit the report cannot possibly have covered
+    stale = accept(world)
+    # the edit the first receipt cannot possibly have covered, followed
+    # by a REAL second gate so the persisted receipt is current
     edit(world, "pipeline/yeni.py", f"VALUE = 8  # {SENTINEL}\n")
+    current = accept(world)
     fresh = changes.derive_candidate_changes(**world.identity)
-    assert fresh.fingerprint != report.candidate_fingerprint, \
+    assert stale.candidate_fingerprint != fresh.fingerprint, \
         "senaryo kurulmadi: aday degismemis"
-    verified = verified_for(world)
-    assert verified.fingerprint == fresh.fingerprint, \
-        "senaryo kurulmadi: dogrulanmis kume de bayat"
+    assert receipt_of(world)["candidate_fingerprint"] == fresh.fingerprint, \
+        "senaryo kurulmadi: makbuz da bayat"
+    report = forged_report(
+        current, candidate_fingerprint=stale.candidate_fingerprint)
 
     before = main_view(world.repo)
     with pytest.raises(application.CandidateNotAccepted) as raised:
-        apply_it(world, verified_changes=verified, acceptance_report=report)
+        apply_it(world, acceptance_report=report)
     assert str(raised.value) == "kabul raporu baska bir adayi adliyor"
     assert writes == [], "ret oncesi ana agaca yazildi"
     assert difference(before, main_view(world.repo)) == ()
@@ -295,33 +334,34 @@ def test_a_receipt_that_is_not_an_acceptance_report_is_refused(
     authority for "this candidate was tested"."""
     world = build_world(tmp_path)
     edit(world, "pipeline/yeni.py", "VALUE = 7\n")
-    candidate = changes.derive_candidate_changes(**world.identity)
-    report = report_for(world, candidate)
-    passing = report.command_results[0]
+    # a REAL gate first, so the persisted receipt is valid and each case
+    # below is refused by the report check rather than by a missing one
+    real = accept(world)
+    passing = real.command_results[0]
 
     if break_it == "altsinif":
         class Sahte(acceptance.AcceptanceReport):
             __slots__ = ()
-        report = Sahte(**{field: getattr(report, field)
+        report = Sahte(**{field: getattr(real, field)
                           for field in acceptance.AcceptanceReport.__slots__})
         assert isinstance(report, acceptance.AcceptanceReport), \
             "senaryo kurulmadi: altsinif degil"
     elif break_it == "gecmedi":
-        report = report_for(world, candidate, passed=False)
+        report = forged_report(real, passed=False)
     elif break_it == "eksik-sonuc":
-        report = report_for(world, candidate, command_results=())
+        report = forged_report(real, command_results=())
     elif break_it == "yabanci-kosu":
-        report = report_for(world, candidate, run_id="baska-kosu-1")
+        report = forged_report(real, run_id="baska-kosu-1")
     elif break_it == "plan-ozeti":
-        report = report_for(world, candidate, command_plan_digest="0" * 64)
+        report = forged_report(real, command_plan_digest="0" * 64)
     elif break_it == "gorev-ozeti":
-        report = report_for(world, candidate, manifest_digest="0" * 64)
+        report = forged_report(real, manifest_digest="0" * 64)
     else:
         forged = types.SimpleNamespace(
             command_id=passing.command_id, passed=True, exit_code=0,
             duration_ms=1, stdout_bytes=0, stderr_bytes=0,
             event=passing.event)
-        report = report_for(world, candidate, command_results=(forged,))
+        report = forged_report(real, command_results=(forged,))
 
     before = main_view(world.repo)
     with pytest.raises((application.CandidateNotAccepted,
@@ -342,7 +382,9 @@ def test_the_exact_task_state_and_workspace_bindings_are_required(
     verified against."""
     world = build_world(tmp_path)
     edit(world, "pipeline/yeni.py", "VALUE = 7\n")
-    verified, report = verified_for(world), report_for(world)
+    # the gate runs FIRST and honestly; every break below happens after
+    # it, so each case is refused by the binding it names
+    verified, report = verified_for(world), accept(world)
     identity = dict(world.identity)
 
     if break_it == "gorev-degisti":
@@ -369,6 +411,302 @@ def test_the_exact_task_state_and_workspace_bindings_are_required(
             **identity, verified_changes=verified, acceptance_report=report)
     assert writes == [], "ret oncesi ana agaca yazildi"
     assert difference(before, main_view(world.repo)) == ()
+
+
+# ---------------------------------------------------------------------
+# THE PERSISTED RECEIPT IS THE AUTHORITY (B2B-C2-R1)
+# ---------------------------------------------------------------------
+
+def test_a_report_built_by_hand_without_a_gate_is_refused(tmp_path, writes,
+                                                          gate_runs):
+    """THE P0 THIS REVISION EXISTS FOR, measured on the commit before it.
+
+    `AcceptanceReport` is a public dataclass, so its constructor is
+    public. On the previous commit a report built by hand -- exact type,
+    every digest honestly derived from fresh evidence -- applied a
+    candidate to the operator's checkout with ZERO acceptance commands
+    launched and ZERO mirrors created. `type(report) is AcceptanceReport`
+    proves the CLASS; it says nothing about whether the gate ran.
+
+    Nothing here is stubbed to make the forgery work: it is the real
+    class, filled with the truth, and the only thing missing is a run."""
+    world = build_world(tmp_path)
+    edit(world, "pipeline/yeni.py", f"VALUE = 7  # {SENTINEL}\n")
+    candidate = changes.derive_candidate_changes(**world.identity)
+    report = acceptance.AcceptanceReport(
+        run_id=candidate.run_id, workspace_id=candidate.workspace_id,
+        baseline_sha=candidate.baseline_sha, passed=True,
+        command_results=tuple(
+            acceptance.AcceptanceCommandResult(
+                command_id=command_id, passed=True, exit_code=0,
+                duration_ms=1, stdout_bytes=0, stderr_bytes=0,
+                event=contract.EventCode.ACCEPTANCE_FINISHED)
+            for command_id, _ in candidate.acceptance_commands),
+        total_duration_ms=5, event=contract.EventCode.ACCEPTANCE_FINISHED,
+        manifest_digest=world.digest,
+        candidate_fingerprint=candidate.fingerprint,
+        command_plan_digest=acceptance.command_plan_digest(
+            candidate.acceptance_commands),
+        receipt_id="a" * 32)
+    assert type(report) is acceptance.AcceptanceReport, \
+        "senaryo kurulmadi: exact constructor kullanilmadi"
+    assert gate_runs == [], "senaryo kurulmadi: kabul komutu calismis"
+    assert not acceptance.receipt_path(world.state_dir).exists(), \
+        "senaryo kurulmadi: makbuz zaten var"
+
+    before = main_view(world.repo)
+    with pytest.raises(application.CandidateNotAccepted):
+        apply_it(world, acceptance_report=report)
+
+    assert gate_runs == [], "ret sirasinda kabul komutu calisti"
+    assert writes == [], "makbuzsuz rapor ana agaca yazdi"
+    assert difference(before, main_view(world.repo)) == ()
+    assert not (world.repo / "pipeline" / "yeni.py").exists()
+    assert application.find_pending_applications(world.repo) == (), \
+        "ret oncesi journal olustu"
+
+
+def test_a_real_gate_writes_pending_then_passed_and_the_apply_follows(
+        tmp_path, gate_runs):
+    """The lifecycle, in order, with the ordering itself measured.
+
+    `pending` has to be on disk BEFORE the first acceptance process
+    starts -- that is what makes a crash fail closed instead of leaving
+    an older green result standing -- and `passed` only after every
+    command has finished."""
+    world = build_world(tmp_path)
+    edit(world, "pipeline/yeni.py", "VALUE = 7\n")
+    seen = []
+    real_popen = process_module.subprocess.Popen
+    mirror_root = str(tmp_path / "ayna-koku").casefold()
+
+    def observer(argv, **kwargs):
+        if mirror_root in str(kwargs.get("cwd", "")).casefold():
+            try:
+                seen.append(receipt_of(world)["status"])
+            except acceptance.AcceptanceError:
+                seen.append(None)
+        return real_popen(argv, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(process_module.subprocess, "Popen", observer)
+        report = accept(world)
+
+    assert seen, "senaryo kurulmadi: hic kabul sureci calismadi"
+    assert set(seen) == {acceptance.STATUS_PENDING}, \
+        f"ilk surecten once pending yazilmamis: {seen}"
+    persisted = receipt_of(world)
+    assert persisted["status"] == acceptance.STATUS_PASSED
+    assert persisted["receipt_id"] == report.receipt_id
+    assert persisted["command_count"] == len(report.command_results)
+
+    outcome = apply_it(world, acceptance_report=report)
+    assert outcome.applied_files == ("pipeline/yeni.py",)
+    assert read(world.repo / "pipeline" / "yeni.py") == "VALUE = 7\n"
+
+
+@pytest.mark.parametrize("state_of", ["yok", "pending", "failed", "bilinmeyen"])
+def test_a_receipt_that_does_not_say_passed_is_refused(tmp_path, writes,
+                                                       state_of):
+    """Only `passed` is permission. `pending` is a run that started and
+    never finished -- exactly what a crash leaves -- and treating it as
+    anything but a refusal is how an interrupted gate becomes a green
+    one."""
+    world = build_world(tmp_path)
+    edit(world, "pipeline/yeni.py", "VALUE = 7\n")
+    report = accept(world)
+    persisted = receipt_of(world)
+    assert persisted["status"] == acceptance.STATUS_PASSED, "senaryo kurulmadi"
+
+    if state_of == "yok":
+        acceptance.receipt_path(world.state_dir).unlink()
+    else:
+        overwrite_receipt(world, {**persisted, "status": state_of})
+
+    before = main_view(world.repo)
+    with pytest.raises(application.CandidateNotAccepted):
+        apply_it(world, acceptance_report=report)
+    assert writes == [], "gecmemis makbuzla ana agaca yazildi"
+    assert difference(before, main_view(world.repo)) == ()
+    assert application.find_pending_applications(world.repo) == ()
+
+
+@pytest.mark.parametrize("field", ["repo_id", "run_id", "workspace_id",
+                                   "baseline_sha", "manifest_digest",
+                                   "candidate_fingerprint",
+                                   "command_plan_digest", "command_count",
+                                   "receipt_id"])
+def test_a_receipt_that_names_something_else_is_refused(tmp_path, writes,
+                                                        field):
+    """Every identity the receipt carries is compared against evidence
+    this call derived for itself. A receipt that is valid, `passed` and
+    about a DIFFERENT run is the most plausible forgery there is -- it
+    can simply be copied from another state directory."""
+    world = build_world(tmp_path)
+    edit(world, "pipeline/yeni.py", "VALUE = 7\n")
+    report = accept(world)
+    persisted = receipt_of(world)
+    replacement = {"command_count": persisted["command_count"] + 1,
+                   "run_id": "baska-kosu-1"}.get(
+        field, "b" * len(str(persisted[field])))
+    assert replacement != persisted[field], "senaryo kurulmadi: alan ayni"
+    overwrite_receipt(world, {**persisted, field: replacement})
+
+    before = main_view(world.repo)
+    with pytest.raises(application.CandidateNotAccepted):
+        apply_it(world, acceptance_report=report)
+    assert writes == [], "yabanci makbuzla ana agaca yazildi"
+    assert difference(before, main_view(world.repo)) == ()
+
+
+@pytest.mark.parametrize("shape", ["bozuk-json", "sema-disi", "baglanti"])
+def test_a_receipt_that_is_corrupt_or_a_link_is_refused(tmp_path, writes,
+                                                        shape):
+    """A receipt is read through a HANDLE, not resolved as a path.
+
+    The link case is a real filesystem object pointing at a real file
+    outside the state directory: without the no-follow open, the gate
+    would happily read whatever it addresses."""
+    world = build_world(tmp_path)
+    edit(world, "pipeline/yeni.py", "VALUE = 7\n")
+    report = accept(world)
+    persisted = receipt_of(world)
+    target = acceptance.receipt_path(world.state_dir)
+    outside = tmp_path / "disarisi"
+    outside.mkdir()
+
+    if shape == "bozuk-json":
+        overwrite_receipt(world, None)
+    elif shape == "sema-disi":
+        overwrite_receipt(world, {**persisted, "kurgu_alani": 1})
+    else:
+        planted = outside / "kanarya-makbuz.json"
+        planted.write_bytes(json.dumps(persisted).encode("utf-8"))
+        target.unlink()
+        if os.name == "nt":
+            done = subprocess.run(["cmd", "/c", "mklink", str(target),
+                                   str(planted)], capture_output=True)
+            if done.returncode != 0:
+                pytest.skip("bu makinede sembolik baglanti olusturulamiyor")
+            planted_ok = bool(os.lstat(target).st_file_attributes & 0x400)
+        else:
+            os.symlink(planted, target)
+            planted_ok = os.path.islink(target)
+        assert planted_ok, "senaryo kurulmadi: makbuz bir baglanti degil"
+        assert json.loads(target.read_text(encoding="utf-8")) == persisted, \
+            "senaryo kurulmadi: baglanti gecerli bir makbuzu gostermiyor"
+
+    before = main_view(world.repo)
+    with pytest.raises(application.CandidateNotAccepted):
+        apply_it(world, acceptance_report=report)
+    assert writes == [], "bozuk makbuzla ana agaca yazildi"
+    assert difference(before, main_view(world.repo)) == ()
+    if shape == "baglanti":
+        assert json.loads(
+            (outside / "kanarya-makbuz.json").read_text(encoding="utf-8")) \
+            == persisted, "disaridaki kanarya degisti"
+
+
+def test_a_failed_second_gate_invalidates_the_earlier_passed_receipt(tmp_path,
+                                                                     writes):
+    """A green result may never be inherited.
+
+    The second run's commands fail, so the receipt that was `passed`
+    becomes `failed` -- and the FIRST run's report, which is still a
+    perfectly valid object, stops being usable with it. Keeping the old
+    receipt around and only refusing the new report would leave exactly
+    the hole this closes."""
+    world = build_world(tmp_path)
+    edit(world, "pipeline/yeni.py", "VALUE = 7\n")
+    first = accept(world)
+    assert receipt_of(world)["status"] == acceptance.STATUS_PASSED
+
+    # the same candidate path, now carrying a test that fails
+    edit(world, "pipeline/test_gecer.py",
+         "def test_kurgu():\n    assert False\n")
+    second = accept(world)
+    assert second.passed is False, "senaryo kurulmadi: ikinci kapi gecti"
+    assert receipt_of(world)["status"] == acceptance.STATUS_FAILED
+
+    before = main_view(world.repo)
+    for report in (first, second):
+        with pytest.raises(application.CandidateNotAccepted):
+            apply_it(world, acceptance_report=report)
+    assert writes == [], "basarisiz ikinci kapidan sonra yazildi"
+    assert difference(before, main_view(world.repo)) == ()
+
+
+def test_an_interrupt_during_the_gate_leaves_no_passed_receipt(tmp_path,
+                                                               writes):
+    """An operator's Ctrl-C during acceptance is not a pass.
+
+    The receipt is already `pending` when the interrupt lands, so the
+    guard holds even if nothing further can be written -- and the
+    interrupt itself travels out exactly as it arrived."""
+    world = build_world(tmp_path)
+    edit(world, "pipeline/yeni.py", "VALUE = 7\n")
+    good = accept(world)
+    assert receipt_of(world)["status"] == acceptance.STATUS_PASSED, \
+        "senaryo kurulmadi: once gecen bir makbuz gerekiyor"
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(acceptance, "_measure",
+                      lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt))
+        with pytest.raises(KeyboardInterrupt):
+            accept(world)
+
+    assert receipt_of(world)["status"] != acceptance.STATUS_PASSED, \
+        "kesme sonrasi makbuz hala gecmis gorunuyor"
+    before = main_view(world.repo)
+    with pytest.raises(application.CandidateNotAccepted):
+        apply_it(world, acceptance_report=good)
+    assert writes == [], "kesilmis kapidan sonra ana agaca yazildi"
+    assert difference(before, main_view(world.repo)) == ()
+
+
+def test_a_receipt_that_cannot_be_persisted_blocks_the_report(tmp_path,
+                                                              gate_runs):
+    """A status this lifecycle cannot demonstrate on disk is a status
+    nothing downstream can verify, so no report is built at all.
+
+    Two moments matter and both are covered: if the PENDING write fails
+    no acceptance process may start, and if the final write fails the
+    run may not hand back a passing report."""
+    world = build_world(tmp_path)
+    edit(world, "pipeline/yeni.py", "VALUE = 7\n")
+    real_write = state.write_json_atomically
+
+    def refuse_first(path, payload, schema, what):
+        if str(path).endswith(acceptance.RECEIPT_NAME):
+            raise OSError("kurgu makbuz yazma arizasi")
+        return real_write(path, payload, schema, what)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(acceptance.state_module, "write_json_atomically",
+                      refuse_first)
+        with pytest.raises(acceptance.AcceptanceError):
+            accept(world)
+    assert gate_runs == [], "makbuz yazilamadan kabul sureci baslatildi"
+    assert not acceptance.receipt_path(world.state_dir).exists()
+
+    calls = []
+
+    def refuse_final(path, payload, schema, what):
+        if str(path).endswith(acceptance.RECEIPT_NAME):
+            calls.append(payload["status"])
+            if payload["status"] != acceptance.STATUS_PENDING:
+                raise OSError("kurgu makbuz guncelleme arizasi")
+        return real_write(path, payload, schema, what)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(acceptance.state_module, "write_json_atomically",
+                      refuse_final)
+        with pytest.raises(acceptance.AcceptanceError):
+            accept(world)
+    assert acceptance.STATUS_PASSED in calls, \
+        "senaryo kurulmadi: son guncelleme hic denenmedi"
+    assert receipt_of(world)["status"] == acceptance.STATUS_PENDING, \
+        "guncellenemeyen makbuz gecmis olarak kaldi"
 
 
 # ---------------------------------------------------------------------

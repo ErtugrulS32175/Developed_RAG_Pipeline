@@ -43,16 +43,21 @@ operating system's own error text.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from jsonschema import Draft202012Validator, ValidationError
+
 from tools.agent_loop import (acceptance_workspace, changes, cli, contract,
-                              flat_workspace, preflight, process, schemas)
+                              flat_workspace, fs_transport, preflight, process,
+                              schemas, state as state_module)
 
 _POLL_SECONDS = 0.02
 
@@ -89,6 +94,81 @@ _EVENTS = {COMPLETED: contract.EventCode.ACCEPTANCE_FINISHED,
 # nothing is discovered inside the mirror and no task can choose an
 # interpreter.
 _PROGRAM_SUFFIXES = ("", ".exe", ".cmd", ".bat") if os.name == "nt" else ("",)
+
+
+# ---------------------------------------------------------------------
+# THE PERSISTED RECEIPT (B2B-C2-R1)
+# ---------------------------------------------------------------------
+#
+# WHY A FILE AND NOT THE REPORT. `AcceptanceReport` is a TRANSPORT
+# OBJECT, and the first version of the application gate treated it as an
+# authority: it checked `type(report) is AcceptanceReport` and took the
+# rest on trust. But a dataclass's constructor is public. Measured on the
+# commit before this one -- exact type, every digest honestly derived,
+# ZERO acceptance commands launched, ZERO mirrors created -- and the
+# candidate landed in the operator's checkout. Proving the CLASS proves
+# nothing about the RUN.
+#
+# So the authority is a file only this lifecycle writes: a fixed name in
+# the runner-owned state directory, written atomically, validated against
+# a closed schema, and read back through a handle before it is believed.
+# The caller cannot name it, cannot supply it and cannot pass a path to
+# it -- there is no parameter for one anywhere in this module or in the
+# application seam.
+#
+# WHAT IT MAY NOT CARRY, for the same reason nothing else here may: no
+# argv, no working directory, no environment, no captured output, no
+# duration, no file or corpus name, no absolute path and no free text.
+# Identity and closed codes only.
+
+RECEIPT_NAME = "acceptance-receipt.json"
+RECEIPT_VERSION = 1
+RECEIPT_CEILING = 8192
+
+# A run that has STARTED, one that FINISHED green, one that did not.
+# `pending` is the state a crash leaves behind, and the application layer
+# refuses it -- which is what makes an interrupted acceptance fail closed
+# rather than fall back on whatever was there before.
+STATUS_PENDING = "pending"
+STATUS_PASSED = "passed"
+STATUS_FAILED = "failed"
+ALL_RECEIPT_STATUSES = (STATUS_PENDING, STATUS_PASSED, STATUS_FAILED)
+
+RECEIPT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["protocol_version", "receipt_version", "receipt_id",
+                 "repo_id", "run_id", "workspace_id", "baseline_sha",
+                 "manifest_digest", "candidate_fingerprint",
+                 "command_plan_digest", "status", "command_count"],
+    "properties": {
+        "protocol_version": {"const": contract.PROTOCOL_VERSION},
+        "receipt_version": {"const": RECEIPT_VERSION},
+        "receipt_id": {"type": "string", "pattern": r"^[0-9a-f]{32}$"},
+        # identity, never a location: an absolute path in a receipt is an
+        # absolute path in whatever prints the receipt
+        "repo_id": {"type": "string", "pattern": r"^[0-9a-f]{32}$"},
+        "run_id": {"type": "string", "pattern": contract.IDENTIFIER_PATTERN},
+        "workspace_id": {"type": "string", "pattern": r"^[0-9a-f]{32}$"},
+        "baseline_sha": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
+        "manifest_digest": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+        "candidate_fingerprint": {"type": "string",
+                                  "pattern": r"^[0-9a-f]{64}$"},
+        "command_plan_digest": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+        "status": {"enum": list(ALL_RECEIPT_STATUSES)},
+        "command_count": {"type": "integer", "minimum": 0, "maximum": 1000},
+    },
+}
+_RECEIPT_VALIDATOR = Draft202012Validator(RECEIPT_SCHEMA)
+
+
+def receipt_path(state_dir) -> Path:
+    """The ONE file a run's receipt can be.
+
+    A constant, not a parameter. A caller-chosen receipt location is a
+    caller-chosen authority, which is the defect this whole mechanism
+    exists to close."""
+    return Path(state_dir) / RECEIPT_NAME
 
 
 class AcceptanceError(RuntimeError):
@@ -163,9 +243,11 @@ class AcceptanceReport:
     the commands, which command plan was actually resolved, and which
     change set was on disk while they ran.
 
-    IT IS STILL NOT A FILESYSTEM AUTHORITY. It is a closed receipt, and
-    the only thing it may ever be used for is comparison against evidence
-    derived FRESH at the moment of use."""
+    IT IS NOT AN AUTHORITY AT ALL (B2B-C2-R1). This class is public and
+    so is its constructor, so holding one proves only that somebody could
+    type its field names. `receipt_id` is what ties an instance to a run
+    that actually happened: the matching value exists in a file only
+    `run_acceptance` writes, and the application layer believes THAT."""
 
     run_id: str
     workspace_id: str
@@ -177,6 +259,7 @@ class AcceptanceReport:
     manifest_digest: str
     candidate_fingerprint: str
     command_plan_digest: str
+    receipt_id: str
 
 
 def command_plan_digest(references) -> str:
@@ -283,6 +366,111 @@ def _assert_manifest(task_file: Path, expected: str) -> None:
         raise AcceptanceRefused(
             "gorev dosyasi degistirildi",
             reason=contract.StopReason.PATH_NOT_ALLOWED)
+
+
+def read_receipt(state_dir):
+    """The persisted receipt, read back THROUGH A HANDLE.
+
+    Not `open(path)` after an `lstat(path)`: that is two questions, and
+    D2 measured the answer changing between them three times. The state
+    directory is opened with the evidence transport's no-follow root
+    open, the entry is taken from that listing, and the file is opened
+    relative to the object that listed it -- so a receipt replaced by a
+    symlink or a junction is refused rather than followed.
+
+    Raises rather than answering `None` for a missing one: every caller
+    of this needs a receipt, and "there wasn't one" is a refusal."""
+    root = _transport_root(state_dir)
+    try:
+        records = _transport(fs_transport.list_directory, root,
+                             message="durum dizini listelenemedi")
+        record = next((item for item in records
+                       if item.name == RECEIPT_NAME), None)
+        if record is None:
+            raise AcceptanceRefused(
+                "kabul makbuzu yok", reason=contract.StopReason.PATH_NOT_ALLOWED)
+        if record.kind != "file" or record.reparse_tag:
+            raise AcceptanceRefused(
+                "kabul makbuzu siradan bir dosya degil",
+                reason=contract.StopReason.PATH_NOT_ALLOWED)
+        descriptor = _transport(fs_transport.open_child_file, root, record,
+                                message="kabul makbuzu acilamadi")
+        try:
+            data = _read_descriptor(descriptor, RECEIPT_CEILING)
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise AcceptanceRefused(
+                    "kabul makbuzu kapatilamadi") from None
+    finally:
+        try:
+            fs_transport.close_directory(root)
+        except (fs_transport.TransportError, OSError):
+            pass
+    try:
+        payload = json.loads(data.decode("utf-8"))
+        _RECEIPT_VALIDATOR.validate(payload)
+    except (UnicodeDecodeError, ValueError, ValidationError):
+        raise AcceptanceRefused(
+            "kabul makbuzu sozlesmeye uymuyor",
+            reason=contract.StopReason.PATH_NOT_ALLOWED) from None
+    return payload
+
+
+def _transport_root(state_dir):
+    try:
+        return fs_transport.open_root(Path(state_dir))
+    except fs_transport.TransportError:
+        raise AcceptanceRefused("durum dizini acilamadi") from None
+    except OSError:
+        raise AcceptanceRefused("durum dizini acilamadi") from None
+
+
+def _transport(call, *args, message):
+    """EVERY transport call goes through here. A `TransportError` already
+    carries a fixed sentence; anything else -- above all a raw `OSError`,
+    whose text names absolute paths -- is replaced by one."""
+    try:
+        return call(*args)
+    except fs_transport.TransportError as refused:
+        raise AcceptanceRefused(str(refused)) from None
+    except OSError:
+        raise AcceptanceRefused(message) from None
+
+
+def _read_descriptor(descriptor: int, ceiling: int) -> bytes:
+    """Bounded WHILE reading. A ceiling applied after the bytes are in
+    the process is a report, not a bound."""
+    chunks, read = [], 0
+    while True:
+        try:
+            block = os.read(descriptor, 4096)
+        except OSError:
+            raise AcceptanceRefused("kabul makbuzu okunamadi") from None
+        if not block:
+            return b"".join(chunks)
+        read += len(block)
+        if read > ceiling:
+            raise AcceptanceRefused("kabul makbuzu tavani asiyor")
+        chunks.append(block)
+
+
+def _persist_receipt(state_dir, payload):
+    """Write the receipt atomically and PROVE it landed.
+
+    The read-back is not ceremony: `write_json_atomically` can return
+    having written to a directory somebody swapped underneath it, and a
+    status this lifecycle cannot demonstrate on disk is a status the
+    application layer must never act on."""
+    try:
+        state_module.write_json_atomically(receipt_path(state_dir), payload,
+                                           RECEIPT_SCHEMA, "kabul makbuzu")
+    except (state_module.StateError, OSError):
+        raise AcceptanceRefused("kabul makbuzu yazilamadi") from None
+    if read_receipt(state_dir) != payload:
+        raise AcceptanceRefused("kabul makbuzu geri okunamadi")
+    return payload
 
 
 def _resolve(reference):
@@ -627,7 +815,78 @@ def run_acceptance(*, repo, state_dir, task_path, manifest_digest, run_id,
         workspace_id=workspace_id, baseline_sha=baseline_sha)
     wants_corpus = any(command_id == "leak_scan" for command_id, _ in commands)
 
+    # THE RECEIPT IS WRITTEN BEFORE ANYTHING RUNS, and it is written
+    # PENDING. Two things follow, both deliberate: an earlier `passed`
+    # receipt for this run is invalidated the moment a new attempt
+    # begins -- so a green result can never be inherited by a later,
+    # worse one -- and a process that dies anywhere below leaves
+    # `pending`, which the application layer refuses. If this cannot be
+    # written and read back, no acceptance process is started at all.
+    receipt = _persist_receipt(state_path, {
+        "protocol_version": contract.PROTOCOL_VERSION,
+        "receipt_version": RECEIPT_VERSION,
+        "receipt_id": secrets.token_hex(16),
+        "repo_id": state_module.repo_identity(repo_path),
+        "run_id": run_id, "workspace_id": workspace_id,
+        "baseline_sha": baseline_sha, "manifest_digest": manifest_digest,
+        "candidate_fingerprint": candidate.fingerprint,
+        "command_plan_digest": command_plan_digest(
+            candidate.acceptance_commands),
+        "status": STATUS_PENDING, "command_count": len(commands)})
+
     started = time.monotonic()
+    try:
+        results = _measure(commands, repo_path=repo_path, workspace=workspace,
+                           run_id=run_id, baseline_sha=baseline_sha,
+                           candidate=candidate, wants_corpus=wants_corpus,
+                           timeout_seconds=timeout_seconds,
+                           max_output_bytes=max_output_bytes,
+                           task_file=task_file, digest=manifest_digest)
+    except BaseException:
+        # The receipt is already `pending`, which is refused downstream,
+        # so this is a CLARIFICATION rather than the guard. It is
+        # attempted and its own failure is consumed: a receipt that
+        # cannot be moved to `failed` is still not `passed`, and letting
+        # this replace the error that got us here would hide the cause.
+        try:
+            _persist_receipt(state_path, {**receipt, "status": STATUS_FAILED})
+        except (AcceptanceError, OSError):        # noqa: BLE001 -- consumed
+            pass
+        raise
+
+    passed = all(result.passed for result in results) \
+        and len(results) == len(commands)
+    # THE STATUS IS PERSISTED AND PROVEN BEFORE THE REPORT EXISTS. A
+    # `passed` report whose receipt could not be written is a report
+    # nothing downstream could verify, so it is never built.
+    _persist_receipt(state_path, {
+        **receipt, "status": STATUS_PASSED if passed else STATUS_FAILED})
+
+    return AcceptanceReport(
+        run_id=run_id, workspace_id=workspace_id, baseline_sha=baseline_sha,
+        passed=passed, command_results=tuple(results),
+        total_duration_ms=int((time.monotonic() - started) * 1000),
+        event=contract.EventCode.ACCEPTANCE_FINISHED,
+        # FROM THIS RUN'S OWN FRESH DERIVATION, never from the caller's
+        # arguments: `manifest_digest` arrived as a parameter and
+        # `candidate.fingerprint` was computed here, so a receipt cannot
+        # be made to name a candidate this run did not have in front of
+        # it. The plan is digested from the same manifest bytes that
+        # chose the commands actually resolved above.
+        manifest_digest=candidate.task_digest,
+        candidate_fingerprint=candidate.fingerprint,
+        command_plan_digest=command_plan_digest(candidate.acceptance_commands),
+        receipt_id=receipt["receipt_id"])
+
+
+def _measure(commands, *, repo_path, workspace, run_id, baseline_sha,
+             candidate, wants_corpus, timeout_seconds, max_output_bytes,
+             task_file, digest):
+    """Build the disposable mirror, run the commands, throw it away.
+
+    Split out of the public seam so the receipt lifecycle wraps it
+    whole: everything that can go wrong with a MIRROR now sits inside
+    one envelope that the receipt's `failed` write is outside of."""
     mirror = acceptance_workspace.create(
         repo=repo_path, workspace=workspace, run_id=run_id,
         baseline_sha=baseline_sha, candidate=candidate,
@@ -645,32 +904,15 @@ def run_acceptance(*, repo, state_dir, task_path, manifest_digest, run_id,
         # deadline: a command cannot buy itself more by being second.
         deadline = time.monotonic() + timeout_seconds
         _prepare_git(mirror, env, deadline, max_output_bytes)
-        results = _walk(commands, mirror=mirror, env=env, deadline=deadline,
-                        max_output_bytes=max_output_bytes,
-                        task_file=task_file, digest=manifest_digest)
+        return _walk(commands, mirror=mirror, env=env, deadline=deadline,
+                     max_output_bytes=max_output_bytes,
+                     task_file=task_file, digest=digest)
     finally:
         # EVERY exit -- success, refusal, timeout, interrupt. A mirror
         # that cannot be proven gone is a STRONGLY TYPED cleanup failure
         # rather than an ordinary red gate: one needs a rerun, the other
         # needs a human.
         acceptance_workspace.remove(mirror)
-
-    return AcceptanceReport(
-        run_id=run_id, workspace_id=workspace_id, baseline_sha=baseline_sha,
-        passed=all(result.passed for result in results)
-        and len(results) == len(commands),
-        command_results=tuple(results),
-        total_duration_ms=int((time.monotonic() - started) * 1000),
-        event=contract.EventCode.ACCEPTANCE_FINISHED,
-        # FROM THIS RUN'S OWN FRESH DERIVATION, never from the caller's
-        # arguments: `manifest_digest` arrived as a parameter and
-        # `candidate.fingerprint` was computed here, so a receipt cannot
-        # be made to name a candidate this run did not have in front of
-        # it. The plan is digested from the same manifest bytes that
-        # chose the commands actually resolved above.
-        manifest_digest=candidate.task_digest,
-        candidate_fingerprint=candidate.fingerprint,
-        command_plan_digest=command_plan_digest(candidate.acceptance_commands))
 
 
 def _prepare_git(mirror, env, deadline, max_output_bytes) -> None:
