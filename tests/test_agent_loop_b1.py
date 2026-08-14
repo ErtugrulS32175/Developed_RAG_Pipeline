@@ -1286,7 +1286,10 @@ def test_every_mutation_still_applies_to_the_current_source():
     # 90 -> 94 in B4-R6: four guards for the error-envelope classifier
     # (the is_error gate, unknown-stays-generic, the class mapping, and
     # the vendor subtype never becoming a recorded value).
-    assert len(tool.MUTATIONS) == 94
+    # 94 -> 98 in B4-R8: the same four intents on the EVALUATOR road --
+    # the exact whole-line gate, unknown-stays-generic, the two roads
+    # never sharing a code, and the marker never becoming a value.
+    assert len(tool.MUTATIONS) == 98
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1300,7 +1303,9 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b3-uygulama-once-onay', 'b4r2-tasima-semasi-otorite',
         'b4r3-zarf-hata-bayragi', 'b4r6-zarf-hata-kapisi',
         'b4r6-bilinmeyen-subtype', 'b4r6-sinif-esleme',
-        'b4r6-ham-subtype-sizintisi',
+        'b4r6-ham-subtype-sizintisi', 'b4r8-tam-eslesme-kapisi',
+        'b4r8-bilinmeyen-stderr', 'b4r8-yol-karismasi',
+        'b4r8-ham-stderr-sizintisi',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

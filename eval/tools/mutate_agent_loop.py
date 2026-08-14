@@ -34,7 +34,13 @@ MODULES = ("state", "locking", "preflight", "execution",
            # B3: the evaluator adapter and the runner that joins every
            # phase. A module absent from this tuple cannot be mutated at
            # all, so its guards would be pinned by nothing here.
-           "audit", "runner", "runner_events")
+           "audit", "runner", "runner_events",
+           # B4-R8: the frozen vocabulary itself. The failure-code table
+           # lives here, and a mutation that files one road's mechanism
+           # under the other road's code could not be expressed while
+           # this module was absent -- the harness raised `KeyError`
+           # instead of judging it.
+           "contract")
 NL = chr(10)
 
 BS = chr(92)
@@ -308,6 +314,49 @@ MUTATIONS = [
      '    return globals()[name](f"model sureci {subtype} sinirinda durdu",'
      + NL + "                           exit_code=exit_code, **measurements)",
      "test_the_classification_never_persists_the_envelope"),
+    # ----------------------------------------------------------------
+    # B4-R8 -- the EVALUATOR's non-zero exit, named from stderr that is
+    # still in a bounded buffer. Same four intents as B4-R6, on the road
+    # that had no failure code at all.
+    # ----------------------------------------------------------------
+    # 1. The match is EXACT and whole-line. Substring search is the
+    #    failure this gate was written against: four of the six near
+    #    misses in the battery contain the marker as a substring.
+    ("b4r8-tam-eslesme-kapisi", "audit",
+     "        name = STDERR_FAILURE_MARKERS.get(line)",
+     "        name = next((v for k, v in STDERR_FAILURE_MARKERS.items()"
+     + NL + "                     if k in line), None)",
+     "test_a_sentence_that_is_not_exactly_the_marker_is_not_classified"),
+    # 2. An unproven stderr must stay GENERIC. A default here hands
+    #    every unnamed refusal a confident code nobody measured.
+    ("b4r8-bilinmeyen-stderr", "audit",
+     "            return globals()[name](" + NL
+     + '                "denetci sureci bildirilen bir nedenle durdu",' + NL
+     + "                exit_code=exit_code, **measurements)" + NL
+     + "    return None",
+     "            return globals()[name](" + NL
+     + '                "denetci sureci bildirilen bir nedenle durdu",' + NL
+     + "                exit_code=exit_code, **measurements)" + NL
+     + '    return RepositoryRefused("denetci sureci bildirilen bir nedenle '
+     'durdu",' + NL + "                             exit_code=exit_code, "
+     "**measurements)",
+     "test_a_nonzero_evaluator_exit_with_unknown_stderr_stays_generic"),
+    # 3. The two roads share class NAMES and must never share codes: a
+    #    name-only lookup files an evaluator failure as an implementer
+    #    one, which is a confidently wrong code an operator acts on.
+    ("b4r8-yol-karismasi", "contract",
+     '    ("audit", "ProcessFailed"): FailureCode.EVALUATOR_PROCESS_FAILED,',
+     '    ("audit", "ProcessFailed"): FailureCode.IMPLEMENTER_PROCESS_FAILED,',
+     "test_the_two_roads_never_share_a_code"),
+    # 4. The matched line is a LOOKUP KEY and never a recorded value:
+    #    putting it in the message carries the vendor's own sentence
+    #    into every report the exception reaches.
+    ("b4r8-ham-stderr-sizintisi", "audit",
+     '                "denetci sureci bildirilen bir nedenle durdu",' + NL
+     + "                exit_code=exit_code, **measurements)",
+     '                f"denetci sureci durdu: {line}",' + NL
+     + "                exit_code=exit_code, **measurements)",
+     "test_no_stderr_byte_reaches_the_exception_that_names_it"),
     # ----------------------------------------------------------------
     # B2A -- the call boundary: validate once, canonicalize once, use
     # only the canonical value. Each mutation reopens exactly one of

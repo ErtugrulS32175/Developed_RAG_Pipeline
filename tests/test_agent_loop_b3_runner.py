@@ -36,8 +36,8 @@ import pytest
 
 import test_agent_loop_b2_changes as legacy
 import test_agent_loop_contract as base
-from tools.agent_loop import (acceptance, application, changes, contract,
-                              execution, flat_workspace, runner,
+from tools.agent_loop import (acceptance, application, audit, changes,
+                              contract, execution, flat_workspace, runner,
                               runner_events)
 from tools.agent_loop import process as process_module
 
@@ -1174,12 +1174,13 @@ def test_the_failure_vocabulary_and_the_event_schema_agree(world):
 
     from tools.agent_loop import schemas as schema_module
 
-    # 10 -> 14 in B4-R6: the four error-envelope classes. The COUNT is
-    # pinned rather than derived so that adding a code stays a decision
-    # somebody makes on purpose -- this assertion is what caught the
-    # addition, which is the whole reason it is a literal.
-    assert len(set(contract.ALL_FAILURE_CODES)) == 14
-    assert len(contract.ALL_FAILURE_CODES) == 14, "yinelenen basarisizlik kodu"
+    # 10 -> 14 in B4-R6: the four error-envelope classes. 14 -> 29 in
+    # B4-R8: the whole evaluator road, which had no code at all. The
+    # COUNT is pinned rather than derived so that adding a code stays a
+    # decision somebody makes on purpose -- this assertion is what caught
+    # both additions, which is the whole reason it is a literal.
+    assert len(set(contract.ALL_FAILURE_CODES)) == 29
+    assert len(contract.ALL_FAILURE_CODES) == 29, "yinelenen basarisizlik kodu"
     assert set(contract.FAILURE_CODES.values()) <= \
         set(contract.ALL_FAILURE_CODES)
     properties = schema_module.EVENT_SCHEMA["properties"]
@@ -1310,3 +1311,90 @@ def test_the_generic_process_failure_still_reads_as_generic(world):
     entry = _terminal_event(world, contract.EventCode.MODEL_CALL_FINISHED)
     assert entry["failure_code"] == \
         contract.FailureCode.IMPLEMENTER_PROCESS_FAILED
+
+
+# =====================================================================
+# B4-R8 -- THE EVALUATOR ROAD REACHES THE JOURNAL TOO
+# =====================================================================
+#
+# The first run that ever got to `auditing` failed there, and the
+# terminal event carried role `evaluator` with NO failure code: the
+# table named only the implementer's family. What only this suite can
+# prove is that the evaluator's own classes now survive the trip --
+# through the importless `(module, class)` key, because the runner still
+# may not import either adapter.
+
+def _run_with_failing_evaluator(world_obj, failure, monkeypatch):
+    """Run with the EVALUATOR seam raising an exact `audit` object. The
+    implementer and acceptance phases run for real, so the failure
+    arrives where the measured one did."""
+    def refuse(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(runner.audit, "run_evaluator", refuse)
+    return run(world_obj)
+
+
+def test_an_evaluator_failure_reaches_the_journal_with_its_own_code(
+        world, monkeypatch):
+    """The measured gap, closed: the same shape of failure that produced
+    a codeless terminal event now names its mechanism."""
+    result = _run_with_failing_evaluator(world, audit.RepositoryRefused(
+        "denetci sureci bildirilen bir nedenle durdu", exit_code=1,
+        duration_ms=4255, stdout_bytes=0, stderr_bytes=733,
+        cleanup_complete=True), monkeypatch)
+
+    assert result.state == contract.State.FAILED
+    assert result.stop_reason == contract.StopReason.MODEL_PROCESS_FAILED
+    assert len(implementer_calls(world)) == 1, "senaryo kurulmadi"
+    entry = _terminal_event(world, contract.EventCode.MODEL_CALL_FINISHED)
+    assert entry["failure_code"] == \
+        contract.FailureCode.EVALUATOR_REPOSITORY_REFUSED
+    assert entry["role"] == contract.Role.EVALUATOR
+    assert entry["exit_code"] == 1 and entry["duration_ms"] == 4255
+    assert entry["stdout_bytes"] == 0 and entry["stderr_bytes"] == 733
+    assert entry["cleanup_complete"] is True
+
+    raw = runner_events.events_path(world.state_dir).read_text(
+        encoding="utf-8")
+    # neither the vendor's sentence nor this package's class name travels
+    assert "trusted directory" not in raw
+    assert "skip-git-repo-check" not in raw
+    assert "RepositoryRefused" not in raw
+
+
+def test_the_two_roads_never_share_a_code(tmp_path, world, monkeypatch):
+    """THE AMBIGUITY THIS SECTION EXISTS FOR. `audit.ProcessFailed` and
+    `execution.ProcessFailed` are the same NAME, and a name-only lookup
+    would file an evaluator failure as an implementer one -- a
+    confidently wrong code an operator would act on.
+
+    TWO WORLDS, because a terminal state belongs to the run that wrote
+    it: a second `runner.run` in the same checkout is refused by
+    preflight and would go green on that refusal instead."""
+    _run_with_failing_evaluator(world, audit.ProcessFailed(
+        "denetci sureci sifirdan farkli koda dondu", exit_code=1,
+        duration_ms=7, stdout_bytes=0, stderr_bytes=11,
+        cleanup_complete=True), monkeypatch)
+    evaluator_side = _terminal_event(
+        world, contract.EventCode.MODEL_CALL_FINISHED)["failure_code"]
+
+    other = build_world(tmp_path, index=4)
+    _run_raising(other, execution.ProcessFailed(
+        "model sureci sifirdan farkli koda dondu", exit_code=1,
+        duration_ms=7, stdout_bytes=0, stderr_bytes=11,
+        cleanup_complete=True))
+    implementer_side = _terminal_event(
+        other, contract.EventCode.MODEL_CALL_FINISHED)["failure_code"]
+
+    assert evaluator_side == contract.FailureCode.EVALUATOR_PROCESS_FAILED
+    assert implementer_side == contract.FailureCode.IMPLEMENTER_PROCESS_FAILED
+    assert evaluator_side != implementer_side
+    # and no code may serve both roads, whatever it is called
+    implementer_codes = {code for (module, _), code
+                         in contract.FAILURE_CODES.items()
+                         if module == "execution"}
+    evaluator_codes = {code for (module, _), code
+                       in contract.FAILURE_CODES.items() if module == "audit"}
+    assert implementer_codes and evaluator_codes
+    assert not implementer_codes & evaluator_codes

@@ -140,6 +140,75 @@ class ProcessFailed(AuditError):
                          **measurements)
 
 
+# ---------------------------------------------------------------------
+# THE STDERR SUBFAMILY (B4-R8)
+#
+# WHY IT EXISTS. The first run that reached `auditing` ended with a
+# non-zero evaluator exit, zero bytes of stdout and a couple of kilobytes
+# of stderr -- and nothing anywhere could say WHICH refusal that was. The
+# bytes existed, in a bounded buffer, at the moment the failure was
+# raised; they were dropped one line later. Every one of these classes
+# is still a `ProcessFailed`, carrying the same measurements: what is
+# added is the name of the mechanism, never the text that proved it.
+#
+# WHAT MAY CREATE ONE. An EXACT line in `STDERR_FAILURE_MARKERS` below.
+# There is no substring search: `"if"` matched inside `verify` once on
+# this road already, and a classifier that guesses is worse than the
+# generic code it replaces, because an operator acts on it.
+
+class StartupRefused(ProcessFailed):
+    """The CLI refused before it began the audit."""
+
+
+class AuthFailed(ProcessFailed):
+    """The CLI has no usable session. Distinct from the plan-only gate,
+    which refuses BEFORE the call: this is the CLI's own answer."""
+
+
+class RepositoryRefused(ProcessFailed):
+    """The CLI refused the working directory it was given.
+
+    THE ONE CLASS WITH A PROVEN MARKER TODAY. The flat workspace is a
+    copy rather than a clone and holds no `.git`, which is exactly the
+    condition this refusal names."""
+
+
+class InvalidArgv(ProcessFailed):
+    """The CLI rejected the command line itself."""
+
+
+class SchemaRefused(ProcessFailed):
+    """The CLI refused the `--output-schema` file.
+
+    Distinct from `SchemaViolation`, which is THIS package refusing a
+    reply: here no reply was ever produced."""
+
+
+class ProviderFailed(ProcessFailed):
+    """The CLI reported a provider-side failure."""
+
+
+# EXACT stderr LINES, each proven locally, mapped to the class it names.
+#
+# THE MATCH IS WHOLE-LINE AND EXACT. The real refusal arrives with a
+# preamble line above it (`Reading prompt from stdin...`), so the whole
+# buffer never equals a marker -- but one of its lines does. Nothing is
+# matched by substring, prefix or case-folding.
+#
+# WHAT IS DELIBERATELY EMPTY. The other five classes above have no
+# marker yet. Their codes exist so the road is spelled out, and a code
+# without a marker is unreachable ON PURPOSE: inventing a sentence this
+# machine has never seen would produce a confident wrong answer, which
+# is the failure mode this whole subfamily was written to end.
+STDERR_FAILURE_MARKERS = {
+    # codex-cli, measured on 0.147.0-alpha.6.6 and reproduced by this
+    # package's own stub: exit 1 before any work, this exact sentence on
+    # stderr, nothing on stdout.
+    "Not inside a trusted directory and --skip-git-repo-check was not "
+    "specified.": "RepositoryRefused",
+}
+
+
 class OutputLimitExceeded(AuditError):
     """A stream or the last-message file crossed its ceiling and the tree
     was stopped.
@@ -496,6 +565,41 @@ def _read_bounded(path, limit):
     return payload
 
 
+def _stderr_failure(stream, measurements, exit_code):
+    """A more precise `ProcessFailed`, or `None` to keep the generic one.
+
+    EVERY CONDITION MUST HOLD, and any one of them failing is silence
+    rather than a guess: the stream must have been read to completion
+    (an overflowed or unreadable buffer is a partial document, and the
+    existing overflow and read-failure authorities outrank this one),
+    the bytes must decode as strict UTF-8, and one whole LINE must equal
+    a marker this package has evidence for.
+
+    NORMALISATION IS EXACTLY THREE THINGS: strict UTF-8, CRLF to LF, and
+    stripping the ends. No case-folding, no whitespace collapsing, no
+    substring search -- each of those turns "looks similar" into
+    "classified", and the wrong closed code is acted on as confidently
+    as the right one.
+
+    NOTHING IS READ OUT OF THE OUTPUT. The matched line is a lookup KEY
+    and is dropped; the unmatched lines, the vendor's wording, any path
+    it printed and the byte count's contents never enter the exception,
+    whose sentence is a fixed one chosen here."""
+    if stream.outcome != READ_COMPLETED or stream.overflowed:
+        return None
+    try:
+        text = bytes(stream.buffer).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    for line in text.replace("\r\n", "\n").strip().split("\n"):
+        name = STDERR_FAILURE_MARKERS.get(line)
+        if name is not None:
+            return globals()[name](
+                "denetci sureci bildirilen bir nedenle durdu",
+                exit_code=exit_code, **measurements)
+    return None
+
+
 def _release(holder):
     """Remove the audit holder, and report whether it is really gone.
 
@@ -665,8 +769,18 @@ def _measure(call, *, cwd, holder, binding):
             raise TransportFailed("denetci ciktisi eksiksiz okunamadi",
                                   exit_code=exit_code, **measurements)
         if exit_code != 0:
-            raise ProcessFailed("denetci sureci sifirdan farkli koda dondu",
-                                exit_code=exit_code, **measurements)
+            # THE STDERR IS STILL IN HAND (B4-R8). The bounded buffer
+            # holds it right now -- the readers were joined above and
+            # the buffer is dropped moments later -- so this is the only
+            # moment at which the refusal can be named without keeping a
+            # byte of it. `_stderr_failure` returns a more precise class
+            # or `None`; it never turns a failure into a success, and
+            # the broken-reader and overflow checks above already ran,
+            # so a partial buffer is never classified.
+            raise _stderr_failure(
+                streams[1], measurements, exit_code) or ProcessFailed(
+                    "denetci sureci sifirdan farkli koda dondu",
+                    exit_code=exit_code, **measurements)
         # A child can answer WITHOUT reading: it writes a valid reply,
         # exits, and the asynchronous write dies on a closed pipe. The
         # reply then judges a candidate against instructions the

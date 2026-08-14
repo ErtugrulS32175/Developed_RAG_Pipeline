@@ -2133,3 +2133,46 @@ def test_the_evaluator_security_invariants_survive_the_skip_flag(tmp_path):
     # and the flag did not smuggle in anything the forbidden list bars
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
     assert "--full-auto" not in argv
+
+
+def test_every_stderr_marker_is_exact_proven_and_wired(tmp_path):
+    """B4-R8. The marker table is the ONLY thing that can produce a
+    specific evaluator code, so its discipline is pinned here rather
+    than left to whoever adds the next entry.
+
+    WHAT THE ASSERTIONS ARE FOR, one by one: a marker that no code names
+    would raise a `KeyError` in production; a marker that is not a single
+    whole line could never match; a table that grew without a decision is
+    the substring-search failure arriving by a different door. The last
+    part is the honest half -- five evaluator codes exist with NO marker,
+    and that gap is measured here instead of being quietly filled with a
+    sentence nobody has seen this machine print."""
+    from tools.agent_loop import audit as audit_module
+
+    markers = audit_module.STDERR_FAILURE_MARKERS
+    assert len(markers) == 1, "isaret tablosu karar verilmeden buyudu"
+    for marker, class_name in markers.items():
+        assert type(marker) is str and marker == marker.strip()
+        assert "\n" not in marker and "\r" not in marker
+        assert contract.FAILURE_CODES[("audit", class_name)].startswith(
+            "evaluator_")
+        klass = getattr(audit_module, class_name)
+        assert issubclass(klass, audit_module.ProcessFailed)
+
+    # THE PROVEN ONE, spelled here independently of the module so a typo
+    # in either place is a red test rather than a silent miss
+    assert markers["Not inside a trusted directory and "
+                   "--skip-git-repo-check was not specified."] == \
+        "RepositoryRefused"
+
+    # and the declared-but-unreachable half, stated as a measurement
+    reachable = {contract.FAILURE_CODES[("audit", name)]
+                 for name in markers.values()}
+    unproven = {contract.FailureCode.EVALUATOR_STARTUP_REFUSED,
+                contract.FailureCode.EVALUATOR_AUTH_FAILED,
+                contract.FailureCode.EVALUATOR_INVALID_ARGV,
+                contract.FailureCode.EVALUATOR_SCHEMA_REFUSED,
+                contract.FailureCode.EVALUATOR_PROVIDER_FAILED}
+    assert not reachable & unproven, \
+        "kanitsiz bir kod uretilebilir hale geldi"
+    assert unproven <= set(contract.FAILURE_CODES.values())

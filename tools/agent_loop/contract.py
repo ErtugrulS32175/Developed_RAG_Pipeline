@@ -386,6 +386,33 @@ class FailureCode:
     CHANGE_DECLARATION_MISMATCH = "change_declaration_mismatch"
     CHANGE_EVIDENCE_UNAVAILABLE = "change_evidence_unavailable"
     CHANGE_UNSAFE = "change_unsafe"
+    # THE EVALUATOR ROAD (B4-R8). Measured on the first run that reached
+    # `auditing`: the evaluator ended non-zero with kilobytes on stderr
+    # and the terminal event carried NO failure code at all, because the
+    # table below named only the implementer's family. Every code here is
+    # spelled `evaluator_` so that no lookup can ever file one road's
+    # mechanism under the other's name.
+    EVALUATOR_PROCESS_FAILED = "evaluator_process_failed"
+    # The stderr-classified subfamily. Each one names a different
+    # operator action -- fix the invocation, log in, look at the repo
+    # gate, look at the schema, look at the provider -- and none of them
+    # may be produced without an EXACT, locally proven marker.
+    EVALUATOR_STARTUP_REFUSED = "evaluator_startup_refused"
+    EVALUATOR_AUTH_FAILED = "evaluator_auth_failed"
+    EVALUATOR_REPOSITORY_REFUSED = "evaluator_repository_refused"
+    EVALUATOR_INVALID_ARGV = "evaluator_invalid_argv"
+    EVALUATOR_SCHEMA_REFUSED = "evaluator_schema_refused"
+    EVALUATOR_PROVIDER_FAILED = "evaluator_provider_failed"
+    # The mechanisms `audit` already had and could not name. Leaving
+    # these codeless would rebuild the same complaint one failure later.
+    EVALUATOR_OUTPUT_LIMIT = "evaluator_output_limit"
+    EVALUATOR_TIMEOUT = "evaluator_timeout"
+    EVALUATOR_SCHEMA_VIOLATION = "evaluator_schema_violation"
+    EVALUATOR_TRANSPORT_FAILED = "evaluator_transport_failed"
+    EVALUATOR_CONTAINMENT_FAILED = "evaluator_containment_failed"
+    EVALUATOR_PROCESS_TREE_SURVIVED = "evaluator_process_tree_survived"
+    EVALUATOR_WORKSPACE_NOT_BOUND = "evaluator_workspace_not_bound"
+    EVALUATOR_HOLDER_NOT_RELEASED = "evaluator_holder_not_released"
 
 
 ALL_FAILURE_CODES = tuple(
@@ -405,9 +432,12 @@ ALL_FAILURE_CODES = tuple(
 # process failure as `implementer_process_failed`, and a confidently
 # wrong closed code is worse than no code at all.
 #
-# WHAT IS DELIBERATELY ABSENT: the evaluator family. This package is
-# scoped to the implementer road, so an `audit` failure still yields no
-# code rather than a guessed one -- the gap is stated, not papered over.
+# THE EVALUATOR FAMILY IS NOW HERE TOO (B4-R8), and the two-part key is
+# what makes that safe: `audit.ProcessFailed` and `execution.ProcessFailed`
+# are the same NAME and two different roads, and the run that motivated
+# this addition would otherwise have been filed as an implementer
+# failure. The gap this closes was measured, not imagined -- a real
+# evaluator failure reached the journal with no code at all.
 FAILURE_CODES = {
     ("execution", "ProcessFailed"): FailureCode.IMPLEMENTER_PROCESS_FAILED,
     ("execution", "MaxBudgetReached"):
@@ -433,6 +463,22 @@ FAILURE_CODES = {
     ("changes", "EvidenceUnavailable"):
         FailureCode.CHANGE_EVIDENCE_UNAVAILABLE,
     ("changes", "UnsafeChange"): FailureCode.CHANGE_UNSAFE,
+    ("audit", "ProcessFailed"): FailureCode.EVALUATOR_PROCESS_FAILED,
+    ("audit", "StartupRefused"): FailureCode.EVALUATOR_STARTUP_REFUSED,
+    ("audit", "AuthFailed"): FailureCode.EVALUATOR_AUTH_FAILED,
+    ("audit", "RepositoryRefused"): FailureCode.EVALUATOR_REPOSITORY_REFUSED,
+    ("audit", "InvalidArgv"): FailureCode.EVALUATOR_INVALID_ARGV,
+    ("audit", "SchemaRefused"): FailureCode.EVALUATOR_SCHEMA_REFUSED,
+    ("audit", "ProviderFailed"): FailureCode.EVALUATOR_PROVIDER_FAILED,
+    ("audit", "OutputLimitExceeded"): FailureCode.EVALUATOR_OUTPUT_LIMIT,
+    ("audit", "Timeout"): FailureCode.EVALUATOR_TIMEOUT,
+    ("audit", "SchemaViolation"): FailureCode.EVALUATOR_SCHEMA_VIOLATION,
+    ("audit", "TransportFailed"): FailureCode.EVALUATOR_TRANSPORT_FAILED,
+    ("audit", "ContainmentFailed"): FailureCode.EVALUATOR_CONTAINMENT_FAILED,
+    ("audit", "ProcessTreeSurvived"):
+        FailureCode.EVALUATOR_PROCESS_TREE_SURVIVED,
+    ("audit", "WorkspaceNotBound"): FailureCode.EVALUATOR_WORKSPACE_NOT_BOUND,
+    ("audit", "HolderNotReleased"): FailureCode.EVALUATOR_HOLDER_NOT_RELEASED,
 }
 
 ALL_ROLES = (Role.IMPLEMENTER, Role.EVALUATOR)

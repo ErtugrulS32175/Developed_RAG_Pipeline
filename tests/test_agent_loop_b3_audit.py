@@ -72,7 +72,20 @@ def main():
                          "Not inside a trusted directory and "
                          "--skip-git-repo-check was not specified.\\n")
         sys.exit(1)
+    if cfg.get("stderr_hex"):
+        # RAW BYTES, so a scenario may hand over output that is not valid
+        # UTF-8 at all -- the classifier has to survive that, and a test
+        # that could only spell decodable text could never prove it.
+        sys.stderr.buffer.write(bytes.fromhex(cfg["stderr_hex"]))
+        sys.stderr.buffer.flush()
     mode = cfg["mode"]
+    if mode == "flood_stderr":
+        blok = b"x" * 4096
+        gonderilen = 0
+        while gonderilen < cfg["bytes"]:
+            sys.stderr.buffer.write(blok)
+            sys.stderr.buffer.flush()
+            gonderilen += len(blok)
     if mode == "reply":
         if cfg.get("read_stdin", True):
             sys.stdin.read()
@@ -590,3 +603,169 @@ def test_the_evaluator_runs_where_there_is_no_git_repository(
     assert outcome.reply["role"] == contract.Role.EVALUATOR
     assert outcome.exit_code == 0
     assert outcome.last_message_bytes > 0
+
+
+# =====================================================================
+# B4-R8 -- NAMING A NON-ZERO EVALUATOR EXIT
+# =====================================================================
+#
+# MEASURED on the first run that ever reached `auditing`: the evaluator
+# ended with exit 1, 0 bytes of stdout and kilobytes of stderr, and the
+# terminal event carried no failure code at all. The bytes that would
+# have named the refusal were in a bounded buffer at the moment the
+# failure was raised and were dropped immediately afterwards.
+#
+# The gate is EXACT and whole-line. These tests are written from both
+# sides: the one proven marker must be named, and everything that merely
+# resembles it must stay generic.
+
+_MARKER = ("Not inside a trusted directory and --skip-git-repo-check "
+           "was not specified.")
+# the real refusal arrives UNDER a preamble line, which is why the whole
+# buffer never equals the marker and the match has to be per line
+_REAL_STDERR = f"Reading prompt from stdin...\n{_MARKER}\n"
+
+
+def _failing(tmp_path, stderr_bytes, *, name="sahte_hata", code=1, **config):
+    return _stub(tmp_path, name=name, mode="fail", code=code,
+                 stderr_hex=stderr_bytes.hex(), **config)
+
+
+def test_a_nonzero_evaluator_exit_with_unknown_stderr_stays_generic(
+        tmp_path, gate, only_fake_models_may_run):
+    """The regression floor. An exit nobody can name keeps the generic
+    class, the generic code and every measurement it already had."""
+    binary = _failing(tmp_path, b"beklenmeyen bir arizanin metni\n", code=3)
+    with pytest.raises(audit.ProcessFailed) as refusal:
+        _audit(binary, gate)
+
+    assert len(only_fake_models_may_run) == 1, "senaryo kurulmadi"
+    failure = refusal.value
+    assert type(failure) is audit.ProcessFailed, "genel sinif ozellestirildi"
+    assert contract.FAILURE_CODES[("audit", type(failure).__name__)] == \
+        contract.FailureCode.EVALUATOR_PROCESS_FAILED
+    assert failure.role == contract.Role.EVALUATOR
+    assert failure.exit_code == 3
+    assert failure.stdout_bytes == 0 and failure.stderr_bytes > 0
+    assert failure.cleanup_complete is True
+    assert failure.reason == contract.StopReason.MODEL_PROCESS_FAILED
+
+
+def test_the_exact_trusted_directory_refusal_is_named(
+        tmp_path, gate, only_fake_models_may_run):
+    """The one classification this package has evidence for -- against
+    the REAL two-line shape, preamble included."""
+    binary = _failing(tmp_path, _REAL_STDERR.encode("utf-8"))
+    with pytest.raises(audit.RepositoryRefused) as refusal:
+        _audit(binary, gate)
+
+    assert len(only_fake_models_may_run) == 1, "senaryo kurulmadi"
+    failure = refusal.value
+    assert isinstance(failure, audit.ProcessFailed), "aile disina cikti"
+    assert contract.FAILURE_CODES[("audit", type(failure).__name__)] == \
+        contract.FailureCode.EVALUATOR_REPOSITORY_REFUSED
+    assert failure.role == contract.Role.EVALUATOR
+    assert failure.event == contract.EventCode.MODEL_CALL_FINISHED
+    assert failure.reason == contract.StopReason.MODEL_PROCESS_FAILED
+    assert failure.exit_code == 1
+    assert failure.stdout_bytes == 0
+    assert failure.stderr_bytes == len(_REAL_STDERR.encode("utf-8"))
+    assert failure.cleanup_complete is True
+    # CRLF is the only spelling difference that may be normalised away
+    crlf = _failing(tmp_path, _REAL_STDERR.replace("\n", "\r\n").encode(),
+                    name="sahte_crlf")
+    with pytest.raises(audit.RepositoryRefused):
+        _audit(crlf, gate)
+
+
+@pytest.mark.parametrize(
+    "metin",
+    [_MARKER.lower(),
+     _MARKER.rstrip("."),
+     _MARKER + " Try again.",
+     f"warning: {_MARKER}",
+     _MARKER.replace("  ", " ").replace(
+         "trusted directory", "trusted  directory"),
+     "".join(_MARKER.split())],
+    ids=["kucuk-harf", "nokta-yok", "sonuna-eklenmis", "basina-eklenmis",
+         "ic-bosluk", "bosluksuz"])
+def test_a_sentence_that_is_not_exactly_the_marker_is_not_classified(
+        tmp_path, gate, metin, only_fake_models_may_run):
+    """SUBSTRING SEARCH WOULD PASS FOUR OF THESE. A classifier that
+    guesses is worse than the generic code it replaces, because an
+    operator acts on it."""
+    binary = _failing(tmp_path, f"{metin}\n".encode("utf-8"))
+    with pytest.raises(audit.ProcessFailed) as refusal:
+        _audit(binary, gate)
+    assert len(only_fake_models_may_run) == 1, "senaryo kurulmadi"
+    assert type(refusal.value) is audit.ProcessFailed
+
+
+def test_undecodable_stderr_stays_generic_and_raises_nothing_of_its_own(
+        tmp_path, gate, only_fake_models_may_run):
+    """Bytes that are not UTF-8 at all, with the marker sitting in the
+    middle of them. The decode failure is the classifier's silence, not
+    an exception that replaces the failure that got us here."""
+    payload = b"\xff\xfe gecersiz " + _MARKER.encode("utf-8") + b"\n\x80\x81"
+    binary = _failing(tmp_path, payload, code=2)
+    with pytest.raises(audit.ProcessFailed) as refusal:
+        _audit(binary, gate)
+    assert len(only_fake_models_may_run) == 1, "senaryo kurulmadi"
+    assert type(refusal.value) is audit.ProcessFailed
+    assert refusal.value.exit_code == 2
+
+
+def test_the_stronger_authorities_still_outrank_the_stderr_class(
+        tmp_path, gate, monkeypatch, only_fake_models_may_run):
+    """Three of them, each carrying the marker on stderr so the new gate
+    would fire if it were allowed to.
+
+    An OVERFLOWED buffer is a partial document; a TIMEOUT is a call that
+    never produced a verdict; EXIT 0 is not a failure at all. None of
+    them may be reclassified by what stderr happened to say."""
+    marker = _REAL_STDERR.encode("utf-8")
+    flooding = _stub(tmp_path, name="sahte_tasan", mode="flood_stderr",
+                     bytes=4_000_000, code=1, stderr_hex=marker.hex())
+    with pytest.raises(audit.OutputLimitExceeded) as overflow:
+        _audit(flooding, gate, max_output_bytes=65536)
+    assert type(overflow.value) is audit.OutputLimitExceeded
+
+    healthy = _stub(tmp_path, name="sahte_saglikli", mode="reply",
+                    body=json.dumps(_code_reply()), stderr_hex=marker.hex())
+    outcome = _audit(healthy, gate)
+    assert outcome.exit_code == 0, "sifir cikisli kosu yeniden siniflandirildi"
+
+    # LAST, because the fast clock stays patched for the rest of the
+    # test: a healthy call made after it would time out at a thousand
+    # times real speed and go red for the fixture's reason
+    slow = _stub(tmp_path, name="sahte_yavas", mode="sleep", seconds=300,
+                 code=1, stderr_hex=marker.hex())
+    with pytest.raises(audit.Timeout) as timeout:
+        _audit_with_fast_clock(slow, gate, monkeypatch)
+    assert type(timeout.value) is audit.Timeout
+
+
+def test_no_stderr_byte_reaches_the_exception_that_names_it(
+        tmp_path, gate, only_fake_models_may_run):
+    """The classification is the ONLY thing that travels. The marker is a
+    lookup key; the sentinel beside it, the absolute path and the
+    vendor's own wording stay in the buffer that is about to be
+    dropped."""
+    sentinel = "GIZLI-DENETCI-CUMLESI"
+    noisy = (f"{sentinel} {gate.tree}\n{_REAL_STDERR}"
+             f"session_id=abc123 {sentinel}\n")
+    binary = _failing(tmp_path, noisy.encode("utf-8"), name="sahte_gurultulu")
+    with pytest.raises(audit.RepositoryRefused) as refusal:
+        _audit(binary, gate)
+
+    failure = refusal.value
+    carried = " ".join([str(failure), repr(failure),
+                        repr(getattr(failure, "__dict__", {})),
+                        repr(getattr(failure, "__notes__", []))])
+    assert sentinel not in carried
+    assert str(gate.tree) not in carried
+    assert "session_id" not in carried
+    # not even the marker that produced the class
+    assert "trusted directory" not in carried
+    assert "--skip-git-repo-check" not in carried
+    assert failure.stderr_bytes == len(noisy.encode("utf-8"))
