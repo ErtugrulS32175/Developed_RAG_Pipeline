@@ -273,6 +273,41 @@ MUTATIONS = [
      '    if payload.get("is_error") is not False:',
      '    if payload.get("is_error"):',
      "test_an_error_envelope_is_refused_even_with_a_valid_payload"),
+    # B4-R6. The error-envelope classifier refines a failure that has
+    # ALREADY been decided by the exit code, so each guard below protects
+    # a different way of claiming to know more than the evidence allows.
+    #
+    # 1. The same truthiness fail-open, on the error side this time:
+    #    `is_error: "true"` is a string, and only `True` is the CLI
+    #    saying the envelope describes a failure.
+    ("b4r6-zarf-hata-kapisi", "execution",
+     '    if payload.get("is_error") is not True:',
+     '    if not payload.get("is_error"):',
+     "test_anything_unproven_stays_the_generic_process_failure"),
+    # 2. An unproven subtype must stay GENERIC. A default here would
+    #    give every unknown envelope a confident code nobody measured --
+    #    the exact failure mode the evidence gate exists to prevent.
+    ("b4r6-bilinmeyen-subtype", "execution",
+     "    name = ENVELOPE_ERROR_SUBTYPES.get(subtype)",
+     '    name = ENVELOPE_ERROR_SUBTYPES.get(subtype, '
+     '"ProviderExecutionFailed")',
+     "test_anything_unproven_stays_the_generic_process_failure"),
+    # 3. The mapping must be the TABLE's, not one class for everything:
+    #    four codes that all mean the same thing are one code.
+    ("b4r6-sinif-esleme", "execution",
+     '    return globals()[name]("model sureci bildirilen bir sinirda durdu",',
+     '    return globals()["ProviderExecutionFailed"]('
+     '"model sureci bildirilen bir sinirda durdu",',
+     "test_each_evidenced_error_subtype_becomes_its_own_class"),
+    # 4. The vendor's own spelling is a LOOKUP KEY and never a recorded
+    #    value: putting it in the message would carry vendor text into
+    #    every report the exception reaches.
+    ("b4r6-ham-subtype-sizintisi", "execution",
+     '    return globals()[name]("model sureci bildirilen bir sinirda durdu",'
+     + NL + "                           exit_code=exit_code, **measurements)",
+     '    return globals()[name](f"model sureci {subtype} sinirinda durdu",'
+     + NL + "                           exit_code=exit_code, **measurements)",
+     "test_the_classification_never_persists_the_envelope"),
     # ----------------------------------------------------------------
     # B2A -- the call boundary: validate once, canonicalize once, use
     # only the canonical value. Each mutation reopens exactly one of

@@ -69,7 +69,7 @@ from jsonschema import Draft202012Validator, ValidationError
 from tools.agent_loop import cli, contract, flat_workspace, schemas
 from tools.agent_loop.process import (
     BoundedStream, Container, ContainmentError, PromptWriter,
-    REAP_SECONDS, READ_CHUNK_BYTES, join_within,
+    REAP_SECONDS, READ_CHUNK_BYTES, READ_COMPLETED, join_within,
     launch_contained, stop, terminate_tree)
 
 _POLL_SECONDS = 0.02
@@ -157,6 +157,53 @@ class ProcessFailed(AdapterError):
                          event=contract.EventCode.MODEL_CALL_FINISHED,
                          reason=contract.StopReason.MODEL_PROCESS_FAILED,
                          **measurements)
+
+
+# The CLI's own terminal error envelopes (B4-R6).
+#
+# MEASURED, NOT GUESSED. Every value below was read out of the installed
+# binary's string table and appears within 400 bytes of the literal
+# `subtype`, which is where an emitting site puts it;
+# `error_max_budget_usd` was additionally observed in a real envelope. A
+# fifth candidate, `error_envelope_no_type`, occurs in the binary and
+# NEVER near `subtype`, so it is not a subtype value and is deliberately
+# absent -- a name whose meaning nobody has proven must not become a
+# code the loop reports.
+#
+# WHY THESE ARE SEPARATE CLASSES. They are four different operator
+# actions: raise a ceiling, allow more turns, look at the schema, look
+# at the provider. `model_process_failed` cannot tell them apart, and
+# the previous real run cost a scripted probe and a session-record hunt
+# to answer a question the process itself had already answered.
+ENVELOPE_ERROR_SUBTYPES = {
+    "error_max_budget_usd": "MaxBudgetReached",
+    "error_max_turns": "MaxTurnsReached",
+    "error_max_structured_output_retries": "StructuredOutputRetriesExhausted",
+    "error_during_execution": "ProviderExecutionFailed",
+}
+
+
+class MaxBudgetReached(ProcessFailed):
+    """The CLI stopped itself at `--max-budget-usd`.
+
+    A `ProcessFailed` still: the process ended non-zero and every
+    measurement it carries is unchanged. What is added is WHICH ceiling
+    ended it."""
+
+
+class MaxTurnsReached(ProcessFailed):
+    """The CLI stopped itself at its turn limit."""
+
+
+class StructuredOutputRetriesExhausted(ProcessFailed):
+    """The CLI could not get a schema-valid answer within its retries.
+
+    Distinct from `SchemaViolation`, which is THIS package refusing a
+    reply it received: here the CLI never obtained one to hand over."""
+
+
+class ProviderExecutionFailed(ProcessFailed):
+    """The CLI reported a failure during execution."""
 
 
 class OutputLimitExceeded(AdapterError):
@@ -579,6 +626,49 @@ def _envelope_payload(payload, measurements):
     return inner
 
 
+def _envelope_failure(stream, measurements, exit_code):
+    """A more precise `ProcessFailed`, or `None` to keep the generic one.
+
+    EVERY CONDITION MUST HOLD, and any one of them failing is silence
+    rather than a guess: the stream must have been read to completion
+    (an overflowed or unreadable buffer is a partial document, and the
+    existing overflow and read-failure authorities outrank this one),
+    the bytes must be one JSON object, the envelope must call itself a
+    result, `is_error` must be exactly `True`, and the `subtype` must be
+    an exact string this package has EVIDENCE for.
+
+    NOTHING IS READ OUT OF THE ENVELOPE. The subtype is used as a lookup
+    key and dropped; the vendor's message, the `result` text, the
+    session id and the cost never enter the exception, whose sentence is
+    a fixed one chosen here. An unknown subtype is not reported as
+    itself -- it falls back to the generic failure, because a code this
+    package cannot define is a code nobody can act on.
+
+    THIS FUNCTION NEVER SUCCEEDS. A valid-looking SUCCESS envelope beside
+    a non-zero exit is still a failure: `is_error is not True` returns
+    `None`, and the caller raises the generic `ProcessFailed`."""
+    if stream.outcome != READ_COMPLETED or stream.overflowed:
+        return None
+    try:
+        payload = json.loads(bytes(stream.buffer).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if type(payload) is not dict:
+        return None
+    if payload.get("type") != ENVELOPE_TYPE:
+        return None
+    if payload.get("is_error") is not True:
+        return None
+    subtype = payload.get("subtype")
+    if type(subtype) is not str:
+        return None
+    name = ENVELOPE_ERROR_SUBTYPES.get(subtype)
+    if name is None:
+        return None
+    return globals()[name]("model sureci bildirilen bir sinirda durdu",
+                           exit_code=exit_code, **measurements)
+
+
 def _parse_reply(raw, measurements, validator):
     """Decode, parse, UNWRAP and validate -- refusing at every step.
 
@@ -811,8 +901,16 @@ def run_implementer(binary, *, repo, state_dir, run_id, workspace_id,
 
         exit_code = process.wait()
         if exit_code != 0:
-            raise ProcessFailed("model sureci sifirdan farkli koda dondu",
-                                exit_code=exit_code, **measurements)
+            # THE ENVELOPE IS STILL IN HAND (B4-R6). The bounded buffer
+            # holds it right now and is dropped moments later, so the
+            # only chance to learn WHICH ceiling ended the call is here.
+            # `_envelope_failure` returns a more precise class or None;
+            # it never turns a failure into a success and never persists
+            # a byte of what it read.
+            raise _envelope_failure(
+                streams[0], measurements, exit_code) or ProcessFailed(
+                    "model sureci sifirdan farkli koda dondu",
+                    exit_code=exit_code, **measurements)
         # A child can answer WITHOUT reading: it writes valid JSON,
         # exits, and the asynchronous write dies on a closed pipe. The
         # reply then answers a question the model was never asked.

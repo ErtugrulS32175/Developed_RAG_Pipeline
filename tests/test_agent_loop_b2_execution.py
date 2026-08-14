@@ -1967,3 +1967,138 @@ def test_the_transport_rules_around_the_parse_are_unchanged(tmp_path, bound):
     # a valid envelope that is not a JSON object at the top level
     with pytest.raises(execution.SchemaViolation):
         _run_with_stdout(tmp_path, bound, b'["result"]')
+
+
+# =====================================================================
+# B4-R6 -- WHICH LIMIT ENDED THE CALL
+# =====================================================================
+#
+# A real run ended `model_process_failed` with exit 1 and 1563 bytes of
+# stdout, and answering "which limit" cost a scripted probe and a hunt
+# through local session records -- which turned out not to hold the
+# envelope at all, because it lives only in the process's stdout.
+#
+# The bounded buffer HAS that envelope at the moment the non-zero exit
+# is judged, and drops it moments later. So it is classified there.
+#
+# THE SUBTYPES ARE EVIDENCE, NOT GUESSES. Each was read out of the
+# installed binary's string table within 400 bytes of the literal
+# `subtype`, and `error_max_budget_usd` was also seen in a real
+# envelope. `error_envelope_no_type` exists in the binary but never
+# near `subtype`, so it is absent from the table on purpose.
+
+def _error_envelope(subtype, **overrides):
+    envelope = {
+        "type": "result", "subtype": subtype, "is_error": True,
+        "duration_ms": 102327, "num_turns": 3, "total_cost_usd": 0.94,
+        "session_id": "00000000-0000-4000-8000-000000000000",
+        "result": "vendor tarafindan yazilmis serbest metin",
+        "usage": {"input_tokens": 9, "output_tokens": 4},
+    }
+    envelope.update(overrides)
+    return {name: value for name, value in envelope.items()
+            if value is not _ABSENT}
+
+
+@pytest.mark.parametrize(
+    ("subtype", "expected", "code"),
+    [("error_max_budget_usd", "MaxBudgetReached",
+      contract.FailureCode.IMPLEMENTER_MAX_BUDGET_REACHED),
+     ("error_max_turns", "MaxTurnsReached",
+      contract.FailureCode.IMPLEMENTER_MAX_TURNS_REACHED),
+     ("error_max_structured_output_retries",
+      "StructuredOutputRetriesExhausted",
+      contract.FailureCode.IMPLEMENTER_STRUCTURED_OUTPUT_RETRIES_EXHAUSTED),
+     ("error_during_execution", "ProviderExecutionFailed",
+      contract.FailureCode.IMPLEMENTER_PROVIDER_EXECUTION_FAILED)])
+def test_each_evidenced_error_subtype_becomes_its_own_class(
+        tmp_path, bound, subtype, expected, code):
+    """The class AND the closed code AND the measurements, pinned
+    together: asserting the reason alone would pass for all four."""
+    kind = getattr(execution, expected)
+    with pytest.raises(kind) as refused:
+        _run_with_stdout(tmp_path, bound, _emit(_error_envelope(subtype)),
+                         code=1)
+    failure = refused.value
+    assert isinstance(failure, execution.ProcessFailed)
+    assert contract.FAILURE_CODES[("execution", type(failure).__name__)] \
+        == code
+    assert failure.reason == contract.StopReason.MODEL_PROCESS_FAILED
+    assert failure.event == contract.EventCode.MODEL_CALL_FINISHED
+    assert failure.exit_code == 1
+    assert isinstance(failure.duration_ms, int)
+    assert failure.stdout_bytes > 0 and failure.stderr_bytes == 0
+    assert failure.cleanup_complete is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"{bu JSON degil",
+     b'["result"]',
+     b"",
+     json.dumps({"type": "assistant", "subtype": "error_max_turns",
+                 "is_error": True}).encode("utf-8"),
+     json.dumps({"type": "result", "subtype": "error_max_turns",
+                 "is_error": "true"}).encode("utf-8"),
+     json.dumps({"type": "result", "subtype": "error_max_turns"}
+                ).encode("utf-8"),
+     json.dumps({"type": "result", "is_error": True}).encode("utf-8"),
+     json.dumps({"type": "result", "subtype": 5,
+                 "is_error": True}).encode("utf-8"),
+     json.dumps({"type": "result", "subtype": "error_envelope_no_type",
+                 "is_error": True}).encode("utf-8"),
+     json.dumps({"type": "result", "subtype": "error_yeni_bir_sey",
+                 "is_error": True}).encode("utf-8")],
+    ids=["bozuk-json", "dizi", "bos", "yanlis-tur", "is-error-metin",
+         "is-error-yok", "subtype-yok", "subtype-sayi",
+         "kanitlanmamis-subtype", "bilinmeyen-subtype"])
+def test_anything_unproven_stays_the_generic_process_failure(
+        tmp_path, bound, payload):
+    """UNKNOWN IS NOT A CLASS. A subtype this package has no evidence
+    for -- including one that exists in the binary but is never used as
+    a subtype -- keeps the generic code rather than inventing one."""
+    with pytest.raises(execution.ProcessFailed) as refused:
+        _run_with_stdout(tmp_path, bound, payload, code=1)
+    failure = refused.value
+    assert type(failure) is execution.ProcessFailed
+    assert contract.FAILURE_CODES[("execution", "ProcessFailed")] == \
+        contract.FailureCode.IMPLEMENTER_PROCESS_FAILED
+
+
+def test_a_success_envelope_beside_a_nonzero_exit_is_still_a_failure(
+        tmp_path, bound):
+    """`is_error is not True` must never be read as 'then it worked'.
+    The exit code decided, and the classifier only ever refines."""
+    with pytest.raises(execution.ProcessFailed) as refused:
+        _run_with_stdout(tmp_path, bound,
+                         _emit(_success_envelope(_valid_reply())), code=1)
+    assert type(refused.value) is execution.ProcessFailed
+
+
+def test_an_unreadable_buffer_keeps_the_existing_authority(tmp_path, bound):
+    """An overflowed stream is a PARTIAL document, and a partial
+    document must not be classified: the output-limit authority outranks
+    this one, and a truncated envelope beside a clean-looking subtype is
+    exactly how a half-read answer becomes a whole one."""
+    envelope = _error_envelope("error_max_turns", padding="x" * 4096)
+    with pytest.raises(execution.OutputLimitExceeded):
+        _run_with_stdout(tmp_path, bound, _emit(envelope),
+                         max_output_bytes=1024, code=1)
+
+
+def test_the_classification_never_persists_the_envelope(tmp_path, bound):
+    """The vendor's message, the cost, the session id and the turn count
+    are all in the envelope. None of them may reach the exception."""
+    sentinel = "VENDOR-SERBEST-METNI"
+    envelope = _error_envelope(
+        "error_max_budget_usd", result=sentinel,
+        session_id=f"{sentinel}-oturum")
+    with pytest.raises(execution.MaxBudgetReached) as refused:
+        _run_with_stdout(tmp_path, bound, _emit(envelope), code=1)
+    failure = refused.value
+    blob = " ".join([str(failure), repr(failure), repr(failure.__dict__),
+                     repr(getattr(failure, "__notes__", []))])
+    assert sentinel not in blob
+    assert "error_max_budget_usd" not in blob, "vendor subtype disari sizdi"
+    assert "0.94" not in blob and "total_cost_usd" not in blob
+    assert str(tmp_path) not in blob

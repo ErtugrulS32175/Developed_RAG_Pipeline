@@ -367,6 +367,16 @@ class FailureCode:
     now records both."""
 
     IMPLEMENTER_PROCESS_FAILED = "implementer_process_failed"
+    # The four ERROR ENVELOPES the CLI itself can report (B4-R6). Each
+    # one is a different operator action -- raise a ceiling, allow more
+    # turns, look at the schema, or look at the provider -- and the
+    # generic code above cannot tell them apart.
+    IMPLEMENTER_MAX_BUDGET_REACHED = "implementer_max_budget_reached"
+    IMPLEMENTER_MAX_TURNS_REACHED = "implementer_max_turns_reached"
+    IMPLEMENTER_STRUCTURED_OUTPUT_RETRIES_EXHAUSTED = (
+        "implementer_structured_output_retries_exhausted")
+    IMPLEMENTER_PROVIDER_EXECUTION_FAILED = (
+        "implementer_provider_execution_failed")
     IMPLEMENTER_OUTPUT_LIMIT = "implementer_output_limit"
     IMPLEMENTER_TIMEOUT = "implementer_timeout"
     IMPLEMENTER_SCHEMA_VIOLATION = "implementer_schema_violation"
@@ -400,6 +410,14 @@ ALL_FAILURE_CODES = tuple(
 # code rather than a guessed one -- the gap is stated, not papered over.
 FAILURE_CODES = {
     ("execution", "ProcessFailed"): FailureCode.IMPLEMENTER_PROCESS_FAILED,
+    ("execution", "MaxBudgetReached"):
+        FailureCode.IMPLEMENTER_MAX_BUDGET_REACHED,
+    ("execution", "MaxTurnsReached"):
+        FailureCode.IMPLEMENTER_MAX_TURNS_REACHED,
+    ("execution", "StructuredOutputRetriesExhausted"):
+        FailureCode.IMPLEMENTER_STRUCTURED_OUTPUT_RETRIES_EXHAUSTED,
+    ("execution", "ProviderExecutionFailed"):
+        FailureCode.IMPLEMENTER_PROVIDER_EXECUTION_FAILED,
     ("execution", "OutputLimitExceeded"): FailureCode.IMPLEMENTER_OUTPUT_LIMIT,
     ("execution", "Timeout"): FailureCode.IMPLEMENTER_TIMEOUT,
     ("execution", "SchemaViolation"):

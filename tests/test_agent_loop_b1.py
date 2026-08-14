@@ -1283,7 +1283,10 @@ def test_every_mutation_still_applies_to_the_current_source():
     # entries (`r2b-yol-degeri`, `r2b-yanlis-sha`) were RETARGETED
     # rather than retired: their security intents still exist, the lines
     # carrying them moved.
-    assert len(tool.MUTATIONS) == 90
+    # 90 -> 94 in B4-R6: four guards for the error-envelope classifier
+    # (the is_error gate, unknown-stays-generic, the class mapping, and
+    # the vendor subtype never becoming a recorded value).
+    assert len(tool.MUTATIONS) == 94
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1295,7 +1298,9 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b3-onarim-butcesi', 'b3-onarim-delta-bildirimi',
         'b3-saat-on-kontrolu', 'b3-stdout-tasma-hukmu',
         'b3-uygulama-once-onay', 'b4r2-tasima-semasi-otorite',
-        'b4r3-zarf-hata-bayragi',
+        'b4r3-zarf-hata-bayragi', 'b4r6-zarf-hata-kapisi',
+        'b4r6-bilinmeyen-subtype', 'b4r6-sinif-esleme',
+        'b4r6-ham-subtype-sizintisi',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

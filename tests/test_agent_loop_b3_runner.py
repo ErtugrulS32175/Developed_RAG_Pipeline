@@ -1174,7 +1174,12 @@ def test_the_failure_vocabulary_and_the_event_schema_agree(world):
 
     from tools.agent_loop import schemas as schema_module
 
-    assert len(set(contract.ALL_FAILURE_CODES)) == 10
+    # 10 -> 14 in B4-R6: the four error-envelope classes. The COUNT is
+    # pinned rather than derived so that adding a code stays a decision
+    # somebody makes on purpose -- this assertion is what caught the
+    # addition, which is the whole reason it is a literal.
+    assert len(set(contract.ALL_FAILURE_CODES)) == 14
+    assert len(contract.ALL_FAILURE_CODES) == 14, "yinelenen basarisizlik kodu"
     assert set(contract.FAILURE_CODES.values()) <= \
         set(contract.ALL_FAILURE_CODES)
     properties = schema_module.EVENT_SCHEMA["properties"]
@@ -1258,3 +1263,50 @@ def test_the_gate_is_re_proven_immediately_before_every_model_call(
     assert result.stop_reason == contract.StopReason.PREFLIGHT_FAILED
     assert len(implementer_calls(other)) == 1
     assert evaluator_calls(other) == []
+
+
+# =====================================================================
+# B4-R6 -- THE ENVELOPE'S LIMIT REACHES THE JOURNAL
+# =====================================================================
+#
+# The adapter now distinguishes the CLI's own terminal error envelopes.
+# What only this suite can prove is that the distinction SURVIVES the
+# trip into the journal -- through the importless `(module, class)`
+# table, because the runner still may not import `execution`.
+
+def test_an_envelope_limit_reaches_the_journal_as_its_own_code(world):
+    """The whole point of B4-R6: an operator reading the journal learns
+    WHICH ceiling ended the call, without a probe."""
+    result = _run_raising(world, execution.MaxBudgetReached(
+        "model sureci bildirilen bir sinirda durdu", exit_code=1,
+        duration_ms=102327, stdout_bytes=1563, stderr_bytes=0,
+        cleanup_complete=True))
+    assert result.stop_reason == contract.StopReason.MODEL_PROCESS_FAILED
+    entry = _terminal_event(world, contract.EventCode.MODEL_CALL_FINISHED)
+    assert entry["failure_code"] == \
+        contract.FailureCode.IMPLEMENTER_MAX_BUDGET_REACHED
+    # NOT the generic one -- that was the whole complaint
+    assert entry["failure_code"] != \
+        contract.FailureCode.IMPLEMENTER_PROCESS_FAILED
+    assert entry["role"] == contract.Role.IMPLEMENTER
+    assert entry["exit_code"] == 1 and entry["duration_ms"] == 102327
+    assert entry["stdout_bytes"] == 1563 and entry["stderr_bytes"] == 0
+    assert entry["cleanup_complete"] is True
+
+    raw = runner_events.events_path(world.state_dir).read_text(
+        encoding="utf-8")
+    # the vendor's own spelling never travels; only this package's code
+    assert "error_max_budget_usd" not in raw
+    assert "MaxBudgetReached" not in raw
+
+
+def test_the_generic_process_failure_still_reads_as_generic(world):
+    """The regression half: refining four envelopes must not have
+    reclassified everything else."""
+    _run_raising(world, execution.ProcessFailed(
+        "model sureci sifirdan farkli koda dondu", exit_code=1,
+        duration_ms=5, stdout_bytes=0, stderr_bytes=0,
+        cleanup_complete=True))
+    entry = _terminal_event(world, contract.EventCode.MODEL_CALL_FINISHED)
+    assert entry["failure_code"] == \
+        contract.FailureCode.IMPLEMENTER_PROCESS_FAILED
