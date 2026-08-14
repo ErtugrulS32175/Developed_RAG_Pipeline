@@ -293,6 +293,22 @@ def build_evaluator_argv(binary, *, repo, schema_path, last_message_path,
     model = exact_model(model)
     argv = [
         exact_launchable_text(binary, what="ikili dosya"), "exec",
+        # A FIXED LITERAL, not a parameter (B4-R3). `codex exec` refuses
+        # to start outside a git repository -- measured on 0.147.0-alpha:
+        # exit 1 after 341ms with "Not inside a trusted directory and
+        # --skip-git-repo-check was not specified", before the schema
+        # file was ever read. The cwd here is the flat workspace's
+        # implementer root, which holds tracked files and no `.git`
+        # because it is a COPY rather than a clone.
+        #
+        # Nothing is loosened by skipping that check: the directory is
+        # not a caller's path but one `flat_workspace.assert_binding`
+        # derives from the recorded run, and `--sandbox read-only` still
+        # bounds what the evaluator may do inside it. Git's notion of a
+        # trusted directory is not the authority on this road, and there
+        # is no keyword through which a caller, a task or a model could
+        # remove this token or add a second one.
+        "--skip-git-repo-check",
         "--sandbox", CODEX_SANDBOX_READ_ONLY,
         *CODEX_APPROVAL_OVERRIDE,
         "--cd", exact_launchable_text(repo, what="depo yolu"),

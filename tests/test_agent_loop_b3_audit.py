@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 
 import test_agent_loop_b2_changes as legacy
-from tools.agent_loop import audit, contract, schemas
+from tools.agent_loop import audit, cli, contract, schemas
 
 RUN = legacy.RUN
 STUB_HOLDER = legacy.STUB_HOLDER
@@ -63,6 +63,15 @@ def main():
         Path(cfg["argv_record"]).write_text(json.dumps(argv), encoding="utf-8")
     if cfg.get("cwd_record"):
         Path(cfg["cwd_record"]).write_text(os.getcwd(), encoding="utf-8")
+    if cfg.get("git_gate") and "--skip-git-repo-check" not in argv \\
+            and not Path(".git").exists():
+        # THE REAL CLI'S OWN GATE, reproduced from a measurement of
+        # codex-cli 0.147.0-alpha.6.6: exit 1 before any work, with this
+        # exact sentence on stderr and nothing on stdout.
+        sys.stderr.write("Reading prompt from stdin...\\n"
+                         "Not inside a trusted directory and "
+                         "--skip-git-repo-check was not specified.\\n")
+        sys.exit(1)
     mode = cfg["mode"]
     if mode == "reply":
         if cfg.get("read_stdin", True):
@@ -528,3 +537,56 @@ def test_the_workspace_binding_is_what_chooses_the_directory(
     with pytest.raises(audit.WorkspaceNotBound):
         _audit(binary, gate, workspace_id="0" * 32)
     assert not only_fake_models_may_run, "baglama tutmadigi halde calisti"
+
+
+# =====================================================================
+# B4-R3 -- A FLAT WORKSPACE IS NOT A GIT REPOSITORY
+# =====================================================================
+#
+# MEASURED on codex-cli 0.147.0-alpha.6.6 with the exact production
+# argv: exit 1 after 341 ms, 0 bytes of stdout, 105 of stderr, no
+# last-message file, and this text:
+#
+#   "Not inside a trusted directory and --skip-git-repo-check was not
+#    specified."
+#
+# The evaluator's cwd is the workspace's implementer root, which holds
+# tracked files and no `.git` -- by design, because it is a copy rather
+# than a clone. The stub below reproduces that gate so the fixture fails
+# for the real reason rather than because a fake was told to fail.
+
+def test_the_evaluator_runs_where_there_is_no_git_repository(
+        tmp_path, gate, only_fake_models_may_run):
+    """Both directions, against a stub carrying the real CLI's gate.
+
+    FIRST the control: the same stub, launched with the production argv
+    MINUS the flag, refuses exactly as the real binary did -- so the
+    gate is genuinely armed and the green half below is not vacuous.
+    THEN the production path, which must pass."""
+    import subprocess as real_subprocess
+
+    assert not (Path(gate.tree) / ".git").exists(), \
+        "senaryo kurulmadi: aday agacinda .git var"
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(_code_reply()),
+                   git_gate=True)
+
+    schema_file = tmp_path / "sema.json"
+    schema_file.write_text("{}", encoding="utf-8")
+    last_message = tmp_path / "son.txt"
+    argv = cli.build_evaluator_argv(binary, repo=gate.tree,
+                                    schema_path=schema_file,
+                                    last_message_path=last_message)
+    assert "--skip-git-repo-check" in argv, "uretim argv'si bayragi tasimiyor"
+    stripped = [token for token in argv if token != "--skip-git-repo-check"]
+    refused = real_subprocess.run(stripped, cwd=str(gate.tree), input=b"",
+                                  capture_output=True)
+    assert refused.returncode == 1
+    assert b"--skip-git-repo-check was not specified" in refused.stderr
+    assert refused.stdout == b""
+    assert not last_message.exists()
+
+    # and with the flag the production seam completes normally
+    outcome = _audit(binary, gate)
+    assert outcome.reply["role"] == contract.Role.EVALUATOR
+    assert outcome.exit_code == 0
+    assert outcome.last_message_bytes > 0

@@ -2022,3 +2022,97 @@ def test_the_argv_carries_the_transport_schema_and_not_the_authority():
     assert token != schemas.IMPLEMENTER_SCHEMA_BINDING.canonical_json
     for keyword in _TRANSPORT_UNSUPPORTED:
         assert f'"{keyword}"' not in token
+
+
+# =====================================================================
+# B4-R3 -- THE EVALUATOR RUNS IN A BOUND FLAT WORKSPACE
+# =====================================================================
+#
+# MEASURED against codex-cli 0.147.0-alpha.6.6, launched with the exact
+# production argv: exit 1 after 341 ms, 0 bytes on stdout, 105 on
+# stderr, and no last-message file. The whole message was
+#
+#   "Reading prompt from stdin...
+#    Not inside a trusted directory and --skip-git-repo-check was not
+#    specified."
+#
+# The working directory is the flat workspace's IMPLEMENTER ROOT, which
+# carries no `.git` by design -- it is a copy of tracked files, not a
+# clone. So the CLI's own git-repository check is asking a question this
+# loop already answers, and answers with something stronger: the
+# directory is not a caller's path but one `flat_workspace.assert_binding`
+# derives from the recorded run, and the sandbox stays `read-only`.
+#
+# WHAT THIS IS NOT. It is not the schema split the implementer road
+# needed. The measured text names no schema and no keyword, and the
+# process died before the schema file was ever read -- an earlier
+# hypothesis built on the audit schema's keyword inventory was wrong and
+# the measurement retired it.
+
+SKIP_GIT_CHECK = "--skip-git-repo-check"
+
+
+def _evaluator_argv(tmp_path, **overrides):
+    call = {"repo": tmp_path, "schema_path": tmp_path / "s.json",
+            "last_message_path": tmp_path / "o.txt"}
+    call.update(overrides)
+    return cli.build_evaluator_argv(tmp_path / "sahte_codex.py", **call)
+
+
+def test_the_evaluator_argv_skips_the_git_repo_check_exactly_once(tmp_path):
+    """EXACTLY ONCE: a repeated flag has no agreed meaning here, and a
+    missing one is the measured failure."""
+    argv = _evaluator_argv(tmp_path)
+    assert argv.count(SKIP_GIT_CHECK) == 1
+    # it belongs to `exec`, so it comes after the subcommand
+    assert argv.index(SKIP_GIT_CHECK) > argv.index("exec")
+
+
+def test_the_skip_flag_is_fixed_and_not_a_caller_parameter(tmp_path):
+    """A SECURITY-SHAPED FLAG IS NOT CONFIGURATION. There is no keyword
+    through which a caller -- or a task, or a model -- can remove it,
+    add a second one, or flip it: the builder simply does not take one,
+    so an attempt is a `TypeError` rather than a quiet override."""
+    import inspect
+
+    parameters = inspect.signature(cli.build_evaluator_argv).parameters
+    assert not any("git" in name or "skip" in name for name in parameters)
+    for attempt in ({"skip_git_repo_check": False},
+                    {"skip_git_repo_check": True},
+                    {"git_check": True}):
+        with pytest.raises(TypeError):
+            _evaluator_argv(tmp_path, **attempt)
+    # and nothing a task or a model can say reaches it: the only inputs
+    # are the four paths and the model name
+    assert _evaluator_argv(tmp_path).count(SKIP_GIT_CHECK) == 1
+
+
+def test_the_implementer_argv_never_carries_the_skip_flag(tmp_path):
+    """The flag is the CODEX road's answer to the CODEX binary's check.
+    Claude has no such check and no such flag."""
+    argv = cli.build_implementer_argv(tmp_path / "sahte_claude.py",
+                                      budget_usd=1.0)
+    assert SKIP_GIT_CHECK not in argv
+
+
+def test_the_evaluator_security_invariants_survive_the_skip_flag(tmp_path):
+    """Adding one flag must not have loosened any of the others: this
+    re-asserts the whole evaluator contract beside the new token."""
+    argv = _evaluator_argv(tmp_path)
+    for flag in contract.CODEX_REQUIRED_FLAGS:
+        assert flag in argv, f"eksik bayrak: {flag}"
+    assert argv[1] == "exec"
+    assert argv[argv.index("--sandbox") + 1] == \
+        contract.CODEX_SANDBOX_READ_ONLY
+    flag, value = contract.CODEX_APPROVAL_OVERRIDE
+    assert value in argv and argv[argv.index(value) - 1] == flag
+    assert "--ask-for-approval" not in argv and "-a" not in argv
+    assert argv[argv.index("--cd") + 1] == str(tmp_path)
+    assert argv[argv.index("--output-schema") + 1] == str(tmp_path / "s.json")
+    assert argv[argv.index("--output-last-message") + 1] == \
+        str(tmp_path / "o.txt")
+    # the prompt is nowhere on the command line -- it goes over stdin
+    assert not any("Adayi" in token or "incele" in token for token in argv)
+    # and the flag did not smuggle in anything the forbidden list bars
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+    assert "--full-auto" not in argv
