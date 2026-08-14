@@ -1186,3 +1186,75 @@ def test_the_failure_vocabulary_and_the_event_schema_agree(world):
     assert not validator.is_valid(
         {"ts": "t", "run_id": "kosu-abc", "event": "model_call_finished",
          "failure_code": "boyle-bir-kod-yok"})
+
+
+# =====================================================================
+# B4-R5 -- THE PLAN-ONLY GATE, WHERE THE RUNNER USES IT
+# =====================================================================
+#
+# The authority itself is proven in `test_agent_loop_plan_auth.py`. What
+# only this suite can prove is WHERE it is consulted: before anything is
+# built, and again immediately before each model call.
+
+def test_an_api_key_stops_the_run_before_anything_is_built(world, monkeypatch):
+    """Preflight's refusal costs nothing: no workspace, no state
+    document, no model process. The counters are asserted rather than
+    the reason alone, because "refused" and "refused before spending"
+    are different claims."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "kurgu-anahtar-degeri")
+    result = run(world)
+    assert result.state == contract.State.BLOCKED
+    assert result.stop_reason == contract.StopReason.PREFLIGHT_FAILED
+    assert model_calls(world) == []
+    assert not (world.state_dir / "state.json").exists()
+    assert result.workspace_id is None
+    root = flat_workspace.runner_temp_root()
+    assert not root.exists() or list(root.iterdir()) == []
+
+
+def test_the_gate_is_re_proven_immediately_before_every_model_call(
+        world, monkeypatch):
+    """A preflight answer describes the moment preflight ran. Each call
+    asks again -- and when the answer changes, THAT call does not
+    happen.
+
+    The second half is the load-bearing one: failing the gate that
+    precedes the evaluator must leave the implementer's single call
+    intact and the evaluator's count at zero."""
+    seen = []
+    genuine = runner.plan_auth.assert_plan_only
+
+    def counting(**kwargs):
+        seen.append(kwargs)
+        return genuine(**kwargs)
+
+    monkeypatch.setattr(runner.plan_auth, "assert_plan_only", counting)
+    result = run(world)
+    assert result.state == contract.State.APPROVED
+    # preflight, then one before the implementer, one before the evaluator
+    assert len(seen) == 3
+    assert {tuple(sorted(call)) for call in seen} == {
+        ("evaluator_binary", "implementer_binary")}
+    # the EXACT canonical binaries, never re-derived from the task
+    for call in seen:
+        assert call["implementer_binary"] == world.binaries["implementer"]
+        assert call["evaluator_binary"] == world.binaries["evaluator"]
+
+    # a SECOND world: a terminal state belongs to the run that wrote it,
+    # so a second `runner.run` in the same checkout would be refused by
+    # preflight and go green on the wrong refusal
+    other = build_world(world.repo.parent, index=3)
+    calls = {"n": 0}
+
+    def failing(**kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 3:            # preflight, implementer, THEN fail
+            raise runner.plan_auth.PlanAuthRefused(
+                "ortamda API anahtari var: ANTHROPIC_API_KEY")
+        return genuine(**kwargs)
+
+    monkeypatch.setattr(runner.plan_auth, "assert_plan_only", failing)
+    result = run(other)
+    assert result.stop_reason == contract.StopReason.PREFLIGHT_FAILED
+    assert len(implementer_calls(other)) == 1
+    assert evaluator_calls(other) == []

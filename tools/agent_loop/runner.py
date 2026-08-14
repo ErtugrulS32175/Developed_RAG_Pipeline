@@ -64,7 +64,7 @@ from pathlib import Path
 
 from tools.agent_loop import (acceptance, application, audit, changes,
                               contract, flat_workspace, fs_evidence, locking,
-                              runner_events, schemas)
+                              plan_auth, runner_events, schemas)
 from tools.agent_loop import preflight as preflight_gates
 from tools.agent_loop import state as state_module
 
@@ -327,6 +327,23 @@ def _recover_applications(repo):
     return tuple(recovered)
 
 
+def _plan_auth_refusal(binaries):
+    """`None` when both CLIs are on subscription sessions.
+
+    ONE AUTHORITY, called from the two places that matter: before a run
+    builds anything, and immediately before every model call. It is not
+    a budget check and does not replace one -- it fixes WHERE the money
+    comes from, while the manifest's ceiling and the runner's ledger
+    bound how much of it a run may spend."""
+    try:
+        plan_auth.assert_plan_only(
+            implementer_binary=binaries["implementer"],
+            evaluator_binary=binaries["evaluator"])
+    except plan_auth.PlanAuthRefused as refused:
+        return refused
+    return None
+
+
 def preflight(task_path, *, repo, binaries) -> RunResult:
     """Every gate that must pass before a model could be called.
 
@@ -336,6 +353,18 @@ def preflight(task_path, *, repo, binaries) -> RunResult:
     rather than at the first paid call."""
     binaries = _exact_binaries(binaries)
     repo_path = Path(repo)
+    # PLAN-ONLY, HERE RATHER THAN INSIDE `preflight` (B4-R5). The gate
+    # belongs where the money is spent, and this package is what spends
+    # it: `preflight.run_preflight` is a pure gate module with callers
+    # and tests of its own, and a binary that merely EXECUTES is a valid
+    # answer to the question it asks. Putting an authentication probe
+    # there would have made "is this file runnable" unanswerable without
+    # a logged-in vendor CLI.
+    refusal = _plan_auth_refusal(binaries)
+    if refusal is not None:
+        return RunResult(state=contract.State.BLOCKED,
+                         stop_reason=refusal.reason,
+                         visited=[contract.State.PREFLIGHT])
     outcome = preflight_gates.run_preflight(
         task_path, repo=repo_path, binaries=binaries,
         state_dir=state_directory(repo_path))
@@ -470,6 +499,12 @@ class _Run:
 
     def execute(self) -> RunResult:
         self.recovered_applications = _recover_applications(self.repo)
+        # BEFORE THE GATES AND BEFORE ANYTHING IS BUILT (B4-R5): a
+        # machine holding an API key stops here, with no workspace, no
+        # state document and no model process to undo.
+        refusal = _plan_auth_refusal(self.binaries)
+        if refusal is not None:
+            return self._result(contract.State.BLOCKED, refusal.reason)
         outcome = preflight_gates.run_preflight(
             self.task_path, repo=self.repo, binaries=self.binaries,
             state_dir=self.state_dir)
@@ -802,6 +837,27 @@ class _Run:
     # the implementer
     # -----------------------------------------------------------------
 
+    def _assert_plan_only(self):
+        """Re-proven IMMEDIATELY BEFORE every model call (B4-R5).
+
+        Preflight's answer describes the moment preflight ran, and a run
+        may spend twenty minutes between that moment and its last model
+        call -- long enough for a session to be re-authenticated against
+        an API balance while the loop is not looking. Asking again costs
+        two free status commands and is the only way the claim covers
+        the call it is supposed to protect.
+
+        THE SAME CANONICAL BINARIES the call will use: `self.binaries` is
+        the mapping `_exact_binaries` already fixed, so the paths checked
+        here and the paths launched afterwards cannot be two different
+        programs. Nothing is re-derived from the task."""
+        refusal = _plan_auth_refusal(self.binaries)
+        if refusal is not None:
+            raise _Stop(refusal.reason, state=contract.State.BLOCKED,
+                        event=refusal.event,
+                        surviving_children=0 if refusal.cleanup_complete
+                        else 1)
+
     def _model_environment(self, round_index, issued=None):
         values = {ENV_RUN_ID: self.run_id, ENV_ROUND: str(round_index)}
         if issued:
@@ -850,6 +906,7 @@ class _Run:
                         state=contract.State.BLOCKED)
         budget = self._assert_budget()
         seconds = self._model_seconds()
+        self._assert_plan_only()
         self._event(contract.EventCode.MODEL_CALL_STARTED, state=self.state)
         with self._guard():
             with self._model_environment(self.rounds["implementation"]):
@@ -875,6 +932,7 @@ class _Run:
         since the audit is a repair of something nobody reviewed."""
         budget = self._assert_budget()
         seconds = self._model_seconds()
+        self._assert_plan_only()
         self._event(contract.EventCode.MODEL_CALL_STARTED, state=self.state)
         with self._guard():
             with self._model_environment(self.rounds["repair"] + 1):
@@ -980,6 +1038,7 @@ class _Run:
         # the tree it is about to accuse the evaluator of touching. The
         # guard stays total (nothing under `.agent-loop/` is excused)
         # precisely because nothing is written while it is open.
+        self._assert_plan_only()
         self._event(contract.EventCode.MODEL_CALL_STARTED, state=self.state)
         policy = changes.freeze_main_policy(self.repo)
         main_key = secrets.token_bytes(fs_evidence.KEY_BYTES)

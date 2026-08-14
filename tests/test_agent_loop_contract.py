@@ -84,6 +84,23 @@ if ARGV == ["--version"]:
     sys.stdout.write("kurgu 0.0\\n")
     sys.exit(0)
 
+if ARGV == ["auth", "status"]:
+    # THE PLAN-ONLY GATE'S QUESTION (B4-R5). Free, token-less, and NOT
+    # recorded for the same reason `--version` is not: a status query is
+    # not a model call, and a test that counts calls must not see one.
+    # The shape is the measured one, minus the account fields -- a
+    # fixture has no business carrying an email or an organisation id.
+    sys.stdout.write(json.dumps({
+        "loggedIn": True, "authMethod": "claude.ai",
+        "apiProvider": "firstParty", "subscriptionType": "pro"}))
+    sys.exit(0)
+
+if ARGV == ["login", "status"]:
+    # The evaluator's half, written to stderr exactly as the installed
+    # CLI was measured to write it.
+    sys.stderr.write("Logged in using ChatGPT\\n")
+    sys.exit(0)
+
 with open(__RECORD__, "a", encoding="utf-8") as handle:
     handle.write(json.dumps({"argv": ARGV}) + "\\n")
 
