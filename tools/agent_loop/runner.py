@@ -174,6 +174,12 @@ _EVENT_FOR_REASON = {
     contract.StopReason.BUDGET_EXHAUSTED: contract.EventCode.BUDGET_CHECK,
 }
 
+# Exactly what a terminal failure event may carry beyond its code and
+# state. Named here so the journal's contents are a decision rather than
+# whatever the failure object happened to expose.
+_DIAGNOSTIC_FIELDS = ("failure_code", "role", "exit_code", "duration_ms",
+                      "stdout_bytes", "stderr_bytes", "cleanup_complete")
+
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
@@ -211,7 +217,7 @@ class _Stop(Exception):
     terminal state it belongs in. Internal: it never leaves the module."""
 
     def __init__(self, reason, *, state, surviving_children=0,
-                 pending_approval=(), event=None):
+                 pending_approval=(), event=None, diagnostics=None):
         super().__init__(reason)
         self.reason = reason
         self.state = state
@@ -222,6 +228,12 @@ class _Stop(Exception):
         # `output_truncated` and `schema_violation` are the same stop
         # reason at this layer and two very different defects below it.
         self.event = event
+        # CLOSED DIAGNOSTICS ONLY (B4-R4): a failure code from the frozen
+        # vocabulary, a role from the frozen pair, and numbers the lower
+        # layer measured itself. Built by `_diagnostics`, which is the one
+        # place allowed to read a failure's attributes -- so there is no
+        # route through this object for a message, a path or an argv.
+        self.diagnostics = dict(diagnostics or {})
 
 
 class _Interrupted(Exception):
@@ -488,7 +500,14 @@ class _Run:
             return self._walk()
         except _Stop as stop:
             if stop.event is not None:
-                self._event(stop.event, state=self.state)
+                # AN EXPLICIT ALLOWLIST, not `**stop.diagnostics`: what
+                # may reach the journal is decided here by name, so a
+                # field added to a lower layer tomorrow cannot ride along
+                # unreviewed. The event schema closes the record again.
+                self._event(stop.event, state=self.state,
+                            **{name: stop.diagnostics[name]
+                               for name in _DIAGNOSTIC_FIELDS
+                               if name in stop.diagnostics})
             if self.state not in contract.TERMINAL_STATES:
                 self._advance(stop.state, stop_reason=stop.reason)
             return self._result(stop.state, stop.reason,
@@ -706,6 +725,43 @@ class _Run:
             return configured.get("model")
         return None
 
+    def _diagnostics(self, failure):
+        """WHICH mechanism failed and what it measured -- closed only.
+
+        THE ONLY PLACE a failure object's attributes are read, and every
+        one of them is checked before it travels. The failure code comes
+        from the contract's table keyed by (module leaf, class name):
+        `isinstance` is unavailable because this module may not import
+        `execution`, and the class NAME alone is ambiguous because
+        `audit` reuses `execution`'s names for its own family -- filing
+        an evaluator failure as an implementer one would be a confidently
+        wrong code, which is worse than none.
+
+        The class name is a LOOKUP KEY here and never a recorded value.
+        Numbers are copied only when the lower layer actually measured
+        them and only at their exact type: a missing measurement stays
+        missing rather than becoming a zero somebody could read as
+        'nothing was written'."""
+        kind = type(failure)
+        module = getattr(kind, "__module__", "").rsplit(".", 1)[-1]
+        code = contract.FAILURE_CODES.get((module, kind.__name__))
+        diagnostics = {}
+        if code in contract.ALL_FAILURE_CODES:
+            diagnostics["failure_code"] = code
+        role = getattr(failure, "role", None)
+        if role in contract.ALL_ROLES:
+            diagnostics["role"] = role
+        for name in ("exit_code", "duration_ms", "stdout_bytes",
+                     "stderr_bytes"):
+            value = getattr(failure, name, None)
+            # exact `int`, which also excludes `bool`
+            if type(value) is int:
+                diagnostics[name] = value
+        cleanup = getattr(failure, "cleanup_complete", None)
+        if type(cleanup) is bool:
+            diagnostics["cleanup_complete"] = cleanup
+        return diagnostics
+
     def _translate(self, failure):
         """A lower layer's typed refusal becomes this run's stop.
 
@@ -727,7 +783,8 @@ class _Run:
             # the failure's own event is preferred over it.
             event = _EVENT_FOR_REASON.get(reason)
         return _Stop(reason, state=_terminal_for(reason),
-                     surviving_children=survived, event=event)
+                     surviving_children=survived, event=event,
+                     diagnostics=self._diagnostics(failure))
 
     @contextlib.contextmanager
     def _guard(self):

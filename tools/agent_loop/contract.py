@@ -349,6 +349,76 @@ ALL_EVENT_CODES = tuple(
     value for name, value in vars(EventCode).items()
     if not name.startswith("_") and isinstance(value, str))
 
+
+class FailureCode:
+    """WHICH mechanism failed, as a closed code (B4-R4).
+
+    THE GAP THIS CLOSES, measured on two real runs. One stopped with
+    `schema_violation` and another with `model_process_failed`, and
+    neither code says what actually broke: `schema_violation` is raised
+    both by the adapter refusing a reply and by the change-set gate
+    refusing a DECLARATION that did not match the filesystem, while
+    `model_process_failed` covers a non-zero exit, a container that could
+    not be built and a process tree that outlived its call. Three
+    different repairs hide behind each of those names.
+
+    A stop reason answers "may the run continue"; a failure code answers
+    "which mechanism broke". They are different questions and the journal
+    now records both."""
+
+    IMPLEMENTER_PROCESS_FAILED = "implementer_process_failed"
+    IMPLEMENTER_OUTPUT_LIMIT = "implementer_output_limit"
+    IMPLEMENTER_TIMEOUT = "implementer_timeout"
+    IMPLEMENTER_SCHEMA_VIOLATION = "implementer_schema_violation"
+    IMPLEMENTER_PROMPT_NOT_DELIVERED = "implementer_prompt_not_delivered"
+    IMPLEMENTER_CONTAINMENT_FAILED = "implementer_containment_failed"
+    IMPLEMENTER_PROCESS_TREE_SURVIVED = "implementer_process_tree_survived"
+    CHANGE_DECLARATION_MISMATCH = "change_declaration_mismatch"
+    CHANGE_EVIDENCE_UNAVAILABLE = "change_evidence_unavailable"
+    CHANGE_UNSAFE = "change_unsafe"
+
+
+ALL_FAILURE_CODES = tuple(
+    value for name, value in vars(FailureCode).items()
+    if not name.startswith("_") and isinstance(value, str))
+
+# The table the runner reads, keyed by (MODULE LEAF, CLASS NAME).
+#
+# WHY BOTH PARTS. The runner may not import `execution` -- that absence
+# is an invariant its own battery pins by walking the runner's AST, and
+# it is what stops the loop from ever editing without the change-set
+# gates. So the failure cannot be matched by `isinstance`, and it cannot
+# be matched by class name alone either: `audit` defines `ProcessFailed`,
+# `SchemaViolation`, `ContainmentFailed`, `OutputLimitExceeded`,
+# `Timeout`, `ProcessTreeSurvived` and `WorkspaceNotBound` under exactly
+# the names `execution` uses. A name-only table would file an EVALUATOR
+# process failure as `implementer_process_failed`, and a confidently
+# wrong closed code is worse than no code at all.
+#
+# WHAT IS DELIBERATELY ABSENT: the evaluator family. This package is
+# scoped to the implementer road, so an `audit` failure still yields no
+# code rather than a guessed one -- the gap is stated, not papered over.
+FAILURE_CODES = {
+    ("execution", "ProcessFailed"): FailureCode.IMPLEMENTER_PROCESS_FAILED,
+    ("execution", "OutputLimitExceeded"): FailureCode.IMPLEMENTER_OUTPUT_LIMIT,
+    ("execution", "Timeout"): FailureCode.IMPLEMENTER_TIMEOUT,
+    ("execution", "SchemaViolation"):
+        FailureCode.IMPLEMENTER_SCHEMA_VIOLATION,
+    ("execution", "PromptNotDelivered"):
+        FailureCode.IMPLEMENTER_PROMPT_NOT_DELIVERED,
+    ("execution", "ContainmentFailed"):
+        FailureCode.IMPLEMENTER_CONTAINMENT_FAILED,
+    ("execution", "ProcessTreeSurvived"):
+        FailureCode.IMPLEMENTER_PROCESS_TREE_SURVIVED,
+    ("changes", "DeclarationMismatch"):
+        FailureCode.CHANGE_DECLARATION_MISMATCH,
+    ("changes", "EvidenceUnavailable"):
+        FailureCode.CHANGE_EVIDENCE_UNAVAILABLE,
+    ("changes", "UnsafeChange"): FailureCode.CHANGE_UNSAFE,
+}
+
+ALL_ROLES = (Role.IMPLEMENTER, Role.EVALUATOR)
+
 # Ids that come back from a LOCKED audit are not model-chosen slugs --
 # a slug is free text with a short leash, and "gizli-belge-adi" is a
 # perfectly valid one. The runner mints these before the call and

@@ -39,7 +39,9 @@ from jsonschema import Draft202012Validator
 from tools.agent_loop.contract import (
     ALL_AUDIT_KINDS,
     ALL_EVENT_CODES,
+    ALL_FAILURE_CODES,
     ALL_LOCKED_FINDING_CLASSES,
+    ALL_ROLES,
     ALL_STOP_REASONS,
     ALL_SUMMARY_CODES,
     COMMAND_REGISTRY,
@@ -424,6 +426,16 @@ EVENT_SCHEMA = {
         "exit_code": {"type": "integer"},
         "duration_ms": {"type": "integer", "minimum": 0},
         "bytes_truncated": {"type": "integer", "minimum": 0},
+        # B4-R4: WHICH mechanism failed, beside the fact that one did.
+        # All closed: a code from the frozen vocabulary, a role from the
+        # frozen pair, and numbers the lower layer measured itself.
+        # `additionalProperties: false` above still bounds the record, so
+        # nothing outside this list can ever reach the journal.
+        "failure_code": {"enum": list(ALL_FAILURE_CODES)},
+        "role": {"enum": list(ALL_ROLES)},
+        "stdout_bytes": {"type": "integer", "minimum": 0},
+        "stderr_bytes": {"type": "integer", "minimum": 0},
+        "cleanup_complete": {"type": "boolean"},
     },
 }
 

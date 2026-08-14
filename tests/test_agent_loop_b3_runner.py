@@ -37,7 +37,8 @@ import pytest
 import test_agent_loop_b2_changes as legacy
 import test_agent_loop_contract as base
 from tools.agent_loop import (acceptance, application, changes, contract,
-                              flat_workspace, runner, runner_events)
+                              execution, flat_workspace, runner,
+                              runner_events)
 from tools.agent_loop import process as process_module
 
 REPO = Path(__file__).resolve().parent.parent
@@ -986,7 +987,202 @@ def test_the_failure_event_carries_no_free_text_and_no_path(world):
     assert secret not in raw
     assert "EvidenceUnavailable" not in raw
     assert str(world.repo) not in raw
+    # B4-R4 added closed diagnostic fields, so the allowlist grows -- but
+    # it stays an ALLOWLIST, and the event schema closes the record too.
     allowed = {"ts", "run_id", "event", "state", "command_id", "exit_code",
-               "duration_ms", "bytes_truncated"}
+               "duration_ms", "bytes_truncated", "failure_code", "role",
+               "stdout_bytes", "stderr_bytes", "cleanup_complete"}
     for entry in _journal(world):
         assert set(entry) <= allowed, sorted(set(entry) - allowed)
+
+
+# =====================================================================
+# B4-R4 -- WHICH MECHANISM FAILED, not merely that one did
+# =====================================================================
+#
+# MEASURED ON TWO REAL RUNS. One ended `schema_violation`, the next
+# `model_process_failed`, and neither code named the defect: the first
+# is raised BOTH by the adapter refusing a reply and by the change-set
+# gate refusing a declaration the filesystem contradicts, and the second
+# covers a non-zero exit, a container that could not be built, and a
+# process tree that outlived its call. Diagnosing either meant writing a
+# probe, which is the cost this section removes.
+#
+# The stop reason answers "may the run continue". The failure code
+# answers "which mechanism broke". Both are recorded now.
+
+def _run_raising(world_obj, failure):
+    """Run with the implementer seam raising an EXACT lower-layer
+    object -- not a stand-in, so the code under test sees the real
+    type it will meet in production."""
+    def refuse(*args, **kwargs):
+        raise failure
+
+    original = changes.run_verified_implementation
+    changes.run_verified_implementation = refuse
+    try:
+        return run(world_obj)
+    finally:
+        changes.run_verified_implementation = original
+
+
+def _terminal_event(world_obj, code):
+    entries = [entry for entry in _journal(world_obj)
+               if entry["event"] == code]
+    assert entries, f"{code} olayi hic yazilmadi"
+    return entries[-1]
+
+
+def test_a_process_failure_records_its_code_and_its_measurements(world):
+    """The numbers are the LOWER LAYER'S OWN -- copied, never invented."""
+    result = _run_raising(world, execution.ProcessFailed(
+        "model sureci sifirdan farkli koda dondu", exit_code=3,
+        duration_ms=1234, stdout_bytes=77, stderr_bytes=9,
+        cleanup_complete=True))
+    assert result.stop_reason == contract.StopReason.MODEL_PROCESS_FAILED
+    entry = _terminal_event(world, contract.EventCode.MODEL_CALL_FINISHED)
+    assert entry["failure_code"] == \
+        contract.FailureCode.IMPLEMENTER_PROCESS_FAILED
+    assert entry["role"] == contract.Role.IMPLEMENTER
+    assert entry["exit_code"] == 3
+    assert entry["duration_ms"] == 1234
+    assert entry["stdout_bytes"] == 77 and entry["stderr_bytes"] == 9
+    assert entry["cleanup_complete"] is True
+    assert entry["failure_code"] in contract.ALL_FAILURE_CODES
+
+
+def test_a_schema_violation_and_a_declaration_mismatch_are_told_apart(
+        tmp_path, world):
+    """THE AMBIGUITY THIS SECTION EXISTS FOR. Both carry stop reason
+    `schema_violation` and event `schema_violation`; they are two
+    different defects and must not share one code.
+
+    TWO WORLDS, because a terminal state belongs to the run that wrote
+    it: a second `runner.run` in the same checkout is refused by
+    preflight, and reusing one world here would go green on that refusal
+    instead of on the thing being measured."""
+    result = _run_raising(world, execution.SchemaViolation(
+        "yanit sema disi (alan: kok)", exit_code=0, duration_ms=11,
+        stdout_bytes=5, stderr_bytes=0, cleanup_complete=True))
+    assert result.stop_reason == contract.StopReason.SCHEMA_VIOLATION
+    adapter = _terminal_event(world, contract.EventCode.SCHEMA_VIOLATION)
+    assert adapter["failure_code"] == \
+        contract.FailureCode.IMPLEMENTER_SCHEMA_VIOLATION
+
+    other = build_world(tmp_path, index=1)
+    result = _run_raising(other, changes.DeclarationMismatch(
+        "bildirim gerceklesenle uyusmuyor"))
+    assert result.stop_reason == contract.StopReason.SCHEMA_VIOLATION
+    gate = _terminal_event(other, contract.EventCode.SCHEMA_VIOLATION)
+    assert gate["failure_code"] == \
+        contract.FailureCode.CHANGE_DECLARATION_MISMATCH
+    # same reason, same event, DIFFERENT mechanism
+    assert gate["failure_code"] != adapter["failure_code"]
+    assert gate.get("exit_code") is None, "olcumu olmayan katman sayi uydurdu"
+
+
+def test_a_containment_failure_is_its_own_code_and_has_no_exit_code(world):
+    """The container could not be built, so no process ever ran -- and
+    that is visible in two ways: a code of its own, and NO `exit_code`,
+    because a process that never started never returned one.
+
+    The byte and duration fields are present as ZEROS, and that is the
+    lower layer's own default rather than a measurement. The runner
+    copies what the layer supplies and does not decide which of its
+    zeros are meaningful: guessing that a `0` means 'absent' is exactly
+    the silent-zero reading this project keeps paying for. The honest
+    discriminator is `exit_code` and the code itself."""
+    _run_raising(world, execution.ContainmentFailed(
+        "surec kapsayicisi kurulamadi"))
+    entry = _terminal_event(world, contract.EventCode.PREFLIGHT_FAILED)
+    assert entry["failure_code"] == \
+        contract.FailureCode.IMPLEMENTER_CONTAINMENT_FAILED
+    assert entry["failure_code"] != \
+        contract.FailureCode.IMPLEMENTER_PROCESS_FAILED
+    assert "exit_code" not in entry, "hic baslamayan surec cikis kodu bildirdi"
+    assert entry["stdout_bytes"] == 0 and entry["stderr_bytes"] == 0
+
+
+def test_an_unproven_cleanup_is_recorded_and_still_counts_a_survivor(world):
+    """`cleanup_complete=False` must reach the journal AND keep the
+    surviving-children count it already produced -- a flag that replaced
+    the count would hide the process."""
+    result = _run_raising(world, execution.ProcessFailed(
+        "model sureci sifirdan farkli koda dondu", exit_code=1,
+        duration_ms=7, stdout_bytes=0, stderr_bytes=0,
+        cleanup_complete=False))
+    assert result.surviving_children == 1
+    entry = _terminal_event(world, contract.EventCode.MODEL_CALL_FINISHED)
+    assert entry["cleanup_complete"] is False
+
+
+def test_a_successful_model_event_carries_no_failure_code(world):
+    """The healthy road is unchanged: a failure code on a success would
+    make the field meaningless."""
+    result = run(world)
+    assert result.state == contract.State.APPROVED
+    for entry in _journal(world):
+        assert "failure_code" not in entry
+        assert "role" not in entry
+    finished = _terminal_event(world, contract.EventCode.MODEL_CALL_FINISHED)
+    assert finished["exit_code"] == 0
+    assert isinstance(finished["duration_ms"], int)
+
+
+def test_no_message_path_or_note_reaches_the_journal(world):
+    """The failure carries a sentinel, an absolute path and a note. The
+    journal may show that it happened and which mechanism -- nothing
+    else."""
+    sentinel = "GIZLI-ARIZA-CUMLESI"
+    failure = execution.ProcessFailed(
+        f"{sentinel} {world.repo}", exit_code=2, duration_ms=1,
+        stdout_bytes=0, stderr_bytes=0)
+    failure.add_note(f"{sentinel} not")
+    _run_raising(world, failure)
+    raw = runner_events.events_path(world.state_dir).read_text(
+        encoding="utf-8")
+    assert sentinel not in raw
+    assert "ProcessFailed" not in raw, "istisna sinif adi gunluge sizdi"
+    assert str(world.repo) not in raw
+    assert "not" not in raw.lower().replace("notification", ""), \
+        "not/cause metni gunluge sizdi"
+    # no path separator of either kind survives in a closed record
+    assert "\\" not in raw and "/" not in raw
+    entry = _terminal_event(world, contract.EventCode.MODEL_CALL_FINISHED)
+    assert entry["failure_code"] == \
+        contract.FailureCode.IMPLEMENTER_PROCESS_FAILED
+
+
+def test_an_unclassified_failure_invents_no_code(world):
+    """A type the table does not name is not ours to label. It keeps the
+    behaviour it already had -- an unclassified exception flies out of
+    the runner untouched -- and no code is guessed for it."""
+    class Bilinmeyen(RuntimeError):
+        pass
+
+    with pytest.raises(Bilinmeyen):
+        _run_raising(world, Bilinmeyen("siniflandirilmamis"))
+    for entry in _journal(world):
+        assert "failure_code" not in entry
+
+
+def test_the_failure_vocabulary_and_the_event_schema_agree(world):
+    """The closed sets are pinned together: a code the schema refuses
+    could never be written, and a journal line is validated before the
+    handle is opened."""
+    from jsonschema import Draft202012Validator
+
+    from tools.agent_loop import schemas as schema_module
+
+    assert len(set(contract.ALL_FAILURE_CODES)) == 10
+    assert set(contract.FAILURE_CODES.values()) <= \
+        set(contract.ALL_FAILURE_CODES)
+    properties = schema_module.EVENT_SCHEMA["properties"]
+    assert properties["failure_code"]["enum"] == list(
+        contract.ALL_FAILURE_CODES)
+    assert properties["role"]["enum"] == list(contract.ALL_ROLES)
+    assert schema_module.EVENT_SCHEMA["additionalProperties"] is False
+    validator = Draft202012Validator(schema_module.EVENT_SCHEMA)
+    assert not validator.is_valid(
+        {"ts": "t", "run_id": "kosu-abc", "event": "model_call_finished",
+         "failure_code": "boyle-bir-kod-yok"})
