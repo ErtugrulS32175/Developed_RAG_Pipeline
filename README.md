@@ -184,6 +184,105 @@ and the answer prompt are identical for both — only the retrieval strategy
 differs, so a difference in the numbers is attributable to the thing being
 compared.
 
+## Controlled task runs (agent-loop)
+
+`tools/agent_loop` runs a task through an implementer and an evaluator under a
+written contract: the task names what may be edited, which acceptance commands
+decide the outcome, and what the run may spend. Nothing about that is inferred
+at runtime — a run refuses rather than widening its own permissions.
+
+### 1. Write the task manifest
+
+A manifest is a JSON file inside the repository. It *names* acceptance commands
+by id (`pytest_full`, `pytest_selected`, `p0_gate`, `leak_scan`); it never
+spells an argv, because the argv lives in the code registry:
+
+    {
+      "protocol_version": "1.0",
+      "objective": "Fix the Turkish number normalisation in table cells",
+      "baseline_sha": "<40-hex commit the run starts from>",
+      "allowed_paths": ["pipeline/extraction/"],
+      "forbidden_paths": ["tools/agent_loop/", "data/", "eval/"],
+      "acceptance_commands": [
+        {"command_id": "pytest_selected", "paths": ["tests/test_tables.py"]},
+        {"command_id": "leak_scan"}
+      ],
+      "acceptance_criteria": ["Turkish decimal commas survive normalisation"],
+      "max_implementation_rounds": 1,
+      "max_repair_rounds": 1,
+      "max_wall_clock_minutes": 30,
+      "max_budget_usd": 3,
+      "max_output_bytes": 1048576,
+      "leak_policy": {"command_id": "leak_scan", "max_hard_findings": 0},
+      "dirty_tree_allowlist": []
+    }
+
+`allowed_paths` may not cover `tools/agent_loop/` — a task that could edit the
+loop would be a task that rewrites the rules it is judged by. The human gates
+below are likewise not a manifest field: there is no setting that removes them.
+
+### 2. Point at the binaries explicitly
+
+Model binaries are never discovered from PATH: the implementer and evaluator
+paths are mandatory explicit arguments. A forgotten binary is an error, never a
+surprise call to whatever happened to be installed. (Runner-owned acceptance
+commands are the one exception, and only for registry-named tools such as
+`python`, `bash` and `git`, resolved through a narrowed PATH.)
+
+    binaries = {
+        "implementer": "/usr/local/bin/claude",   # Windows: r"C:\...\claude.exe"
+        "evaluator":   "/usr/local/bin/codex",
+    }
+
+### 3. Preflight, then run
+
+Preflight is every gate that must pass before a model could be called. It makes
+no model call and builds no workspace or run state; it may launch contained,
+free CLI version and auth-status probes — so run it first and read its answer
+before paying for anything.
+
+    from tools.agent_loop import runner
+
+    result = runner.preflight("tasks/normalise.json", repo=".", binaries=binaries)
+    if result.stop_reason == "completed":
+        result = runner.run("tasks/normalise.json", repo=".", binaries=binaries)
+
+The implementer works in a flat copy of the tree and is allowed to read and
+edit files only — it holds no shell, so it cannot install, fetch or commit
+anything. The acceptance commands are run by the runner, not by the model, and
+that split is what makes the gates mean anything.
+
+### 4. Read the result
+
+`RunResult` carries identities, counts and closed codes — `state`,
+`stop_reason`, `applied_files`, `acceptance_passed`, `pending_approval` — and
+never raw model output or a patch. The durable record is in `.agent-loop/`:
+
+    .agent-loop/state.json      # where the run got to, and why it stopped
+    .agent-loop/events.jsonl    # the transition journal
+    .agent-loop/findings.json   # what the evaluator reported
+
+An accepted candidate is moved into your working tree behind a write-ahead
+journal, and only when your copy of each target still matches the baseline
+byte for byte. If it has drifted, the run refuses instead of discarding your
+edits. `runner.resume(repo=".", binaries=binaries)` reads back an interrupted
+run and rolls back a crashed application; it does not continue the loop.
+
+### 5. Commit and push are yours
+
+**The loop never stages, commits, pushes, rewrites history or deletes
+branches.** It does use Git read-only, to materialise objects and gather
+evidence, and it creates disposable Git metadata inside acceptance mirrors.
+`git add`, `git commit`, `git push`, branch deletion, history rewriting,
+dependency installation and contract changes are on a frozen human-approval
+list, and no task file can shorten it. A run that needs one of them stops with
+`user_approval_required` and names it in `pending_approval`. The changes are in
+your working tree; review the diff and commit them yourself:
+
+    git diff
+    git add -p && git commit
+    git push
+
 ## Stack
 
 PaddleOCR-VL and HunyuanOCR (table extraction), PaddleOCR PP-OCRv5 (OCR),
