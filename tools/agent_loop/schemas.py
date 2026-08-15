@@ -580,12 +580,17 @@ CLAUDE_TRANSPORT_DROPPED = frozenset({
 })
 
 
-def _transport_node(node):
+def _transport_node(node, *, supported, dropped):
     """One schema node, reduced to the supported subset.
 
     STRUCTURE-AWARE, not a blind key walk: under `properties` the keys
     are property NAMES chosen by this contract, and a blind walk would
     have tried to classify `stop_reason` as a JSON Schema keyword.
+
+    THE POLICY IS A PARAMETER (B4-R11), because there are two providers
+    and they do not accept the same subset. It is not a default: a
+    caller who forgets to say which provider gets a `TypeError` rather
+    than silently the other one's rules.
 
     Dropped constraints are NOT restated as `description` prose the way
     the vendor SDKs do it. This boundary exists to keep free text out,
@@ -594,23 +599,26 @@ def _transport_node(node):
         raise TransportSchemaError("sema dugumu bir nesne degil")
     reduced = {}
     for key, value in node.items():
-        if key in CLAUDE_TRANSPORT_DROPPED:
+        if key in dropped:
             continue
-        if key not in CLAUDE_TRANSPORT_KEYWORDS:
+        if key not in supported:
             # the KEYWORD, which is this package's own vocabulary --
             # never a value, which could be model-facing content
             raise TransportSchemaError(f"siniflandirilmamis anahtar: {key}")
         if key == "properties":
-            reduced[key] = {name: _transport_node(sub)
+            reduced[key] = {name: _transport_node(sub, supported=supported,
+                                                  dropped=dropped)
                             for name, sub in value.items()}
         elif key == "items":
-            reduced[key] = _transport_node(value)
+            reduced[key] = _transport_node(value, supported=supported,
+                                           dropped=dropped)
         elif key in ("allOf", "anyOf"):
             # A branch whose whole content was unsupported becomes an
             # EMPTY schema, which constrains nothing and would only add
             # depth for the API to compile. Empty branches are removed,
             # and a combinator left with none goes with them.
-            branches = [_transport_node(sub) for sub in value]
+            branches = [_transport_node(sub, supported=supported,
+                                        dropped=dropped) for sub in value]
             branches = [branch for branch in branches if branch]
             if branches:
                 reduced[key] = branches
@@ -636,7 +644,8 @@ def claude_transport_schema(schema):
     """The API-compatible copy of a schema. Deterministic and pure: the
     source document is never mutated, and equal sources give equal
     canonical bytes."""
-    return _transport_node(schema)
+    return _transport_node(schema, supported=CLAUDE_TRANSPORT_KEYWORDS,
+                           dropped=CLAUDE_TRANSPORT_DROPPED)
 
 
 CLAUDE_TRANSPORT_SCHEMA = claude_transport_schema(AUTHORITATIVE_RESULT_SCHEMA)
@@ -661,3 +670,65 @@ def locked_audit_schema(*, run_id, issued_finding_ids, issued_mechanism_ids):
     finding["finding_id"] = {"enum": sorted(issued_finding_ids)}
     finding["mechanism_id"] = {"enum": sorted(issued_mechanism_ids)}
     return schema
+
+
+# ---------------------------------------------------------------------
+# B4-R11 -- THE CODEX TRANSPORT SCHEMA
+# ---------------------------------------------------------------------
+#
+# MEASURED, not inferred. The first run that reached `auditing` failed
+# every time with the evaluator's own session record naming the cause:
+#
+#     status 400, invalid_request_error, code `invalid_json_schema`,
+#     param `text.format.schema`, message: Invalid schema for
+#     response_format 'codex_output_schema': In context=(), 'allOf' is
+#     not permitted.
+#
+# `context=()` is the ROOT, and the root of every audit schema is where
+# `_conditional_rules` puts its `allOf`. So the evaluator road had been
+# sending the acceptance authority straight to the API since it existed,
+# while the implementer road has sent a derived transport schema since
+# B4-R2. This closes that asymmetry with the SAME pure helper rather
+# than a second copy of it -- one difference, spelled once:
+#
+#     Claude accepts `allOf`;  Codex does not.
+#
+# THE INVARIANT IS UNCHANGED, and it is worth restating because this is
+# the road where an evaluator's verdict decides whether a candidate is
+# applied:
+#
+#     argv schema constrains generation;
+#     authoritative local schema decides acceptance.
+#
+# Nothing validates a reply with a transport schema. A payload that
+# satisfies the transport copy and fails the authoritative binding is
+# refused, which is exactly what the conditional rules stripped here are
+# for: `approved` carrying findings, `changes_requested` carrying none.
+CODEX_TRANSPORT_KEYWORDS = CLAUDE_TRANSPORT_KEYWORDS - {"allOf"}
+CODEX_TRANSPORT_DROPPED = CLAUDE_TRANSPORT_DROPPED | {"allOf"}
+
+
+def codex_transport_schema(schema):
+    """The Codex-compatible copy of an audit schema.
+
+    Deterministic and pure, exactly like its Claude twin: the source
+    document is never mutated and equal sources give equal canonical
+    bytes. It is derived from whatever authoritative schema this call
+    will be judged by -- for a LOCKED audit that is the schema already
+    BOUND to the ids the runner issued, so the `const` run id and the
+    `enum` of issued ids travel with it. Deriving a locked transport
+    from the static schema instead would hand the model a document that
+    accepts ids nobody minted."""
+    return _transport_node(schema, supported=CODEX_TRANSPORT_KEYWORDS,
+                           dropped=CODEX_TRANSPORT_DROPPED)
+
+
+# The CODE audit's transport copy: static, so it is derived once and
+# hash-pinned here rather than rebuilt per call.
+CODE_AUDIT_TRANSPORT_SCHEMA = codex_transport_schema(CODE_AUDIT_RESULT_SCHEMA)
+
+# The two bindings of the CODE road, pinned INDEPENDENTLY. The first is
+# the acceptance authority and never leaves this process; the second is
+# the only one whose bytes reach a file on an argv.
+CODE_AUDIT_SCHEMA_BINDING = SchemaBinding(CODE_AUDIT_RESULT_SCHEMA)
+CODE_AUDIT_TRANSPORT_BINDING = SchemaBinding(CODE_AUDIT_TRANSPORT_SCHEMA)

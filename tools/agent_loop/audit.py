@@ -289,8 +289,12 @@ class HolderNotReleased(AuditError):
 class AuditRun:
     """A validated evaluator reply plus what the call cost.
 
-    `schema_sha256` names the EXACT canonical schema bytes that were in
-    the file on the argv and that validated this reply."""
+    `schema_sha256` names the EXACT canonical bytes of the AUTHORITY
+    that validated this reply. `transport_sha256` names the bytes that
+    were in the file on the argv. They were one field until B4-R11,
+    which is precisely the conflation that sent the acceptance schema to
+    the provider -- so they are two now, and a report that wants to know
+    which document did which job can ask."""
 
     reply: dict
     audit_kind: str
@@ -301,6 +305,7 @@ class AuditRun:
     last_message_bytes: int
     event: str
     schema_sha256: str
+    transport_sha256: str
 
 
 def _now():
@@ -410,7 +415,19 @@ def _opaque_ids(values, what):
 
 def _schema_for(audit_kind, *, issued_run_id, issued_finding_ids,
                 issued_mechanism_ids):
-    """The schema this call will be judged by, chosen by the RUNNER.
+    """The TWO schemas this call needs, as `(authoritative, transport)`.
+
+    THEY ARE NOT INTERCHANGEABLE, and B4-R11 exists because one object
+    used to play both parts. The authoritative schema decides whether a
+    reply is acceptable and never leaves this process. The transport
+    schema is written to the file on the argv and constrains generation
+    only -- Codex refuses `allOf` at the root, which is exactly where
+    the conditional rules live, so every evaluator call was rejected by
+    the provider before the model saw anything.
+
+    The transport copy is DERIVED FROM the authoritative one, per call,
+    so the two can never describe different documents: a locked audit's
+    transport carries the same issued-id bindings its authority does.
 
     A LOCKED audit gets the per-call bound schema: the reply's `run_id`
     pinned with `const` and each id field an `enum` of exactly what was
@@ -433,7 +450,10 @@ def _schema_for(audit_kind, *, issued_run_id, issued_finding_ids,
             # something, and nothing would be bound
             raise AuditInputRefused(
                 "kod denetimi verilmis kimlik almaz")
-        return schemas.CODE_AUDIT_RESULT_SCHEMA
+        # STATIC on this road, so the transport copy is the one derived
+        # and hash-pinned at import rather than rebuilt here
+        return (schemas.CODE_AUDIT_RESULT_SCHEMA,
+                schemas.CODE_AUDIT_TRANSPORT_SCHEMA)
     if audit_kind == contract.AuditKind.LOCKED:
         if issued_run_id is None or not issued_finding_ids \
                 or not issued_mechanism_ids:
@@ -442,9 +462,14 @@ def _schema_for(audit_kind, *, issued_run_id, issued_finding_ids,
             # a gate nobody can tell from a broken one
             raise AuditInputRefused(
                 "kilitli denetim icin kimlik verilmedi")
-        return schemas.locked_audit_schema(
+        # BOUND FIRST, then reduced: the transport copy is derived from
+        # this call's bound authority, so the issued ids travel with it.
+        # A static locked transport would describe a document accepting
+        # ids the runner never minted.
+        authoritative = schemas.locked_audit_schema(
             run_id=issued_run_id, issued_finding_ids=issued_finding_ids,
             issued_mechanism_ids=issued_mechanism_ids)
+        return authoritative, schemas.codex_transport_schema(authoritative)
     raise AuditInputRefused("denetim turu sozlesmede yok")
 
 
@@ -468,7 +493,11 @@ class _CanonicalAuditCall:
     timeout_seconds: int
     max_output_bytes: int
     model: object
+    # THE ACCEPTANCE AUTHORITY. Never written to a file, never sent.
     schema: dict
+    # The generation constraint, and the only schema that reaches an
+    # argv. Weaker on purpose; it decides nothing.
+    transport: dict
 
 
 def _canonical_call(binary, *, repo, state_dir, run_id, workspace_id,
@@ -487,9 +516,9 @@ def _canonical_call(binary, *, repo, state_dir, run_id, workspace_id,
                                         "verilen kosu kimligi")
     if type(audit_kind) is not str or audit_kind not in contract.ALL_AUDIT_KINDS:
         raise AuditInputRefused("denetim turu sozlesmede yok")
-    schema = _schema_for(audit_kind, issued_run_id=issued_run_id,
-                         issued_finding_ids=findings,
-                         issued_mechanism_ids=mechanisms)
+    schema, transport = _schema_for(audit_kind, issued_run_id=issued_run_id,
+                                    issued_finding_ids=findings,
+                                    issued_mechanism_ids=mechanisms)
     try:
         return _CanonicalAuditCall(
             binary=_usable_binary(binary),
@@ -505,7 +534,7 @@ def _canonical_call(binary, *, repo, state_dir, run_id, workspace_id,
                                          "calisma alani kimligi"),
             baseline_sha=_exact_identity(baseline_sha, _BASELINE_PATTERN,
                                          "taban surum"),
-            audit_kind=audit_kind, schema=schema)
+            audit_kind=audit_kind, schema=schema, transport=transport)
     except cli.UnsafeInvocation as refused:
         raise AuditInputRefused(str(refused)) from None
 
@@ -651,10 +680,16 @@ def run_evaluator(binary, *, repo, state_dir, run_id, workspace_id,
     except flat_workspace.FlatWorkspaceError as refused:
         raise WorkspaceNotBound(str(refused)) from None
 
+    # TWO BINDINGS, pinned independently (B4-R11). `binding` is the
+    # acceptance authority and is the only thing a reply is judged by;
+    # `transport_binding` is the document the provider is asked to
+    # generate against, and its bytes are the only ones that reach disk.
     binding = schemas.SchemaBinding(call.schema)
+    transport_binding = schemas.SchemaBinding(call.transport)
     holder = Path(tempfile.mkdtemp(prefix=HOLDER_PREFIX))
     try:
-        return _measure(call, cwd=cwd, holder=holder, binding=binding)
+        return _measure(call, cwd=cwd, holder=holder, binding=binding,
+                        transport_binding=transport_binding)
     finally:
         # the holder's own removal is checked inside `_measure` on the
         # success path so it can outrank a verdict; this is the net for
@@ -662,12 +697,18 @@ def run_evaluator(binary, *, repo, state_dir, run_id, workspace_id,
         shutil.rmtree(holder, ignore_errors=True)
 
 
-def _measure(call, *, cwd, holder, binding):
+def _measure(call, *, cwd, holder, binding, transport_binding):
     """Everything from the first file to the last reap, with exactly one
-    way out of each phase."""
+    way out of each phase.
+
+    THE FILE ON THE ARGV CARRIES THE TRANSPORT BYTES. Writing the
+    authority here is what made every evaluator call fail with a
+    provider 400, and it is also what would send the acceptance rules
+    to a vendor. The authority stays in `binding`, which is what
+    `_parse_reply` judges the answer with."""
     schema_file = holder / SCHEMA_NAME
     last_message = holder / LAST_MESSAGE_NAME
-    schema_file.write_bytes(binding.canonical_bytes)
+    schema_file.write_bytes(transport_binding.canonical_bytes)
 
     argv = cli.build_evaluator_argv(
         call.binary, repo=cwd, schema_path=schema_file,
@@ -815,7 +856,9 @@ def _measure(call, *, cwd, holder, binding):
                         exit_code=exit_code,
                         last_message_bytes=len(raw),
                         event=contract.EventCode.MODEL_CALL_FINISHED,
-                        schema_sha256=binding.sha256, **measurements)
+                        schema_sha256=binding.sha256,
+                        transport_sha256=transport_binding.sha256,
+                        **measurements)
     finally:
         # EVERY exit, including an exception raised between the launch
         # and the drain above. An injected thread-start failure used to

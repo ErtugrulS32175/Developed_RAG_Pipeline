@@ -2135,6 +2135,136 @@ def test_the_evaluator_security_invariants_survive_the_skip_flag(tmp_path):
     assert "--full-auto" not in argv
 
 
+_PROVIDER_FORBIDDEN = ("allOf", "if", "then", "minLength", "maxLength",
+                       "minimum", "maximum", "maxItems", "minItems",
+                       "pattern", "else")
+
+
+def _schema_keywords(node, counts=None):
+    """Count keywords RECURSIVELY. "No allOf at the root" is not the
+    claim -- the root is merely where the provider stopped reading, and
+    a nested conditional would fail the same call."""
+    counts = {} if counts is None else counts
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "properties" and isinstance(value, dict):
+                for sub in value.values():
+                    _schema_keywords(sub, counts)
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            _schema_keywords(value, counts)
+    elif isinstance(node, list):
+        for value in node:
+            _schema_keywords(value, counts)
+    return counts
+
+
+def _forbidden_counts(schema):
+    counts = _schema_keywords(schema)
+    return {key: counts[key] for key in _PROVIDER_FORBIDDEN
+            if counts.get(key)}
+
+
+def test_the_audit_authority_and_the_codex_transport_are_two_documents():
+    """B4-R11. The evaluator road sent its ACCEPTANCE schema to the
+    provider, which refused it with a 400 naming `allOf` at the root.
+    What is pinned here is the separation itself: two documents, two
+    digests, neither an alias of the other, and the strict one still
+    strict."""
+    from jsonschema import Draft202012Validator
+
+    authority = schemas.CODE_AUDIT_RESULT_SCHEMA
+    transport = schemas.CODE_AUDIT_TRANSPORT_SCHEMA
+
+    # the AUTHORITY keeps every rule it ever had
+    assert _forbidden_counts(authority) == {
+        "allOf": 1, "if": 4, "then": 4, "minLength": 4, "maxLength": 4,
+        "minimum": 6, "maximum": 1, "maxItems": 3, "minItems": 1,
+        "pattern": 4}
+    # the TRANSPORT carries none of them, counted recursively
+    assert _forbidden_counts(transport) == {}
+    # what it must still carry, or it would constrain nothing
+    assert transport["type"] == "object"
+    assert transport["additionalProperties"] is False
+    assert transport["required"] == authority["required"]
+    assert set(transport["properties"]) == set(authority["properties"])
+    assert transport["properties"]["role"] == {"const": contract.Role.EVALUATOR}
+    assert transport["properties"]["status"]["enum"] == \
+        authority["properties"]["status"]["enum"]
+
+    # not aliases, and not equal
+    assert transport is not authority
+    assert transport != authority
+    assert schemas.CODE_AUDIT_TRANSPORT_BINDING.sha256 != \
+        schemas.CODE_AUDIT_SCHEMA_BINDING.sha256
+    assert schemas.CODE_AUDIT_SCHEMA_BINDING.sha256 == \
+        schemas.SchemaBinding(schemas.CODE_AUDIT_RESULT_SCHEMA).sha256
+
+    for document in (authority, schemas.LOCKED_AUDIT_RESULT_SCHEMA, transport):
+        Draft202012Validator.check_schema(document)
+
+
+def test_the_codex_derivation_is_pure_and_deterministic():
+    """A derivation that mutated its source would quietly weaken the
+    acceptance authority for the rest of the process -- the authority is
+    a module-level dictionary, so one in-place edit is permanent."""
+    # A SOURCE BUILT HERE, not the module's own. The module-level
+    # authority is reduced once AT IMPORT, so a derivation that edits
+    # its argument has already done the damage before any test body
+    # runs -- comparing the module dictionary with itself afterwards
+    # compares two copies of the same wreckage and passes. The mutation
+    # harness caught exactly that: this assertion used to be vacuous.
+    yerel = {"type": "object", "additionalProperties": False,
+             "required": ["status"],
+             "properties": {"status": {"enum": ["approved", "blocked"]},
+                            "note": {"type": "string", "minLength": 1}},
+             "allOf": [{"if": {"properties": {"status": {"const": "blocked"}},
+                               "required": ["status"]},
+                        "then": {"required": ["note"]}}]}
+    yerel_once = json.dumps(yerel, sort_keys=True)
+    yerel_tasima = schemas.codex_transport_schema(yerel)
+    assert json.dumps(yerel, sort_keys=True) == yerel_once, \
+        "turetim kendi kaynagini degistirdi"
+    assert "allOf" in yerel, "kaynaktan allOf dusuruldu"
+    assert _forbidden_counts(yerel_tasima) == {}
+    assert _forbidden_counts(yerel) == {"allOf": 1, "if": 1, "then": 1,
+                                        "minLength": 1}
+
+    before = json.dumps(schemas.CODE_AUDIT_RESULT_SCHEMA, sort_keys=True)
+    first = schemas.codex_transport_schema(schemas.CODE_AUDIT_RESULT_SCHEMA)
+    second = schemas.codex_transport_schema(schemas.CODE_AUDIT_RESULT_SCHEMA)
+    after = json.dumps(schemas.CODE_AUDIT_RESULT_SCHEMA, sort_keys=True)
+
+    assert before == after, "otorite sema turetim sirasinda degisti"
+    # and the module authority still HAS what the transport drops: if a
+    # derivation stripped it at import, everything above would compare
+    # equal and prove nothing
+    assert "allOf" in schemas.CODE_AUDIT_RESULT_SCHEMA
+    assert first == second
+    assert schemas.canonical_json(first) == schemas.canonical_json(second)
+    assert schemas.SchemaBinding(first).sha256 == \
+        schemas.SchemaBinding(second).sha256
+    assert first is not schemas.CODE_AUDIT_RESULT_SCHEMA
+
+    # the two policies differ in EXACTLY one keyword, and it is the one
+    # the provider named
+    assert schemas.CLAUDE_TRANSPORT_KEYWORDS - \
+        schemas.CODEX_TRANSPORT_KEYWORDS == {"allOf"}
+    assert schemas.CODEX_TRANSPORT_DROPPED - \
+        schemas.CLAUDE_TRANSPORT_DROPPED == {"allOf"}
+    assert not (schemas.CODEX_TRANSPORT_KEYWORDS &
+                schemas.CODEX_TRANSPORT_DROPPED)
+
+    # a locked derivation is bound per call and equally deterministic
+    bound = schemas.locked_audit_schema(
+        run_id="a" * 32, issued_finding_ids=["f" * 32],
+        issued_mechanism_ids=["e" * 32])
+    locked_transport = schemas.codex_transport_schema(bound)
+    assert _forbidden_counts(locked_transport) == {}
+    assert locked_transport["properties"]["run_id"] == {"const": "a" * 32}
+    assert schemas.codex_transport_schema(bound) == locked_transport
+
+
 def test_every_stderr_marker_is_exact_proven_and_wired(tmp_path):
     """B4-R8. The marker table is the ONLY thing that can produce a
     specific evaluator code, so its discipline is pinned here rather

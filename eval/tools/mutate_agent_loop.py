@@ -358,6 +358,44 @@ MUTATIONS = [
      + "                exit_code=exit_code, **measurements)",
      "test_no_stderr_byte_reaches_the_exception_that_names_it"),
     # ----------------------------------------------------------------
+    # B4-R11 -- the evaluator's two schemas. One constrains generation
+    # and travels; one decides acceptance and never leaves. Each mutant
+    # below is a way of collapsing them back into one, which is what a
+    # measured provider 400 proved had been happening all along.
+    # ----------------------------------------------------------------
+    # 1. The acceptance authority on the argv: the defect itself, and
+    #    also the road by which the acceptance rules reach a vendor.
+    ("b4r11-argv-otorite-semasi", "audit",
+     "    schema_file.write_bytes(transport_binding.canonical_bytes)",
+     "    schema_file.write_bytes(binding.canonical_bytes)",
+     "test_the_file_on_the_argv_carries_the_transport_and_not_the_authority"),
+    # 2. Judging the reply with the WEAKER document. Every conditional
+    #    rule the transport drops becomes unenforced: `approved` with
+    #    findings, `changes_requested` with none.
+    ("b4r11-zayif-otorite", "audit",
+     "    binding = schemas.SchemaBinding(call.schema)",
+     "    binding = schemas.SchemaBinding(call.transport)",
+     "test_what_the_transport_allows_the_authority_still_refuses"),
+    # 3. A STATIC locked transport describes a document that accepts ids
+    #    the runner never minted -- the exact promise `locked_audit_schema`
+    #    exists to keep.
+    ("b4r11-kilitli-statik-tasima", "audit",
+     "        return authoritative, schemas.codex_transport_schema("
+     "authoritative)",
+     "        return authoritative, schemas.codex_transport_schema("
+     + NL + "            schemas.LOCKED_AUDIT_RESULT_SCHEMA)",
+     "test_a_locked_transport_carries_this_call_s_issued_ids"),
+    # 4. A derivation that edits its source weakens the ACCEPTANCE
+    #    authority for the rest of the process: the authority is a
+    #    module-level dictionary, so one in-place edit is permanent.
+    ("b4r11-turetim-kaynagi-bozuyor", "schemas",
+     "    return _transport_node(schema, supported=CODEX_TRANSPORT_KEYWORDS,"
+     + NL + "                           dropped=CODEX_TRANSPORT_DROPPED)",
+     '    schema.pop("allOf", None)' + NL
+     + "    return _transport_node(schema, supported=CODEX_TRANSPORT_KEYWORDS,"
+     + NL + "                           dropped=CODEX_TRANSPORT_DROPPED)",
+     "test_the_codex_derivation_is_pure_and_deterministic"),
+    # ----------------------------------------------------------------
     # B2A -- the call boundary: validate once, canonicalize once, use
     # only the canonical value. Each mutation reopens exactly one of
     # the check/use divergences the package closed.

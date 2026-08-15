@@ -1289,7 +1289,10 @@ def test_every_mutation_still_applies_to_the_current_source():
     # 94 -> 98 in B4-R8: the same four intents on the EVALUATOR road --
     # the exact whole-line gate, unknown-stays-generic, the two roads
     # never sharing a code, and the marker never becoming a value.
-    assert len(tool.MUTATIONS) == 98
+    # 98 -> 102 in B4-R11: the evaluator's transport/authority split --
+    # the argv file, the validating binding, the locked ids and the
+    # purity of the derivation.
+    assert len(tool.MUTATIONS) == 102
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1305,7 +1308,9 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b4r6-bilinmeyen-subtype', 'b4r6-sinif-esleme',
         'b4r6-ham-subtype-sizintisi', 'b4r8-tam-eslesme-kapisi',
         'b4r8-bilinmeyen-stderr', 'b4r8-yol-karismasi',
-        'b4r8-ham-stderr-sizintisi',
+        'b4r8-ham-stderr-sizintisi', 'b4r11-argv-otorite-semasi',
+        'b4r11-zayif-otorite', 'b4r11-kilitli-statik-tasima',
+        'b4r11-turetim-kaynagi-bozuyor',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

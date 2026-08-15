@@ -63,6 +63,12 @@ def main():
         Path(cfg["argv_record"]).write_text(json.dumps(argv), encoding="utf-8")
     if cfg.get("cwd_record"):
         Path(cfg["cwd_record"]).write_text(os.getcwd(), encoding="utf-8")
+    if cfg.get("schema_record"):
+        # the BYTES the child was actually handed, copied from the path
+        # on its own argv -- the caller's word for what it wrote is not
+        # evidence about what arrived
+        sema = flag(argv, "--output-schema")
+        Path(cfg["schema_record"]).write_bytes(Path(sema).read_bytes())
     if cfg.get("git_gate") and "--skip-git-repo-check" not in argv \\
             and not Path(".git").exists():
         # THE REAL CLI'S OWN GATE, reproduced from a measurement of
@@ -769,3 +775,167 @@ def test_no_stderr_byte_reaches_the_exception_that_names_it(
     assert "trusted directory" not in carried
     assert "--skip-git-repo-check" not in carried
     assert failure.stderr_bytes == len(noisy.encode("utf-8"))
+
+
+# =====================================================================
+# B4-R11 -- WHAT TRAVELS IS NOT WHAT DECIDES
+# =====================================================================
+#
+# MEASURED from the failing run's own session record: the provider
+# answered 400 `invalid_json_schema`, param `text.format.schema`, saying
+# `allOf` is not permitted at the root -- which is exactly where the
+# audit schema's conditional rules live. The argv file now carries a
+# derived TRANSPORT copy; the reply is still judged by the authority.
+#
+# Every test below proves BOTH halves, because "the transport accepted
+# it" is not a verdict and a suite that only checked the weaker document
+# would go green on the defect this package exists to remove.
+
+_FORBIDDEN_KEYWORDS = ("allOf", "if", "then", "minLength", "maxLength",
+                       "minimum", "maximum", "maxItems", "minItems",
+                       "pattern", "else")
+
+
+def _keyword_counts(node, counts=None):
+    """RECURSIVE, because "no allOf at the root" is not the claim. The
+    root was merely where the provider stopped reading."""
+    counts = {} if counts is None else counts
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "properties" and isinstance(value, dict):
+                for sub in value.values():
+                    _keyword_counts(sub, counts)
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            _keyword_counts(value, counts)
+    elif isinstance(node, list):
+        for value in node:
+            _keyword_counts(value, counts)
+    return counts
+
+
+def _forbidden(schema):
+    counts = _keyword_counts(schema)
+    return {key: counts[key] for key in _FORBIDDEN_KEYWORDS if counts.get(key)}
+
+
+def test_the_file_on_the_argv_carries_the_transport_and_not_the_authority(
+        tmp_path, gate, only_fake_models_may_run):
+    """THE DEFECT, stated as a test. The witness is the CHILD's copy of
+    the file it was handed -- what the adapter says it wrote is not
+    evidence about what arrived."""
+    kayit = tmp_path / "verilen-sema.json"
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(_code_reply()),
+                   schema_record=kayit)
+    outcome = _audit(binary, gate)
+
+    teslim = kayit.read_bytes()
+    assert teslim == schemas.CODE_AUDIT_TRANSPORT_BINDING.canonical_bytes
+    assert teslim != schemas.CODE_AUDIT_SCHEMA_BINDING.canonical_bytes
+    # and it is provider-compatible by COUNT, not by root inspection
+    assert _forbidden(json.loads(teslim.decode("utf-8"))) == {}
+    assert _forbidden(schemas.CODE_AUDIT_RESULT_SCHEMA)["allOf"] == 1
+    # the reply was judged by the AUTHORITY all the same
+    assert outcome.schema_sha256 == schemas.CODE_AUDIT_SCHEMA_BINDING.sha256
+    assert outcome.transport_sha256 == \
+        schemas.CODE_AUDIT_TRANSPORT_BINDING.sha256
+    assert outcome.schema_sha256 != outcome.transport_sha256
+
+
+_CODE_FINDING_BODY = {"finding_id": "bulgu-1", "mechanism_id": "mekanizma-1",
+                      "severity": "high", "claim": "kurgu iddia",
+                      "reproduction_result": "reproduced",
+                      "required_action": "kurgu eylem"}
+
+
+@pytest.mark.parametrize(
+    "govde",
+    [{"status": contract.Status.APPROVED, "next_action": "stop",
+      "findings": [_CODE_FINDING_BODY]},
+     {"status": contract.Status.CHANGES_REQUESTED,
+      "next_action": "await_repair", "findings": []},
+     {"status": contract.Status.APPROVED, "next_action": "await_repair"}],
+    ids=["onaylandi-ama-bulgu-var", "degisiklik-ama-bulgu-yok",
+         "onaylandi-ama-yanlis-eylem"])
+def test_what_the_transport_allows_the_authority_still_refuses(
+        tmp_path, gate, govde, only_fake_models_may_run):
+    """THE LOAD-BEARING TEST of the whole split. Each body is chosen so
+    the WEAKER document accepts it -- proven here, not assumed -- and
+    the authority must still refuse it. If the adapter ever validated
+    with the transport copy, every one of these would be approved."""
+    reply = _code_reply(**govde)
+    # the transport copy really does accept it: that is what makes the
+    # refusal below evidence about the authority rather than about JSON
+    schemas.SchemaBinding(schemas.CODE_AUDIT_TRANSPORT_SCHEMA).validate(reply)
+
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(reply))
+    with pytest.raises(audit.SchemaViolation) as refusal:
+        _audit(binary, gate)
+    assert len(only_fake_models_may_run) == 1, "senaryo kurulmadi"
+    assert "sema disi" in str(refusal.value)
+
+
+def test_a_healthy_reply_passes_the_transport_and_the_authority(
+        tmp_path, gate, only_fake_models_may_run):
+    """The positive control: an adapter that refused everything would
+    pass the test above."""
+    reply = _code_reply()
+    schemas.SchemaBinding(schemas.CODE_AUDIT_TRANSPORT_SCHEMA).validate(reply)
+    schemas.CODE_AUDIT_SCHEMA_BINDING.validate(reply)
+
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(reply))
+    outcome = _audit(binary, gate)
+    assert outcome.reply["status"] == contract.Status.APPROVED
+    assert outcome.exit_code == 0
+
+
+def test_a_locked_transport_carries_this_call_s_issued_ids(
+        tmp_path, gate, only_fake_models_may_run):
+    """A STATIC locked transport would describe a document accepting ids
+    nobody minted. The transport is derived from the schema already
+    bound to this call, so `const` and the two `enum`s travel with it."""
+    kosu, bulgu_id, mekanizma_id = "a" * 32, "f" * 32, "e" * 32
+    bulgu = {"finding_id": bulgu_id, "mechanism_id": mekanizma_id,
+             "severity": "high",
+             "error_class": contract.LockedFindingClass.WRONG_ROW,
+             "case_count": 3}
+    reply = _locked_reply(
+        kosu, status=contract.Status.CHANGES_REQUESTED,
+        summary_code=contract.SummaryCode.REGRESSION_DETECTED,
+        next_action="await_repair", findings=[bulgu])
+    kayit = tmp_path / "kilitli-sema.json"
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(reply),
+                   schema_record=kayit)
+    outcome = _audit(binary, gate, audit_kind=contract.AuditKind.LOCKED,
+                     issued_run_id=kosu, issued_finding_ids=[bulgu_id],
+                     issued_mechanism_ids=[mekanizma_id])
+
+    teslim = json.loads(kayit.read_text(encoding="utf-8"))
+    assert _forbidden(teslim) == {}
+    assert teslim["properties"]["run_id"] == {"const": kosu}
+    alanlar = teslim["properties"]["findings"]["items"]["properties"]
+    assert alanlar["finding_id"] == {"enum": [bulgu_id]}
+    assert alanlar["mechanism_id"] == {"enum": [mekanizma_id]}
+    assert outcome.schema_sha256 != outcome.transport_sha256
+
+
+def test_an_unissued_locked_id_is_still_refused_by_the_authority(
+        tmp_path, gate, only_fake_models_may_run):
+    """The reduction must not have loosened the binding it travels
+    with. The stub answers whatever it is told, so nothing but the
+    authority is between this reply and an approval."""
+    kosu, bulgu_id, mekanizma_id = "a" * 32, "f" * 32, "e" * 32
+    kacak = {"finding_id": "b" * 32, "mechanism_id": mekanizma_id,
+             "severity": "high",
+             "error_class": contract.LockedFindingClass.WRONG_ROW,
+             "case_count": 3}
+    reply = _locked_reply(
+        kosu, status=contract.Status.CHANGES_REQUESTED,
+        summary_code=contract.SummaryCode.REGRESSION_DETECTED,
+        next_action="await_repair", findings=[kacak])
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(reply))
+    with pytest.raises(audit.SchemaViolation):
+        _audit(binary, gate, audit_kind=contract.AuditKind.LOCKED,
+               issued_run_id=kosu, issued_finding_ids=[bulgu_id],
+               issued_mechanism_ids=[mekanizma_id])
+    assert len(only_fake_models_may_run) == 1, "senaryo kurulmadi"
