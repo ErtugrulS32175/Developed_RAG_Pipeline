@@ -1000,6 +1000,57 @@ def test_the_whole_agent_loop_test_family_is_control_plane(repo, task,
         dirty_allowlist=["tests/test_agent_loop_b1.py"]).ok is False
 
 
+@pytest.mark.parametrize(
+    "entry",
+    ["tests/test_db_lifecycle.py", "tests/test_api_end_to_end.py",
+     "tests/test_api_auth.py", "tests/test_api_rag_contract.py",
+     "tests/test_documents_inventory.py"])
+def test_an_explicit_safe_test_file_reaches_a_completed_preflight(
+        repo, tmp_path, binaries, entry):
+    """B5-R1, END TO END rather than at the schema alone. A real
+    development manifest named two ordinary test files and preflight
+    answered `path_not_allowed` -- because the schema's control-plane
+    pattern matched the ANCESTOR `tests` against everything under it.
+
+    The file does not have to exist: `allowed_paths` is a permission,
+    and a task whose whole point is to CREATE a test would otherwise be
+    unexpressible."""
+    friendly = tmp_path / "guvenli-task.json"
+    friendly.write_text(json.dumps(dict(
+        BASE_TASK, baseline_sha=_git(repo, "rev-parse", "HEAD"),
+        allowed_paths=["pipeline/", entry])), encoding="utf-8")
+
+    result = preflight.run_preflight(friendly, repo=repo, binaries=binaries)
+    assert result.ok is True, result.stop_reason
+    assert result.stop_reason is None
+
+
+def test_a_safe_test_file_in_the_dirty_allowlist_is_not_a_control_plane_path(
+        repo, task, binaries):
+    """The allowlist rule is about the CONTROL PLANE, not about the
+    `tests/` directory. Excusing an ordinary modified test file is an
+    operator's call; the control-plane hash gate is not.
+
+    Both halves are asserted, because the useful failure here is the one
+    where the second stops being true."""
+    victim = repo / "tests"
+    victim.mkdir(exist_ok=True)
+    (victim / "test_db_lifecycle.py").write_text("# kurgu\n", encoding="utf-8")
+
+    result = preflight.run_preflight(
+        task, repo=repo, binaries=binaries,
+        dirty_allowlist=["tests/test_db_lifecycle.py"])
+    assert result.stop_reason != contract.StopReason.PATH_NOT_ALLOWED
+
+    # and the same allowlist still cannot launder the control plane
+    guarded = preflight.run_preflight(
+        task, repo=repo, binaries=binaries,
+        dirty_allowlist=["tests/test_db_lifecycle.py",
+                         "tests/test_agent_loop_b1.py"])
+    assert guarded.ok is False
+    assert guarded.stop_reason == contract.StopReason.PATH_NOT_ALLOWED
+
+
 def test_the_atomic_write_flushes_the_directory_entry_too(state_dir,
                                                           monkeypatch):
     """The CALL SITE, not just the helper. A mutation removing the
@@ -1298,7 +1349,10 @@ def test_every_mutation_still_applies_to_the_current_source():
     # 105 -> 110 in B4-R17: the derived `next_action` -- the table, the
     # refusal to overwrite, the projection running before the authority,
     # the field leaving the transport, and the protocol matrix.
-    assert len(tool.MUTATIONS) == 110
+    # 110 -> 113 in B5-R1: the schema's three control-plane relations --
+    # exact ancestors, the frozen test family, and the broad ancestors
+    # that must stay refused.
+    assert len(tool.MUTATIONS) == 113
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1320,7 +1374,8 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b4r14-hepsi-zorunlu', 'b4r14-eleme-genisligi',
         'b4r17-turetme-tablosu', 'b4r17-sessiz-ustune-yazma',
         'b4r17-projeksiyon-atlandi', 'b4r17-tasimada-kaldi',
-        'b4r17-protokol-matrisi',
+        'b4r17-protokol-matrisi', 'b5r1-ata-tam-eslesme',
+        'b5r1-sema-test-ailesi', 'b5r1-genis-ata-izni',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

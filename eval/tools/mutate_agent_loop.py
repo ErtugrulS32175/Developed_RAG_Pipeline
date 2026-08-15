@@ -168,6 +168,32 @@ MUTATIONS = [
      + "        contract.CONTROL_PLANE_GLOBS)",
      "    return tuple(contract.CONTROL_PLANE_PATHS)",
      "whole_agent_loop_test_family_is_control_plane"),
+    # ----------------------------------------------------------------
+    # B5-R1 -- the SCHEMA's three relations. Measured: one alternation
+    # anchored only at the start made the ancestor `tests` match
+    # everything beneath it, and a real manifest naming an ordinary test
+    # file was refused. The fix has two failure directions, so it gets a
+    # mutant for each.
+    # ----------------------------------------------------------------
+    # 1. Ancestors compared by PREFIX again -- the original defect, and
+    #    the one no security test can see, because it only ever refuses
+    #    too much.
+    ("b5r1-ata-tam-eslesme", "schemas",
+     '        parts.append("^(" + "|".join(re.escape(entry) '
+     'for entry in ancestors)' + NL + '                     + ")/?$")',
+     '        parts.append("^(" + "|".join(re.escape(entry) '
+     'for entry in ancestors)' + NL + '                     + ").*$")',
+     "test_an_explicitly_named_safe_test_file_is_an_allowed_path"),
+    # 2. The frozen family dropped from the pattern: a test file
+    #    invented tomorrow would become an allowed path today.
+    ("b5r1-sema-test-ailesi", "schemas",
+     "    if CONTROL_PLANE_GLOBS:", "    if False:",
+     "test_the_control_plane_its_ancestors_and_its_family_stay_refused"),
+    # 3. The broad ancestors dropped entirely, which is how
+    #    `allowed_paths: ["tests/"]` would come back.
+    ("b5r1-genis-ata-izni", "schemas",
+     "    if ancestors:", "    if False:",
+     "test_the_control_plane_its_ancestors_and_its_family_stay_refused"),
     ("allowlist-test-ailesi", "preflight",
      "        if any(fnmatch.fnmatch(normalised, pattern)" + NL
      + "               for pattern in contract.CONTROL_PLANE_GLOBS):",

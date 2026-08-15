@@ -47,6 +47,7 @@ from tools.agent_loop.contract import (
     ALL_SUMMARY_CODES,
     COMMAND_REGISTRY,
     CONTROL_PLANE_BLOCKED_PATHS,
+    CONTROL_PLANE_GLOBS,
     CONTROL_PLANE_PATHS,
     DEFAULTS,
     IDENTIFIER_PATTERN,
@@ -71,10 +72,69 @@ _ALL_STATES = sorted(
 # accepted because only the exact prefix was refused -- and `tools/`
 # contains `tools/agent_loop/`. Permission over a parent is permission
 # over the child.
-_CONTROL_PLANE_RE = "^(" + "|".join(
-    re.escape(prefix) for prefix in
-    sorted(CONTROL_PLANE_BLOCKED_PATHS | set(CONTROL_PLANE_PATHS))
-    if prefix) + ")"
+#
+# THREE RELATIONS, AND THEY ARE NOT THE SAME ONE (B5-R1). Joining every
+# blocked entry into a single alternation anchored only at the start
+# made the ANCESTOR `tests` match everything beneath it, so a manifest
+# naming `tests/test_db_lifecycle.py` -- an ordinary test file, no part
+# of this loop -- was refused with `path_not_allowed`. The runtime gate
+# in `preflight` never had that defect: it compares ancestors by
+# EQUALITY. Two layers answering the same question differently is a
+# policy split nobody can see, so these rules are now spelled the way
+# that gate spells them:
+#
+#   1. a protected prefix, itself and everything under it;
+#   2. a broad ancestor, EXACTLY -- `tests`, not `tests/anything`;
+#   3. the frozen glob family, so a test file invented tomorrow is
+#      protected today.
+#
+# Derived from the contract's own constants, never a hand-kept list of
+# today's exceptions: an entry added to `CONTROL_PLANE_PATHS` or
+# `CONTROL_PLANE_GLOBS` closes here without anybody editing this file.
+
+
+def _glob_to_regex(pattern):
+    """The frozen glob family as a regex, FAIL-CLOSED.
+
+    `*` becomes `.*` -- deliberately the same span `fnmatch` gives it,
+    including across `/`, so the schema can never be more permissive
+    than the runtime gate that uses `fnmatch`. Any other wildcard is
+    unsupported and raises at import rather than being silently escaped
+    into a literal, which would leave the family open."""
+    out = []
+    for character in pattern:
+        if character == "*":
+            out.append(".*")
+        elif character in "?[]":
+            raise ValueError(
+                "kontrol duzlemi glob'u desteklenmeyen joker tasiyor")
+        else:
+            out.append(re.escape(character))
+    return "".join(out)
+
+
+def _control_plane_pattern():
+    """One pattern, three relations, each anchored on its own terms."""
+    prefixes = tuple(CONTROL_PLANE_PATHS)
+    exact = {prefix.rstrip("/") for prefix in prefixes}
+    ancestors = sorted(
+        {entry.rstrip("/") for entry in CONTROL_PLANE_BLOCKED_PATHS
+         if entry.rstrip("/")} - exact)
+    parts = []
+    for prefix in sorted(prefixes):
+        # everything under it, and the prefix itself without its slash
+        parts.append("^" + re.escape(prefix) + ".*$")
+        parts.append("^" + re.escape(prefix.rstrip("/")) + "$")
+    if ancestors:
+        parts.append("^(" + "|".join(re.escape(entry) for entry in ancestors)
+                     + ")/?$")
+    if CONTROL_PLANE_GLOBS:
+        parts.append("^(" + "|".join(_glob_to_regex(glob)
+                                     for glob in CONTROL_PLANE_GLOBS) + ")$")
+    return "|".join(parts)
+
+
+_CONTROL_PLANE_RE = _control_plane_pattern()
 
 _OPAQUE_ID = {"type": "string", "pattern": OPAQUE_ID_PATTERN}
 

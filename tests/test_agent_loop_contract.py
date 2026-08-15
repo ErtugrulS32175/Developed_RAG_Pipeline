@@ -33,7 +33,7 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
-from tools.agent_loop import cli, contract, flat_workspace, schemas
+from tools.agent_loop import cli, contract, flat_workspace, preflight, schemas
 
 REPO = Path(__file__).resolve().parent.parent
 BACKSLASH = chr(92)
@@ -1101,6 +1101,105 @@ def test_the_control_plane_covers_the_loop_and_its_own_tests():
     assert "test_agent_loop_contract.py" in covered
     assert contract.CONTROL_PLANE_VIOLATION_IS_TERMINAL is True
     assert contract.StopReason.CONTROL_PLANE_MODIFIED in         contract.ALL_STOP_REASONS
+
+
+# =====================================================================
+# B5-R1 -- THREE RELATIONS, NOT ONE ALTERNATION
+# =====================================================================
+#
+# MEASURED on a real development manifest: naming `tests/test_db_lifecycle.py`
+# as an allowed path was refused with `path_not_allowed`. The schema's
+# pattern joined every blocked entry into one alternation anchored only
+# at the START, so the ancestor `tests` matched every path beneath it.
+# The runtime gate never had this defect -- it compares ancestors by
+# EQUALITY -- so the two layers disagreed about five paths.
+#
+# The three relations, kept apart on purpose:
+#   1. a protected prefix and everything under it   (tools/agent_loop/...)
+#   2. a broad ancestor, EXACTLY                    (tests, tests/)
+#   3. the frozen glob family                       (tests/test_agent_loop*.py)
+
+_SAFE_SINGLE_TEST_FILES = [
+    "tests/test_db_lifecycle.py", "tests/test_api_end_to_end.py",
+    "tests/test_api_auth.py", "tests/test_api_rag_contract.py",
+    # a sibling that does not exist yet: the rule is about the NAME,
+    # not about what happens to be on disk today
+    "tests/test_documents_inventory.py",
+]
+
+_STILL_REFUSED = [
+    "tests", "tests/", "tools", "tools/", "eval", "eval/", "eval/tools",
+    "eval/tools/", "scripts", "scripts/", ".", "./",
+    "tools/agent_loop", "tools/agent_loop/", "tools/agent_loop/cli.py",
+    "tools/agent_loop/schemas.py", "eval/tools/leak_scan.py",
+    "scripts/p0_gate.sh", "tests/test_agent_loop_contract.py",
+    "tests/test_agent_loop_b1.py", "tests/test_agent_loop_b99.py",
+    "tests/test_agent_loop.py",
+]
+
+
+def _allowed_path_is_valid(entry):
+    """Exactly the schema's own judgement about ONE allowed_paths item."""
+    return Draft202012Validator(
+        schemas.TASK_SCHEMA["properties"]["allowed_paths"]["items"]
+    ).is_valid(entry)
+
+
+@pytest.mark.parametrize("entry", _SAFE_SINGLE_TEST_FILES)
+def test_an_explicitly_named_safe_test_file_is_an_allowed_path(workspace,
+                                                               entry):
+    """THE MEASURED P0. A single test file that is not part of the
+    agent-loop family is ordinary source: the task that has to change it
+    must be able to say so."""
+    assert _allowed_path_is_valid(entry)
+    task = dict(workspace["task"], allowed_paths=[entry])
+    Draft202012Validator(schemas.TASK_SCHEMA).validate(task)
+    # and the runtime gate agrees -- it always did
+    assert not preflight._touches_control_plane([entry])
+
+
+@pytest.mark.parametrize("entry", _STILL_REFUSED)
+def test_the_control_plane_its_ancestors_and_its_family_stay_refused(
+        workspace, entry):
+    """Everything the widening could have leaked, asserted one by one.
+    `tests/test_agent_loop_b99.py` does not exist and must be refused
+    anyway: the family is frozen by PATTERN, not by inventory."""
+    assert not _allowed_path_is_valid(entry)
+    task = dict(workspace["task"], allowed_paths=[entry])
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schemas.TASK_SCHEMA).validate(task)
+    assert preflight._touches_control_plane([entry])
+
+
+def test_the_schema_and_the_runtime_gate_never_disagree():
+    """THE DIVERGENCE ITSELF, pinned. Two layers answering the same
+    question differently is how a task gets refused for a reason its
+    author cannot see -- and, in the other direction, how a permission
+    slips past one gate because the other was assumed to have caught it.
+
+    The whole corpus is checked both ways rather than the fixed lists
+    above, so a future entry added to only one layer fails here."""
+    corpus = (_SAFE_SINGLE_TEST_FILES + _STILL_REFUSED
+              + ["pipeline/index/db.py", "pipeline/api/app.py",
+                 "pipeline/", "services/api.py", "README.md",
+                 "eval/answer/rescore.py", "eval/tools/mutate_agent_loop.py",
+                 "toolsmith/x.py", "tools_extra.py",
+                 "tools/agent_loop_extra.py", "testsuite/x.py"])
+    ayrisan = [entry for entry in corpus
+               if _allowed_path_is_valid(entry)
+               is preflight._touches_control_plane([entry])]
+    assert ayrisan == [], f"sema ile calisma zamani ayrisiyor: {ayrisan}"
+
+
+def test_a_prefix_sibling_is_not_swallowed_by_the_control_plane():
+    """The other error the anchoring could make: refusing a path merely
+    because it STARTS with a protected name. `tools_extra.py` is not
+    inside `tools/`, and `testsuite/` is not `tests/`."""
+    for entry in ("tools_extra.py", "toolsmith/x.py", "testsuite/x.py",
+                  "tools/agent_loop_extra.py", "evaluation/x.py",
+                  "scripts_extra/x.sh"):
+        assert _allowed_path_is_valid(entry), entry
+        assert not preflight._touches_control_plane([entry])
 
 
 # =====================================================================
