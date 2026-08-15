@@ -372,10 +372,17 @@ MUTATIONS = [
     # 2. Judging the reply with the WEAKER document. Every conditional
     #    rule the transport drops becomes unenforced: `approved` with
     #    findings, `changes_requested` with none.
+    # RETARGETED in B4-R14. The false-green battery used to carry this
+    # claim, and after the strict transport it cannot: swapping the
+    # binding ALSO refuses those bodies, because the elided reply lacks
+    # fields the strict copy requires -- so the test passed for a reason
+    # that had nothing to do with which document decides. The
+    # discriminator is a reply the AUTHORITY accepts and the transport
+    # would not, which is what the positive control now asserts.
     ("b4r11-zayif-otorite", "audit",
      "    binding = schemas.SchemaBinding(call.schema)",
      "    binding = schemas.SchemaBinding(call.transport)",
-     "test_what_the_transport_allows_the_authority_still_refuses"),
+     "test_a_healthy_reply_passes_the_transport_and_the_authority"),
     # 3. A STATIC locked transport describes a document that accepts ids
     #    the runner never minted -- the exact promise `locked_audit_schema`
     #    exists to keep.
@@ -388,13 +395,48 @@ MUTATIONS = [
     # 4. A derivation that edits its source weakens the ACCEPTANCE
     #    authority for the rest of the process: the authority is a
     #    module-level dictionary, so one in-place edit is permanent.
+    # RETARGETED in B4-R14, not retired: the intent is unchanged and the
+    # line carrying it moved when the derivation grew its second pass.
     ("b4r11-turetim-kaynagi-bozuyor", "schemas",
-     "    return _transport_node(schema, supported=CODEX_TRANSPORT_KEYWORDS,"
-     + NL + "                           dropped=CODEX_TRANSPORT_DROPPED)",
+     "    reduced = _transport_node(schema, supported="
+     "CODEX_TRANSPORT_KEYWORDS," + NL
+     + "                              dropped=CODEX_TRANSPORT_DROPPED)",
      '    schema.pop("allOf", None)' + NL
-     + "    return _transport_node(schema, supported=CODEX_TRANSPORT_KEYWORDS,"
-     + NL + "                           dropped=CODEX_TRANSPORT_DROPPED)",
+     + "    reduced = _transport_node(schema, supported="
+     "CODEX_TRANSPORT_KEYWORDS," + NL
+     + "                              dropped=CODEX_TRANSPORT_DROPPED)",
      "test_the_codex_derivation_is_pure_and_deterministic"),
+    # ----------------------------------------------------------------
+    # B4-R14 -- the STRICT subset. Two measured provider refusals (root
+    # `allOf`, then a property with no `type`) said the transport copy
+    # has to satisfy the published contract as a whole, not one rule at
+    # a time. Each mutant below removes one of those rules -- and each
+    # is deliberately shaped to keep the module IMPORTABLE, because a
+    # mutation that explodes at import breaks collection and the
+    # harness cannot tell which guard caught it.
+    # ----------------------------------------------------------------
+    # 1. The inference that gives `const`/`enum` nodes an explicit type.
+    #    Substituting a constant instead of inferring it is the same
+    #    defect the provider named at ('properties', 'audit_kind').
+    ("b4r14-tip-cikarimi", "schemas",
+     "    else:" + NL + "        base = _scalar_type(strict)",
+     "    else:" + NL + '        base = strict.get("type", "object")',
+     "test_the_codex_transport_satisfies_the_strict_subset"),
+    # 2. "Every property is required" is the subset's rule; keeping the
+    #    authority's own list here is exactly the pre-B4-R14 document.
+    ("b4r14-hepsi-zorunlu", "schemas",
+     '        strict["required"] = list(strict["properties"])',
+     '        strict["required"] = list(strict.get("required", ()))',
+     "test_optional_authority_fields_become_required_and_nullable"),
+    # 3. The normaliser is where an invalid reply could quietly become a
+    #    valid one: widening it to every null would delete a REQUIRED
+    #    null and an UNKNOWN null, and the authority would never see
+    #    either of the refusals it is there to make.
+    ("b4r14-eleme-genisligi", "schemas",
+     "            if key in properties and key not in zorunlu "
+     "and value is None:",
+     "            if value is None:",
+     "test_elision_removes_exactly_the_optional_nulls"),
     # ----------------------------------------------------------------
     # B2A -- the call boundary: validate once, canonicalize once, use
     # only the canonical value. Each mutation reopens exactly one of

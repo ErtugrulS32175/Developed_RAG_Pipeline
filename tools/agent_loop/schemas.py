@@ -708,6 +708,108 @@ CODEX_TRANSPORT_KEYWORDS = CLAUDE_TRANSPORT_KEYWORDS - {"allOf"}
 CODEX_TRANSPORT_DROPPED = CLAUDE_TRANSPORT_DROPPED | {"allOf"}
 
 
+def _primitive_type(value):
+    """The JSON type of a literal, EXACTLY.
+
+    `bool` is checked before `int` because it is a subclass of it in
+    Python and nowhere else: `True` typed as `integer` would tell the
+    provider to generate a number where the contract wants a boolean.
+    A non-finite float is not JSON at all."""
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "boolean"
+    if type(value) is int:
+        return "integer"
+    if type(value) is float:
+        if value != value or value in (float("inf"), float("-inf")):
+            raise TransportSchemaError("sonlu olmayan sayi JSON degil")
+        return "number"
+    if type(value) is str:
+        return "string"
+    raise TransportSchemaError("ilkel olmayan sema degeri")
+
+
+def _scalar_type(node):
+    """The explicit type of a leaf node, declared or INFERRED.
+
+    The provider refuses a property schema with no `type` -- measured:
+    400 `invalid_json_schema` at `('properties', 'audit_kind')`, which
+    this contract spells as a bare `const`. Inference is closed and
+    fail-shut: `const` gives its literal's type, `enum` gives the one
+    type all its members share, and anything else raises rather than
+    guessing a type the model would then generate against."""
+    declared = node.get("type")
+    if type(declared) is str:
+        return declared
+    if declared is not None:
+        raise TransportSchemaError("tip gosterimi metin degil")
+    if "const" in node:
+        return _primitive_type(node["const"])
+    if "enum" in node:
+        kinds = {_primitive_type(member) for member in node["enum"]}
+        kinds.discard("null")
+        if len(kinds) != 1:
+            raise TransportSchemaError("enum tek bir ilkel tip tasimiyor")
+        return kinds.pop()
+    raise TransportSchemaError("alt sema icin tip cikarilamiyor")
+
+
+def _nullable(node, base):
+    """An OPTIONAL field, expressed the way the strict subset allows.
+
+    The subset has no optional properties: everything is required, and
+    absence is spelled as `null`. So an authoritative optional field
+    keeps its shape and gains `null` -- and a `const` becomes a
+    two-member `enum`, because a `const` that also accepts `null` is a
+    contradiction the provider would be right to refuse."""
+    node["type"] = [base, "null"]
+    if "const" in node:
+        node["enum"] = [node.pop("const"), None]
+    elif "enum" in node and None not in node["enum"]:
+        node["enum"] = list(node["enum"]) + [None]
+    return node
+
+
+def _strict_node(node, *, optional):
+    """One reduced node, made to satisfy the strict subset.
+
+    THREE RULES, applied together because the provider applies them
+    together: every node carries an explicit `type`; every object
+    requires ALL of its properties and closes itself with
+    `additionalProperties: false`; and a property the AUTHORITY treats
+    as optional becomes required-but-nullable here.
+
+    The authority's own `required` list is what decides optionality --
+    it survived the keyword reduction, so this pass never has to guess
+    which fields were optional, and `elide_optional_nulls` reads the
+    same list when the answer comes back."""
+    if not isinstance(node, dict):
+        raise TransportSchemaError("sema dugumu bir nesne degil")
+    strict = dict(node)
+    if "properties" in strict:
+        zorunlu = set(strict.get("required", ()))
+        strict["properties"] = {
+            name: _strict_node(sub, optional=name not in zorunlu)
+            for name, sub in strict["properties"].items()}
+        # ALL of them, in the source's own order so the bytes stay
+        # deterministic, and the object closed against anything else
+        strict["required"] = list(strict["properties"])
+        strict["additionalProperties"] = False
+        base = "object"
+    elif "items" in strict:
+        # an array's ITEMS are never optional: absence is expressed by
+        # the array being empty or null, not by a hole inside it
+        strict["items"] = _strict_node(strict["items"], optional=False)
+        base = "array"
+    else:
+        base = _scalar_type(strict)
+    if optional:
+        return _nullable(strict, base)
+    strict["type"] = base
+    return strict
+
+
 def codex_transport_schema(schema):
     """The Codex-compatible copy of an audit schema.
 
@@ -715,12 +817,60 @@ def codex_transport_schema(schema):
     document is never mutated and equal sources give equal canonical
     bytes. It is derived from whatever authoritative schema this call
     will be judged by -- for a LOCKED audit that is the schema already
-    BOUND to the ids the runner issued, so the `const` run id and the
-    `enum` of issued ids travel with it. Deriving a locked transport
-    from the static schema instead would hand the model a document that
-    accepts ids nobody minted."""
-    return _transport_node(schema, supported=CODEX_TRANSPORT_KEYWORDS,
-                           dropped=CODEX_TRANSPORT_DROPPED)
+    BOUND to the ids the runner issued, so the run id and the issued
+    ids travel with it, now carrying explicit types. Deriving a locked
+    transport from the static schema instead would hand the model a
+    document that accepts ids nobody minted.
+
+    TWO PASSES, in this order: drop what the subset cannot express,
+    then make what remains satisfy the rest of the contract. Reversing
+    them would infer types for keywords about to be discarded."""
+    reduced = _transport_node(schema, supported=CODEX_TRANSPORT_KEYWORDS,
+                              dropped=CODEX_TRANSPORT_DROPPED)
+    strict = _strict_node(reduced, optional=False)
+    # THE ROOT IS NEVER NULLABLE and never a union: the reply is an
+    # object or it is nothing, and a root that could be `null` would
+    # make "no answer" a valid answer.
+    if strict.get("type") != "object":
+        raise TransportSchemaError("tasima semasinin koku nesne degil")
+    return strict
+
+
+def elide_optional_nulls(schema, payload):
+    """The reply, with transport `null`s for OPTIONAL fields removed.
+
+    WHY THIS EXISTS. The strict subset has no optional properties, so
+    the transport copy asks for every field and lets the absent ones be
+    `null`. The authority spells the same thing as ABSENCE. Without
+    this seam the two documents would disagree about every optional
+    field, and the fix would have been to loosen the authority -- which
+    is the one thing this split exists to avoid.
+
+    NARROW ON PURPOSE, and every exclusion is a refusal the authority
+    still gets to make: a `null` under a REQUIRED name stays (the
+    authority rejects it), a `null` under a name the schema does not
+    declare stays (`additionalProperties: false` rejects it), and no
+    non-null value is ever touched -- `"null"`, `0`, `False`, `[]` and
+    `{}` are values somebody meant. Pure: neither argument is mutated
+    and equal inputs give equal output."""
+    if isinstance(payload, dict) and isinstance(schema, dict):
+        properties = schema.get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        zorunlu = set(schema.get("required", ()))
+        temiz = {}
+        for key, value in payload.items():
+            if key in properties and key not in zorunlu and value is None:
+                continue
+            alt = properties.get(key)
+            temiz[key] = (elide_optional_nulls(alt, value)
+                          if isinstance(alt, dict) else value)
+        return temiz
+    if isinstance(payload, list) and isinstance(schema, dict):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            return [elide_optional_nulls(items, entry) for entry in payload]
+        return list(payload)
+    return payload
 
 
 # The CODE audit's transport copy: static, so it is derived once and

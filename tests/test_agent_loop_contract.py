@@ -2183,12 +2183,15 @@ def test_the_audit_authority_and_the_codex_transport_are_two_documents():
         "pattern": 4}
     # the TRANSPORT carries none of them, counted recursively
     assert _forbidden_counts(transport) == {}
-    # what it must still carry, or it would constrain nothing
+    # what it must still carry, or it would constrain nothing.
+    # B4-R14 changed two of these BY DESIGN: the subset requires every
+    # property, and every node carries an explicit type.
     assert transport["type"] == "object"
     assert transport["additionalProperties"] is False
-    assert transport["required"] == authority["required"]
+    assert set(transport["required"]) == set(transport["properties"])
     assert set(transport["properties"]) == set(authority["properties"])
-    assert transport["properties"]["role"] == {"const": contract.Role.EVALUATOR}
+    assert transport["properties"]["role"] == {"type": "string",
+                                               "const": contract.Role.EVALUATOR}
     assert transport["properties"]["status"]["enum"] == \
         authority["properties"]["status"]["enum"]
 
@@ -2261,8 +2264,206 @@ def test_the_codex_derivation_is_pure_and_deterministic():
         issued_mechanism_ids=["e" * 32])
     locked_transport = schemas.codex_transport_schema(bound)
     assert _forbidden_counts(locked_transport) == {}
-    assert locked_transport["properties"]["run_id"] == {"const": "a" * 32}
+    assert locked_transport["properties"]["run_id"] == {"type": "string",
+                                                        "const": "a" * 32}
     assert schemas.codex_transport_schema(bound) == locked_transport
+
+
+# =====================================================================
+# B4-R14 -- THE STRICT SUBSET, AS A STRUCTURAL VERIFIER
+# =====================================================================
+#
+# TWO measured refusals, one contract. The provider rejected the audit
+# schema twice: `allOf` at the root (context `()`), then a property with
+# no `type` (context `('properties', 'audit_kind')`). Patching the
+# second alone would only have found the third, so the verifier below
+# encodes the published subset as a whole: object root, explicit types
+# everywhere, every property required, absence expressed as `null`,
+# every object closed, and none of the composition keywords.
+
+_UNSUPPORTED_COMPOSITION = ("allOf", "anyOf", "oneOf", "if", "then", "else",
+                            "not", "dependentSchemas", "dependentRequired")
+
+# Conservative local ceilings, far under the published ones -- what is
+# pinned is that this contract stays small, not the provider's limits.
+_MAX_DEPTH = 5
+_MAX_PROPERTIES = 200
+_MAX_ENUM = 200
+
+
+def assert_strict_subset(node, *, path="()", depth=1, seen=None):
+    """Every rule of the strict subset, checked RECURSIVELY.
+
+    Returns the number of properties visited so the caller can pin the
+    total. `path` is spelled the way the provider spells it, so a
+    failure here reads like the 400 it is meant to prevent."""
+    seen = {"properties": 0} if seen is None else seen
+    assert isinstance(node, dict), f"{path}: sema dugumu nesne degil"
+    assert depth <= _MAX_DEPTH, f"{path}: ic ice gecme tavani asildi"
+    for keyword in _UNSUPPORTED_COMPOSITION:
+        assert keyword not in node, f"{path}: desteklenmeyen anahtar {keyword}"
+
+    kind = node.get("type")
+    assert kind is not None, f"{path}: acik type yok"
+    if isinstance(kind, list):
+        # the ONLY union the subset needs, and only for optional fields
+        assert "null" in kind and len(kind) == 2, f"{path}: beklenmeyen union"
+        temel = [entry for entry in kind if entry != "null"][0]
+    else:
+        assert isinstance(kind, str), f"{path}: type metin degil"
+        temel = kind
+
+    if "enum" in node:
+        assert len(node["enum"]) <= _MAX_ENUM, f"{path}: enum tavani asildi"
+        uyeler = {type(member) for member in node["enum"]} - {type(None)}
+        assert len(uyeler) == 1, f"{path}: enum karisik tur tasiyor"
+        if isinstance(kind, list):
+            assert None in node["enum"], f"{path}: nullable enum null tasimiyor"
+
+    if temel == "object":
+        assert "properties" in node, f"{path}: object properties tasimiyor"
+        assert node.get("additionalProperties") is False, \
+            f"{path}: additionalProperties false degil"
+        assert set(node["required"]) == set(node["properties"]), \
+            f"{path}: required butun alanlari kapsamiyor"
+        seen["properties"] += len(node["properties"])
+        assert seen["properties"] <= _MAX_PROPERTIES, "alan tavani asildi"
+        for name, sub in node["properties"].items():
+            assert_strict_subset(sub, path=f"{path[:-1]}'properties', '{name}')"
+                                 if path == "()" else f"{path}/{name}",
+                                 depth=depth + 1, seen=seen)
+    elif temel == "array":
+        assert "items" in node, f"{path}: array items tasimiyor"
+        assert_strict_subset(node["items"], path=f"{path}/items",
+                             depth=depth + 1, seen=seen)
+    return seen["properties"]
+
+
+def test_the_codex_transport_satisfies_the_strict_subset():
+    """B4-R14, on BOTH roads. The locked transport is derived per call,
+    so a static check of the CODE copy alone would leave the road that
+    carries issued ids unverified."""
+    alanlar = assert_strict_subset(schemas.CODE_AUDIT_TRANSPORT_SCHEMA)
+    assert alanlar >= 10, "dogrulayici hicbir sey gezmemis olabilir"
+    assert schemas.CODE_AUDIT_TRANSPORT_SCHEMA["type"] == "object"
+
+    bound = schemas.locked_audit_schema(
+        run_id="a" * 32, issued_finding_ids=["f" * 32, "b" * 32],
+        issued_mechanism_ids=["e" * 32])
+    kilitli = schemas.codex_transport_schema(bound)
+    assert_strict_subset(kilitli)
+    # the ids still bind, and now they carry explicit types
+    assert kilitli["properties"]["run_id"] == {"type": "string",
+                                               "const": "a" * 32}
+    bulgu = kilitli["properties"]["findings"]["items"]["properties"]
+    assert bulgu["finding_id"] == {"type": "string",
+                                   "enum": ["b" * 32, "f" * 32]}
+    assert bulgu["mechanism_id"] == {"type": "string", "enum": ["e" * 32]}
+    # and the derivation is still pure and deterministic
+    assert schemas.codex_transport_schema(bound) == kilitli
+    assert "allOf" in bound, "kilitli otorite turetim sirasinda soyuldu"
+
+
+def test_the_strict_derivation_leaves_the_authority_untouched():
+    """The authority is the acceptance gate. Every rule the transport
+    drops or rewrites must still be there when the reply comes back."""
+    assert _forbidden_counts(schemas.CODE_AUDIT_RESULT_SCHEMA) == {
+        "allOf": 1, "if": 4, "then": 4, "minLength": 4, "maxLength": 4,
+        "minimum": 6, "maximum": 1, "maxItems": 3, "minItems": 1,
+        "pattern": 4}
+    assert schemas.CODE_AUDIT_SCHEMA_BINDING.sha256 == \
+        schemas.SchemaBinding(schemas.CODE_AUDIT_RESULT_SCHEMA).sha256
+    assert schemas.CODE_AUDIT_SCHEMA_BINDING.sha256 != \
+        schemas.CODE_AUDIT_TRANSPORT_BINDING.sha256
+    # the AUTHORITY still distinguishes required from optional, which is
+    # what the elision reads: if this list ever became "everything", the
+    # normaliser would silently stop removing anything
+    otorite = schemas.CODE_AUDIT_RESULT_SCHEMA
+    assert set(otorite["properties"]) - set(otorite["required"]) == \
+        {"tests", "findings", "stop_reason"}
+
+
+def test_optional_authority_fields_become_required_and_nullable():
+    """The subset's answer to "optional": ask for everything, let the
+    absent ones be null. Spelled out field by field, because this is the
+    transformation the whole package turns on."""
+    otorite = schemas.CODE_AUDIT_RESULT_SCHEMA
+    tasima = schemas.CODE_AUDIT_TRANSPORT_SCHEMA
+    assert set(tasima["required"]) == set(tasima["properties"])
+
+    for name in ("tests", "findings"):
+        assert name not in otorite["required"]
+        assert tasima["properties"][name]["type"] == ["array", "null"]
+    assert tasima["properties"]["stop_reason"]["type"] == ["string", "null"]
+    assert None in tasima["properties"]["stop_reason"]["enum"]
+
+    # required fields are NOT made nullable
+    assert tasima["properties"]["summary"]["type"] == "string"
+    assert tasima["properties"]["status"]["type"] == "string"
+    assert None not in tasima["properties"]["status"]["enum"]
+    # the exact node the provider named in its second refusal
+    assert tasima["properties"]["audit_kind"] == {
+        "type": "string", "const": contract.AuditKind.CODE}
+    assert tasima["properties"]["role"] == {"type": "string",
+                                            "const": contract.Role.EVALUATOR}
+
+    # nested objects follow the same rule, one level down
+    bulgu = tasima["properties"]["findings"]["items"]
+    assert set(bulgu["required"]) == set(bulgu["properties"])
+    assert bulgu["properties"]["file"]["type"] == ["string", "null"]
+    assert bulgu["properties"]["line"]["type"] == ["integer", "null"]
+    assert bulgu["properties"]["claim"]["type"] == "string"
+
+
+@pytest.mark.parametrize(
+    "govde, beklenen",
+    [({"summary": None}, {"summary": None}),
+     ({"bilinmeyen": None}, {"bilinmeyen": None}),
+     ({"stop_reason": None}, {}),
+     ({"tests": None, "findings": None}, {}),
+     ({"stop_reason": "null"}, {"stop_reason": "null"}),
+     ({"findings": []}, {"findings": []}),
+     ({"tests": 0}, {"tests": 0}),
+     ({"findings": False}, {"findings": False})],
+    ids=["zorunlu-null-kalir", "bilinmeyen-null-kalir", "opsiyonel-null-gider",
+         "iki-opsiyonel-gider", "null-metni-kalir", "bos-liste-kalir",
+         "sifir-kalir", "false-kalir"])
+def test_elision_removes_exactly_the_optional_nulls(govde, beklenen):
+    """EVERY exclusion here is a refusal the authority still gets to
+    make. A normaliser that removed a required null would turn an
+    invalid reply into a valid one, which is the whole risk of having a
+    normaliser at all."""
+    payload = dict(govde)
+    once = json.dumps(payload, sort_keys=True)
+    temiz = schemas.elide_optional_nulls(schemas.CODE_AUDIT_RESULT_SCHEMA,
+                                         payload)
+    assert temiz == beklenen
+    assert json.dumps(payload, sort_keys=True) == once, "girdi degistirildi"
+    assert temiz is not payload
+    # deterministic
+    assert schemas.elide_optional_nulls(
+        schemas.CODE_AUDIT_RESULT_SCHEMA, payload) == temiz
+
+
+def test_elision_recurses_into_findings_and_touches_nothing_else():
+    """The nested optional fields are `file` and `line`; everything the
+    finding actually said must survive untouched."""
+    bulgu = {"finding_id": "b-1", "mechanism_id": "m-1", "severity": "high",
+             "claim": "iddia", "reproduction_result": "reproduced",
+             "required_action": "eylem", "file": None, "line": None}
+    payload = {"status": "changes_requested", "findings": [bulgu],
+               "tests": None}
+    once = json.dumps(payload, sort_keys=True)
+    temiz = schemas.elide_optional_nulls(schemas.CODE_AUDIT_RESULT_SCHEMA,
+                                         payload)
+
+    assert "tests" not in temiz
+    assert temiz["findings"][0] == {
+        "finding_id": "b-1", "mechanism_id": "m-1", "severity": "high",
+        "claim": "iddia", "reproduction_result": "reproduced",
+        "required_action": "eylem"}
+    assert json.dumps(payload, sort_keys=True) == once, "girdi degistirildi"
+    assert temiz["findings"][0] is not bulgu
 
 
 def test_every_stderr_marker_is_exact_proven_and_wired(tmp_path):

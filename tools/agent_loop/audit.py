@@ -844,7 +844,8 @@ def _measure(call, *, cwd, holder, binding, transport_binding):
                 "son mesaj dosyasi sinirini asti", stream="last_message",
                 exit_code=exit_code, **measurements)
         reply = _parse_reply(raw, dict(measurements, exit_code=exit_code),
-                             binding, call.audit_kind)
+                             binding, call.audit_kind,
+                             authoritative=call.schema)
         # THE HOLDER'S RELEASE OUTRANKS THE VERDICT. A holder left on
         # disk carries the model's own output past the boundary this
         # module exists to keep, so an approval whose cleanup cannot be
@@ -870,13 +871,22 @@ def _measure(call, *, cwd, holder, binding, transport_binding):
                             else time.monotonic() + REAP_SECONDS)
 
 
-def _parse_reply(raw, measurements, binding, audit_kind):
-    """Decode, parse and validate -- refusing at every step.
+def _parse_reply(raw, measurements, binding, audit_kind, *, authoritative):
+    """Decode, parse, NORMALISE and validate -- refusing at every step.
 
     THE DISCRIMINATOR IS CHECKED FIRST. A reply that claims the other
     audit kind must not be judged by this call's schema: the two kinds
     are a TYPE boundary, and a locked reply validated against the code
     schema would be a locked finding carrying free text.
+
+    THE ONE NORMALISATION, and its exact place in the order (B4-R14):
+    the strict transport subset has no optional properties, so an
+    absent field arrives as `null`. `elide_optional_nulls` removes
+    exactly those -- optional by the AUTHORITY's own `required` list --
+    and then the authority judges the result. It runs after the
+    discriminator and before validation, never the other way round: a
+    normaliser that ran on an unvalidated document of the wrong kind
+    would be reshaping something this call never asked for.
 
     Strict UTF-8: replacement characters would turn undecodable bytes
     into a string that might then parse into something plausible."""
@@ -894,6 +904,7 @@ def _parse_reply(raw, measurements, binding, audit_kind):
     if payload.get("audit_kind") != audit_kind:
         raise SchemaViolation("yanit baska bir denetim turunu adliyor",
                               **measurements)
+    payload = schemas.elide_optional_nulls(authoritative, payload)
     try:
         binding.validate(payload)
     except ValidationError as invalid:

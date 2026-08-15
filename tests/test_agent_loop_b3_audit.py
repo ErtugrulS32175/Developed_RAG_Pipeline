@@ -842,10 +842,19 @@ def test_the_file_on_the_argv_carries_the_transport_and_not_the_authority(
     assert outcome.schema_sha256 != outcome.transport_sha256
 
 
+# `file` and `line` are spelled as nulls for the same reason the
+# envelope's optional fields are: the strict transport requires every
+# property of every object, including the ones inside `findings`.
 _CODE_FINDING_BODY = {"finding_id": "bulgu-1", "mechanism_id": "mekanizma-1",
                       "severity": "high", "claim": "kurgu iddia",
                       "reproduction_result": "reproduced",
-                      "required_action": "kurgu eylem"}
+                      "required_action": "kurgu eylem",
+                      "file": None, "line": None}
+
+# What the STRICT transport asks for and the authority calls absence.
+# B4-R14: the subset has no optional properties, so an honest reply
+# carries every field and spells the empty ones `null`.
+_TRANSPORT_NULLS = {"tests": None, "findings": None, "stop_reason": None}
 
 
 @pytest.mark.parametrize(
@@ -862,8 +871,13 @@ def test_what_the_transport_allows_the_authority_still_refuses(
     """THE LOAD-BEARING TEST of the whole split. Each body is chosen so
     the WEAKER document accepts it -- proven here, not assumed -- and
     the authority must still refuse it. If the adapter ever validated
-    with the transport copy, every one of these would be approved."""
-    reply = _code_reply(**govde)
+    with the transport copy, every one of these would be approved.
+
+    The optional fields are spelled as `null` because B4-R14 made the
+    transport strict: it has no optional properties, so a reply that
+    simply OMITS them is refused by the transport for a reason that has
+    nothing to do with the rule under test."""
+    reply = _code_reply(**dict(_TRANSPORT_NULLS, **govde))
     # the transport copy really does accept it: that is what makes the
     # refusal below evidence about the authority rather than about JSON
     schemas.SchemaBinding(schemas.CODE_AUDIT_TRANSPORT_SCHEMA).validate(reply)
@@ -878,15 +892,40 @@ def test_what_the_transport_allows_the_authority_still_refuses(
 def test_a_healthy_reply_passes_the_transport_and_the_authority(
         tmp_path, gate, only_fake_models_may_run):
     """The positive control: an adapter that refused everything would
-    pass the test above."""
-    reply = _code_reply()
+    pass the test above.
+
+    BOTH documents are exercised on their own terms -- the transport on
+    the reply as SENT (nulls included), the authority on the reply as
+    NORMALISED -- because after B4-R14 those are two different
+    documents and validating one of them twice would prove nothing."""
+    reply = _code_reply(**_TRANSPORT_NULLS)
     schemas.SchemaBinding(schemas.CODE_AUDIT_TRANSPORT_SCHEMA).validate(reply)
-    schemas.CODE_AUDIT_SCHEMA_BINDING.validate(reply)
+    schemas.CODE_AUDIT_SCHEMA_BINDING.validate(
+        schemas.elide_optional_nulls(schemas.CODE_AUDIT_RESULT_SCHEMA, reply))
 
     binary = _stub(tmp_path, mode="reply", body=json.dumps(reply))
     outcome = _audit(binary, gate)
     assert outcome.reply["status"] == contract.Status.APPROVED
     assert outcome.exit_code == 0
+
+    # THE DISCRIMINATOR (B4-R14). This reply OMITS the optional fields
+    # entirely: the authority allows that, the strict transport does not
+    # -- it requires every property. So an adapter that judged replies
+    # with the transport copy would refuse it, and only an adapter that
+    # judges with the authority accepts it. Before B4-R14 the
+    # false-green battery could carry this claim on its own; it cannot
+    # any more, because the transport now refuses those bodies too, for
+    # a reason that has nothing to do with which document decides.
+    eksik = _code_reply()
+    with pytest.raises(Exception):
+        schemas.SchemaBinding(
+            schemas.CODE_AUDIT_TRANSPORT_SCHEMA).validate(eksik)
+    schemas.CODE_AUDIT_SCHEMA_BINDING.validate(eksik)
+    ikinci = _stub(tmp_path, name="sahte_eksik", mode="reply",
+                   body=json.dumps(eksik))
+    kabul = _audit(ikinci, gate)
+    assert kabul.reply["status"] == contract.Status.APPROVED
+    assert kabul.schema_sha256 == schemas.CODE_AUDIT_SCHEMA_BINDING.sha256
 
 
 def test_a_locked_transport_carries_this_call_s_issued_ids(
@@ -912,11 +951,102 @@ def test_a_locked_transport_carries_this_call_s_issued_ids(
 
     teslim = json.loads(kayit.read_text(encoding="utf-8"))
     assert _forbidden(teslim) == {}
-    assert teslim["properties"]["run_id"] == {"const": kosu}
+    # the ids still bind, and since B4-R14 they carry explicit types --
+    # the second thing the provider refused this schema for
+    assert teslim["properties"]["run_id"] == {"type": "string", "const": kosu}
     alanlar = teslim["properties"]["findings"]["items"]["properties"]
-    assert alanlar["finding_id"] == {"enum": [bulgu_id]}
-    assert alanlar["mechanism_id"] == {"enum": [mekanizma_id]}
+    assert alanlar["finding_id"] == {"type": "string", "enum": [bulgu_id]}
+    assert alanlar["mechanism_id"] == {"type": "string",
+                                       "enum": [mekanizma_id]}
     assert outcome.schema_sha256 != outcome.transport_sha256
+
+
+def test_a_reply_using_transport_nulls_is_accepted_after_elision(
+        tmp_path, gate, only_fake_models_may_run):
+    """B4-R14, end to end through the adapter. The strict subset has no
+    optional properties, so an honest evaluator answers `null` where the
+    authority expects ABSENCE -- and both halves are proven here: the
+    transport really does accept the nulls, and the authority really
+    does accept what comes out of the elision."""
+    reply = _code_reply(tests=None, findings=None, stop_reason=None)
+    # the transport copy accepts it AS SENT -- otherwise the acceptance
+    # below would be evidence about nothing
+    schemas.SchemaBinding(schemas.CODE_AUDIT_TRANSPORT_SCHEMA).validate(reply)
+    # and the authority would REFUSE it as sent, which is why the
+    # normaliser exists at all
+    with pytest.raises(Exception):
+        schemas.CODE_AUDIT_SCHEMA_BINDING.validate(reply)
+
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(reply))
+    outcome = _audit(binary, gate)
+
+    assert len(only_fake_models_may_run) == 1, "senaryo kurulmadi"
+    assert outcome.reply["status"] == contract.Status.APPROVED
+    # the nulls are GONE from what the run reports, not merely tolerated
+    for name in ("tests", "findings", "stop_reason"):
+        assert name not in outcome.reply
+    assert outcome.schema_sha256 == schemas.CODE_AUDIT_SCHEMA_BINDING.sha256
+    assert outcome.transport_sha256 == \
+        schemas.CODE_AUDIT_TRANSPORT_BINDING.sha256
+
+
+# the same body, under the name that says what it is used for here: a
+# REAL finding, whose optional fields happen to be null
+_NULL_FINDING = _CODE_FINDING_BODY
+
+
+@pytest.mark.parametrize(
+    "govde",
+    [{"summary": None},
+     {"bilinmeyen_alan": None},
+     {"stop_reason": "null"},
+     {"status": contract.Status.CHANGES_REQUESTED,
+      "next_action": "await_repair", "findings": None},
+     {"status": contract.Status.APPROVED, "next_action": "stop",
+      "findings": [_NULL_FINDING]}],
+    ids=["zorunlu-alan-null", "bilinmeyen-alan-null", "null-metni",
+         "degisiklik-ama-bulgu-null", "onaylandi-ama-gercek-bulgu"])
+def test_authority_refusals_survive_the_null_normalisation(
+        tmp_path, gate, govde, only_fake_models_may_run):
+    """THE FALSE-GREEN BATTERY. A normaliser is a place where an invalid
+    document can be quietly turned into a valid one, so each of these
+    reaches it and must still be refused by the authority afterwards."""
+    reply = _code_reply(**govde)
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(reply))
+    with pytest.raises(audit.SchemaViolation) as refusal:
+        _audit(binary, gate)
+    assert len(only_fake_models_may_run) == 1, "senaryo kurulmadi"
+    assert "sema disi" in str(refusal.value)
+
+
+def test_a_locked_reply_with_transport_nulls_keeps_its_id_binding(
+        tmp_path, gate, only_fake_models_may_run):
+    """The locked road gets the same normalisation and loses none of its
+    binding: the issued ids are still the only ones that pass."""
+    kosu, bulgu_id, mekanizma_id = "a" * 32, "f" * 32, "e" * 32
+    bulgu = {"finding_id": bulgu_id, "mechanism_id": mekanizma_id,
+             "severity": "high",
+             "error_class": contract.LockedFindingClass.WRONG_ROW,
+             "case_count": 3}
+    ortak = {"audit_kind": contract.AuditKind.LOCKED, "issued_run_id": kosu,
+             "issued_finding_ids": [bulgu_id],
+             "issued_mechanism_ids": [mekanizma_id]}
+    saglikli = _locked_reply(
+        kosu, status=contract.Status.CHANGES_REQUESTED,
+        summary_code=contract.SummaryCode.REGRESSION_DETECTED,
+        next_action="await_repair", findings=[bulgu], stop_reason=None)
+
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(saglikli))
+    outcome = _audit(binary, gate, **ortak)
+    assert "stop_reason" not in outcome.reply
+    assert outcome.reply["findings"][0]["finding_id"] == bulgu_id
+
+    kacak = json.loads(json.dumps(saglikli))
+    kacak["findings"][0]["finding_id"] = "b" * 32
+    sahte = _stub(tmp_path, name="sahte_kilitli_kacak", mode="reply",
+                  body=json.dumps(kacak))
+    with pytest.raises(audit.SchemaViolation):
+        _audit(sahte, gate, **ortak)
 
 
 def test_an_unissued_locked_id_is_still_refused_by_the_authority(

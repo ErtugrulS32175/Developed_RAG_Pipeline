@@ -1292,7 +1292,10 @@ def test_every_mutation_still_applies_to_the_current_source():
     # 98 -> 102 in B4-R11: the evaluator's transport/authority split --
     # the argv file, the validating binding, the locked ids and the
     # purity of the derivation.
-    assert len(tool.MUTATIONS) == 102
+    # 102 -> 105 in B4-R14: the strict subset's own three rules --
+    # explicit types, every property required, and the null normaliser
+    # staying narrow enough that the authority keeps its refusals.
+    assert len(tool.MUTATIONS) == 105
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1310,7 +1313,8 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b4r8-bilinmeyen-stderr', 'b4r8-yol-karismasi',
         'b4r8-ham-stderr-sizintisi', 'b4r11-argv-otorite-semasi',
         'b4r11-zayif-otorite', 'b4r11-kilitli-statik-tasima',
-        'b4r11-turetim-kaynagi-bozuyor',
+        'b4r11-turetim-kaynagi-bozuyor', 'b4r14-tip-cikarimi',
+        'b4r14-hepsi-zorunlu', 'b4r14-eleme-genisligi',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',
