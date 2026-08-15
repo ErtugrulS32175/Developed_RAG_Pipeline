@@ -1295,7 +1295,10 @@ def test_every_mutation_still_applies_to_the_current_source():
     # 102 -> 105 in B4-R14: the strict subset's own three rules --
     # explicit types, every property required, and the null normaliser
     # staying narrow enough that the authority keeps its refusals.
-    assert len(tool.MUTATIONS) == 105
+    # 105 -> 110 in B4-R17: the derived `next_action` -- the table, the
+    # refusal to overwrite, the projection running before the authority,
+    # the field leaving the transport, and the protocol matrix.
+    assert len(tool.MUTATIONS) == 110
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1315,6 +1318,9 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b4r11-zayif-otorite', 'b4r11-kilitli-statik-tasima',
         'b4r11-turetim-kaynagi-bozuyor', 'b4r14-tip-cikarimi',
         'b4r14-hepsi-zorunlu', 'b4r14-eleme-genisligi',
+        'b4r17-turetme-tablosu', 'b4r17-sessiz-ustune-yazma',
+        'b4r17-projeksiyon-atlandi', 'b4r17-tasimada-kaldi',
+        'b4r17-protokol-matrisi',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

@@ -63,6 +63,11 @@ def main():
         Path(cfg["argv_record"]).write_text(json.dumps(argv), encoding="utf-8")
     if cfg.get("cwd_record"):
         Path(cfg["cwd_record"]).write_text(os.getcwd(), encoding="utf-8")
+    if cfg.get("prompt_record"):
+        # what the CHILD actually read on stdin, not what the caller
+        # says it sent
+        Path(cfg["prompt_record"]).write_text(sys.stdin.read(),
+                                              encoding="utf-8")
     if cfg.get("schema_record"):
         # the BYTES the child was actually handed, copied from the path
         # on its own argv -- the caller's word for what it wrote is not
@@ -165,12 +170,16 @@ def _stub(tmp_path, name="sahte_codex", **config):
     return shim
 
 
+# WHAT A COMPLIANT EVALUATOR SENDS (B4-R17): no `next_action`. The
+# transport schema has no such property, so a model constrained by it
+# cannot produce one; the adapter derives it from `status`. A test that
+# needs the non-compliant shape adds the field explicitly, which is
+# exactly the case the projection must refuse.
 def _code_reply(**overrides):
     payload = {"protocol_version": contract.PROTOCOL_VERSION, "run_id": RUN,
                "role": contract.Role.EVALUATOR,
                "audit_kind": contract.AuditKind.CODE,
-               "status": contract.Status.APPROVED, "summary": "kurgu denetim",
-               "next_action": "stop"}
+               "status": contract.Status.APPROVED, "summary": "kurgu denetim"}
     payload.update(overrides)
     return payload
 
@@ -180,8 +189,7 @@ def _locked_reply(run_id, **overrides):
                "run_id": run_id, "role": contract.Role.EVALUATOR,
                "audit_kind": contract.AuditKind.LOCKED,
                "status": contract.Status.APPROVED,
-               "summary_code": contract.SummaryCode.CRITERIA_MET,
-               "next_action": "stop"}
+               "summary_code": contract.SummaryCode.CRITERIA_MET}
     payload.update(overrides)
     return payload
 
@@ -438,7 +446,7 @@ def test_a_locked_audit_is_bound_to_the_ids_the_runner_issued(
     saglikli = _locked_reply(
         kosu, status=contract.Status.CHANGES_REQUESTED,
         summary_code=contract.SummaryCode.REGRESSION_DETECTED,
-        next_action="await_repair", findings=[bulgu])
+        findings=[bulgu])
     # `run_id` stays the LOOP's readable identifier -- it is what binds
     # the workspace. `issued_run_id` is the opaque one the runner mints
     # for the textless envelope, and pinning the two together would make
@@ -859,13 +867,16 @@ _TRANSPORT_NULLS = {"tests": None, "findings": None, "stop_reason": None}
 
 @pytest.mark.parametrize(
     "govde",
-    [{"status": contract.Status.APPROVED, "next_action": "stop",
+    # B4-R17: `next_action` is no longer sendable, so the third case --
+    # an approving verdict paired with the wrong action -- cannot be
+    # expressed by a model any more. Its place is taken by a rule the
+    # authority alone still enforces: a terminal status owes a reason.
+    [{"status": contract.Status.APPROVED,
       "findings": [_CODE_FINDING_BODY]},
-     {"status": contract.Status.CHANGES_REQUESTED,
-      "next_action": "await_repair", "findings": []},
-     {"status": contract.Status.APPROVED, "next_action": "await_repair"}],
+     {"status": contract.Status.CHANGES_REQUESTED, "findings": []},
+     {"status": contract.Status.BLOCKED, "stop_reason": None}],
     ids=["onaylandi-ama-bulgu-var", "degisiklik-ama-bulgu-yok",
-         "onaylandi-ama-yanlis-eylem"])
+         "engellendi-ama-sebep-yok"])
 def test_what_the_transport_allows_the_authority_still_refuses(
         tmp_path, gate, govde, only_fake_models_may_run):
     """THE LOAD-BEARING TEST of the whole split. Each body is chosen so
@@ -900,8 +911,12 @@ def test_a_healthy_reply_passes_the_transport_and_the_authority(
     documents and validating one of them twice would prove nothing."""
     reply = _code_reply(**_TRANSPORT_NULLS)
     schemas.SchemaBinding(schemas.CODE_AUDIT_TRANSPORT_SCHEMA).validate(reply)
+    # the authority sees the document the ADAPTER builds: derived first
+    # (B4-R17), then normalised (B4-R14) -- the production order
     schemas.CODE_AUDIT_SCHEMA_BINDING.validate(
-        schemas.elide_optional_nulls(schemas.CODE_AUDIT_RESULT_SCHEMA, reply))
+        schemas.elide_optional_nulls(
+            schemas.CODE_AUDIT_RESULT_SCHEMA,
+            schemas.project_derived_fields(reply)))
 
     binary = _stub(tmp_path, mode="reply", body=json.dumps(reply))
     outcome = _audit(binary, gate)
@@ -920,7 +935,11 @@ def test_a_healthy_reply_passes_the_transport_and_the_authority(
     with pytest.raises(Exception):
         schemas.SchemaBinding(
             schemas.CODE_AUDIT_TRANSPORT_SCHEMA).validate(eksik)
-    schemas.CODE_AUDIT_SCHEMA_BINDING.validate(eksik)
+    # through the production order: derive, then judge. B4-R17 made the
+    # authority's `next_action` unreachable for a model, so the
+    # authority is asked about the document the ADAPTER builds
+    schemas.CODE_AUDIT_SCHEMA_BINDING.validate(
+        schemas.project_derived_fields(eksik))
     ikinci = _stub(tmp_path, name="sahte_eksik", mode="reply",
                    body=json.dumps(eksik))
     kabul = _audit(ikinci, gate)
@@ -941,7 +960,7 @@ def test_a_locked_transport_carries_this_call_s_issued_ids(
     reply = _locked_reply(
         kosu, status=contract.Status.CHANGES_REQUESTED,
         summary_code=contract.SummaryCode.REGRESSION_DETECTED,
-        next_action="await_repair", findings=[bulgu])
+        findings=[bulgu])
     kayit = tmp_path / "kilitli-sema.json"
     binary = _stub(tmp_path, mode="reply", body=json.dumps(reply),
                    schema_record=kayit)
@@ -1000,9 +1019,8 @@ _NULL_FINDING = _CODE_FINDING_BODY
     [{"summary": None},
      {"bilinmeyen_alan": None},
      {"stop_reason": "null"},
-     {"status": contract.Status.CHANGES_REQUESTED,
-      "next_action": "await_repair", "findings": None},
-     {"status": contract.Status.APPROVED, "next_action": "stop",
+     {"status": contract.Status.CHANGES_REQUESTED, "findings": None},
+     {"status": contract.Status.APPROVED,
       "findings": [_NULL_FINDING]}],
     ids=["zorunlu-alan-null", "bilinmeyen-alan-null", "null-metni",
          "degisiklik-ama-bulgu-null", "onaylandi-ama-gercek-bulgu"])
@@ -1034,7 +1052,7 @@ def test_a_locked_reply_with_transport_nulls_keeps_its_id_binding(
     saglikli = _locked_reply(
         kosu, status=contract.Status.CHANGES_REQUESTED,
         summary_code=contract.SummaryCode.REGRESSION_DETECTED,
-        next_action="await_repair", findings=[bulgu], stop_reason=None)
+        findings=[bulgu], stop_reason=None)
 
     binary = _stub(tmp_path, mode="reply", body=json.dumps(saglikli))
     outcome = _audit(binary, gate, **ortak)
@@ -1047,6 +1065,79 @@ def test_a_locked_reply_with_transport_nulls_keeps_its_id_binding(
                   body=json.dumps(kacak))
     with pytest.raises(audit.SchemaViolation):
         _audit(sahte, gate, **ortak)
+
+
+def test_the_b4r15_shape_now_completes_through_the_adapter(
+        tmp_path, gate, only_fake_models_may_run):
+    """THE MEASURED FAILURE, END TO END. The reply that once died on
+    `next_action` under the approved branch now passes: the model does
+    not send the field, the adapter derives it, and the authority --
+    unchanged -- accepts the result.
+
+    All three gates are proven separately, because "it returned" would
+    also be true of an adapter that had simply stopped checking."""
+    reply = _code_reply(**_TRANSPORT_NULLS)
+    assert "next_action" not in reply
+    # 1. the transport accepts what is SENT
+    schemas.SchemaBinding(schemas.CODE_AUDIT_TRANSPORT_SCHEMA).validate(reply)
+    # 2. the authority REFUSES it as sent -- the derivation is doing work
+    with pytest.raises(Exception):
+        schemas.CODE_AUDIT_SCHEMA_BINDING.validate(reply)
+    # 3. and accepts exactly what the adapter builds
+    schemas.CODE_AUDIT_SCHEMA_BINDING.validate(
+        schemas.elide_optional_nulls(
+            schemas.CODE_AUDIT_RESULT_SCHEMA,
+            schemas.project_derived_fields(reply)))
+
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(reply))
+    outcome = _audit(binary, gate)
+    assert len(only_fake_models_may_run) == 1, "senaryo kurulmadi"
+    assert outcome.reply["status"] == contract.Status.APPROVED
+    assert outcome.reply["next_action"] == "stop"
+    assert outcome.exit_code == 0
+    assert outcome.schema_sha256 == schemas.CODE_AUDIT_SCHEMA_BINDING.sha256
+
+
+def test_a_reply_that_writes_the_derived_field_is_refused_by_the_adapter(
+        tmp_path, gate, only_fake_models_may_run):
+    """A model that sends `next_action` has stopped following the
+    instruction, and the run must say so rather than paper over it --
+    even when the value it sent is the right one."""
+    for name, govde in (("sahte_dogru", {"next_action": "stop"}),
+                        ("sahte_yanlis", {"next_action": "await_repair"})):
+        reply = _code_reply(**dict(_TRANSPORT_NULLS, **govde))
+        binary = _stub(tmp_path, name=name, mode="reply",
+                       body=json.dumps(reply))
+        with pytest.raises(audit.SchemaViolation) as refusal:
+            _audit(binary, gate)
+        # the closed sentence names the mechanism, never the value
+        assert "turetilebilir" in str(refusal.value)
+        assert "await_repair" not in str(refusal.value)
+        assert "stop" not in str(refusal.value)
+
+
+def test_the_protocol_matrix_travels_with_every_evaluator_call(
+        tmp_path, gate, only_fake_models_may_run):
+    """The rules the transport cannot carry are said once, in the
+    adapter that enforces them. Measured on the bytes the CHILD read,
+    not on the string the caller passed."""
+    okunan = tmp_path / "istem.txt"
+    binary = _stub(tmp_path, mode="reply", body=json.dumps(_code_reply()),
+                   prompt_record=okunan)
+    _audit(binary, gate, prompt="KURGU GOREV METNI")
+
+    teslim = okunan.read_text(encoding="utf-8")
+    assert "KURGU GOREV METNI" in teslim, "cagiranin istemi kayboldu"
+    for satir in audit.PROTOCOL_MATRIX:
+        assert satir in teslim, satir
+    # it tells the model NOT to write the derived field, and never
+    # names a value for it
+    assert "next_action YAZMA" in teslim
+    assert "next_action=" not in teslim
+    # every conditional the strict transport cannot express is stated
+    assert "approved" in teslim and "changes_requested" in teslim
+    assert "blocked" in teslim and "failed" in teslim
+    assert "stop_reason" in teslim and "finding" in teslim
 
 
 def test_an_unissued_locked_id_is_still_refused_by_the_authority(
@@ -1062,7 +1153,7 @@ def test_an_unissued_locked_id_is_still_refused_by_the_authority(
     reply = _locked_reply(
         kosu, status=contract.Status.CHANGES_REQUESTED,
         summary_code=contract.SummaryCode.REGRESSION_DETECTED,
-        next_action="await_repair", findings=[kacak])
+        findings=[kacak])
     binary = _stub(tmp_path, mode="reply", body=json.dumps(reply))
     with pytest.raises(audit.SchemaViolation):
         _audit(binary, gate, audit_kind=contract.AuditKind.LOCKED,

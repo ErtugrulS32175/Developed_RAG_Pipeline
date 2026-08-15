@@ -117,8 +117,17 @@ def issued(name):
     return [item for item in os.environ.get(name, "").split(",") if item]
 
 
-def emit(payload):
+def emit(payload, derived=False):
     """Answer the way THIS CLI actually answers.
+
+    B4-R17: on the EVALUATOR road a compliant model does not send
+    `next_action` -- the transport schema has no such property and the
+    adapter derives it from `status`. So the fake drops it when it
+    answers into the last-message file, exactly as a model constrained
+    by that schema would. `derived=True` keeps it, which is how the one
+    test that proves a NON-compliant reply is refused gets its shape.
+    The implementer road is untouched: its schema still asks for the
+    field and its own tests still pin it.
 
     `codex exec` writes its final message into the file named by
     `--output-last-message`; `claude --print` answers on stdout with a
@@ -154,6 +163,9 @@ def emit(payload):
             "modelUsage": {}, "result": text, "structured_output": payload}))
         sys.stdout.flush()
     else:
+        if not derived:
+            payload.pop("next_action", None)
+            text = json.dumps(payload)
         with open(target, "w", encoding="utf-8") as handle:
             handle.write(text)
 
@@ -566,7 +578,13 @@ def test_a_fake_binary_really_runs_through_the_built_argv(workspace, tmp_path):
     assert done.returncode == 0, done.stderr
     assert done.stdout == "", "denetci yanitini stdout'a basti"
     reply = json.loads(last_message.read_text(encoding="utf-8"))
-    Draft202012Validator(schemas.CODE_AUDIT_RESULT_SCHEMA).validate(reply)
+    # WHAT THE FILE HOLDS IS WHAT A MODEL SENDS, and since B4-R17 that
+    # is a document without `next_action`: the transport schema has no
+    # such property. The authority is asked about the document the
+    # ADAPTER builds from it, which is the same order production uses.
+    assert "next_action" not in reply
+    Draft202012Validator(schemas.CODE_AUDIT_RESULT_SCHEMA).validate(
+        schemas.project_derived_fields(reply))
     recorded = [json.loads(line) for line in
                 workspace["record"].read_text(encoding="utf-8").splitlines()]
     assert recorded, "sahte CLI cagrilmadi"
@@ -2189,7 +2207,12 @@ def test_the_audit_authority_and_the_codex_transport_are_two_documents():
     assert transport["type"] == "object"
     assert transport["additionalProperties"] is False
     assert set(transport["required"]) == set(transport["properties"])
-    assert set(transport["properties"]) == set(authority["properties"])
+    # B4-R17: the transport asks for everything the authority does
+    # EXCEPT the fields the adapter derives -- the model is not asked
+    # for a value it cannot be constrained to get right
+    assert set(transport["properties"]) == (
+        set(authority["properties"]) - set(schemas.DERIVED_EVALUATOR_FIELDS))
+    assert "next_action" in authority["required"]
     assert transport["properties"]["role"] == {"type": "string",
                                                "const": contract.Role.EVALUATOR}
     assert transport["properties"]["status"]["enum"] == \
@@ -2464,6 +2487,110 @@ def test_elision_recurses_into_findings_and_touches_nothing_else():
         "required_action": "eylem"}
     assert json.dumps(payload, sort_keys=True) == once, "girdi degistirildi"
     assert temiz["findings"][0] is not bulgu
+
+
+# =====================================================================
+# B4-R17 -- A FIELD THE MODEL IS NO LONGER ASKED FOR
+# =====================================================================
+#
+# MEASURED on the first evaluator reply that ever reached the model: one
+# error, `next_action` under the `approved` branch, expected `stop`.
+# The rule is a CONSEQUENCE of the verdict and the strict subset cannot
+# express a conditional, so the field left the transport and the adapter
+# derives it.
+
+def _branch_actions(schema):
+    """The status -> next_action pairs the AUTHORITY itself states.
+
+    Read from the conditional branches rather than restated here, so the
+    table cannot drift from the rules that enforce it."""
+    out = {}
+    for rule in schema["allOf"]:
+        status = rule["if"]["properties"]["status"]["const"]
+        action = rule["then"].get("properties", {}).get("next_action", {})
+        if "const" in action:
+            out[status] = action["const"]
+    return out
+
+
+def test_the_derived_action_table_is_exactly_what_the_authority_states():
+    """The table is not a second opinion: every entry is the `const` the
+    authority puts in that status's own branch, for BOTH audit kinds."""
+    table = dict(schemas.EVALUATOR_NEXT_ACTION)
+    assert table == {"approved": "stop", "changes_requested": "await_repair",
+                     "blocked": "stop", "failed": "stop"}
+    for schema in (schemas.CODE_AUDIT_RESULT_SCHEMA,
+                   schemas.LOCKED_AUDIT_RESULT_SCHEMA):
+        assert _branch_actions(schema) == table
+        assert set(schema["properties"]["status"]["enum"]) == set(table)
+    # every evaluator status the contract allows has exactly one action
+    assert set(table) == set(contract.ROLE_STATUSES[contract.Role.EVALUATOR])
+    # and the table cannot be widened by a caller
+    with pytest.raises(TypeError):
+        schemas.EVALUATOR_NEXT_ACTION["kurgu"] = "stop"
+
+
+def test_the_derived_field_is_absent_from_both_evaluator_transports():
+    """CODE and LOCKED, because the locked transport is built per call
+    and a static check of one would leave the other unproven."""
+    for authority, transport in (
+            (schemas.CODE_AUDIT_RESULT_SCHEMA,
+             schemas.CODE_AUDIT_TRANSPORT_SCHEMA),
+            (schemas.LOCKED_AUDIT_RESULT_SCHEMA,
+             schemas.evaluator_transport_schema(
+                 schemas.LOCKED_AUDIT_RESULT_SCHEMA))):
+        assert "next_action" in authority["properties"]
+        assert "next_action" in authority["required"]
+        assert "next_action" not in transport["properties"]
+        assert "next_action" not in transport["required"]
+        # `additionalProperties: false` is what makes the absence a BAN
+        # rather than an omission the model could ignore
+        assert transport["additionalProperties"] is False
+        assert_strict_subset(transport)
+
+    bound = schemas.locked_audit_schema(
+        run_id="a" * 32, issued_finding_ids=["f" * 32],
+        issued_mechanism_ids=["e" * 32])
+    per_call = schemas.evaluator_transport_schema(bound)
+    assert "next_action" not in per_call["properties"]
+    assert per_call["properties"]["run_id"] == {"type": "string",
+                                                "const": "a" * 32}
+    assert per_call["properties"]["findings"]["items"]["properties"][
+        "finding_id"] == {"type": "string", "enum": ["f" * 32]}
+    assert "next_action" in bound["required"], "bound otorite degisti"
+
+
+@pytest.mark.parametrize(
+    "status, beklenen",
+    [("approved", "stop"), ("changes_requested", "await_repair"),
+     ("blocked", "stop"), ("failed", "stop")])
+def test_every_allowed_status_projects_to_its_exact_action(status, beklenen):
+    payload = {"status": status, "summary": "kurgu"}
+    projected = schemas.project_derived_fields(payload)
+    assert projected["next_action"] == beklenen
+    assert "next_action" not in payload, "girdi mutate edildi"
+    assert projected is not payload
+    assert schemas.project_derived_fields(payload) == projected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"status": "implemented"}, {"status": "onaylandi"}, {"status": None},
+     {"status": 1}, {"status": ["approved"]}, {},
+     {"status": "approved", "next_action": "stop"},
+     {"status": "approved", "next_action": "await_repair"}],
+    ids=["baska-rolun-statusu", "bilinmeyen", "null", "sayi", "liste",
+         "status-yok", "kendi-yazdi-dogru", "kendi-yazdi-yanlis"])
+def test_a_reply_the_projection_cannot_complete_is_refused(payload):
+    """Two refusals in one table. An unknown status has no single
+    action, so inventing one would be a guess with a verdict attached.
+    A reply that wrote the field ITSELF is refused rather than
+    overwritten -- even when it happens to be right -- because a silent
+    overwrite hides a model that stopped following the instruction."""
+    before = json.dumps(payload, sort_keys=True)
+    with pytest.raises(schemas.ProjectionError):
+        schemas.project_derived_fields(payload)
+    assert json.dumps(payload, sort_keys=True) == before
 
 
 def test_every_stderr_marker_is_exact_proven_and_wired(tmp_path):

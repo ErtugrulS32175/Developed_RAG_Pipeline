@@ -386,11 +386,15 @@ MUTATIONS = [
     # 3. A STATIC locked transport describes a document that accepts ids
     #    the runner never minted -- the exact promise `locked_audit_schema`
     #    exists to keep.
+    # RETARGETED in B4-R17: the intent is unchanged and the line moved
+    # when the locked road began deriving through the evaluator
+    # projection.
     ("b4r11-kilitli-statik-tasima", "audit",
-     "        return authoritative, schemas.codex_transport_schema("
-     "authoritative)",
-     "        return authoritative, schemas.codex_transport_schema("
-     + NL + "            schemas.LOCKED_AUDIT_RESULT_SCHEMA)",
+     "        return (authoritative," + NL
+     + "                schemas.evaluator_transport_schema(authoritative))",
+     "        return (authoritative," + NL
+     + "                schemas.evaluator_transport_schema(" + NL
+     + "                    schemas.LOCKED_AUDIT_RESULT_SCHEMA))",
      "test_a_locked_transport_carries_this_call_s_issued_ids"),
     # 4. A derivation that edits its source weakens the ACCEPTANCE
     #    authority for the rest of the process: the authority is a
@@ -437,6 +441,49 @@ MUTATIONS = [
      "and value is None:",
      "            if value is None:",
      "test_elision_removes_exactly_the_optional_nulls"),
+    # ----------------------------------------------------------------
+    # B4-R17 -- `next_action` is a CONSEQUENCE of `status`, derived by
+    # the adapter because the strict subset cannot express the
+    # conditional that ties them. Measured: the first evaluator reply
+    # that ever reached the model failed on exactly that pairing.
+    # ----------------------------------------------------------------
+    # 1. The table IS the authority's own branches. One wrong entry and
+    #    the derivation confidently produces a reply the authority
+    #    refuses -- the original defect, now with our name on it.
+    ("b4r17-turetme-tablosu", "schemas",
+     '    "approved": "stop",', '    "approved": "await_repair",',
+     "test_the_derived_action_table_is_exactly_what_the_authority_states"),
+    # 2. A reply that wrote the field itself is REFUSED, never
+    #    overwritten: a silent overwrite hides a model that stopped
+    #    following the instruction, including one that got it wrong.
+    ("b4r17-sessiz-ustune-yazma", "schemas",
+     "        if name in payload:" + NL
+     + '            raise ProjectionError("yanit turetilen bir alani '
+     'kendisi yazdi")',
+     "        if False:" + NL
+     + '            raise ProjectionError("yanit turetilen bir alani '
+     'kendisi yazdi")',
+     "test_a_reply_the_projection_cannot_complete_is_refused"),
+    # 3. The derivation must actually RUN, and before the authority
+    #    judges: without it every compliant reply is missing a required
+    #    field and the road is dead again.
+    ("b4r17-projeksiyon-atlandi", "audit",
+     "        payload = schemas.project_derived_fields(payload)",
+     "        payload = dict(payload)",
+     "test_the_b4r15_shape_now_completes_through_the_adapter"),
+    # 4. The field must leave the TRANSPORT. Leaving it there asks the
+    #    model for a value it cannot be constrained to get right, which
+    #    is the whole reason this package exists.
+    ("b4r17-tasimada-kaldi", "schemas",
+     '        document.get("properties", {}).pop(name, None)',
+     '        document.get("properties", {}).get(name, None)',
+     "test_the_derived_field_is_absent_from_both_evaluator_transports"),
+    # 5. The matrix is the only lever left for rules the transport
+    #    cannot carry; dropping it leaves them unstated everywhere.
+    ("b4r17-protokol-matrisi", "audit",
+     '    return "\\n".join([prompt, *PROTOCOL_MATRIX])',
+     "    return prompt",
+     "test_the_protocol_matrix_travels_with_every_evaluator_call"),
     # ----------------------------------------------------------------
     # B2A -- the call boundary: validate once, canonicalize once, use
     # only the canonical value. Each mutation reopens exactly one of

@@ -356,6 +356,45 @@ def _exact_path(value, what):
     return Path(text)
 
 
+# THE PROTOCOL MATRIX (B4-R17), in the adapter rather than in whatever
+# built the prompt -- because THIS is the layer that owns the schema the
+# reply is judged by and performs the derivation the last line promises.
+# A caller cannot forget it and a second caller cannot spell it
+# differently.
+#
+# EVERY LINE IS A RULE THE TRANSPORT CANNOT CARRY. The strict subset has
+# no conditionals, so "approved means no findings" and "blocked needs a
+# stop reason" are unenforceable at generation time; saying them once,
+# in closed vocabulary, is the only lever left. Nothing here is task
+# content, a path, or a candidate byte.
+PROTOCOL_MATRIX = (
+    "SOZLESME (kapali):",
+    "  - next_action YAZMA; adapter onu status'tan turetir",
+    "  - status=approved -> findings bos ya da null",
+    "  - status=changes_requested -> en az bir finding",
+    "  - status=blocked veya failed -> stop_reason bos olamaz",
+)
+
+
+def _with_protocol(prompt):
+    """The caller's prompt plus the closed protocol matrix.
+
+    Appended rather than merged: the runner owns what the task IS, this
+    module owns what a valid ANSWER is, and the two must not be able to
+    contradict each other in a shared string.
+
+    THE CALLER'S HALF IS JUDGED FIRST, and that ordering is load-bearing
+    rather than tidy: appending the matrix makes any prompt non-empty,
+    so an empty one would have sailed through the ceiling check below
+    carrying nothing but this module's own text -- an instruction the
+    evaluator was never given, in a call somebody paid for."""
+    if type(prompt) is not str:
+        raise AuditInputRefused("istem bir metin degil")
+    if not prompt.encode("utf-8"):
+        raise AuditInputRefused("istem bos")
+    return "\n".join([prompt, *PROTOCOL_MATRIX])
+
+
 def _prompt_bytes(prompt):
     """Encoded and measured before launch. EXACTLY `str`: a subclass
     checked as one thing returned entirely different bytes from
@@ -469,7 +508,8 @@ def _schema_for(audit_kind, *, issued_run_id, issued_finding_ids,
         authoritative = schemas.locked_audit_schema(
             run_id=issued_run_id, issued_finding_ids=issued_finding_ids,
             issued_mechanism_ids=issued_mechanism_ids)
-        return authoritative, schemas.codex_transport_schema(authoritative)
+        return (authoritative,
+                schemas.evaluator_transport_schema(authoritative))
     raise AuditInputRefused("denetim turu sozlesmede yok")
 
 
@@ -522,7 +562,10 @@ def _canonical_call(binary, *, repo, state_dir, run_id, workspace_id,
     try:
         return _CanonicalAuditCall(
             binary=_usable_binary(binary),
-            prompt_bytes=_prompt_bytes(prompt),
+            # the ceiling is measured on what is actually SENT, matrix
+            # included -- measuring the caller's half would let a prompt
+            # at the limit cross it on the way out
+            prompt_bytes=_prompt_bytes(_with_protocol(prompt)),
             timeout_seconds=canonical_timeout,
             max_output_bytes=canonical_output,
             model=cli.exact_model(model),
@@ -904,6 +947,19 @@ def _parse_reply(raw, measurements, binding, audit_kind, *, authoritative):
     if payload.get("audit_kind") != audit_kind:
         raise SchemaViolation("yanit baska bir denetim turunu adliyor",
                               **measurements)
+    # DERIVE, THEN NORMALISE, THEN JUDGE (B4-R17). `next_action` is a
+    # consequence of `status`, not a judgement, and the strict subset
+    # cannot express the conditional that ties them -- so the model is
+    # not asked for it and the adapter fills it in here. The authority
+    # below still requires the field and still refuses a wrong pairing,
+    # so this step adds a value rather than a verdict.
+    try:
+        payload = schemas.project_derived_fields(payload)
+    except schemas.ProjectionError:
+        # the closed sentence is chosen HERE; the reply's own values
+        # never travel into a refusal
+        raise SchemaViolation("yanit turetilebilir bir durum tasimiyor",
+                              **measurements) from None
     payload = schemas.elide_optional_nulls(authoritative, payload)
     try:
         binding.validate(payload)

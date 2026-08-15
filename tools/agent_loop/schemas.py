@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from types import MappingProxyType
 
 from jsonschema import Draft202012Validator
 
@@ -836,6 +837,104 @@ def codex_transport_schema(schema):
     return strict
 
 
+# ---------------------------------------------------------------------
+# B4-R17 -- A FIELD THE MODEL SHOULD NEVER HAVE BEEN ASKED FOR
+# ---------------------------------------------------------------------
+#
+# MEASURED on the first evaluator call that ever reached the model: the
+# reply was contract-shaped in every other respect and failed on ONE
+# rule -- `status: approved` paired with a `next_action` that was not
+# `stop`. That pairing is not a judgement the evaluator makes; it is a
+# consequence of the verdict, spelled out four times in the authority's
+# own conditional rules.
+#
+# The strict transport subset cannot express a conditional, so the rule
+# was unenforceable at generation time BY CONSTRUCTION. Rather than ask
+# the model for a value it cannot be constrained to get right, the
+# evaluator road stops asking: `next_action` leaves the transport
+# schema and the adapter derives it from `status`.
+#
+# WHAT THIS IS NOT. It is not a relaxation: the authority still requires
+# `next_action` and still refuses every wrong pairing, and the derived
+# value is validated by it like any other. A projection that produced
+# the wrong action would be caught by the same rule that caught the
+# model.
+#
+# The values are READ FROM the authority, never invented: each entry
+# below is the `const` inside one `allOf/*/then/properties/next_action`
+# branch, and a test pins the table against those branches.
+EVALUATOR_NEXT_ACTION = MappingProxyType({
+    "approved": "stop",
+    "changes_requested": "await_repair",
+    "blocked": "stop",
+    "failed": "stop",
+})
+
+# The fields the EVALUATOR road derives rather than receives. Named as a
+# constant so the projection and the schema reduction cannot drift: one
+# removes them from what is asked for, the other puts them back.
+DERIVED_EVALUATOR_FIELDS = ("next_action",)
+
+
+class ProjectionError(ValueError):
+    """A reply the derivation cannot honestly complete.
+
+    Raised for an unknown status and for a reply that supplied a
+    derived field itself -- never for a value this package can fix by
+    guessing, because there is no such value."""
+
+
+def _without_derived(schema):
+    """A COPY of an authoritative schema with the derived fields gone.
+
+    A copy, and through JSON, so nothing here can reach the authority:
+    it is a module-level dictionary and one in-place edit would remove
+    `next_action` from the acceptance gate for the rest of the
+    process."""
+    document = json.loads(json.dumps(schema))
+    for name in DERIVED_EVALUATOR_FIELDS:
+        document.get("properties", {}).pop(name, None)
+        if name in document.get("required", ()):
+            document["required"] = [entry for entry in document["required"]
+                                    if entry != name]
+    return document
+
+
+def evaluator_transport_schema(authoritative):
+    """The transport copy for the EVALUATOR road.
+
+    The strict subset, MINUS the fields the adapter derives. This is a
+    deliberate second step rather than a change to
+    `codex_transport_schema`: that helper serves every caller and must
+    keep meaning "the same document, expressed in what the provider
+    accepts". Dropping a property is a different claim, and it belongs
+    to the road that knows how to put the property back."""
+    return codex_transport_schema(_without_derived(authoritative))
+
+
+def project_derived_fields(payload):
+    """The reply, with the derived fields filled in from `status`.
+
+    PURE: the argument is not mutated and a new document is returned.
+    The order this sits in matters and is fixed by the caller -- derive,
+    then elide transport nulls, then let the AUTHORITY judge the
+    result. Nothing here decides whether a reply is acceptable.
+
+    A reply that supplies a derived field itself is REFUSED rather than
+    overwritten: silently replacing it would hide a model that had been
+    told not to send it, and the refusal is the only way anybody learns
+    the instruction stopped working."""
+    if type(payload) is not dict:
+        raise ProjectionError("yanit bir JSON nesnesi degil")
+    for name in DERIVED_EVALUATOR_FIELDS:
+        if name in payload:
+            raise ProjectionError("yanit turetilen bir alani kendisi yazdi")
+    status = payload.get("status")
+    if type(status) is not str or status not in EVALUATOR_NEXT_ACTION:
+        raise ProjectionError("durum kapali degerlendirici kumesinde degil")
+    return dict(payload, next_action=EVALUATOR_NEXT_ACTION[status])
+
+
 def elide_optional_nulls(schema, payload):
     """The reply, with transport `null`s for OPTIONAL fields removed.
 
@@ -874,8 +973,11 @@ def elide_optional_nulls(schema, payload):
 
 
 # The CODE audit's transport copy: static, so it is derived once and
-# hash-pinned here rather than rebuilt per call.
-CODE_AUDIT_TRANSPORT_SCHEMA = codex_transport_schema(CODE_AUDIT_RESULT_SCHEMA)
+# hash-pinned here rather than rebuilt per call. Built through the
+# EVALUATOR projection (B4-R17), so `next_action` is absent from what
+# the model is asked for and present in what the authority demands.
+CODE_AUDIT_TRANSPORT_SCHEMA = evaluator_transport_schema(
+    CODE_AUDIT_RESULT_SCHEMA)
 
 # The two bindings of the CODE road, pinned INDEPENDENTLY. The first is
 # the acceptance authority and never leaves this process; the second is
