@@ -2692,6 +2692,58 @@ def test_a_reply_the_projection_cannot_complete_is_refused(payload):
     assert json.dumps(payload, sort_keys=True) == before
 
 
+def test_the_schema_diagnosis_vocabulary_is_closed_and_agrees_everywhere():
+    """B5-R3. Two words carry the whole diagnosis of a schema
+    violation, so what they may say is pinned in one place and the event
+    schema is checked to accept exactly that and nothing else."""
+    from jsonschema import Draft202012Validator
+
+    issues = contract.ALL_SCHEMA_ISSUES
+    fields = contract.ALL_SCHEMA_FIELDS
+    assert len(set(issues)) == len(issues) == 18
+    assert len(set(fields)) == len(fields) == 14
+    # the stages that happen before the authority is consulted
+    for word in ("invalid_utf8", "invalid_json", "wrong_root_type",
+                 "invalid_envelope", "unknown_schema_violation"):
+        assert word in issues
+    # EVERY declared field of the authority has a word, so a failure can
+    # always be placed without inventing one
+    declared = set(schemas.AUTHORITATIVE_RESULT_SCHEMA["properties"])
+    assert declared <= set(fields), sorted(declared - set(fields))
+    # and the only words that are NOT declared fields are the four this
+    # contract adds on purpose
+    assert set(fields) - declared == {"root", "envelope", "multiple",
+                                      "unknown"}
+
+    # every keyword the table maps lands inside the vocabulary
+    assert set(contract.SCHEMA_ISSUE_FOR_VALIDATOR.values()) <= set(issues)
+    for keyword in ("required", "additionalProperties", "type", "enum",
+                    "const", "pattern", "minItems", "maxItems"):
+        assert keyword in contract.SCHEMA_ISSUE_FOR_VALIDATOR
+    # jsonschema's own spelling is never a value
+    assert "additionalProperties" not in issues
+    assert "minLength" not in issues
+
+    properties = schemas.EVENT_SCHEMA["properties"]
+    assert properties["schema_issue"]["enum"] == list(issues)
+    assert properties["schema_field"]["enum"] == list(fields)
+    assert schemas.EVENT_SCHEMA["additionalProperties"] is False
+    # OPTIONAL: an event that is not a schema violation carries neither
+    assert "schema_issue" not in schemas.EVENT_SCHEMA["required"]
+    assert "schema_field" not in schemas.EVENT_SCHEMA["required"]
+
+    validator = Draft202012Validator(schemas.EVENT_SCHEMA)
+    healthy = {"ts": "t", "run_id": "kosu-abc", "event": "schema_violation",
+               "schema_issue": "required", "schema_field": "next_action"}
+    assert validator.is_valid(healthy)
+    assert validator.is_valid({"ts": "t", "run_id": "kosu-abc",
+                               "event": "schema_violation"})
+    for bad in ({"schema_issue": "uydurma"}, {"schema_field": "uydurma"},
+                {"schema_issue": "additionalProperties"},
+                {"schema_field": "gizli_model_alani"}):
+        assert not validator.is_valid(dict(healthy, **bad)), bad
+
+
 def test_every_stderr_marker_is_exact_proven_and_wired(tmp_path):
     """B4-R8. The marker table is the ONLY thing that can produce a
     specific evaluator code, so its discipline is pinned here rather

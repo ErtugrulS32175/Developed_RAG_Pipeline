@@ -483,6 +483,114 @@ FAILURE_CODES = {
 
 ALL_ROLES = (Role.IMPLEMENTER, Role.EVALUATOR)
 
+
+# ---------------------------------------------------------------------
+# B5-R3 -- WHICH RULE THE REPLY BROKE, AS TWO CLOSED WORDS
+# ---------------------------------------------------------------------
+#
+# MEASURED. A real run ended `implementer_schema_violation` with exit 0
+# and 6766 bytes of stdout, and that code was the whole record: the
+# adapter put the failing field path in its exception SENTENCE, and the
+# runner -- correctly -- does not carry free-text messages into the
+# journal. The envelope lived only in the child's stdout, and the local
+# session transcript does not keep it, so the diagnosis could not be
+# recovered afterwards at any price.
+#
+# The answer is not to persist output. It is to say the same thing in
+# words this contract owns: WHICH rule refused, and WHICH declared field
+# it refused at. Both come from these tuples and nowhere else -- a model
+# cannot put a value in the journal by choosing what to send, because
+# nothing here is derived from what it sent.
+
+
+class SchemaIssue:
+    """WHICH rule refused the reply. One word per stage or validator."""
+
+    # the stages before the schema is even consulted
+    INVALID_UTF8 = "invalid_utf8"
+    INVALID_JSON = "invalid_json"
+    WRONG_ROOT_TYPE = "wrong_root_type"
+    INVALID_ENVELOPE = "invalid_envelope"
+    # the authority's own vocabulary, one closed word per validator
+    REQUIRED = "required"
+    ADDITIONAL_PROPERTIES = "additional_properties"
+    TYPE = "type"
+    ENUM = "enum"
+    CONST = "const"
+    PATTERN = "pattern"
+    MIN_LENGTH = "min_length"
+    MAX_LENGTH = "max_length"
+    MINIMUM = "minimum"
+    MAXIMUM = "maximum"
+    MIN_ITEMS = "min_items"
+    MAX_ITEMS = "max_items"
+    # `allOf`/`if`/`then`: the status-to-envelope rules, which are one
+    # mechanism to an operator however many keywords express them
+    CONDITIONAL = "conditional"
+    # a validator this contract has no word for. NEVER the validator's
+    # own name: that is jsonschema's vocabulary, not this one, and a
+    # future keyword would enter the journal unreviewed.
+    UNKNOWN = "unknown_schema_violation"
+
+
+ALL_SCHEMA_ISSUES = tuple(
+    value for name, value in vars(SchemaIssue).items()
+    if not name.startswith("_") and isinstance(value, str))
+
+
+class SchemaField:
+    """WHERE it refused -- a DECLARED field of the result schema.
+
+    Never a model-chosen name. An unknown property is reported as the
+    position it appeared in plus the `additional_properties` issue; the
+    key itself is the model's text and stays out."""
+
+    ROOT = "root"
+    ENVELOPE = "envelope"
+    PROTOCOL_VERSION = "protocol_version"
+    RUN_ID = "run_id"
+    ROLE = "role"
+    STATUS = "status"
+    SUMMARY = "summary"
+    NEXT_ACTION = "next_action"
+    CHANGED_FILES = "changed_files"
+    TESTS = "tests"
+    FINDINGS = "findings"
+    STOP_REASON = "stop_reason"
+    # more than one declared field is implicated, or none can be proven
+    MULTIPLE = "multiple"
+    UNKNOWN = "unknown"
+
+
+ALL_SCHEMA_FIELDS = tuple(
+    value for name, value in vars(SchemaField).items()
+    if not name.startswith("_") and isinstance(value, str))
+
+# jsonschema's keyword -> this contract's word. A TABLE, so a keyword
+# nobody has classified becomes `unknown_schema_violation` rather than
+# leaking jsonschema's spelling into a closed field.
+SCHEMA_ISSUE_FOR_VALIDATOR = {
+    "required": SchemaIssue.REQUIRED,
+    "additionalProperties": SchemaIssue.ADDITIONAL_PROPERTIES,
+    "type": SchemaIssue.TYPE,
+    "enum": SchemaIssue.ENUM,
+    "const": SchemaIssue.CONST,
+    "pattern": SchemaIssue.PATTERN,
+    "minLength": SchemaIssue.MIN_LENGTH,
+    "maxLength": SchemaIssue.MAX_LENGTH,
+    "minimum": SchemaIssue.MINIMUM,
+    "maximum": SchemaIssue.MAXIMUM,
+    "minItems": SchemaIssue.MIN_ITEMS,
+    "maxItems": SchemaIssue.MAX_ITEMS,
+    "allOf": SchemaIssue.CONDITIONAL,
+    "anyOf": SchemaIssue.CONDITIONAL,
+    "oneOf": SchemaIssue.CONDITIONAL,
+    "if": SchemaIssue.CONDITIONAL,
+    "then": SchemaIssue.CONDITIONAL,
+    "else": SchemaIssue.CONDITIONAL,
+    "not": SchemaIssue.CONDITIONAL,
+}
+
 # Ids that come back from a LOCKED audit are not model-chosen slugs --
 # a slug is free text with a short leash, and "gizli-belge-adi" is a
 # perfectly valid one. The runner mints these before the call and

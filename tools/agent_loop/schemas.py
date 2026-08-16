@@ -43,6 +43,8 @@ from tools.agent_loop.contract import (
     ALL_FAILURE_CODES,
     ALL_LOCKED_FINDING_CLASSES,
     ALL_ROLES,
+    ALL_SCHEMA_FIELDS,
+    ALL_SCHEMA_ISSUES,
     ALL_STOP_REASONS,
     ALL_SUMMARY_CODES,
     COMMAND_REGISTRY,
@@ -497,6 +499,12 @@ EVENT_SCHEMA = {
         "stdout_bytes": {"type": "integer", "minimum": 0},
         "stderr_bytes": {"type": "integer", "minimum": 0},
         "cleanup_complete": {"type": "boolean"},
+        # B5-R3: which schema rule refused a reply, and at which
+        # DECLARED field. Closed enums, and optional -- an event that is
+        # not a schema violation carries neither, which is why they are
+        # absent from `required` rather than nullable.
+        "schema_issue": {"enum": list(ALL_SCHEMA_ISSUES)},
+        "schema_field": {"enum": list(ALL_SCHEMA_FIELDS)},
     },
 }
 

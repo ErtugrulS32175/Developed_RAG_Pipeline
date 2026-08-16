@@ -1301,6 +1301,71 @@ def test_an_envelope_limit_reaches_the_journal_as_its_own_code(world):
     assert "MaxBudgetReached" not in raw
 
 
+def test_a_schema_violation_reaches_the_journal_with_its_two_closed_words(
+        world):
+    """B5-R3, at the layer that matters. A real run recorded
+    `implementer_schema_violation` and nothing else, because the
+    adapter's diagnosis lived in a SENTENCE and sentences do not
+    travel. These two words do."""
+    result = _run_raising(world, execution.SchemaViolation(
+        "yanit sema disi (alan: next_action)",
+        schema_issue=contract.SchemaIssue.REQUIRED,
+        schema_field=contract.SchemaField.NEXT_ACTION,
+        exit_code=0, duration_ms=219171, stdout_bytes=6766, stderr_bytes=0,
+        cleanup_complete=True))
+    assert result.stop_reason == contract.StopReason.SCHEMA_VIOLATION
+    entry = _terminal_event(world, contract.EventCode.SCHEMA_VIOLATION)
+    assert entry["failure_code"] == \
+        contract.FailureCode.IMPLEMENTER_SCHEMA_VIOLATION
+    assert entry["schema_issue"] == contract.SchemaIssue.REQUIRED
+    assert entry["schema_field"] == contract.SchemaField.NEXT_ACTION
+    assert entry["role"] == contract.Role.IMPLEMENTER
+    assert entry["exit_code"] == 0 and entry["stdout_bytes"] == 6766
+
+    raw = runner_events.events_path(world.state_dir).read_text(
+        encoding="utf-8")
+    # the adapter's own sentence is NOT what travelled
+    assert "yanit sema disi" not in raw
+    assert "alan:" not in raw
+
+
+def test_a_word_outside_the_contract_never_reaches_the_journal(world):
+    """The allowlist is a membership test, not a copy. A failure that
+    carries invented words -- or model text under those names -- writes
+    neither."""
+    sentinel = "GIZLI-MODEL-ALANI"
+    failure = execution.SchemaViolation(
+        "yanit sema disi (alan: kok)", exit_code=0, duration_ms=5,
+        stdout_bytes=1, stderr_bytes=0, cleanup_complete=True)
+    # set AFTER construction, bypassing the exception's own check, so
+    # this test measures the RUNNER's gate rather than the adapter's
+    object.__setattr__(failure, "schema_issue", sentinel)
+    object.__setattr__(failure, "schema_field", sentinel)
+    _run_raising(world, failure)
+
+    entry = _terminal_event(world, contract.EventCode.SCHEMA_VIOLATION)
+    assert "schema_issue" not in entry
+    assert "schema_field" not in entry
+    assert entry["failure_code"] == \
+        contract.FailureCode.IMPLEMENTER_SCHEMA_VIOLATION
+    raw = runner_events.events_path(world.state_dir).read_text(
+        encoding="utf-8")
+    assert sentinel not in raw
+
+
+def test_a_failure_that_is_not_a_schema_violation_writes_neither_word(world):
+    """The two words belong to one mechanism. A process failure must not
+    acquire them, or an operator reading the journal would look for a
+    schema problem that never happened."""
+    _run_raising(world, execution.ProcessFailed(
+        "model sureci sifirdan farkli koda dondu", exit_code=1,
+        duration_ms=5, stdout_bytes=0, stderr_bytes=0,
+        cleanup_complete=True))
+    entry = _terminal_event(world, contract.EventCode.MODEL_CALL_FINISHED)
+    assert "schema_issue" not in entry
+    assert "schema_field" not in entry
+
+
 def test_the_generic_process_failure_still_reads_as_generic(world):
     """The regression half: refining four envelopes must not have
     reclassified everything else."""

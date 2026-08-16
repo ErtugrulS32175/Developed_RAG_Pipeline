@@ -169,6 +169,48 @@ MUTATIONS = [
      "    return tuple(contract.CONTROL_PLANE_PATHS)",
      "whole_agent_loop_test_family_is_control_plane"),
     # ----------------------------------------------------------------
+    # B5-R3 -- WHICH schema rule refused, as two closed words. Measured:
+    # a real run recorded `implementer_schema_violation` and nothing
+    # else, and the envelope that would have explained it existed only
+    # in the child's stdout.
+    # ----------------------------------------------------------------
+    # 1. Every validator collapsed to the generic word: the journal
+    #    would say a rule broke without saying which, which is the
+    #    state this package exists to leave.
+    ("b5r3-validator-sinifi", "contract",
+     '    "required": SchemaIssue.REQUIRED,',
+     '    "required": SchemaIssue.UNKNOWN,',
+     "test_a_missing_required_field_is_named_from_the_schema"),
+    # 2. The field pinned to the root: an operator sent to "the reply"
+    #    when the schema knows the field.
+    ("b5r3-alan-daima-kok", "execution",
+     "    for part in path:" + NL + "        if isinstance(part, str):",
+     "    for part in []:" + NL + "        if isinstance(part, str):",
+     "test_a_broken_rule_names_the_declared_field_it_broke"),
+    # 3. The missing-field computation skipped, so `required` stops
+    #    naming the absent field.
+    ("b5r3-eksik-alan-hesabi", "execution",
+     "    if issue == contract.SchemaIssue.REQUIRED and not path:",
+     "    if False:",
+     "test_a_missing_required_field_is_named_from_the_schema"),
+    # 4. The runner's allowlist narrowed: the adapter would classify and
+    #    the journal would still say nothing.
+    ("b5r3-runner-izin-listesi", "runner",
+     '        for name, allowed in (("schema_issue", '
+     "contract.ALL_SCHEMA_ISSUES)," + NL
+     + '                              ("schema_field", '
+     "contract.ALL_SCHEMA_FIELDS)):",
+     '        for name, allowed in (("schema_issue", '
+     "contract.ALL_SCHEMA_ISSUES),):",
+     "test_a_schema_violation_reaches_the_journal_with_its_two_closed_words"),
+    # 5. THE PRIVACY ONE: the membership check dropped, so a word the
+    #    contract does not own -- including model text under that name --
+    #    reaches the journal.
+    ("b5r3-uyelik-kontrolu", "runner",
+     "            if type(value) is str and value in allowed:",
+     "            if type(value) is str:",
+     "test_a_word_outside_the_contract_never_reaches_the_journal"),
+    # ----------------------------------------------------------------
     # B5-R1 -- the SCHEMA's three relations. Measured: one alternation
     # anchored only at the start made the ancestor `tests` match
     # everything beneath it, and a real manifest naming an ordinary test

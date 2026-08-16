@@ -1352,7 +1352,10 @@ def test_every_mutation_still_applies_to_the_current_source():
     # 110 -> 113 in B5-R1: the schema's three control-plane relations --
     # exact ancestors, the frozen test family, and the broad ancestors
     # that must stay refused.
-    assert len(tool.MUTATIONS) == 113
+    # 113 -> 118 in B5-R3: the two closed words of a schema violation --
+    # the validator class, the field path, the missing-field
+    # computation, the runner's allowlist and its membership check.
+    assert len(tool.MUTATIONS) == 118
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1376,6 +1379,9 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b4r17-projeksiyon-atlandi', 'b4r17-tasimada-kaldi',
         'b4r17-protokol-matrisi', 'b5r1-ata-tam-eslesme',
         'b5r1-sema-test-ailesi', 'b5r1-genis-ata-izni',
+        'b5r3-validator-sinifi', 'b5r3-alan-daima-kok',
+        'b5r3-eksik-alan-hesabi', 'b5r3-runner-izin-listesi',
+        'b5r3-uyelik-kontrolu',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

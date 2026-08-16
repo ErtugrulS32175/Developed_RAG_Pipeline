@@ -178,7 +178,12 @@ _EVENT_FOR_REASON = {
 # state. Named here so the journal's contents are a decision rather than
 # whatever the failure object happened to expose.
 _DIAGNOSTIC_FIELDS = ("failure_code", "role", "exit_code", "duration_ms",
-                      "stdout_bytes", "stderr_bytes", "cleanup_complete")
+                      "stdout_bytes", "stderr_bytes", "cleanup_complete",
+                      # B5-R3: WHICH schema rule refused, and at which
+                      # declared field. Two closed words, and the only
+                      # reason a schema violation is diagnosable at all
+                      # -- the adapter's sentence never travels.
+                      "schema_issue", "schema_field")
 
 
 @dataclass(frozen=True, slots=True)
@@ -795,6 +800,15 @@ class _Run:
         cleanup = getattr(failure, "cleanup_complete", None)
         if type(cleanup) is bool:
             diagnostics["cleanup_complete"] = cleanup
+        # NAMED ONE BY ONE, and each checked against its own closed
+        # tuple (B5-R3). Copying `failure.__dict__` would have been
+        # shorter and would have carried whatever a future exception
+        # happened to hold -- which on this road is model output.
+        for name, allowed in (("schema_issue", contract.ALL_SCHEMA_ISSUES),
+                              ("schema_field", contract.ALL_SCHEMA_FIELDS)):
+            value = getattr(failure, name, None)
+            if type(value) is str and value in allowed:
+                diagnostics[name] = value
         return diagnostics
 
     def _translate(self, failure):

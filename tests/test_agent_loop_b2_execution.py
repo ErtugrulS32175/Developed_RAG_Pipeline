@@ -2086,6 +2086,171 @@ def test_an_unreadable_buffer_keeps_the_existing_authority(tmp_path, bound):
                          max_output_bytes=1024, code=1)
 
 
+# =====================================================================
+# B5-R3 -- WHICH SCHEMA RULE REFUSED, AS TWO CLOSED WORDS
+# =====================================================================
+#
+# MEASURED. A real run ended `implementer_schema_violation` with exit 0
+# and 6766 bytes of stdout, and that code was the entire record: the
+# adapter put the failing path in its exception SENTENCE, and the runner
+# does not carry sentences into the journal. The envelope existed only
+# in the child's stdout and the local transcript does not keep it, so
+# the diagnosis was unrecoverable at any price afterwards.
+#
+# The fix is not to keep output. It is to say the same thing in two
+# words this contract owns -- and every case below goes through the real
+# adapter seam, because a classifier proven only against hand-built
+# `ValidationError` objects is a classifier nobody has run.
+
+
+def _violation(tmp_path, bound, payload_bytes, **kwargs):
+    with pytest.raises(execution.SchemaViolation) as refused:
+        _run_with_stdout(tmp_path, bound, payload_bytes, **kwargs)
+    return refused.value
+
+
+@pytest.mark.parametrize(
+    "govde, issue, field",
+    [(b"\xff\xfe" + b'{"type": "result"}', "invalid_utf8", "root"),
+     (b"bu JSON degil", "invalid_json", "root"),
+     (b'["result"]', "wrong_root_type", "root"),
+     (b'{"type": "not_a_result"}', "invalid_envelope", "envelope"),
+     (b'{"type": "result", "subtype": "success", "is_error": false}',
+      "invalid_envelope", "envelope")],
+    ids=["utf8", "json", "root-tipi", "zarf-turu", "zarf-payload-yok"])
+def test_each_parse_stage_names_its_own_closed_issue(tmp_path, bound, govde,
+                                                     issue, field):
+    """The stages BEFORE the authority is consulted. Each has its own
+    word, because "schema violation" covers a corrupt pipe, a chatty
+    non-JSON answer and a well-formed reply that broke one rule -- three
+    different things to look at."""
+    failure = _violation(tmp_path, bound, govde)
+    assert failure.schema_issue == issue
+    assert failure.schema_field == field
+    assert failure.schema_issue in contract.ALL_SCHEMA_ISSUES
+    assert failure.schema_field in contract.ALL_SCHEMA_FIELDS
+
+
+def test_a_missing_required_field_is_named_from_the_schema(tmp_path, bound):
+    """The missing name is computed from the AUTHORITY's own `required`
+    list against the payload's keys -- never parsed out of the exception
+    message, which embeds the value."""
+    reply = _valid_reply()
+    reply.pop("next_action")
+    failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert failure.schema_issue == contract.SchemaIssue.REQUIRED
+    assert failure.schema_field == contract.SchemaField.NEXT_ACTION
+
+
+def test_several_missing_required_fields_report_multiple(tmp_path, bound):
+    """Two absent fields is not one diagnosis. `multiple` says look at
+    the reply as a whole rather than sending an operator to one field."""
+    reply = _valid_reply()
+    reply.pop("next_action")
+    reply.pop("summary")
+    failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert failure.schema_issue == contract.SchemaIssue.REQUIRED
+    assert failure.schema_field == contract.SchemaField.MULTIPLE
+
+
+@pytest.mark.parametrize(
+    "reply_overrides, field",
+    [({"next_action": "kurgu-eylem"}, "next_action"),
+     ({"status": "kurgu-durum"}, "status"),
+     ({"protocol_version": "0.9"}, "protocol_version"),
+     ({"changed_files": "pipeline/kurgu.py"}, "changed_files"),
+     ({"run_id": "GECERSIZ KIMLIK"}, "run_id")],
+    ids=["next-action", "status", "protocol", "changed-files", "run-id"])
+def test_a_broken_rule_names_the_declared_field_it_broke(
+        tmp_path, bound, reply_overrides, field):
+    """The field is read from the failure PATH, which is made of names
+    the schema declared. The VALUE that broke it never travels."""
+    reply = _valid_reply(**reply_overrides)
+    failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert failure.schema_field == field
+    assert failure.schema_issue in contract.ALL_SCHEMA_ISSUES
+    assert failure.schema_issue not in (
+        contract.SchemaIssue.UNKNOWN, contract.SchemaIssue.REQUIRED)
+
+
+def test_an_unknown_property_is_a_position_and_never_a_name(tmp_path, bound):
+    """`additionalProperties` is the one failure whose "where" is a name
+    the MODEL chose. The position travels; the name does not."""
+    marker = "modelin_uydurdugu_alan"
+    reply = _valid_reply(**{marker: "GIZLI-DEGER"})
+    failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert failure.schema_issue == contract.SchemaIssue.ADDITIONAL_PROPERTIES
+    assert failure.schema_field == contract.SchemaField.ROOT
+    blob = " ".join([str(failure), repr(failure), repr(failure.__dict__)])
+    assert marker not in blob
+    assert "GIZLI-DEGER" not in blob
+
+
+@pytest.mark.parametrize(
+    "reply_overrides, field",
+    [({"tests": [{"command_id": "pytest_full"}]}, "tests"),
+     ({"changed_files": ["../gizli/yol.py"]}, "changed_files")],
+    ids=["tests-icinde", "changed-files-icinde"])
+def test_a_nested_failure_reports_only_its_top_level_field(
+        tmp_path, bound, reply_overrides, field):
+    """A nested name is either the declared field's own structure -- in
+    which case the top-level name is the honest answer -- or a key the
+    model invented, which never travels."""
+    reply = _valid_reply(**reply_overrides)
+    failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert failure.schema_field == field
+
+
+def test_the_closed_diagnosis_carries_no_model_text(tmp_path, bound):
+    """THE PRIVACY CLAIM, with a sentinel in every place a value could
+    hide: the invalid value itself, an invented key, an absolute path, a
+    token, an e-mail and a session id."""
+    sentinels = {
+        "deger": "GIZLI-GECERSIZ-DEGER",
+        "anahtar": "gizli_uydurma_anahtar",
+        "yol": str(tmp_path),
+        "jeton": "sk-ant-api03-GIZLIJETON",
+        "eposta": "gizli@example.invalid",
+        "oturum": "11111111-2222-4333-8444-555555555555",
+    }
+    reply = _valid_reply(status=sentinels["deger"],
+                         summary=f"{sentinels['eposta']} {sentinels['yol']}",
+                         **{sentinels["anahtar"]: sentinels["jeton"]})
+    envelope = _success_envelope(reply, session_id=sentinels["oturum"],
+                                 result=sentinels["deger"])
+    failure = _violation(tmp_path, bound, _emit(envelope))
+
+    blob = " ".join([str(failure), repr(failure), repr(failure.__dict__),
+                     repr(getattr(failure, "__notes__", [])),
+                     repr(failure.__cause__), repr(failure.__context__)])
+    for name, value in sentinels.items():
+        assert value not in blob, name
+    # what DOES travel is two contract words and nothing else
+    assert failure.schema_issue in contract.ALL_SCHEMA_ISSUES
+    assert failure.schema_field in contract.ALL_SCHEMA_FIELDS
+
+
+def test_a_failure_that_is_not_a_schema_violation_carries_no_diagnosis(
+        tmp_path, bound):
+    """The fields are for one mechanism. A budget stop is not a schema
+    problem and must not acquire a schema word."""
+    envelope = _error_envelope("error_max_budget_usd")
+    with pytest.raises(execution.MaxBudgetReached) as refused:
+        _run_with_stdout(tmp_path, bound, _emit(envelope), code=1)
+    assert getattr(refused.value, "schema_issue", None) is None
+    assert getattr(refused.value, "schema_field", None) is None
+
+
+def test_a_word_outside_the_contract_cannot_be_attached(tmp_path, bound):
+    """The membership check lives in the exception, so a future caller
+    cannot invent a word by passing one."""
+    failure = execution.SchemaViolation(
+        "kurgu", schema_issue="uydurma_sinif", schema_field="uydurma_alan",
+        exit_code=0, duration_ms=1, stdout_bytes=0, stderr_bytes=0)
+    assert failure.schema_issue is None
+    assert failure.schema_field is None
+
+
 def test_the_classification_never_persists_the_envelope(tmp_path, bound):
     """The vendor's message, the cost, the session id and the turn count
     are all in the envelope. None of them may reach the exception."""

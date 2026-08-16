@@ -227,12 +227,31 @@ class Timeout(AdapterError):
 
 class SchemaViolation(AdapterError):
     """The reply is not something the frozen schema accepts. Never
-    repaired: a guessed field is a field nobody agreed to."""
+    repaired: a guessed field is a field nobody agreed to.
 
-    def __init__(self, message, **measurements):
+    CARRIES TWO CLOSED WORDS (B5-R3). `schema_issue` says which rule
+    refused and `schema_field` says which DECLARED field it refused at,
+    both from the contract's own tuples. They exist because the sentence
+    below cannot travel: a message is free text, the runner will not put
+    free text in the journal, and a real run therefore recorded nothing
+    but `implementer_schema_violation`.
+
+    Anything not proven is left out rather than guessed, and neither
+    field is ever derived from a value the model chose."""
+
+    def __init__(self, message, *, schema_issue=None, schema_field=None,
+                 **measurements):
         super().__init__(message, event=contract.EventCode.SCHEMA_VIOLATION,
                          reason=contract.StopReason.SCHEMA_VIOLATION,
                          **measurements)
+        # membership-checked HERE, so a caller cannot attach a word the
+        # contract does not own even by accident
+        self.schema_issue = (schema_issue
+                             if schema_issue in contract.ALL_SCHEMA_ISSUES
+                             else None)
+        self.schema_field = (schema_field
+                             if schema_field in contract.ALL_SCHEMA_FIELDS
+                             else None)
 
 
 @dataclass
@@ -597,18 +616,26 @@ def _envelope_payload(payload, measurements):
     the adapter reports measurements it made itself, and a cost figure
     from the envelope would be a number a caller could subtract from a
     budget on the strength of the model's own bookkeeping."""
+    # EVERY refusal in this function is the ENVELOPE stage (B5-R3): the
+    # transport document was wrong, so the authority never saw a payload
+    # and no declared field can be blamed.
+    envelope = {"schema_issue": contract.SchemaIssue.INVALID_ENVELOPE,
+                "schema_field": contract.SchemaField.ENVELOPE}
     if payload.get("type") != ENVELOPE_TYPE:
-        raise SchemaViolation("cikti bir sonuc zarfi degil", **measurements)
+        raise SchemaViolation("cikti bir sonuc zarfi degil",
+                              **envelope, **measurements)
     if payload.get("subtype") != ENVELOPE_SUBTYPE:
         raise SchemaViolation("zarf basarili bir sonuc bildirmiyor",
-                              **measurements)
+                              **envelope, **measurements)
     if payload.get("is_error") is not False:
-        raise SchemaViolation("zarf hata bayragi tasiyor", **measurements)
+        raise SchemaViolation("zarf hata bayragi tasiyor",
+                              **envelope, **measurements)
     inner = payload.get(PAYLOAD_FIELD)
     # EXACTLY `dict`, so a subclass cannot answer the validator's
     # questions differently from the mapping that gets returned
     if type(inner) is not dict:
-        raise SchemaViolation("zarf yapisal sonucu tasimiyor", **measurements)
+        raise SchemaViolation("zarf yapisal sonucu tasimiyor",
+                              **envelope, **measurements)
     # A SECOND payload that DISAGREES is refused. Agreement is the
     # normal case -- the CLI renders the same object into both fields --
     # and prose in `result` is not a competing payload at all. Silently
@@ -622,7 +649,7 @@ def _envelope_payload(payload, measurements):
             rendered = None
         if isinstance(rendered, dict) and rendered != inner:
             raise SchemaViolation("zarf celisen iki sonuc tasiyor",
-                                  **measurements)
+                                  **envelope, **measurements)
     return inner
 
 
@@ -669,6 +696,60 @@ def _envelope_failure(stream, measurements, exit_code):
                            exit_code=exit_code, **measurements)
 
 
+def _declared_field(path):
+    """The first element of a failure path, IF the contract declares it.
+
+    Only the top level is read. A nested name is either a declared
+    field's own sub-structure -- in which case the top-level name is the
+    honest answer -- or a key the model invented, which never travels."""
+    for part in path:
+        if isinstance(part, str):
+            return (part if part in contract.ALL_SCHEMA_FIELDS
+                    else contract.SchemaField.UNKNOWN)
+        return contract.SchemaField.UNKNOWN
+    return contract.SchemaField.ROOT
+
+
+def _missing_required_field(error, payload):
+    """WHICH required field is absent, computed from the SCHEMA and the
+    payload's key set -- never parsed out of the exception message.
+
+    The message embeds the value; the schema's own `required` list does
+    not exist. One missing declared field names it, several are
+    `multiple`, and anything unprovable stays `unknown`."""
+    declared = error.validator_value
+    if not isinstance(declared, list) or not isinstance(error.instance, dict):
+        return contract.SchemaField.UNKNOWN
+    missing = [name for name in declared if name not in error.instance]
+    known = [name for name in missing
+             if name in contract.ALL_SCHEMA_FIELDS]
+    if len(missing) == 1 and len(known) == 1:
+        return known[0]
+    if len(missing) > 1:
+        return contract.SchemaField.MULTIPLE
+    return contract.SchemaField.UNKNOWN
+
+
+def _schema_diagnosis(error, payload):
+    """The two closed words for one validation error.
+
+    NOTHING HERE READS A VALUE. The issue comes from a table keyed by
+    jsonschema's keyword; the field comes from the failure PATH, which
+    is made of names the schema declared -- with the single exception of
+    an undeclared key, which is reported as `unknown` rather than
+    spelled out."""
+    issue = contract.SCHEMA_ISSUE_FOR_VALIDATOR.get(
+        str(error.validator), contract.SchemaIssue.UNKNOWN)
+    path = list(error.absolute_path)
+    # A missing field is only nameable AT THE ROOT: deeper down the
+    # absent name belongs to a nested structure -- a test result, a
+    # finding -- and the honest answer is the declared field that
+    # contains it, not a name from a sub-schema nobody asked about.
+    if issue == contract.SchemaIssue.REQUIRED and not path:
+        return issue, _missing_required_field(error, payload)
+    return issue, _declared_field(path)
+
+
 def _parse_reply(raw, measurements, validator):
     """Decode, parse, UNWRAP and validate -- refusing at every step.
 
@@ -685,22 +766,45 @@ def _parse_reply(raw, measurements, validator):
         text = bytes(raw).decode("utf-8")
     except UnicodeDecodeError:
         raise SchemaViolation("cikti gecerli UTF-8 degil",
+                              schema_issue=contract.SchemaIssue.INVALID_UTF8,
+                              schema_field=contract.SchemaField.ROOT,
                               **measurements) from None
     try:
         payload = json.loads(text)
     except ValueError:
-        raise SchemaViolation("cikti JSON degil", **measurements) from None
+        raise SchemaViolation("cikti JSON degil",
+                              schema_issue=contract.SchemaIssue.INVALID_JSON,
+                              schema_field=contract.SchemaField.ROOT,
+                              **measurements) from None
     if not isinstance(payload, dict):
-        raise SchemaViolation("cikti bir JSON nesnesi degil", **measurements)
+        raise SchemaViolation(
+            "cikti bir JSON nesnesi degil",
+            schema_issue=contract.SchemaIssue.WRONG_ROOT_TYPE,
+            schema_field=contract.SchemaField.ROOT, **measurements)
     payload = _envelope_payload(payload, measurements)
+    refusal = None
     try:
         validator.validate(payload)
     except ValidationError as invalid:
         # the failing FIELD PATH, never the failing value: the value is
-        # model output and this text travels into reports
+        # model output and this text travels into reports. The two
+        # closed words are what actually reaches the journal (B5-R3);
+        # this sentence stays for a human reading a traceback.
         where = "/".join(str(part) for part in invalid.absolute_path) or "kok"
-        raise SchemaViolation(f"yanit sema disi (alan: {where})",
-                              **measurements) from None
+        issue, field = _schema_diagnosis(invalid, payload)
+        refusal = (f"yanit sema disi (alan: {where})", issue, field)
+    # RAISED OUTSIDE THE HANDLER, and that is not style. `from None`
+    # suppresses the DISPLAY of the cause but leaves `__context__`
+    # pointing at the `ValidationError`, whose message embeds the value
+    # that broke the rule -- an invented key, a token, a path. Leaving
+    # the handler first means the exception this package hands upwards
+    # has no chain to walk. Measured: a sentinel test caught the leak
+    # through `__context__` while `str`, `repr` and `__dict__` were all
+    # already clean.
+    if refusal is not None:
+        message, issue, field = refusal
+        raise SchemaViolation(message, schema_issue=issue, schema_field=field,
+                              **measurements)
     return payload
 
 
