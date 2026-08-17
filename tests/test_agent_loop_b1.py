@@ -1355,7 +1355,16 @@ def test_every_mutation_still_applies_to_the_current_source():
     # 113 -> 118 in B5-R3: the two closed words of a schema violation --
     # the validator class, the field path, the missing-field
     # computation, the runner's allowlist and its membership check.
-    assert len(tool.MUTATIONS) == 118
+    # 118 -> 127 in B6-R1: a git-clean checkout is not drift. Four for
+    # the clean-conversion authority (the verdict, the baseline operand,
+    # the attribute refusal, silence-is-not-absence), three for the
+    # application precondition (raw bytes as sole authority, the separate
+    # mode check, the backup carrying the OPERATOR's bytes) and two for
+    # the transport (the bounded-stdin completeness gate, and the
+    # return-code gate -- which had guarded this transport since
+    # B2B-A-D3A and was pinned by nothing here, because its battery was
+    # not in `BATTERY` until this package added it).
+    assert len(tool.MUTATIONS) == 127
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1382,6 +1391,11 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b5r3-validator-sinifi', 'b5r3-alan-daima-kok',
         'b5r3-eksik-alan-hesabi', 'b5r3-runner-izin-listesi',
         'b5r3-uyelik-kontrolu',
+        'b6r1-esdegerlik-kosulsuz', 'b6r1-taban-nesne-kimligi',
+        'b6r1-donusum-reddi', 'b6r1-sessizlik-yokluk-degil',
+        'b6r1-ham-bayt-tek-otorite', 'b6r1-mod-ayri-kontrol',
+        'b6r1-yedek-operator-baytlari', 'b6r1-girdi-tamlik-kapisi',
+        'b6r1-git-donus-kodu-tasima',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

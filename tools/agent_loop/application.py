@@ -38,19 +38,29 @@ displaced content is RENAMED into the holder. So the undo of any step is
 the same step backwards, and nothing that was on disk when this call
 started stops existing until the holder is removed.
 
-A DECLARED LIMIT, MEASURED WHILE BUILDING THIS. "Has the operator drifted
-from the baseline" is answered by comparing their file to the MATERIALISED
-BASELINE, byte for byte. A checkout whose working tree does not agree with
-its own blobs -- the ordinary result of `core.autocrlf=true` on Windows,
-which is Git for Windows' installed default -- therefore differs from the
-baseline in every text file, and every MODIFIED or DELETED target is
-refused with `MainCheckoutMismatch`.
+THE LIMIT THAT USED TO BE DECLARED HERE, and how B6-R1 closed it. "Has
+the operator drifted from the baseline" was answered by comparing their
+file to the MATERIALISED BASELINE, byte for byte and nothing else. But a
+tracked file has TWO legitimate working-tree representations, and git's
+clean conversion is what maps either onto the single blob it stores -- so
+under `core.autocrlf=true`, which is Git for Windows' installed default,
+an untouched checkout differs from its own blobs in every line ending.
+Every MODIFIED and DELETED target was refused with
+`MainCheckoutMismatch`, and the shipped run was refused exactly there:
+approved candidate, passing receipt, byte-identical staging, and a clean
+checkout the gate read as drift.
 
-That is the safe direction and it is deliberate. This package has no git
-and cannot ask which differences a filter would have normalised away, so
-the alternative is to treat SOME byte differences as no difference --
-which is exactly how a real edit of the operator's would get discarded.
-A loud refusal costs a run; the other answer costs their work.
+The old note called that the safe direction because this package could
+not ask which differences a conversion would have normalised away. It can
+now, and it does not guess: `git_clean` hands the operator's bytes to
+GIT'S OWN clean conversion at that exact path and compares the resulting
+object id to the baseline blob's, exactly. Raw equality remains the fast
+path; the conversion is consulted only when raw bytes differ. Nothing is
+loosened -- a real edit still fails both comparisons, and the three
+attribute classes that could make unequal content hash equal (`filter`,
+`ident`, `working-tree-encoding`) are refused before any of them runs. A
+loud refusal costs a run; the other answer costs the operator's work; and
+calling a clean checkout drift cost a shipped feature its automated path.
 
 WHAT MAY LEAVE. Normalised repo-relative paths, counts, closed contract
 codes and an opaque application id. Never a byte of a file, never a
@@ -74,7 +84,7 @@ from jsonschema import Draft202012Validator, ValidationError
 
 from tools.agent_loop import (acceptance, application_transport as transport,
                               changes, cli, contract, flat_workspace,
-                              fs_evidence, preflight, schemas,
+                              fs_evidence, git_clean, preflight, schemas,
                               state as state_module)
 
 # A SIBLING of the repository, on the same volume by construction: a
@@ -793,16 +803,43 @@ def _bind_workspace(repo: Path, state_dir: Path, run_id, workspace_id,
 # preconditions and the move plan
 # ---------------------------------------------------------------------
 
-def _plan(candidate, main: _Tree, reference: _Tree, *, ceiling):
+def _clean_equivalent(repo_path, relative, current_bytes, baseline_bytes):
+    """Git's clean conversion, asked as a yes/no and nothing more.
+
+    A REFUSAL FROM THAT LAYER IS NOT A MISMATCH. A custom filter, an
+    `ident` path, an unsupported working-tree encoding or a git call that
+    could not be completed all mean the question was not answered -- so
+    they become `ApplicationRefused`, which says nothing was written,
+    rather than `MainCheckoutMismatch`, which would claim the operator's
+    file had drifted. The lower layer's sentence is fixed and carries no
+    path, and its reason is closed and is not re-decided here."""
+    try:
+        return git_clean.clean_equivalent(
+            repo_path, relative=relative, current_bytes=current_bytes,
+            baseline_bytes=baseline_bytes)
+    except git_clean.CleanConversionRefused as refused:
+        raise ApplicationRefused(str(refused), reason=refused.reason) from None
+
+
+def _plan(candidate, main: _Tree, reference: _Tree, *, ceiling, repo_path):
     """What every target must be right now, and the moves that follow.
 
     THE BASELINE IS THE REFERENCE TREE, not a record. A MODIFIED or
     DELETED entry describes a transformation OF THE BASELINE, so the
-    operator's copy has to still BE the baseline -- byte for byte and
-    mode for mode -- or applying it silently discards whatever they did
-    instead. That comparison is made against the materialised baseline
-    itself, because a digest recorded earlier is a claim and the tree is
-    evidence.
+    operator's copy has to still BE the baseline -- mode for mode, and in
+    content either byte for byte or through git's own clean conversion --
+    or applying it silently discards whatever they did instead. That
+    comparison is made against the materialised baseline itself, because
+    a digest recorded earlier is a claim and the tree is evidence.
+
+    TWO WORKING-TREE REPRESENTATIONS, ONE BLOB. Raw byte equality is the
+    fast path and stays first: it needs no subprocess and answers most
+    targets. Only when the raw bytes differ is `git_clean` asked whether
+    the checkout's file still cleans to the baseline's blob -- which is
+    what an untouched checkout under `core.autocrlf` does, and what the
+    shipped run was refused for. A file that fails BOTH has really
+    drifted. See `git_clean` for why `git status` is not consulted and
+    why `filter`, `ident` and `working-tree-encoding` are refused.
 
     Nothing is written here. A precondition that fails costs the caller
     exactly one refusal and leaves the checkout untouched."""
@@ -828,12 +865,26 @@ def _plan(candidate, main: _Tree, reference: _Tree, *, ceiling):
             raise MainCheckoutMismatch("taban surumde hedef yok")
         if current is None:
             raise MainCheckoutMismatch("degistirilecek hedef yok")
-        if current[0] != baseline[0] or current[1] != baseline[1]:
+        # MODE IS EXACT AND SEPARATE. No conversion has anything to say
+        # about it, so an executable bit that changed is drift whatever
+        # the content does -- and asking about content first would let a
+        # mode change ride in behind an equal-looking file.
+        if current[1] != baseline[1]:
             raise MainCheckoutMismatch("hedef taban surumden sapmis")
+        if current[0] != baseline[0] and not _clean_equivalent(
+                repo_path, change.path, current[2], baseline[2]):
+            raise MainCheckoutMismatch("hedef taban surumden sapmis")
+        # THE OPERATOR'S OWN BYTES, not the baseline's. This move carries
+        # the file out of the checkout and into the holder, and `_execute`
+        # proves a source against the hash recorded here before touching
+        # it -- so recording the baseline's hash would refuse every
+        # clean-equivalent target at the first move. It is also what
+        # rollback restores, which means the operator gets THEIR bytes
+        # back, in THEIR line endings, rather than a normalised copy.
         moves.append(_Move(index=len(moves), from_side=REPO_SIDE,
                            from_name=change.path, to_side=HOLD_SIDE,
-                           to_name=f"b{slot:04d}", sha256=baseline[0],
-                           mode=baseline[1]))
+                           to_name=f"b{slot:04d}", sha256=current[0],
+                           mode=current[1]))
         if change.kind == changes.MODIFIED:
             moves.append(_Move(index=len(moves), from_side=HOLD_SIDE,
                                from_name=f"s{slot:04d}", to_side=REPO_SIDE,
@@ -1160,7 +1211,7 @@ def _apply(candidate, *, repo_path, workspace, task_file, task_before,
     rolled_back = False
     try:
         moves, staged, wanted = _plan(candidate, main, reference,
-                                      ceiling=ceiling)
+                                      ceiling=ceiling, repo_path=repo_path)
         directories = _missing_directories(main, wanted)
 
         try:

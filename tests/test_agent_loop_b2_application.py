@@ -1370,3 +1370,466 @@ def test_nothing_of_this_turn_survives_success_or_refusal(tmp_path):
 def _force_writable(function, path, error):
     os.chmod(path, 0o700)
     function(path)
+
+
+# ---------------------------------------------------------------------
+# 24  A GIT-CLEAN CHECKOUT IS NOT DRIFT. PACKAGE B6-R1.
+#
+# THE SHAPE BELOW IS THE SHIPPED FAILURE, REBUILT. An approved candidate,
+# a passing receipt, four allowed files, byte-identical staging -- and the
+# application refused it with `MainCheckoutMismatch` because three of the
+# four working files were CRLF over LF blobs. The tree was clean; the
+# question was wrong.
+#
+# `build_world` IS DELIBERATELY NOT USED HERE. Its
+# `_match_checkout_to_its_baseline` rewrites every CRLF working file to LF
+# so the rest of this file can test something else -- which means it is
+# exactly the thing that hides this defect. The world below is built from
+# the shared builder and then materialised BY GIT, so the checkout carries
+# the line endings git itself would give it and the index stat entries
+# agree, which is what makes `git status` genuinely empty.
+# ---------------------------------------------------------------------
+
+_CRLF_SEED = (("pipeline/bir.py", "BIR = 1\nX = 1\n"),
+              ("pipeline/iki.py", "IKI = 2\nX = 2\n"),
+              ("pipeline/uc.py", "UC = 3\nX = 3\n"),
+              # NO trailing newline: there is nothing for the conversion to
+              # do, so this target stays byte-identical to its blob and
+              # exercises the raw fast path in the same call as the other
+              # three. The shipped run had exactly this 3-and-1 mix.
+              ("pipeline/dort.py", "DORT = 4"))
+
+_CRLF_TARGETS = ("pipeline/bir.py", "pipeline/iki.py", "pipeline/uc.py")
+_LF_TARGET = "pipeline/dort.py"
+
+
+def crlf_world(tmp_path, index=0):
+    """A world whose checkout git wrote under `core.autocrlf=true`.
+
+    Every property this scenario needs is ASSERTED rather than assumed: a
+    fixture that quietly produced an LF checkout would make each test
+    below pass by testing nothing, which is how the defect survived a
+    whole battery in the first place."""
+    world = world_module.build_world(tmp_path, index, seed=_CRLF_SEED)
+    legacy._git(world.repo, "config", "core.autocrlf", "true")
+    for relative in legacy._git(world.repo, "ls-files").splitlines():
+        if not relative:
+            continue
+        (world.repo / relative).unlink()
+        legacy._git(world.repo, "checkout", "--", relative)
+
+    for relative in _CRLF_TARGETS:
+        disk = (world.repo / relative).read_bytes()
+        blob = (world.reference / relative).read_bytes()
+        assert b"\r\n" in disk, \
+            f"senaryo kurulmadi: {relative} CRLF degil"
+        assert b"\r\n" not in blob, \
+            f"senaryo kurulmadi: {relative} blob'u LF degil"
+        assert disk != blob, \
+            f"senaryo kurulmadi: {relative} tabanla bayt-esit"
+    assert (world.repo / _LF_TARGET).read_bytes() == \
+        (world.reference / _LF_TARGET).read_bytes(), \
+        "senaryo kurulmadi: karisik sekil yok, dorduncu hedef de farkli"
+    # The checkout was re-materialised by git, so its permission bits come
+    # from the index and the runner's umask rather than from the builder.
+    # Mode is compared EXACTLY by the precondition, so a runner where
+    # those disagree with the reference tree would fail every test below
+    # for a reason that has nothing to do with line endings -- and it
+    # should say so here instead.
+    for relative in _CRLF_TARGETS + (_LF_TARGET,):
+        assert (os.stat(world.repo / relative).st_mode & 0o777) == \
+            (os.stat(world.reference / relative).st_mode & 0o777), \
+            f"senaryo kurulmadi: {relative} izin bitleri tabanla ayni degil"
+    # THE PROPERTY THAT MAKES THIS THE SHIPPED SHAPE: git considers every
+    # tracked file unmodified while three of them differ from their blobs
+    # in every line ending. Asked as `diff` rather than `status` because
+    # the task manifest is untracked by design and `status` reports it --
+    # and because the claim is about TRACKED content, not about the tree
+    # being empty.
+    assert _tracked_diff(world.repo) == (), \
+        "senaryo kurulmadi: git izlenen dosyalari degismis goruyor"
+    assert _staged(world.repo) == (), "senaryo kurulmadi: indekste degisiklik"
+    return world
+
+
+def _tracked_diff(repo):
+    """What git itself says changed in the working tree, by name."""
+    return tuple(sorted(item for item in
+                        legacy._git(repo, "diff", "--name-only").splitlines()
+                        if item))
+
+
+def _staged(repo):
+    return tuple(sorted(item for item in
+                        legacy._git(repo, "diff", "--cached",
+                                    "--name-only").splitlines() if item))
+
+
+def test_a_clean_crlf_checkout_is_applied_instead_of_being_called_drift(
+        tmp_path, writes):
+    """THE regression. Four MODIFIED targets, three of them CRLF over LF
+    blobs and one byte-identical, all in one call.
+
+    Before B6-R1 this raised `MainCheckoutMismatch` on the first CRLF
+    target and nothing was applied."""
+    world = crlf_world(tmp_path)
+    for relative in _CRLF_TARGETS:
+        edit(world, relative, f"# {relative}\nYENI = 99\n")
+    edit(world, _LF_TARGET, "DORT = 44")
+    before = main_view(world.repo)
+
+    report = apply_it(world)
+
+    assert report.applied_files == ("pipeline/bir.py", "pipeline/dort.py",
+                                   "pipeline/iki.py", "pipeline/uc.py")
+    assert (report.added, report.modified, report.deleted) == (0, 4, 0)
+    assert difference(before, main_view(world.repo)) == (
+        ("pipeline/bir.py", changes.MODIFIED),
+        ("pipeline/dort.py", changes.MODIFIED),
+        ("pipeline/iki.py", changes.MODIFIED),
+        ("pipeline/uc.py", changes.MODIFIED))
+    # the candidate's content really landed
+    assert read(world.repo / "pipeline" / "bir.py") == \
+        "# pipeline/bir.py\nYENI = 99\n"
+    assert read(world.repo / _LF_TARGET) == "DORT = 44"
+    # SEMANTIC git diff: exactly the candidate's files and nothing else.
+    # The CRLF siblings this call did not touch must NOT appear -- if the
+    # gate had been "loosened" by rewriting line endings, they would.
+    assert _tracked_diff(world.repo) == report.applied_files
+    assert _staged(world.repo) == (), "indekse bir sey yazildi"
+    assert len(writes) == 8, \
+        f"hedef basina bir yedek bir yerlestirme beklenir: {len(writes)}"
+
+
+def test_a_byte_identical_target_never_asks_git_anything(tmp_path):
+    """Raw equality stays the FAST PATH, and this is what "first" means.
+
+    B6-R1 put a git subprocess into the verification surface for the
+    first time. It must be reached only when the cheap comparison has
+    already failed -- otherwise every ordinary apply on an LF checkout
+    pays for a process per target, and the surface grows for no reason."""
+    world = crlf_world(tmp_path)
+    edit(world, _LF_TARGET, "DORT = 44")
+    verified = verified_for(world)
+    report = accept(world)
+    cagrildi = []
+    real = application.git_clean.clean_equivalent
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(application.git_clean, "clean_equivalent",
+                      lambda *a, **k: cagrildi.append(1) or real(*a, **k))
+        outcome = apply_it(world, verified_changes=verified,
+                           acceptance_report=report)
+
+    assert outcome.applied_files == (_LF_TARGET,)
+    assert cagrildi == [], \
+        "bayt-esit hedef icin git alt sureci baslatildi"
+
+
+def test_one_real_edit_among_clean_crlf_targets_stops_the_whole_apply(
+        tmp_path, writes):
+    """The gate did not get weaker. Three targets are clean-equivalent and
+    the fourth carries the operator's own work: nothing is applied, and
+    the work is still there afterwards."""
+    world = crlf_world(tmp_path)
+    for relative in _CRLF_TARGETS + (_LF_TARGET,):
+        edit(world, relative, f"# {relative}\nYENI = 99\n")
+    kirli = world.repo / "pipeline" / "uc.py"
+    kirli.write_bytes(f"UC = 3\r\nX = 3\r\nYEREL {SENTINEL}\r\n"
+                      .encode("utf-8"))
+    assert SENTINEL in read(kirli), "senaryo kurulmadi: sapma yok"
+    before = main_view(world.repo)
+
+    with pytest.raises(application.MainCheckoutMismatch):
+        apply_it(world)
+
+    assert SENTINEL in read(kirli), "operatorun isi kayboldu"
+    assert difference(before, main_view(world.repo)) == ()
+    assert writes == [], "sapmaya ragmen ana agaca yazildi"
+
+
+def test_a_same_size_edit_with_a_restored_timestamp_is_still_refused(
+        tmp_path, writes):
+    """The class a stat comparison misses. Same byte count, same mtime,
+    different content -- and an object id is not a stat."""
+    world = crlf_world(tmp_path)
+    edit(world, "pipeline/bir.py", "# yeni\nYENI = 99\n")
+    target = world.repo / "pipeline" / "bir.py"
+    original = target.read_bytes()
+    stats = os.stat(target)
+    degisen = original.replace(b"X = 1", b"X = 9")
+    assert len(degisen) == len(original) and degisen != original, \
+        "senaryo kurulmadi: boyut degisti"
+    target.write_bytes(degisen)
+    os.utime(target, ns=(stats.st_atime_ns, stats.st_mtime_ns))
+    assert os.stat(target).st_size == stats.st_size
+
+    with pytest.raises(application.MainCheckoutMismatch):
+        apply_it(world)
+
+    assert target.read_bytes() == degisen
+    assert writes == [], "ayni boyutlu sapmaya ragmen yazildi"
+
+
+def test_a_mode_drift_is_refused_while_the_content_cleans_equal(tmp_path,
+                                                                writes):
+    """Mode is checked exactly and SEPARATELY -- on every platform.
+
+    MEASURED: `handle_mode` reports an EMPTY mode on Windows, because a
+    Windows file has no executable bit to report. So the real `chmod`
+    scenario below can only run on POSIX, and on Windows a removed mode
+    check would be caught by nothing at all. The drift is therefore
+    injected at the seam that REPORTS a mode, which is the same seam the
+    real one travels through.
+
+    MEASURED, and what makes the injection deterministic: `_plan` reads
+    the operator's copy FIRST and the baseline SECOND, so the first mode
+    read of the call is the checkout's. The content is left
+    clean-equivalent on purpose -- if the mode check had been folded into
+    the content comparison, this would apply successfully."""
+    world = crlf_world(tmp_path)
+    edit(world, "pipeline/bir.py", "# yeni\nYENI = 99\n")
+    # computed BEFORE the patch: the acceptance gate and the fresh
+    # derivation read modes too, and a counter that included them would
+    # be measuring the fixture
+    verified = verified_for(world)
+    report = accept(world)
+    calls = []
+    real = application_transport.handle_mode
+
+    def reporter(handle):
+        mode = real(handle)
+        calls.append(mode)
+        return "100755" if len(calls) == 1 else mode
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(application.transport, "handle_mode", reporter)
+        with pytest.raises(application.MainCheckoutMismatch):
+            apply_it(world, verified_changes=verified,
+                     acceptance_report=report)
+
+    assert len(calls) >= 2, \
+        f"senaryo kurulmadi: iki mod okunmadi ({len(calls)})"
+    assert calls[1] != "100755", \
+        "senaryo kurulmadi: taban da ayni modu bildirdi, sapma yok"
+    assert writes == [], "mod sapmasina ragmen yazildi"
+
+
+@pytest.mark.skipif(os.name == "nt",
+                    reason="Windows dosya modunda calistirilabilir bit yok")
+def test_a_real_chmod_is_drift_even_when_the_content_cleans_equal(tmp_path,
+                                                                 writes):
+    """Mode is checked exactly and SEPARATELY. No conversion has anything
+    to say about it, so an executable bit that appeared is drift however
+    perfectly the bytes clean."""
+    world = crlf_world(tmp_path)
+    edit(world, "pipeline/bir.py", "# yeni\nYENI = 99\n")
+    target = world.repo / "pipeline" / "bir.py"
+    os.chmod(target, 0o755)
+    assert target.stat().st_mode & 0o111, "senaryo kurulmadi: mod degismedi"
+
+    with pytest.raises(application.MainCheckoutMismatch):
+        apply_it(world)
+
+    assert writes == [], "mod sapmasina ragmen yazildi"
+
+
+def test_the_operators_own_bytes_are_what_a_rollback_puts_back(tmp_path):
+    """The backup carries the CHECKOUT's bytes, not the baseline's.
+
+    Two things would break if it carried the baseline's: the first move
+    would be refused outright, because `_execute` proves a source against
+    the hash recorded for it -- and a rollback that did somehow run would
+    hand the operator a NORMALISED copy of their own file. The CRLF bytes
+    have to come back exactly."""
+    world = crlf_world(tmp_path)
+    for relative in _CRLF_TARGETS:
+        edit(world, relative, f"# {relative}\nYENI = 99\n")
+    once = {relative: (world.repo / relative).read_bytes()
+            for relative in _CRLF_TARGETS}
+    before = main_view(world.repo)
+    calls, fired = [], []
+    real = application_transport.rename_child
+
+    def breaker(source, source_name, target, target_name):
+        calls.append(target_name)
+        if len(calls) == 4:
+            fired.append(True)
+            raise OSError("kurgu tasima arizasi")
+        return real(source, source_name, target, target_name)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(application.transport, "rename_child", breaker)
+        with pytest.raises(application.ApplicationError) as raised:
+            apply_it(world)
+
+    assert fired == [True], "senaryo kurulmadi: ariza tetiklenmedi"
+    assert not isinstance(raised.value, application.RollbackFailed)
+    assert difference(before, main_view(world.repo)) == (), "geri alma tam degil"
+    for relative, data in once.items():
+        assert (world.repo / relative).read_bytes() == data, \
+            f"{relative} operatorun baytlariyla geri gelmedi"
+        assert b"\r\n" in (world.repo / relative).read_bytes(), \
+            f"{relative} normalize edilmis olarak geri geldi"
+    assert _tracked_diff(world.repo) == (), \
+        "geri alma sonrasi izlenen dosyalar degismis gorunuyor"
+
+
+@pytest.mark.parametrize("nitelik", [b"*.py filter=kurgu\n",
+                                     b"*.py ident\n",
+                                     b"*.py working-tree-encoding=UTF-16\n"])
+def test_a_conversion_this_gate_cannot_reason_about_refuses_the_apply(
+        tmp_path, writes, nitelik):
+    """A refusal, not a verdict. The application says NOTHING about
+    whether the file drifted -- it says the question could not be answered
+    safely -- so this is `ApplicationRefused` and not
+    `MainCheckoutMismatch`, and nothing was written either way."""
+    world = crlf_world(tmp_path)
+    edit(world, "pipeline/bir.py", "# yeni\nYENI = 99\n")
+    (world.repo / ".gitattributes").write_bytes(nitelik)
+    before = main_view(world.repo)
+
+    with pytest.raises(application.ApplicationRefused) as ret:
+        apply_it(world)
+
+    assert not isinstance(ret.value, application.MainCheckoutMismatch)
+    assert writes == [], "reddedilen donusume ragmen yazildi"
+    assert difference(before, main_view(world.repo)) == ()
+
+
+def test_a_refused_conversion_leaves_no_holder_and_no_journal(tmp_path):
+    """Every precondition is settled before a journal exists. A refusal
+    here must cost the caller one exception and nothing on disk."""
+    world = crlf_world(tmp_path)
+    edit(world, "pipeline/bir.py", "# yeni\nYENI = 99\n")
+    (world.repo / ".gitattributes").write_bytes(b"*.py ident\n")
+
+    with pytest.raises(application.ApplicationRefused):
+        apply_it(world)
+
+    root = application.apply_root_for(world.repo)
+    assert not root.exists() or list(root.iterdir()) == [], \
+        "reddedilen cagri bir tutucu birakti"
+    assert application.find_pending_applications(world.repo) == ()
+
+
+@pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
+def test_an_index_flag_that_blinds_git_status_cannot_hide_a_drift(tmp_path,
+                                                                 writes, flag):
+    """MEASURED: both flags make `git status` AND `git diff --quiet` report
+    a clean tree over content that really changed. The application never
+    asks either of them, so the drift is still found."""
+    world = crlf_world(tmp_path)
+    edit(world, "pipeline/bir.py", "# yeni\nYENI = 99\n")
+    target = world.repo / "pipeline" / "bir.py"
+    target.write_bytes(f"BIR = 1\r\nYEREL {SENTINEL}\r\n".encode("utf-8"))
+    legacy._git(world.repo, "update-index", flag, "--", "pipeline/bir.py")
+    assert _tracked_diff(world.repo) == (), \
+        f"senaryo kurulmadi: {flag} korluk yaratmadi"
+
+    with pytest.raises(application.MainCheckoutMismatch):
+        apply_it(world)
+
+    assert SENTINEL in read(target)
+    assert writes == [], "korlestirilmis sapmaya ragmen yazildi"
+
+
+def test_staged_content_cannot_make_a_drifted_target_look_clean(tmp_path,
+                                                                writes):
+    """The index records what git was TOLD. A drift that has been staged
+    is still a drift, and staging is not an authority this gate consults."""
+    world = crlf_world(tmp_path)
+    edit(world, "pipeline/bir.py", "# yeni\nYENI = 99\n")
+    target = world.repo / "pipeline" / "bir.py"
+    target.write_bytes(f"BIR = 1\r\nSTAGED {SENTINEL}\r\n".encode("utf-8"))
+    legacy._git(world.repo, "add", "--", "pipeline/bir.py")
+    assert _tracked_diff(world.repo) == (), \
+        "senaryo kurulmadi: worktree diff temiz degil"
+
+    with pytest.raises(application.MainCheckoutMismatch):
+        apply_it(world)
+
+    assert SENTINEL in read(target)
+    assert writes == [], "staged sapmaya ragmen yazildi"
+
+
+def test_committing_the_drift_does_not_make_it_clean(tmp_path, writes):
+    """HEAD is not the baseline. The reference tree this call compares
+    against is the baseline the candidate was BUILT from, so moving HEAD
+    forward over the operator's edit does not turn that edit into the
+    thing the candidate expected to find."""
+    world = crlf_world(tmp_path)
+    edit(world, "pipeline/bir.py", "# yeni\nYENI = 99\n")
+    target = world.repo / "pipeline" / "bir.py"
+    target.write_bytes(f"BIR = 1\r\nCOMMITTED {SENTINEL}\r\n".encode("utf-8"))
+    legacy._git(world.repo, "add", "--", "pipeline/bir.py")
+    legacy._git(world.repo, "-c", "user.email=k@example.invalid",
+                "-c", "user.name=Kurgu", "commit", "-qm", "kurgu-operator")
+    assert _tracked_diff(world.repo) == () and _staged(world.repo) == (), \
+        "senaryo kurulmadi: commit sonrasi agac temiz gorunmuyor"
+
+    with pytest.raises(application.MainCheckoutMismatch):
+        apply_it(world)
+
+    assert SENTINEL in read(target)
+    assert writes == [], "commit edilmis sapmaya ragmen yazildi"
+
+
+def test_a_reparse_point_at_a_target_never_reaches_the_conversion(tmp_path,
+                                                                  writes):
+    """A REAL junction on Windows and a REAL symlink on POSIX, standing
+    where a MODIFIED target should be.
+
+    The conversion is handed bytes that were read through the no-follow,
+    handle-bound transport, so the containment refusal has to happen
+    BEFORE any of them exist -- otherwise the thing being cleaned is
+    whatever the link pointed at. Proven by asserting the conversion was
+    never called at all, not merely that the call was refused."""
+    world = crlf_world(tmp_path)
+    edit(world, "pipeline/bir.py", "# yeni\nYENI = 99\n")
+    outside = tmp_path / "disari"
+    outside.mkdir()
+    canary = outside / "kanarya.py"
+    canary.write_bytes(b"KANARYA = 1\n")
+    target = world.repo / "pipeline" / "bir.py"
+    target.unlink()
+    if os.name == "nt":
+        done = subprocess.run(["cmd", "/c", "mklink", str(target),
+                               str(canary)], capture_output=True)
+        if done.returncode != 0:
+            pytest.skip("bu makinede sembolik baglanti olusturulamiyor")
+        planted = bool(os.lstat(target).st_file_attributes & 0x400)
+    else:
+        os.symlink(canary, target)
+        planted = os.path.islink(target)
+    assert planted, "senaryo kurulmadi: yeniden ayrisma noktasi yok"
+
+    cagrildi = []
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(application.git_clean, "clean_equivalent",
+                      lambda *a, **k: cagrildi.append(1))
+        with pytest.raises(application.ApplicationContainment):
+            apply_it(world)
+
+    assert cagrildi == [], "baglantidan gelen baytlar donusume verildi"
+    assert writes == [], "baglantiya ragmen ana agaca yazildi"
+    assert canary.read_bytes() == b"KANARYA = 1\n"
+
+
+def test_a_clean_crlf_deletion_is_applied_too(tmp_path):
+    """DELETED targets go through the same precondition as MODIFIED ones,
+    so the fix has to cover both -- and a deletion is the case where
+    getting it wrong destroys rather than overwrites."""
+    world = crlf_world(tmp_path)
+    drop(world, "pipeline/bir.py")
+    target = world.repo / "pipeline" / "bir.py"
+    assert b"\r\n" in target.read_bytes(), "senaryo kurulmadi: CRLF degil"
+    before = main_view(world.repo)
+
+    report = apply_it(world)
+
+    assert not target.exists()
+    assert (report.added, report.modified, report.deleted) == (0, 0, 1)
+    assert difference(before, main_view(world.repo)) == (
+        ("pipeline/bir.py", changes.DELETED),)

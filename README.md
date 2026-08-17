@@ -263,10 +263,15 @@ never raw model output or a patch. The durable record is in `.agent-loop/`:
     .agent-loop/findings.json   # what the evaluator reported
 
 An accepted candidate is moved into your working tree behind a write-ahead
-journal, and only when your copy of each target still matches the baseline
-byte for byte. If it has drifted, the run refuses instead of discarding your
-edits. `runner.resume(repo=".", binaries=binaries)` reads back an interrupted
-run and rolls back a crashed application; it does not continue the loop.
+journal, and only when your copy of each target still matches the baseline —
+byte for byte, or by cleaning to the same Git object, so a checkout whose line
+endings came from `core.autocrlf` is not mistaken for an edit. Mode is compared
+exactly, and a path configured with a custom clean filter, `ident` or a
+working-tree encoding is refused rather than guessed at. If a target has really
+drifted, the run refuses instead of discarding your edits, and your own bytes
+are what a rollback puts back. `runner.resume(repo=".", binaries=binaries)`
+reads back an interrupted run and rolls back a crashed application; it does not
+continue the loop.
 
 ### 5. Commit and push are yours
 

@@ -40,7 +40,12 @@ MODULES = ("state", "locking", "preflight", "execution",
            # under the other road's code could not be expressed while
            # this module was absent -- the harness raised `KeyError`
            # instead of judging it.
-           "contract")
+           "contract",
+           # B6-R1: the clean-conversion authority and the transport that
+           # carries its bounded stdin. Absent from this tuple, neither
+           # the attribute refusals nor the equality that replaced the
+           # raw-bytes-only gate could be mutated at all.
+           "git_clean", "git_transport")
 NL = chr(10)
 
 BS = chr(92)
@@ -79,6 +84,11 @@ BATTERY = (
     # B3: the evaluator adapter and the runner.
     "tests/test_agent_loop_b3_audit.py",
     "tests/test_agent_loop_b3_runner.py",
+    # B6-R1: the clean-conversion authority, and the transport battery --
+    # which was NOT in this tuple before, so the bounded-stdin gate and
+    # even the long-standing return-code gate were pinned by nothing here.
+    "tests/test_agent_loop_b2_git_clean.py",
+    "tests/test_agent_loop_b2_git_transport.py",
 )
 
 # (label, module, old, new, expected_test_substring)
@@ -999,6 +1009,92 @@ MUTATIONS = [
      "    allowed = RECORD_FIELDS.get(audit_kind)",
      "    allowed = tuple(finding) if isinstance(finding, dict) else ()",
      "test_no_model_authored_prose_is_written_into_the_state_directory"),
+    # ----------------------------------------------------------------
+    # B6-R1 -- a git-clean checkout is not drift. MEASURED: an LF blob
+    # checked out under `core.autocrlf=true` is CRLF on disk and `git
+    # status` is empty, and the byte-for-byte gate refused the whole
+    # shipped candidate for it. Every entry below pins one half of the
+    # replacement: the equality that now answers the question, and the
+    # refusals that keep that equality from meaning anything looser.
+    # ----------------------------------------------------------------
+    # 1. The verdict forced true. A gate that always says "equivalent"
+    #    is the same as no gate, and it discards the operator's work.
+    ("b6r1-esdegerlik-kosulsuz", "git_clean",
+     "    return clean_object_id(repo, relative, current_bytes) == " + BS + NL
+     + "        git_objects.blob_object_id(baseline_bytes)",
+     "    return True",
+     "real_content_drift_is_never_clean_equivalent"),
+    # 2. The BASELINE operand dropped. Comparing the cleaned bytes to
+    #    the raw bytes they came from answers a question nobody asked --
+    #    and answers `False` for exactly the clean checkout this package
+    #    exists to accept.
+    ("b6r1-taban-nesne-kimligi", "git_clean",
+     "        git_objects.blob_object_id(baseline_bytes)",
+     "        git_objects.blob_object_id(current_bytes)",
+     "a_crlf_checkout_over_an_lf_blob_is_clean_equivalent"),
+    # 3. The attribute refusal removed. MEASURED: `hash-object --path=`
+    #    really does execute a configured clean filter, and `ident`
+    #    really does collapse smuggled bytes onto the baseline blob. With
+    #    this gate gone the equality proves nothing whatsoever.
+    ("b6r1-donusum-reddi", "git_clean",
+     "        if values[name] not in _ABSENT:" + NL
+     + "            raise CleanConversionRefused(",
+     "        if False:" + NL + "            raise CleanConversionRefused(",
+     "a_custom_filter_is_refused_and_its_process_never_starts"),
+    # 4. Silence read as absence. An attribute git did not answer for is
+    #    an unproven answer, not a proof that nothing is set -- the
+    #    silent-zero shape this project keeps finding.
+    #
+    #    The refusal becomes a `continue`, NOT a disabled `if`. Disabling
+    #    the condition leaves `values[name]` raising `KeyError`, which
+    #    fails the target test for the wrong reason: a crash is not the
+    #    hole. Skipping the attribute is the actual fail-open shape --
+    #    unproven silently treated as safe.
+    ("b6r1-sessizlik-yokluk-degil", "git_clean",
+     '            raise CleanConversionRefused("git nitelik cevabi '
+     'kanitlanamadi")',
+     "            continue",
+     "an_attribute_git_did_not_answer_for_is_not_treated_as_absent"),
+    # 5. Back to the old behaviour: raw mismatch alone refuses. This is
+    #    the shipped failure, reintroduced -- and it must not be able to
+    #    return quietly.
+    ("b6r1-ham-bayt-tek-otorite", "application",
+     "        if current[0] != baseline[0] and not _clean_equivalent(" + NL
+     + "                repo_path, change.path, current[2], baseline[2]):",
+     "        if current[0] != baseline[0]:",
+     "a_clean_crlf_checkout_is_applied_instead_of_being_called_drift"),
+    # 6. The mode check removed. No conversion has anything to say about
+    #    a permission bit, so it is exact and separate; folding it into
+    #    the content comparison lets a mode change ride in behind bytes
+    #    that clean equal.
+    ("b6r1-mod-ayri-kontrol", "application",
+     "        if current[1] != baseline[1]:", "        if False:",
+     "a_mode_drift_is_refused_while_the_content_cleans_equal"),
+    # 7. The backup move records the BASELINE's hash again. `_execute`
+    #    proves a source against the hash recorded for it, so this both
+    #    refuses every clean-equivalent target at the first move AND
+    #    would hand the operator a normalised copy of their own file on
+    #    rollback.
+    ("b6r1-yedek-operator-baytlari", "application",
+     '                           to_name=f"b{slot:04d}", sha256=current[0],'
+     + NL + "                           mode=current[1]))",
+     '                           to_name=f"b{slot:04d}", sha256=baseline[0],'
+     + NL + "                           mode=baseline[1]))",
+     "a_clean_crlf_checkout_is_applied_instead_of_being_called_drift"),
+    # 8. The bounded-stdin completeness gate removed. A payload written
+    #    in part means the object id describes bytes nobody has, and the
+    #    child exits ZERO -- nothing else in the call notices.
+    ("b6r1-girdi-tamlik-kapisi", "git_transport",
+     "    if any(not yazici.completed for yazici in yazicilar):",
+     "    if False:",
+     "a_partially_written_stdin_is_refused_even_when_git_exits_zero"),
+    # 9. The return-code gate, pinned at last. It has guarded this
+    #    transport since B2B-A-D3A, but the battery that catches it was
+    #    not in `BATTERY` until this package added it -- so the guard was
+    #    covered by a test nothing here ever ran.
+    ("b6r1-git-donus-kodu-tasima", "git_transport",
+     "    if proc.returncode != 0:", "    if False:",
+     "a_nonzero_exit_is_refused_without_its_stderr"),
 ]
 
 

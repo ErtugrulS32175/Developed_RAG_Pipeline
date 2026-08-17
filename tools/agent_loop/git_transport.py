@@ -95,7 +95,8 @@ def _finite_positive(value, what):
     return value
 
 
-def _pump(proc, tripped, okuyucular, stdout_limit, timeout):
+def _pump(proc, tripped, okuyucular, stdout_limit, timeout, stdin_bytes,
+          yazicilar):
     """Read both pipes to a bound and decide the outcome.
 
     RETURNS `(stdout bytes | None, refusal | None)` and NEVER RAISES.
@@ -103,13 +104,29 @@ def _pump(proc, tripped, okuyucular, stdout_limit, timeout):
     raised by the caller after cleanup has finished, so our own fixed
     sentence can never be chained to a raw `OSError` through
     `__context__`. Readers are recorded in `okuyucular` as they start,
-    so the caller can join exactly the threads that exist."""
+    so the caller can join exactly the threads that exist.
+
+    `stdin_bytes` is `None` for every read that asks git a question, and
+    BOUNDED EXPLICIT BYTES for the one that hands git content to convert.
+    The writer goes into `okuyucular` too, so the single grace budget in
+    `_cleanup` joins it along with the readers, and into `yazicilar` so
+    the caller can ask -- AFTER that join -- whether the whole payload
+    actually went. A partial write is not a short answer: it is an answer
+    about DIFFERENT BYTES than the caller asked about."""
     try:
         deadline = time.monotonic() + timeout
-        try:
-            proc.stdin.close()
-        except (OSError, ValueError):
-            pass
+        if stdin_bytes is None:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+        else:
+            yazici = process_mod.PromptWriter(proc.stdin, stdin_bytes)
+            yazici.start()
+            # recorded AFTER the start succeeds, for the same reason the
+            # readers are
+            okuyucular.append(yazici)
+            yazicilar.append(yazici)
         disari = process_mod.BoundedStream("stdout", proc.stdout,
                                            stdout_limit, tripped)
         hata = process_mod.BoundedStream("stderr", proc.stderr,
@@ -182,7 +199,7 @@ def _cleanup(proc, container, okuyucular):
     return temiz
 
 
-def run_git_bounded(argv, *, cwd, stdout_limit,
+def run_git_bounded(argv, *, cwd, stdout_limit, stdin_bytes=None,
                     timeout=_GIT_TIMEOUT_SECONDS):
     """Run git contained, read it bounded, and prove the container empty.
 
@@ -196,6 +213,10 @@ def run_git_bounded(argv, *, cwd, stdout_limit,
     raw is carried along as `__context__` or `__cause__`."""
     byte_ceiling(stdout_limit, "stdout tavani")
     _finite_positive(timeout, "zaman asimi")
+    if stdin_bytes is not None and type(stdin_bytes) is not bytes:
+        # a `str` would be encoded by somebody's default, and a memoryview
+        # would make the payload's lifetime somebody else's problem
+        raise FlatWorkspaceError("git girdisi bayt dizisi degil")
 
     tripped = threading.Event()
     try:
@@ -213,7 +234,9 @@ def run_git_bounded(argv, *, cwd, stdout_limit,
     # `start()` calls each left a live process and a live container
     # behind with nobody holding a reference to either.
     okuyucular = []
-    cikti, ret = _pump(proc, tripped, okuyucular, stdout_limit, timeout)
+    yazicilar = []
+    cikti, ret = _pump(proc, tripped, okuyucular, stdout_limit, timeout,
+                       stdin_bytes, yazicilar)
     temiz = _cleanup(proc, container, okuyucular)
 
     if not temiz:
@@ -224,11 +247,22 @@ def run_git_bounded(argv, *, cwd, stdout_limit,
         # the command NAME, never its stderr: that text carries paths,
         # remotes and credential-helper complaints
         raise FlatWorkspaceError("git komutu basarisiz")
+    # LAST, and deliberately AFTER the return code. A command that failed
+    # explains its own unread stdin, and reporting the writer instead
+    # would bury the real cause. The case this catches is the other one:
+    # git exited ZERO having read only part of the payload, so the answer
+    # describes bytes nobody has and nothing else in the call objects.
+    #
+    # ASKED AFTER THE JOIN, never before. The writer sets `completed` as
+    # its last act, so a check made while the thread is still alive races
+    # it and reads `False` from a write that was about to finish.
+    if any(not yazici.completed for yazici in yazicilar):
+        raise FlatWorkspaceError("git girdisi tam yazilamadi")
     return cikti
 
 
-def git_bytes(repo, *args, stdout_limit) -> bytes:
+def git_bytes(repo, *args, stdout_limit, stdin_bytes=None) -> bytes:
     """Every git read names its own ceiling. There is no generic
     unbounded reader left to reach for."""
     return run_git_bounded(["git", "-C", str(repo), *args], cwd=repo,
-                           stdout_limit=stdout_limit)
+                           stdout_limit=stdout_limit, stdin_bytes=stdin_bytes)

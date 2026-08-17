@@ -18,6 +18,7 @@ nothing, which is how three earlier rounds ended.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -86,6 +87,55 @@ def _uretici(tmp_path, *, boyut, akis="stdout", cocuk=False, bekle=0.0,
     return [sys.executable, str(betik)], ortam, isaret
 
 
+# The producer above never reads stdin, which is exactly right for every
+# read that asks git a question. PACKAGE B6-R1 added the one call that
+# HANDS git bytes -- `hash-object --stdin` -- so the stand-in below is
+# its counterpart: it consumes stdin and records the DIGEST of what
+# arrived, which is the only way to tell a payload that was delivered
+# whole from one that was quietly cut in half.
+_TUKETICI_KAYNAK = "\n".join([
+    '# A disposable stand-in that CONSUMES stdin and reports what it got.',
+    'import hashlib',
+    'import os',
+    'import sys',
+    'import time',
+    '',
+    "NEREYE = os.environ['TUKETICI_ISARET']",
+    "OKU = os.environ.get('TUKETICI_OKU', '1') == '1'",
+    "BEKLE = float(os.environ.get('TUKETICI_BEKLE', '0'))",
+    "CIKIS = int(os.environ.get('TUKETICI_CIKIS', '0'))",
+    "YAZ = os.environ.get('TUKETICI_YAZ', '')",
+    '',
+    'if BEKLE:',
+    '    time.sleep(BEKLE)',
+    '',
+    'alinan = b""',
+    'if OKU:',
+    '    alinan = sys.stdin.buffer.read()',
+    '',
+    'if YAZ:',
+    "    sys.stdout.buffer.write(YAZ.encode('ascii'))",
+    'else:',
+    "    sys.stdout.buffer.write(hashlib.sha256(alinan).hexdigest()",
+    "                            .encode('ascii'))",
+    'sys.stdout.buffer.flush()',
+    '',
+    "with open(NEREYE, 'w', encoding='ascii') as akis:",
+    "    akis.write(f'{len(alinan)}:{hashlib.sha256(alinan).hexdigest()}')",
+    'sys.exit(CIKIS)',
+])
+
+
+def _tuketici(tmp_path, *, oku=True, bekle=0.0, cikis=0, yaz=""):
+    betik = tmp_path / "sahte_git_tuketici.py"
+    betik.write_text(_TUKETICI_KAYNAK, encoding="utf-8")
+    isaret = tmp_path / "tuketici-bitti.txt"
+    ortam = {"TUKETICI_ISARET": str(isaret), "TUKETICI_OKU":
+             "1" if oku else "0", "TUKETICI_BEKLE": str(bekle),
+             "TUKETICI_CIKIS": str(cikis), "TUKETICI_YAZ": yaz}
+    return [sys.executable, str(betik)], ortam, isaret
+
+
 @pytest.fixture
 def kur(tmp_path, monkeypatch):
     """Install the producer's environment on the transport's own seam.
@@ -95,6 +145,17 @@ def kur(tmp_path, monkeypatch):
     means a failing test cannot leave the seam replaced."""
     def kurulum(**kwargs):
         argv, ortam, isaret = _uretici(tmp_path, **kwargs)
+        monkeypatch.setattr(git_transport, "_git_env",
+                            lambda: {**os.environ, **ortam})
+        return argv, isaret
+    return kurulum
+
+
+@pytest.fixture
+def kur_tuketici(tmp_path, monkeypatch):
+    """The consumer's environment, installed on the same seam as `kur`."""
+    def kurulum(**kwargs):
+        argv, ortam, isaret = _tuketici(tmp_path, **kwargs)
         monkeypatch.setattr(git_transport, "_git_env",
                             lambda: {**os.environ, **ortam})
         return argv, isaret
@@ -477,6 +538,253 @@ def test_a_nonzero_exit_is_refused_without_its_stderr(kur, tmp_path):
     assert isaret.exists(), "senaryo kurulmadi: uretici cikisa ulasmadi"
     assert str(ret.value) == "git komutu basarisiz"
     assert "K" not in _tum_metin(ret.value)
+
+
+# =====================================================================
+# BOUNDED STDIN. PACKAGE B6-R1.
+#
+# The transport used to close stdin unconditionally, which is right for
+# every call that ASKS git something. `hash-object --stdin` is the first
+# that TELLS git something, and a payload delivered in part is not a
+# short answer -- it is an answer about different bytes than the caller
+# asked about. Every test below therefore proves what the child actually
+# received, not merely that the call returned.
+# =====================================================================
+
+def test_bounded_stdin_arrives_at_the_child_whole(kur_tuketici, tmp_path):
+    """Deliberately larger than any pipe buffer.
+
+    A single `write` on a raw stream moves what it can and returns that
+    count without raising -- the defect `PromptWriter` was rewritten for.
+    A payload that fits in the buffer would pass either way, so this one
+    does not fit."""
+    yuk = bytes(range(256)) * 16384                      # 4 MiB
+    argv, isaret = kur_tuketici()
+    cikti = git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                          stdout_limit=1 << 20,
+                                          stdin_bytes=yuk, timeout=60)
+    beklenen = hashlib.sha256(yuk).hexdigest()
+    assert cikti.decode("ascii") == beklenen
+    assert isaret.read_text(encoding="ascii") == f"{len(yuk)}:{beklenen}"
+
+
+def test_stdin_stays_closed_when_no_payload_is_given(kur_tuketici, tmp_path):
+    """The behaviour every existing caller depends on. A child that reads
+    stdin must see EOF immediately, not block waiting for a writer that
+    was never asked for."""
+    argv, isaret = kur_tuketici()
+    cikti = git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                          stdout_limit=1 << 20, timeout=60)
+    bos = hashlib.sha256(b"").hexdigest()
+    assert cikti.decode("ascii") == bos
+    assert isaret.read_text(encoding="ascii") == f"0:{bos}"
+
+
+def test_an_empty_payload_is_a_payload_and_not_a_closed_pipe(kur_tuketici,
+                                                             tmp_path):
+    """`b""` and `None` are different requests. MEASURED in Task A: the
+    empty blob is a legal object with a real id, so an empty payload must
+    reach git as an empty stream rather than be treated as "no stdin"."""
+    argv, isaret = kur_tuketici()
+    cikti = git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                          stdout_limit=1 << 20,
+                                          stdin_bytes=b"", timeout=60)
+    assert cikti.decode("ascii") == hashlib.sha256(b"").hexdigest()
+    assert isaret.exists(), "senaryo kurulmadi: tuketici bitmedi"
+
+
+class _KisaAkis:
+    """A raw stream that accepts a fixed prefix and then stops accepting.
+
+    THE EXACT MACHINE BEHAVIOUR the writer was rewritten for: `bufsize=0`
+    makes stdin raw, and a raw write moves what it can and RETURNS THAT
+    COUNT without raising. Nothing about it looks like an error."""
+
+    def __init__(self, gercek, kabul):
+        self._gercek = gercek
+        self._kalan = kabul
+
+    def write(self, data):
+        if self._kalan <= 0:
+            return 0                       # the pipe stopped accepting
+        n = min(self._kalan, len(data))
+        self._gercek.write(bytes(data[:n]))
+        self._kalan -= n
+        return n
+
+    def flush(self):
+        self._gercek.flush()
+
+    def close(self):
+        self._gercek.close()
+
+
+def test_a_partially_written_stdin_is_refused_even_when_git_exits_zero(
+        kur_tuketici, tmp_path, monkeypatch):
+    """THE gap this parameter opens, closed.
+
+    The pipe takes 64 bytes of a 4096-byte payload and then stops. The
+    child reads those 64 bytes, computes a perfectly valid digest OF THE
+    WRONG BYTES and exits ZERO. Nothing in the return code, the output
+    ceiling or the container says anything is wrong -- and the answer
+    would have been recorded as the object id of a file nobody has."""
+    yuk = b"A" * 4096
+    kabul = 64
+    argv, isaret = kur_tuketici()
+    kesildi = {"evet": False}
+    gercek = process_mod.PromptWriter
+
+    class Yarim(gercek):
+        def __init__(self, stream, payload):
+            kesildi["evet"] = True
+            super().__init__(_KisaAkis(stream, kabul), payload)
+
+    monkeypatch.setattr(process_mod, "PromptWriter", Yarim)
+    with pytest.raises(git_transport.FlatWorkspaceError) as ret:
+        git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                      stdout_limit=1 << 20,
+                                      stdin_bytes=yuk, timeout=60)
+    assert kesildi["evet"], "senaryo kurulmadi: yazici degistirilmedi"
+    # the child really did finish, and really did see only the prefix
+    assert isaret.read_text(encoding="ascii").startswith(f"{kabul}:")
+    assert str(ret.value) == "git girdisi tam yazilamadi"
+
+
+def test_a_writer_that_never_completes_is_refused(kur_tuketici, tmp_path,
+                                                  monkeypatch):
+    """The flag is asked AFTER the join, so a writer that is merely slow
+    is not mistaken for one that failed -- and one that truly never
+    finished is not accepted because the return code looked fine."""
+    argv, isaret = kur_tuketici()
+    gercek = process_mod.PromptWriter
+
+    class HicYazmaz(gercek):
+        def run(self):
+            try:
+                self._stream.close()
+            except (OSError, ValueError):
+                pass
+            # `completed` deliberately left False
+
+    monkeypatch.setattr(process_mod, "PromptWriter", HicYazmaz)
+    with pytest.raises(git_transport.FlatWorkspaceError) as ret:
+        git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                      stdout_limit=1 << 20,
+                                      stdin_bytes=b"X" * 32, timeout=60)
+    assert isaret.exists(), "senaryo kurulmadi: tuketici hic calismadi"
+    assert str(ret.value) == "git girdisi tam yazilamadi"
+
+
+@pytest.mark.parametrize("kotu", ["metin", bytearray(b"ab"),
+                                  memoryview(b"ab"), 5, [1, 2]])
+def test_a_payload_that_is_not_bytes_is_refused_before_launch(
+        kur_tuketici, tmp_path, kotu):
+    """A `str` would be encoded by somebody's default and a `memoryview`
+    would make the payload's lifetime somebody else's problem. Checked
+    before the container exists, so nothing runs."""
+    argv, isaret = kur_tuketici()
+    with pytest.raises(git_transport.FlatWorkspaceError) as ret:
+        git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                      stdout_limit=1 << 20,
+                                      stdin_bytes=kotu, timeout=60)
+    assert not isaret.exists(), "gecersiz yuke ragmen program calisti"
+    assert str(ret.value) == "git girdisi bayt dizisi degil"
+
+
+def test_a_child_that_ignores_a_large_payload_neither_hangs_nor_survives(
+        kur_tuketici, tmp_path):
+    """The writer parks in `write` until the pipe closes, which is fine
+    HERE and was fatal on the main path. What must hold is that the
+    deadline still governs, the run is refused rather than accepted on a
+    partial write, and nothing is left alive -- the autouse fixture
+    proves the last part."""
+    argv, isaret = kur_tuketici(oku=False)
+    basla = time.monotonic()
+    with pytest.raises(git_transport.FlatWorkspaceError) as ret:
+        git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                      stdout_limit=1 << 20,
+                                      stdin_bytes=b"B" * (8 << 20), timeout=20)
+    gecen = time.monotonic() - basla
+    assert gecen < 40, f"cagri deadline'i asti: {gecen:.1f}s"
+    assert isaret.exists(), "senaryo kurulmadi: tuketici hic calismadi"
+    assert str(ret.value) == "git girdisi tam yazilamadi"
+
+
+def test_a_timeout_with_a_payload_leaves_no_parent_and_no_child(
+        kur_tuketici, tmp_path):
+    """A stalled child must not become a call that never returns just
+    because there is now a writer thread in the picture."""
+    argv, isaret = kur_tuketici(bekle=90.0)
+    basla = time.monotonic()
+    with pytest.raises(git_transport.FlatWorkspaceError) as ret:
+        git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                      stdout_limit=1 << 20,
+                                      stdin_bytes=b"C" * 64, timeout=5)
+    gecen = time.monotonic() - basla
+    assert gecen < 40, f"kapsayici birakmadi: {gecen:.1f}s"
+    assert "zaman asimina" in str(ret.value)
+    assert not isaret.exists(), "tuketici bitirdi -- durdurulmadi"
+
+
+def test_the_output_ceiling_still_governs_while_stdin_is_written(
+        kur_tuketici, tmp_path):
+    """Two bounds, both live at once. A payload going in must not buy the
+    child an unbounded channel coming out."""
+    argv, _ = kur_tuketici(yaz="D" * 4096)
+    with pytest.raises(git_transport.FlatWorkspaceError) as ret:
+        git_transport.run_git_bounded(argv, cwd=tmp_path, stdout_limit=64,
+                                      stdin_bytes=b"E" * 128, timeout=60)
+    assert "tavan" in str(ret.value)
+
+
+def test_a_nonzero_exit_with_a_payload_is_refused_without_its_stderr(
+        kur_tuketici, tmp_path):
+    argv, isaret = kur_tuketici(cikis=4)
+    with pytest.raises(git_transport.FlatWorkspaceError) as ret:
+        git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                      stdout_limit=1 << 20,
+                                      stdin_bytes=b"F" * 32, timeout=60)
+    assert isaret.exists(), "senaryo kurulmadi: tuketici cikisa ulasmadi"
+    assert str(ret.value) == "git komutu basarisiz"
+
+
+def test_no_payload_byte_survives_a_stdin_refusal(kur_tuketici, tmp_path,
+                                                  monkeypatch):
+    """The payload is a file of the operator's. It is the LAST thing that
+    may appear in a refusal's text, its cause or its context."""
+    yuk = SENTINEL.encode("ascii") * 8
+    argv, _ = kur_tuketici(cikis=5)
+    with pytest.raises(git_transport.FlatWorkspaceError) as ret:
+        git_transport.run_git_bounded(argv, cwd=tmp_path,
+                                      stdout_limit=1 << 20,
+                                      stdin_bytes=yuk, timeout=60)
+    metin = _tum_metin(ret.value)
+    assert SENTINEL not in metin, "yuk disari cikti"
+    assert ret.value.__cause__ is None
+    assert ret.value.__context__ is None, "ham hata baglam olarak tasindi"
+
+
+def test_git_bytes_forwards_the_payload_and_defaults_to_no_stdin(monkeypatch,
+                                                                 tmp_path):
+    """The named helper every caller reaches for, not just the low-level
+    seam. A wrapper that dropped `stdin_bytes` on the floor would send
+    git an EMPTY stream and hash the wrong thing -- silently, because the
+    empty blob is a perfectly valid object."""
+    gorulen = []
+
+    def sahte(argv, *, cwd, stdout_limit, stdin_bytes=None,
+              timeout=git_transport._GIT_TIMEOUT_SECONDS):
+        gorulen.append((tuple(argv), stdin_bytes))
+        return b"tamam"
+
+    monkeypatch.setattr(git_transport, "run_git_bounded", sahte)
+    git_transport.git_bytes(tmp_path, "cat-file", "-t", "x", stdout_limit=8)
+    git_transport.git_bytes(tmp_path, "hash-object", "--stdin",
+                            stdout_limit=41, stdin_bytes=b"YUK")
+
+    assert gorulen[0][1] is None, "girdisiz cagri bir yuk uydurdu"
+    assert gorulen[1][1] == b"YUK", "yuk tasimaya gecmedi"
+    assert gorulen[1][0][:3] == ("git", "-C", str(tmp_path))
 
 
 def test_the_git_environment_carries_its_isolation_flags():
