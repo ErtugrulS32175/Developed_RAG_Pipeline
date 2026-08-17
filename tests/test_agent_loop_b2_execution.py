@@ -1284,7 +1284,17 @@ def test_a_lying_str_subclass_cannot_impersonate_the_schema(
     Three assertions, because two of them alone would not notice a
     validator built from `{}`: the typed refusal, zero processes, and
     the arbitrary reply never being accepted."""
-    binding = schemas.IMPLEMENTER_SCHEMA_BINDING
+    # THE TRANSPORT BINDING, because that is the one `_argv_schema`
+    # compares the argv token against. It named the AUTHORITY binding
+    # until B6-R1-F1, and the B4-R2 split had silently made the two
+    # different objects -- so the impostor's lie no longer matched what
+    # the code actually checks, the canonical/digest gate refused it
+    # first, and the exact-type guard below was never exercised at all.
+    # The test stayed green and proved nothing; `r2br11-alt-sinif`
+    # survived and reported MISDIRECTED. The impostor has to satisfy
+    # every gate the token really passes through, so that the ONLY
+    # remaining reason to refuse it is that it is not exactly a `str`.
+    binding = schemas.IMPLEMENTER_TRANSPORT_BINDING
 
     class Taklitci(str):
         def __eq__(self, other):
