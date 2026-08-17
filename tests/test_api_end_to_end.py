@@ -937,6 +937,209 @@ def test_unsafe_filename_is_rejected_before_path_construction(filename):
     assert error.value.status_code == 400
 
 
+# --- the document inventory --------------------------------------------
+
+
+def _inventory_row(document_id, uploaded_at, **overrides):
+    """A row as the DATABASE holds it -- candidate columns included.
+
+    These tests deliberately feed the endpoint MORE than the real query
+    selects. The narrow SELECT is the first guard and is checked in
+    test_db_lifecycle; what is measured here is the second one, the
+    endpoint's own projection, which is the guard that still holds if a
+    column is later added to that SELECT list.
+    """
+    row = {
+        "document_id": document_id,
+        "id": document_id,
+        "filename": f"{document_id}.pdf",
+        "file_type": "pdf",
+        "uploaded_at": uploaded_at,
+        "status": "done",
+        "status_note": None,
+        "active_generation": 2,
+        "content_sha256": "KURGU_SHA_" + document_id,
+        "candidate_id": "KURGU_ADAY_" + document_id,
+        "candidate_state": PUBLISHED,
+    }
+    row.update(overrides)
+    return row
+
+
+INVENTORY = [
+    _inventory_row("kurgu-uc", f"{999:04d}-03-03T00:00:00+00:00"),
+    _inventory_row("kurgu-iki", f"{999:04d}-02-02T00:00:00+00:00",
+                   status="partial", status_note="sayfa 2 kayip"),
+    _inventory_row("kurgu-bir", f"{999:04d}-01-01T00:00:00+00:00"),
+]
+
+
+def _wire_inventory(monkeypatch, api, rows=INVENTORY):
+    """Replace the query with one that records how it was CALLED.
+
+    It returns the ``limit + 1`` window the real helper returns, so the
+    endpoint's `has_more` is computed from the same evidence in the test
+    as in production."""
+    asked = []
+
+    def list_documents(_conn, limit, offset):
+        asked.append((limit, offset))
+        return [dict(row) for row in rows[offset:offset + limit + 1]]
+
+    monkeypatch.setattr(api.db, "list_documents", list_documents)
+    return asked
+
+
+def test_the_document_inventory_pages_with_a_limit_plus_one_probe(
+        monkeypatch, tmp_path):
+    """`has_more` comes out of the page's OWN scan: the endpoint asks for
+    one row past the page and publishes the flag, never the row."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api)
+
+    first = client.get("/documents?limit=2", headers=_headers(api))
+
+    assert first.status_code == 200
+    body = first.json()
+    assert [doc["document_id"] for doc in body["documents"]] == [
+        "kurgu-uc", "kurgu-iki"]
+    assert (body["limit"], body["offset"], body["has_more"]) == (2, 0, True)
+    # the sentinel row is EVIDENCE, not content -- it is not published
+    assert len(body["documents"]) == 2
+    assert asked == [(2, 0)]
+
+    last = client.get("/documents?limit=2&offset=2", headers=_headers(api))
+
+    assert last.status_code == 200
+    tail = last.json()
+    assert [doc["document_id"] for doc in tail["documents"]] == ["kurgu-bir"]
+    assert (tail["limit"], tail["offset"], tail["has_more"]) == (2, 2, False)
+
+
+def test_the_inventory_publishes_only_the_safe_document_fields(
+        monkeypatch, tmp_path):
+    """The recorded candidate's bytes and its immutable identity are
+    single-document detail. A listing is read by anyone holding the key,
+    and it must not hand them out one page at a time."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    _wire_inventory(monkeypatch, api)
+
+    response = client.get("/documents", headers=_headers(api))
+
+    assert response.status_code == 200
+    documents = response.json()["documents"]
+    assert len(documents) == 3
+    for document in documents:
+        assert set(document) == {
+            "document_id", "filename", "file_type", "uploaded_at",
+            "status", "status_note", "active_generation"}
+    # not merely absent as keys: the VALUES never appear in the response
+    assert "content_sha256" not in response.text
+    assert "candidate_id" not in response.text
+    assert "KURGU_SHA_" not in response.text
+    assert "KURGU_ADAY_" not in response.text
+    assert documents[1]["status_note"] == "sayfa 2 kayip"
+
+
+def test_the_inventory_defaults_to_the_first_twenty(monkeypatch, tmp_path):
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api)
+
+    body = client.get("/documents", headers=_headers(api)).json()
+
+    assert asked == [(20, 0)]
+    assert (body["limit"], body["offset"], body["has_more"]) == (20, 0, False)
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["limit=0", "limit=101", "limit=-1", "offset=-1", "limit=abc",
+     "limit=20&offset=-5"],
+)
+def test_an_unsized_page_is_refused_before_the_database_is_touched(
+        monkeypatch, tmp_path, query):
+    """A page the endpoint cannot size must cost NOTHING: no pooled
+    connection, no scan. The bounds live in the signature, so FastAPI
+    refuses the request before the body -- and therefore before the
+    connection checkout -- ever runs."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    borrowed = []
+    queried = []
+
+    @contextmanager
+    def recording_conn():
+        borrowed.append(1)
+        yield object()
+
+    monkeypatch.setattr(api, "db_conn", recording_conn)
+    monkeypatch.setattr(
+        api.db, "list_documents",
+        lambda *a, **k: queried.append(1) or [])
+
+    response = client.get(f"/documents?{query}", headers=_headers(api))
+
+    assert response.status_code == 422
+    assert borrowed == []
+    assert queried == []
+
+
+def test_the_inventory_sits_behind_the_same_key_as_the_other_document_routes(
+        monkeypatch, tmp_path):
+    """Not "it has some dependency" -- the SAME one, by identity. A
+    listing walks the whole corpus, so an inventory left one dependency
+    short is a bigger opening than any single-document route."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    _wire_inventory(monkeypatch, api)
+
+    def dependencies(path):
+        for route in api.app.routes:
+            if (getattr(route, "path", None) == path
+                    and "GET" in getattr(route, "methods", ())):
+                return [depends.dependency for depends in route.dependencies]
+        raise AssertionError(f"{path} yok")
+
+    assert dependencies("/documents") == [api.require_api_key]
+    assert dependencies("/documents") == dependencies("/documents/{document_id}")
+
+
+def test_the_inventory_is_refused_without_the_configured_key(monkeypatch):
+    """The dependency identity above is structure; this is the behaviour."""
+    import importlib
+
+    import pipeline.api.app as api
+
+    # the key is built, not written out: a literal `Bearer <long token>`
+    # in a source file is a key-shaped object to the leak scanner even
+    # when the token is invented
+    key = "zeta-gamma-envanter-anahtari"
+    monkeypatch.setenv("API_KEY", key)
+    importlib.reload(api)
+    try:
+        monkeypatch.setattr(api, "db_conn", _fake_db_conn)
+        monkeypatch.setattr(api.db, "list_documents", lambda *a, **k: [])
+        client = TestClient(api.app)
+
+        assert client.get("/documents").status_code == 401
+        assert client.get(
+            "/documents",
+            headers={"Authorization": "Bearer yanlis"},
+        ).status_code == 401
+        allowed = client.get(
+            "/documents",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        assert allowed.status_code == 200
+        assert allowed.json()["documents"] == []
+    finally:
+        monkeypatch.delenv("API_KEY", raising=False)
+        importlib.reload(api)
+
+
 def test_unhandled_dependency_error_never_copies_its_message_to_logs(
         monkeypatch, caplog):
     from pipeline.api import app as api

@@ -641,6 +641,54 @@ def get_document(conn, document_id: str) -> dict | None:
     return row
 
 
+def list_documents(conn, limit: int, offset: int) -> list[dict]:
+    """One page of the document inventory, newest first.
+
+    THE PROJECTION IS THE GATE. Only the columns an inventory may show are
+    selected at all, so ``content_sha256`` and ``candidate_id`` -- the
+    recorded candidate's bytes and its immutable identity -- never leave
+    the database on this path. A caller that needs them asks for a single
+    document; a listing is read by anyone holding the API key.
+
+    ORDERING IS TOTAL, not merely "newest first". ``uploaded_at`` is not
+    unique -- a batch upload can land several rows inside one clock tick
+    -- and a partial order under LIMIT/OFFSET lets the server return the
+    same row on two pages while another is never returned at all. The id
+    tie-break makes the sequence the same on every page of one scan.
+
+    ONE EXTRA ROW is fetched on purpose: ``limit + 1``. It answers "is
+    there another page" from the same scan the page came from, without a
+    second COUNT over the whole table and without the window between the
+    two that would make the count disagree with the page. The caller gets
+    up to ``limit + 1`` rows and decides what to publish -- the sentinel
+    row is evidence, not content.
+    """
+    # A page size is arithmetic, and arithmetic on a value nobody checked
+    # is how OFFSET -1 reaches the server. The API rejects these before it
+    # borrows a connection; this refuses them for every OTHER caller, so
+    # the guard does not live in one endpoint's signature alone.
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("limit 1 veya daha buyuk bir tamsayi olmali")
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise ValueError("offset 0 veya daha buyuk bir tamsayi olmali")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT id, filename, file_type, uploaded_at, status, "
+            "status_note, active_generation "
+            "FROM documents "
+            "ORDER BY uploaded_at DESC, id DESC "
+            "LIMIT %(limit)s OFFSET %(offset)s",
+            {"limit": limit + 1, "offset": offset})
+        rows = cur.fetchall()
+    listed = []
+    for row in rows:
+        # `id` is a uuid object; every other reader of this row is JSON,
+        # so it is stringified here under the name the API publishes it by
+        row["document_id"] = str(row.pop("id"))
+        listed.append(row)
+    return listed
+
+
 def set_document_status(conn, document_id: str, status: str,
                         note: str | None = None,
                         expected_active: int | None = None,

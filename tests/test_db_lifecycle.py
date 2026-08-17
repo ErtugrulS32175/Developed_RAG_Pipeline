@@ -207,3 +207,126 @@ def test_retrieve_borrows_from_the_pool_per_query(monkeypatch):
 
 def pooled_returns_match(pool):
     return pool.returned == len(pool.handed_out)
+
+
+# --- the inventory query's own contract ---------------------------------
+#
+# The listing endpoint is the first read that returns MANY rows, and the
+# three properties below are the ones a page of rows can quietly get
+# wrong: values spliced into the SQL, an order that is not total, and a
+# "next page" flag derived from a second statement that disagrees with
+# the first. They are checked at the cursor seam, because that is where
+# the statement and its parameters are still separable.
+
+
+class RecordingCursor:
+    """Captures the statement and its parameters instead of running them."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchall(self):
+        return [dict(row) for row in self._rows]
+
+
+class RecordingConn:
+    def __init__(self, rows=()):
+        self.cur = RecordingCursor(rows)
+
+    def cursor(self, row_factory=None):
+        return self.cur
+
+
+def _listing_row(**overrides):
+    import uuid
+
+    row = {
+        "id": uuid.UUID("00000000-0000-0000-0000-0000000000aa"),
+        "filename": "kurgu-belge.pdf",
+        "file_type": "pdf",
+        "uploaded_at": f"{999:04d}-01-01T00:00:00+00:00",
+        "status": "done",
+        "status_note": None,
+        "active_generation": 3,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_the_listing_query_is_parameterized_and_totally_ordered():
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=20, offset=40)
+
+    sql, params = conn.cur.executed[0]
+    # the page bounds travel as PARAMETERS, never as text in the statement
+    assert params == {"limit": 21, "offset": 40}
+    assert "20" not in sql and "40" not in sql
+    # `uploaded_at` alone is not unique: two rows sharing a clock tick can
+    # swap places between pages, showing one twice and never showing the
+    # other. The id tie-break makes the sequence total.
+    assert "ORDER BY uploaded_at DESC, id DESC" in sql
+
+
+def test_the_listing_query_asks_for_one_row_beyond_the_page():
+    """`has_more` is answered by the SAME scan the page came from.
+
+    A second COUNT over the table would be a different snapshot, and the
+    flag could then contradict the rows next to it."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=1, offset=0)
+
+    _sql, params = conn.cur.executed[0]
+    assert params["limit"] == 2
+
+
+def test_the_listing_query_never_selects_the_candidate_columns():
+    """The projection is the gate: what is not selected cannot leak."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0)
+
+    sql = conn.cur.executed[0][0]
+    assert "content_sha256" not in sql
+    assert "candidate_id" not in sql
+
+
+def test_the_listing_returns_a_string_document_id():
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    rows = db.list_documents(conn, limit=5, offset=0)
+
+    assert rows[0]["document_id"] == "00000000-0000-0000-0000-0000000000aa"
+    assert "id" not in rows[0]
+    assert rows[0]["active_generation"] == 3
+
+
+@pytest.mark.parametrize(
+    ("limit", "offset"),
+    [(0, 0), (-1, 0), (5, -1), (True, 0), (5, True), ("5", 0), (5, "0")],
+)
+def test_the_listing_refuses_a_page_it_cannot_size(limit, offset):
+    """A page size is arithmetic, and `limit + 1` on an unchecked value is
+    how OFFSET -1 reaches the server. The API rejects these in its own
+    signature; this is the guard for every other caller."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    with pytest.raises(ValueError):
+        db.list_documents(conn, limit=limit, offset=offset)
+    assert conn.cur.executed == []

@@ -9,7 +9,9 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Union
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, UploadFile, File
+from fastapi import (
+    Depends, FastAPI, Header, HTTPException, Query, Response, UploadFile, File,
+)
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -633,6 +635,71 @@ def process_document(document_id: str):
     if note:
         response["status_note"] = note
     return response
+
+
+# What an INVENTORY may say about a document. Deliberately not "the row
+# minus a blocklist": a column added to `documents` later joins this list
+# only when someone writes its name here, so the next candidate-shaped
+# secret cannot arrive in a listing by default. `content_sha256` and
+# `candidate_id` are absent for that reason -- they describe the recorded
+# candidate's bytes and its immutable identity, which is single-document
+# detail, not something to hand out one page at a time.
+DOCUMENT_LIST_FIELDS = (
+    "document_id",
+    "filename",
+    "file_type",
+    "uploaded_at",
+    "status",
+    "status_note",
+    "active_generation",
+)
+
+# A page nobody sized is a full table scan waiting for its first large
+# corpus; a cap that only the database enforces is a scan that already
+# started. Both bounds are decided here, in the signature, so an
+# out-of-range page never reaches a connection at all.
+DOCUMENT_PAGE_DEFAULT = 20
+DOCUMENT_PAGE_MAX = 100
+
+
+def _document_summary(row):
+    """Project one listing row onto the published field set.
+
+    The query already selects only these columns, so this is the SECOND
+    guard rather than the only one -- and it is the guard that does not
+    depend on remembering to keep a SELECT list narrow. Missing keys
+    become None instead of raising: an inventory that fails outright
+    because one legacy row lacks a note tells the caller nothing.
+    """
+    return {field: row.get(field) for field in DOCUMENT_LIST_FIELDS}
+
+
+@app.get("/documents", dependencies=AUTH)
+def list_documents(
+    limit: int = Query(DOCUMENT_PAGE_DEFAULT, ge=1, le=DOCUMENT_PAGE_MAX),
+    offset: int = Query(0, ge=0),
+):
+    """One page of the document inventory, newest first.
+
+    `has_more` comes from the query itself: the database is asked for
+    ``limit + 1`` rows and the extra one, if it exists, is the evidence
+    that another page follows. It is never published -- the page is
+    truncated back to `limit` -- and no COUNT over the whole table is
+    run, so the flag cannot disagree with the page it was computed with.
+
+    The bounds are declared on the parameters, which means FastAPI
+    refuses a bad page with 422 BEFORE this body runs: `db_conn()` is
+    below the validation, so a limit of 0, 101 or a negative offset
+    costs no pooled connection and no scan.
+    """
+    with db_conn() as conn:
+        rows = db.list_documents(conn, limit=limit, offset=offset)
+    return {
+        "documents": [_document_summary(row) for row in rows[:limit]],
+        "limit": limit,
+        "offset": offset,
+        "has_more": len(rows) > limit,
+    }
 
 
 @app.get("/documents/{document_id}", dependencies=AUTH)
