@@ -1364,7 +1364,15 @@ def test_every_mutation_still_applies_to_the_current_source():
     # return-code gate -- which had guarded this transport since
     # B2B-A-D3A and was pinned by nothing here, because its battery was
     # not in `BATTERY` until this package added it).
-    assert len(tool.MUTATIONS) == 127
+    # 127 -> 139 in B6-R2: the one seam that archives a terminal run and
+    # then deletes things. Twelve entries, each pinning one half of the
+    # ordering that makes deleting safe -- the terminal gate, the caller's
+    # run id, the read-back proof, the completion record, the public
+    # workspace seam, the digest re-check before each unlink, the
+    # tracked-manifest refusal, archive containment, the pending-application
+    # gate, the exact-name allowlist, the candidate's derived scope, and
+    # the second measurement of every source after the copy loop.
+    assert len(tool.MUTATIONS) == 139
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1396,6 +1404,12 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b6r1-ham-bayt-tek-otorite', 'b6r1-mod-ayri-kontrol',
         'b6r1-yedek-operator-baytlari', 'b6r1-girdi-tamlik-kapisi',
         'b6r1-git-donus-kodu-tasima',
+        'b6r2-terminal-kapisi', 'b6r2-beklenen-kosu-kimligi',
+        'b6r2-geri-okuma-kaniti', 'b6r2-tamamlanma-kaydi-once',
+        'b6r2-workspace-public-seam', 'b6r2-silmeden-once-dogrulama',
+        'b6r2-izlenen-gorev-dosyasi', 'b6r2-arsiv-kapsama',
+        'b6r2-bekleyen-uygulama', 'b6r2-kapali-ad-listesi',
+        'b6r2-aday-kapsami', 'b6r2-kaynak-yeniden-olcum',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

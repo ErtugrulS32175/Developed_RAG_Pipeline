@@ -288,6 +288,35 @@ your working tree; review the diff and commit them yourself:
     git add -p && git commit
     git push
 
+### 6. Close the run, then start the next one
+
+A finished run leaves its evidence behind on purpose — the state document, the
+events journal, the acceptance receipt, and for a run that stopped, the only
+copy of the candidate. `runner.finalize` archives all of it byte-exact and then
+resets the repository, in one call:
+
+    runner.finalize(
+        repo=".",
+        archive_root="/somewhere/outside/the/repo",
+        expected_run_id=result.run_id,
+        task_path="tasks/normalise.json",   # optional
+        shipped_commit=head_sha,            # optional
+        ci_run_id="32047794474",            # optional, recorded only
+    )
+
+It takes no `binaries` because it starts no process: nothing is launched and no
+network request is made. `shipped_commit` and `ci_run_id` are recorded, and the
+shipment claim is checked against your repository — an approved run whose work
+is not committed is archived as `unshipped` rather than filed as shipped.
+
+Nothing is removed until every file has been copied, read back off the disk and
+matched by digest, and a completion record is durable; each source is measured
+again in the instant before it is unlinked. `run.lock` and the workspace ledger
+directory stay. The task manifest is removed only if it is yours to remove —
+inside the repository, an ordinary file, carrying this run's exact digest, and
+unknown to git in both the index and the tree. If anything cannot be proven the
+call refuses and removes nothing.
+
 ## Stack
 
 PaddleOCR-VL and HunyuanOCR (table extraction), PaddleOCR PP-OCRv5 (OCR),

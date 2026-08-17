@@ -45,7 +45,11 @@ MODULES = ("state", "locking", "preflight", "execution",
            # carries its bounded stdin. Absent from this tuple, neither
            # the attribute refusals nor the equality that replaced the
            # raw-bytes-only gate could be mutated at all.
-           "git_clean", "git_transport")
+           "git_clean", "git_transport",
+           # B6-R2: the one seam that archives a terminal run and then
+           # deletes things. Its ordering guarantees are the whole safety
+           # argument, so they have to be mutable to be pinned.
+           "finalization")
 NL = chr(10)
 
 BS = chr(92)
@@ -89,6 +93,8 @@ BATTERY = (
     # even the long-standing return-code gate were pinned by nothing here.
     "tests/test_agent_loop_b2_git_clean.py",
     "tests/test_agent_loop_b2_git_transport.py",
+    # B6-R2: the finalize battery, whose worlds are REAL terminal runs.
+    "tests/test_agent_loop_b6_finalization.py",
 )
 
 # (label, module, old, new, expected_test_substring)
@@ -1095,6 +1101,98 @@ MUTATIONS = [
     ("b6r1-git-donus-kodu-tasima", "git_transport",
      "    if proc.returncode != 0:", "    if False:",
      "a_nonzero_exit_is_refused_without_its_stderr"),
+    # ----------------------------------------------------------------
+    # B6-R2 -- archive a terminal run, then reset. Every entry below is
+    # one half of the ordering that makes deleting safe: prove who the
+    # run is, prove where the archive may go, prove the copy by reading
+    # it back, and remove nothing until a completion record is durable.
+    # ----------------------------------------------------------------
+    # 1. The terminal-state gate. A run still in flight has a workspace
+    #    somebody is using and a state document somebody is advancing.
+    ("b6r2-terminal-kapisi", "finalization",
+     "    if terminal not in contract.TERMINAL_STATES:" + NL
+     + '        raise RunNotTerminal("kosu terminal durumda degil")',
+     "    if False:" + NL
+     + '        raise RunNotTerminal("kosu terminal durumda degil")',
+     "test_a_non_terminal_run_is_refused_and_nothing_is_written"),
+    # 2. The caller's identity gate. Without it, pointing the call at the
+    #    wrong checkout archives and deletes somebody else's run.
+    ("b6r2-beklenen-kosu-kimligi", "finalization",
+     "    if run_id != expected_run_id:", "    if False:",
+     "test_a_wrong_expected_run_id_is_refused"),
+    # 3. The read-back. A write that returned and a digest computed from
+    #    bytes still in memory prove nothing about what reached the disk,
+    #    and this archive is about to become the only copy.
+    ("b6r2-geri-okuma-kaniti", "finalization",
+     "    if _read_back(directory, name) != data:",
+     "    if False:",
+     "test_a_corrupted_read_back_is_refused_before_any_cleanup"),
+    # 4. Cleanup before the completion record is durable. This is the
+    #    ordering the whole design exists to enforce.
+    ("b6r2-tamamlanma-kaydi-once", "finalization",
+     "        if not (existing / COMPLETE_NAME).is_file():" + NL
+     + '            raise PartialArchivePresent("tamamlanmamis arsiv '
+     'dizini var")',
+     "        if False:" + NL
+     + '            raise PartialArchivePresent("tamamlanmamis arsiv '
+     'dizini var")',
+     "test_a_half_written_archive_is_never_counted_as_success"),
+    # 5. The workspace goes through the public seam, which is the only
+    #    thing that checks the ledger record authorises it.
+    ("b6r2-workspace-public-seam", "finalization",
+     "            flat_workspace.remove(repo_path, state_dir=state_dir," + NL
+     + "                                  workspace_id=workspace_id)",
+     "            pass",
+     "test_the_workspace_goes_only_through_the_public_remove_seam"),
+    # 6. The digest re-check in the instant before an unlink. Between the
+    #    archive and the removal there is a window a rewrite fits in.
+    ("b6r2-silmeden-once-dogrulama", "finalization",
+     "    if hashlib.sha256(_read_back(directory, name)).hexdigest() "
+     "!= expected:",
+     "    if False:",
+     "test_a_source_that_drifts_before_its_removal_stops_the_cleanup"),
+    # 7. The tracked/staged refusal for the task manifest. Deleting a file
+    #    git knows about is a commit nobody asked for.
+    ("b6r2-izlenen-gorev-dosyasi", "finalization",
+     '        raise TaskManifestMismatch("gorev dosyasi git tarafindan '
+     'izleniyor")',
+     "        pass",
+     "test_a_tracked_or_staged_task_manifest_is_never_removed"),
+    # 8. Archive containment. A destination inside the tree being cleaned
+    #    up is how an archive deletes itself.
+    ("b6r2-arsiv-kapsama", "finalization",
+     "        if _overlaps(resolved, candidate):",
+     "        if False:",
+     "test_an_archive_root_that_overlaps_the_run_is_refused"),
+    # 9. The pending-application gate. An unfinished application means the
+    #    checkout is in a state nobody has described.
+    ("b6r2-bekleyen-uygulama", "finalization",
+     "    if pending:" + NL
+     + '        raise PendingApplication("bitmemis uygulama var")',
+     "    if False:" + NL
+     + '        raise PendingApplication("bitmemis uygulama var")',
+     "test_a_pending_application_refuses_the_whole_operation"),
+    # 10. The exact-name allowlist. Iterating the directory instead would
+    #     remove `run.lock` and anything else a future package puts there.
+    ("b6r2-kapali-ad-listesi", "finalization",
+     "        for name in REMOVABLE_STATE_FILES:",
+     "        for name in sorted(digests):",
+     "test_a_failed_run_is_archived_and_its_workspace_released"),
+    # 11. The candidate's scope. Deriving it from the change authority is
+    #     what keeps a workspace edited after the fact from being copied
+    #     wholesale into the archive.
+    ("b6r2-aday-kapsami", "finalization",
+     "    except changes.ChangeSetError:" + NL
+     + '        raise CandidateScopeRefused("aday kaniti turetilemedi") '
+     "from None",
+     "    except changes.ChangeSetError:" + NL + "        return ()",
+     "test_a_candidate_change_outside_the_allowed_paths_stops_everything"),
+    # 12. The second measurement of every source after the copy loop. A
+    #     file rewritten while the loop was elsewhere leaves an archive
+    #     that is a snapshot of no single moment.
+    ("b6r2-kaynak-yeniden-olcum", "finalization",
+     "        _verify_sources_unchanged(verify)", "        pass",
+     "test_a_source_that_drifts_during_archiving_stops_everything"),
 ]
 
 

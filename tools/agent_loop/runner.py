@@ -63,8 +63,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from tools.agent_loop import (acceptance, application, audit, changes,
-                              contract, flat_workspace, fs_evidence, locking,
-                              plan_auth, runner_events, schemas)
+                              contract, finalization, flat_workspace,
+                              fs_evidence, locking, plan_auth, runner_events,
+                              schemas)
 from tools.agent_loop import preflight as preflight_gates
 from tools.agent_loop import state as state_module
 
@@ -460,6 +461,38 @@ def resume(*, repo, binaries) -> RunResult:
             evaluator_rounds=rounds.get("evaluator", 0),
             recovered_from_backup=recovered,
             recovered_applications=recovered_applications)
+
+
+# Re-exported so a caller of this seam never has to import the
+# finalization module to catch what it raises or to read what it returns.
+FinalizeResult = finalization.FinalizeResult
+FinalizeStatus = finalization.FinalizeStatus
+FinalizeRefused = finalization.FinalizeRefused
+Shipment = finalization.Shipment
+
+
+def finalize(*, repo, archive_root, expected_run_id, task_path=None,
+             shipped_commit=None, ci_run_id=None):
+    """Archive a TERMINAL run byte-exact, then reset the repository.
+
+    A THIN DELEGATION, deliberately. The ordering that makes this safe --
+    prove the identities, prove the destination, copy and read back, record
+    completion durably, and only then remove anything -- lives in
+    `finalization`, which owns it end to end. Putting any of it here would
+    make the run loop a second cleanup authority, and there is exactly one.
+
+    `binaries` is NOT a parameter, and that is the point: this call starts
+    no process of any kind. Nothing is launched, nothing is asked of a
+    vendor CLI, and no network request is made -- `shipped_commit` and
+    `ci_run_id` are recorded, and the shipment claim is checked against the
+    repository itself.
+
+    See `finalization.finalize` for the gates and `FinalizeResult` for the
+    closed fields that come back."""
+    return finalization.finalize(
+        repo=repo, archive_root=archive_root,
+        expected_run_id=expected_run_id, task_path=task_path,
+        shipped_commit=shipped_commit, ci_run_id=ci_run_id)
 
 
 class _Run:
