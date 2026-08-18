@@ -58,6 +58,10 @@ from tools.agent_loop.contract import (
     AuditKind,
     Role,
     ROLE_STATUSES,
+    # B7-R1: the two closed words a refused projection records, so the
+    # adapter does not have to re-derive why it refused.
+    SchemaField,
+    SchemaIssue,
     State,
 )
 
@@ -717,7 +721,102 @@ def claude_transport_schema(schema):
                            dropped=CLAUDE_TRANSPORT_DROPPED)
 
 
-CLAUDE_TRANSPORT_SCHEMA = claude_transport_schema(AUTHORITATIVE_RESULT_SCHEMA)
+# ---------------------------------------------------------------------
+# B7-R1 -- THE IMPLEMENTER'S `next_action` IS DERIVED, NOT DEMANDED
+# ---------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES, measured on run `kosu-cb554917f660c70c3016beac`.
+# `claude_transport_schema` drops `if`/`then`, so the authority's
+# conditional `const` rules do not survive into the copy the model
+# receives -- while `next_action` stayed REQUIRED there, carrying a
+# five-value enum. The model was obliged to choose a value whose rule it
+# had never been shown, and the authority then refused it with exactly
+# that rule: `schema_issue=const`, `schema_field=next_action`. The CLI
+# exited 0 and four allowed files had really been edited; only the
+# protocol envelope was wrong.
+#
+# The evaluator road already solved this in B4-R17. What is different
+# here is where the table comes from: the evaluator's is written out by
+# hand, and this one is DERIVED from the authority's own branches, so a
+# rule changed in the schema cannot leave a stale copy behind.
+
+DERIVED_IMPLEMENTER_FIELDS = ("next_action",)
+
+
+def derive_next_action_table(schema):
+    """`status -> next_action`, read out of the authority's own branches.
+
+    FAIL-CLOSED AT EVERY SEAM, because the alternative to refusing is
+    defaulting -- and a defaulted entry means some status silently starts
+    meaning `stop` without anybody choosing that. Refused: a status with
+    no branch, a status with two, a branch whose action is not a single
+    `const`, and a branch for a status the vocabulary does not contain.
+
+    Returns a plain dict; the caller freezes it."""
+    statuses = schema.get("properties", {}).get("status", {}).get("enum")
+    if not isinstance(statuses, list) or not statuses:
+        raise TransportSchemaError("semada kapali durum sozlugu yok")
+    table = {}
+    for rule in schema.get("allOf", ()):
+        condition = rule.get("if", {}).get("properties", {}).get("status", {})
+        status = condition.get("const")
+        if status is None:
+            # a conditional about something other than `status` is not
+            # this table's business and is left alone
+            continue
+        action = rule.get("then", {}).get("properties", {}).get(
+            "next_action", {})
+        if "const" not in action:
+            raise TransportSchemaError(
+                "durum dali tekil bir next_action const tasimiyor")
+        if status in table:
+            raise TransportSchemaError("durum icin birden fazla dal var")
+        table[status] = action["const"]
+    if set(table) != set(statuses):
+        # BOTH directions: a status with no rule, and a rule for a status
+        # the vocabulary does not know
+        raise TransportSchemaError(
+            "durum sozlugu ile dal kumesi tam ortusmuyor")
+    return table
+
+
+IMPLEMENTER_NEXT_ACTION = MappingProxyType(
+    derive_next_action_table(AUTHORITATIVE_RESULT_SCHEMA))
+
+
+def _without_fields(schema, names):
+    """A COPY of an authoritative schema with `names` gone.
+
+    A copy, and through JSON, so nothing here can reach the authority: it
+    is a module-level dictionary and one in-place edit would remove the
+    field from the acceptance gate for the rest of the process.
+
+    THE FIELD SET IS A PARAMETER, following the same rule the transport
+    policy already follows in this file: two roads derive different
+    fields, and a default would silently give one road the other's."""
+    document = json.loads(json.dumps(schema))
+    for name in names:
+        document.get("properties", {}).pop(name, None)
+        if name in document.get("required", ()):
+            document["required"] = [entry for entry in document["required"]
+                                    if entry != name]
+    return document
+
+
+def implementer_transport_schema(authoritative):
+    """The transport copy for the IMPLEMENTER road.
+
+    The provider subset, MINUS the fields the adapter derives. A separate
+    step rather than a change to `claude_transport_schema`: that helper
+    serves every caller and must keep meaning "the same document,
+    expressed in what the provider accepts". Dropping a property is a
+    different claim, and it belongs to the road that puts it back."""
+    return claude_transport_schema(
+        _without_fields(authoritative, DERIVED_IMPLEMENTER_FIELDS))
+
+
+CLAUDE_TRANSPORT_SCHEMA = implementer_transport_schema(
+    AUTHORITATIVE_RESULT_SCHEMA)
 
 # The SECOND binding, hash-pinned independently of the first. It is the
 # only schema that travels on an argv.
@@ -949,23 +1048,23 @@ class ProjectionError(ValueError):
 
     Raised for an unknown status and for a reply that supplied a
     derived field itself -- never for a value this package can fix by
-    guessing, because there is no such value."""
+    guessing, because there is no such value.
+
+    B7-R1 gave it the two CLOSED WORDS the journal records, so the
+    adapter does not have to re-derive why the projection refused. They
+    are optional: the evaluator road raises this without them and its
+    behaviour is unchanged."""
+
+    def __init__(self, message, *, schema_issue=None, schema_field=None):
+        super().__init__(message)
+        self.schema_issue = schema_issue
+        self.schema_field = schema_field
 
 
 def _without_derived(schema):
-    """A COPY of an authoritative schema with the derived fields gone.
-
-    A copy, and through JSON, so nothing here can reach the authority:
-    it is a module-level dictionary and one in-place edit would remove
-    `next_action` from the acceptance gate for the rest of the
-    process."""
-    document = json.loads(json.dumps(schema))
-    for name in DERIVED_EVALUATOR_FIELDS:
-        document.get("properties", {}).pop(name, None)
-        if name in document.get("required", ()):
-            document["required"] = [entry for entry in document["required"]
-                                    if entry != name]
-    return document
+    """A COPY of an authoritative schema with the EVALUATOR's derived
+    fields gone. One algorithm, spelled once in `_without_fields`."""
+    return _without_fields(schema, DERIVED_EVALUATOR_FIELDS)
 
 
 def evaluator_transport_schema(authoritative):
@@ -992,15 +1091,54 @@ def project_derived_fields(payload):
     overwritten: silently replacing it would hide a model that had been
     told not to send it, and the refusal is the only way anybody learns
     the instruction stopped working."""
+    return _project_action(payload, table=EVALUATOR_NEXT_ACTION,
+                           fields=DERIVED_EVALUATOR_FIELDS)
+
+
+def project_implementer_fields(payload):
+    """The same derivation, for the IMPLEMENTER road.
+
+    The table is the one derived from the implementer authority, so this
+    cannot pair a status with an action the acceptance gate would then
+    refuse. Everything else -- purity, the refusal to overwrite, the
+    closed words -- is shared with the evaluator road below."""
+    return _project_action(payload, table=IMPLEMENTER_NEXT_ACTION,
+                           fields=DERIVED_IMPLEMENTER_FIELDS)
+
+
+def _project_action(payload, *, table, fields):
+    """One algorithm, two roads. THE TABLE IS A PARAMETER for the same
+    reason the transport policy is: a default would quietly give one road
+    the other road's vocabulary.
+
+    PURE: the argument is not mutated and a new document is returned.
+    Nothing here decides whether a reply is acceptable -- it adds a
+    value, and the AUTHORITY judges the result afterwards."""
     if type(payload) is not dict:
-        raise ProjectionError("yanit bir JSON nesnesi degil")
-    for name in DERIVED_EVALUATOR_FIELDS:
+        raise ProjectionError(
+            "yanit bir JSON nesnesi degil",
+            schema_issue=SchemaIssue.WRONG_ROOT_TYPE,
+            schema_field=SchemaField.ROOT)
+    for name in fields:
         if name in payload:
-            raise ProjectionError("yanit turetilen bir alani kendisi yazdi")
-    status = payload.get("status")
-    if type(status) is not str or status not in EVALUATOR_NEXT_ACTION:
-        raise ProjectionError("durum kapali degerlendirici kumesinde degil")
-    return dict(payload, next_action=EVALUATOR_NEXT_ACTION[status])
+            raise ProjectionError(
+                "yanit turetilen bir alani kendisi yazdi",
+                schema_issue=SchemaIssue.ADDITIONAL_PROPERTIES,
+                schema_field=SchemaField.NEXT_ACTION)
+    if "status" not in payload:
+        raise ProjectionError("yanit durum tasimiyor",
+                              schema_issue=SchemaIssue.REQUIRED,
+                              schema_field=SchemaField.STATUS)
+    status = payload["status"]
+    if type(status) is not str:
+        raise ProjectionError("durum bir metin degil",
+                              schema_issue=SchemaIssue.TYPE,
+                              schema_field=SchemaField.STATUS)
+    if status not in table:
+        raise ProjectionError("durum kapali kumede degil",
+                              schema_issue=SchemaIssue.ENUM,
+                              schema_field=SchemaField.STATUS)
+    return dict(payload, next_action=table[status])
 
 
 def elide_optional_nulls(schema, payload):

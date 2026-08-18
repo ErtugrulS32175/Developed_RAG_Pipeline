@@ -1364,6 +1364,15 @@ def test_every_mutation_still_applies_to_the_current_source():
     # return-code gate -- which had guarded this transport since
     # B2B-A-D3A and was pinned by nothing here, because its battery was
     # not in `BATTERY` until this package added it).
+    # 139 -> 148 in B7-R1: the implementer's `next_action`, derived from
+    # `status` instead of demanded from the model. Six for the schema
+    # side (the table stays DERIVED rather than a hand-typed twin, a
+    # missing branch, a duplicate branch, the field leaving the
+    # transport, the refusal to overwrite a model-supplied value, and an
+    # unknown status not falling through to a default) and three for the
+    # adapter (the projection running before the authority, the protocol
+    # note reaching the child, and the empty-prompt gate judging the
+    # CALLER's half rather than the appended matrix).
     # 127 -> 139 in B6-R2: the one seam that archives a terminal run and
     # then deletes things. Twelve entries, each pinning one half of the
     # ordering that makes deleting safe -- the terminal gate, the caller's
@@ -1372,7 +1381,7 @@ def test_every_mutation_still_applies_to_the_current_source():
     # tracked-manifest refusal, archive containment, the pending-application
     # gate, the exact-name allowlist, the candidate's derived scope, and
     # the second measurement of every source after the copy loop.
-    assert len(tool.MUTATIONS) == 139
+    assert len(tool.MUTATIONS) == 148
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1410,6 +1419,11 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b6r2-izlenen-gorev-dosyasi', 'b6r2-arsiv-kapsama',
         'b6r2-bekleyen-uygulama', 'b6r2-kapali-ad-listesi',
         'b6r2-aday-kapsami', 'b6r2-kaynak-yeniden-olcum',
+        'b7r1-turetme-yerine-sabit-tablo', 'b7r1-eksik-dal-varsayilani',
+        'b7r1-cift-dal', 'b7r1-tasimada-kalan-alan',
+        'b7r1-sessiz-ustune-yazma', 'b7r1-bilinmeyen-durum-varsayilani',
+        'b7r1-projeksiyon-atlandi', 'b7r1-protokol-matrisi',
+        'b7r1-bos-istem-kapisi',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

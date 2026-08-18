@@ -101,8 +101,15 @@ if ARGV == ["login", "status"]:
     sys.stderr.write("Logged in using ChatGPT\\n")
     sys.exit(0)
 
+# The prompt the child ACTUALLY received, alongside the argv. Read here
+# rather than left in the pipe: the adapter writes it asynchronously and
+# a fake that never drains it would be measuring a different call than
+# the real CLI makes. Recorded as a KEY nobody had before, so every
+# existing reader of `argv` is unaffected.
+STDIN = sys.stdin.read()
+
 with open(__RECORD__, "a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"argv": ARGV}) + "\\n")
+    handle.write(json.dumps({"argv": ARGV, "stdin": STDIN}) + "\\n")
 
 
 def flag(name):
@@ -247,7 +254,9 @@ def _implementer_reply(**overrides) -> dict:
         "status": contract.Status.IMPLEMENTED,
         "summary": "kurgu degisiklik",
         "changed_files": ["pipeline/kurgu.py"],
-        "next_action": "await_acceptance",
+        # NO `next_action` (B7-R1): the transport no longer asks for it
+        # and the adapter derives it from `status`. A fake that still
+        # sent it would be refused -- which is pinned elsewhere.
     }
     base.update(overrides)
     return base
@@ -409,8 +418,10 @@ def test_the_base_workspace_task_is_valid(workspace):
     the wrong reason. Round-A3 made `tools/` illegal (it is an ancestor
     of the control plane) and this fixture was still using it."""
     Draft202012Validator(schemas.TASK_SCHEMA).validate(workspace["task"])
+    # PROJECTED first: the fixture is the document a model may SEND, and
+    # the authority judges what the adapter hands it (B7-R1)
     Draft202012Validator(schemas.IMPLEMENTER_RESULT_SCHEMA).validate(
-        _implementer_reply())
+        schemas.project_implementer_fields(_implementer_reply()))
     Draft202012Validator(schemas.CODE_AUDIT_RESULT_SCHEMA).validate(
         _code_audit_reply())
 
@@ -618,8 +629,14 @@ def test_the_implementer_fake_really_runs_with_schema_budget_and_tools(
     assert envelope["type"] == "result"
     assert envelope["subtype"] == "success"
     assert envelope["is_error"] is False
-    Draft202012Validator(schemas.AUTHORITATIVE_RESULT_SCHEMA).validate(
+    # What the fake EMITS satisfies the transport; what the adapter would
+    # hand the authority is that document plus the derived field (B7-R1).
+    # Both halves are asserted, so neither the transport nor the
+    # projection can quietly stop doing its job.
+    Draft202012Validator(schemas.CLAUDE_TRANSPORT_SCHEMA).validate(
         envelope["structured_output"])
+    Draft202012Validator(schemas.AUTHORITATIVE_RESULT_SCHEMA).validate(
+        schemas.project_implementer_fields(envelope["structured_output"]))
 
     recorded = [json.loads(line) for line in
                 workspace["record"].read_text(encoding="utf-8").splitlines()]
@@ -1352,7 +1369,11 @@ def test_an_evaluator_result_has_no_changed_files_field():
 def test_a_path_escaping_the_repo_is_rejected(path):
     """The backslash cases are the ones the first pattern let through:
     it rejected `../` and drive letters and never looked at `\\`."""
-    payload = _implementer_reply(changed_files=[path])
+    # PROJECTED first, so the only rule left to break is the path
+    # pattern -- otherwise the missing derived field would refuse this
+    # for a reason that has nothing to do with what the test is about
+    payload = schemas.project_implementer_fields(
+        _implementer_reply(changed_files=[path]))
     with pytest.raises(ValidationError):
         Draft202012Validator(schemas.IMPLEMENTER_RESULT_SCHEMA).validate(
             payload)
@@ -2064,13 +2085,18 @@ def test_the_transport_schema_keeps_every_closed_field_it_may_keep():
     # next_action pins inside the conditionals. What remains is
     # `protocol_version` and `role`.
     assert counts["const"] == 2
-    # every closed vocabulary survives -- none of them lived in a
-    # conditional
-    assert counts["enum"] == 6
+    # 6 -> 5 in B7-R1: `next_action` is DERIVED by the adapter now, so
+    # its enum leaves with the property. Every OTHER closed vocabulary
+    # survives -- none of them lived in a conditional.
+    assert counts["enum"] == 5
+    assert "next_action" not in transport["properties"]
     assert transport["additionalProperties"] is False
     assert transport["type"] == "object"
+    # every required field the transport MAY keep -- which is all of them
+    # except the ones the adapter derives (B7-R1)
     assert set(transport["required"]) == set(
-        schemas.AUTHORITATIVE_RESULT_SCHEMA["required"])
+        schemas.AUTHORITATIVE_RESULT_SCHEMA["required"]) - set(
+            schemas.DERIVED_IMPLEMENTER_FIELDS)
     assert transport["properties"]["role"] == {"const": "implementer"}
     assert transport["properties"]["status"]["enum"] == \
         schemas.AUTHORITATIVE_RESULT_SCHEMA["properties"]["status"]["enum"]
@@ -2080,14 +2106,17 @@ def test_a_transport_valid_reply_still_faces_the_authoritative_schema():
     """THE POINT OF THE SPLIT. `run_id` loses its pattern on the way to
     the API, so the API can no longer refuse a malformed one -- and the
     acceptance gate still does."""
+    # no `next_action`: the transport forbids it since B7-R1, and the
+    # adapter derives it -- so the document under test is the one a model
+    # may actually send
     reply = {"protocol_version": "1.0", "run_id": "BUYUK HARF VE BOSLUK",
              "role": "implementer", "status": "blocked",
-             "summary": "kurgu", "next_action": "stop",
-             "stop_reason": "interrupted"}
+             "summary": "kurgu", "stop_reason": "interrupted"}
     transport = Draft202012Validator(schemas.CLAUDE_TRANSPORT_SCHEMA)
     assert transport.is_valid(reply), "tasima semasi bunu zaten reddediyor"
     with pytest.raises(ValidationError):
-        schemas.IMPLEMENTER_SCHEMA_BINDING.validate(reply)
+        schemas.IMPLEMENTER_SCHEMA_BINDING.validate(
+            schemas.project_implementer_fields(reply))
 
 
 def test_the_transport_schema_cannot_relax_the_status_conditionals():
@@ -2096,10 +2125,13 @@ def test_the_transport_schema_cannot_relax_the_status_conditionals():
     authority."""
     reply = {"protocol_version": "1.0", "run_id": "kosu-abc",
              "role": "implementer", "status": "blocked",
-             "summary": "kurgu", "next_action": "stop"}
+             "summary": "kurgu"}
     assert Draft202012Validator(schemas.CLAUDE_TRANSPORT_SCHEMA).is_valid(reply)
+    # PROJECTED first, so the only thing left for the authority to refuse
+    # is the missing `stop_reason` -- which is what this test is about
     with pytest.raises(ValidationError):
-        schemas.IMPLEMENTER_SCHEMA_BINDING.validate(reply)
+        schemas.IMPLEMENTER_SCHEMA_BINDING.validate(
+            schemas.project_implementer_fields(reply))
 
 
 def test_the_two_bindings_are_independently_hash_pinned():
@@ -2119,10 +2151,15 @@ def test_the_two_bindings_are_independently_hash_pinned():
 def test_the_transport_derivation_is_deterministic():
     """Derived twice from the same source, byte-identical -- and the
     module-level binding is that same value."""
-    again = schemas.claude_transport_schema(
+    again = schemas.implementer_transport_schema(
         schemas.AUTHORITATIVE_RESULT_SCHEMA)
     assert schemas.canonical_json(again) == \
         schemas.IMPLEMENTER_TRANSPORT_BINDING.canonical_json
+    # the generic helper is still deterministic too, and still a
+    # DIFFERENT document -- the projection is a second, explicit step
+    assert schemas.canonical_json(
+        schemas.claude_transport_schema(schemas.AUTHORITATIVE_RESULT_SCHEMA)) \
+        != schemas.IMPLEMENTER_TRANSPORT_BINDING.canonical_json
 
 
 def test_the_derivation_refuses_a_keyword_nobody_classified():
@@ -2785,3 +2822,254 @@ def test_every_stderr_marker_is_exact_proven_and_wired(tmp_path):
     assert not reachable & unproven, \
         "kanitsiz bir kod uretilebilir hale geldi"
     assert unproven <= set(contract.FAILURE_CODES.values())
+
+
+# =====================================================================
+# B7-R1 -- THE IMPLEMENTER'S next_action IS DERIVED, NOT DEMANDED
+#
+# THE MEASURED DEFECT. `claude_transport_schema` drops `if`/`then`, so
+# the authority's conditional `const` rules vanish from the copy the
+# model receives -- while `next_action` stayed REQUIRED there with a
+# five-value enum. The model was obliged to pick a value it had never
+# been shown the rule for, and the authority then refused it with the
+# const it was never given. Run `kosu-cb554917f660c70c3016beac` died
+# exactly there: `schema_issue=const`, `schema_field=next_action`,
+# `exit_code=0`, and four allowed files really edited.
+#
+# The fix mirrors B4-R17 on the evaluator road: the field leaves the
+# transport, and the adapter derives it from `status` before the
+# AUTHORITY -- unchanged -- judges the result.
+# =====================================================================
+
+# MEASURED BEFORE THE B7-R1 EDIT and written down here, so "the
+# authority did not change" is a comparison against a number taken from
+# the tree as it stood -- not against whatever the code happens to
+# produce after the change.
+AUTHORITY_SHA256 = \
+    "4241b1100e9a03f706d4d7ede872fe1e7d0522f28a0c8596afc6aea814f0a86d"
+# The transport digest BEFORE the edit. It must MOVE, because the field
+# leaves the document the model receives.
+TRANSPORT_SHA256_BEFORE = \
+    "2dd889dbe20e89a8872e9e16d9866ad866b59c78e7535909f99710cc5f9079b8"
+
+
+def _property_names(node, seen=None):
+    """Every name that is a PROPERTY name rather than a schema keyword."""
+    seen = set() if seen is None else seen
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "properties" and isinstance(value, dict):
+                seen |= set(value)
+                for sub in value.values():
+                    _property_names(sub, seen)
+            else:
+                _property_names(value, seen)
+    elif isinstance(node, list):
+        for item in node:
+            _property_names(item, seen)
+    return seen
+
+
+def test_the_implementer_action_table_is_derived_from_the_authority():
+    """Not a second opinion and not a hand-written twin: every entry is
+    the `const` the authority states in that status's own branch.
+
+    The evaluator's table was written out by hand in B4-R17. This one is
+    DERIVED, so a rule changed in the schema cannot leave a stale copy
+    behind for the adapter to keep trusting."""
+    table = dict(schemas.IMPLEMENTER_NEXT_ACTION)
+    assert table == _branch_actions(schemas.IMPLEMENTER_RESULT_SCHEMA)
+    assert table == {"implemented": "await_acceptance",
+                     "blocked": "stop", "failed": "stop"}
+
+
+def test_the_implementer_action_table_covers_the_whole_status_vocabulary():
+    table = dict(schemas.IMPLEMENTER_NEXT_ACTION)
+    assert set(table) == set(
+        schemas.IMPLEMENTER_RESULT_SCHEMA["properties"]["status"]["enum"])
+    assert set(table) == set(
+        contract.ROLE_STATUSES[contract.Role.IMPLEMENTER])
+
+
+def test_the_implementer_action_table_cannot_be_widened_by_a_caller():
+    with pytest.raises(TypeError):
+        schemas.IMPLEMENTER_NEXT_ACTION["kurgu"] = "stop"
+    with pytest.raises(TypeError):
+        del schemas.IMPLEMENTER_NEXT_ACTION["implemented"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "not-const",
+                                    "unknown-status"])
+def test_a_schema_the_action_table_cannot_be_derived_from_is_refused(damage):
+    """The derivation is fail-closed at its own seam. A schema whose
+    branches do not cover the vocabulary exactly is one this package
+    cannot honestly build a table from -- and defaulting the missing
+    entry is how a status silently starts meaning `stop`."""
+    schema = json.loads(json.dumps(schemas.IMPLEMENTER_RESULT_SCHEMA))
+    if damage == "missing":
+        schema["allOf"] = [rule for rule in schema["allOf"]
+                           if rule["if"]["properties"]["status"]["const"]
+                           != "blocked"]
+    elif damage == "duplicate":
+        schema["allOf"].append(json.loads(json.dumps(schema["allOf"][0])))
+    elif damage == "not-const":
+        schema["allOf"][0]["then"]["properties"]["next_action"] = {
+            "enum": ["await_acceptance", "stop"]}
+    else:
+        schema["properties"]["status"]["enum"] = ["implemented", "blocked",
+                                                  "failed", "kurgu"]
+    with pytest.raises(schemas.TransportSchemaError):
+        schemas.derive_next_action_table(schema)
+
+
+def test_the_implementer_authority_keeps_every_rule_it_had():
+    """The acceptance gate is not loosened to make the transport easier.
+    If this digest moves, something changed the authority."""
+    authority = schemas.IMPLEMENTER_RESULT_SCHEMA
+    assert "next_action" in authority["properties"]
+    assert "next_action" in authority["required"]
+    assert authority["additionalProperties"] is False
+    assert _branch_actions(authority) == {"implemented": "await_acceptance",
+                                          "blocked": "stop", "failed": "stop"}
+    assert schemas.IMPLEMENTER_SCHEMA_BINDING.sha256 == AUTHORITY_SHA256
+
+
+def test_the_derived_field_is_absent_from_the_implementer_transport():
+    transport = schemas.CLAUDE_TRANSPORT_SCHEMA
+    assert "next_action" not in transport["properties"]
+    assert "next_action" not in transport.get("required", ())
+    # absence is a BAN rather than an omission only because the object
+    # is closed
+    assert transport["additionalProperties"] is False
+    assert schemas.IMPLEMENTER_TRANSPORT_BINDING.sha256 != \
+        schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
+    # and it really MOVED: the transport that carried the field is not
+    # the transport that now omits it
+    assert schemas.IMPLEMENTER_TRANSPORT_BINDING.sha256 != \
+        TRANSPORT_SHA256_BEFORE
+
+
+def test_the_implementer_transport_still_satisfies_its_provider_subset():
+    """Removing a property must not smuggle a refused keyword back in."""
+    counts = _keywords(schemas.CLAUDE_TRANSPORT_SCHEMA)
+    for banned in schemas.CLAUDE_TRANSPORT_DROPPED:
+        assert banned not in counts, f"tasima yasakli anahtar tasiyor: {banned}"
+    names = _property_names(schemas.CLAUDE_TRANSPORT_SCHEMA)
+    for key in counts:
+        assert key in schemas.CLAUDE_TRANSPORT_KEYWORDS or key in names, \
+            f"siniflandirilmamis anahtar: {key}"
+
+
+def test_a_model_supplied_next_action_is_refused_by_the_transport():
+    """The transport is closed, so the field the model was told not to
+    write cannot even be spelled without failing generation."""
+    reply = {"protocol_version": "1.0", "run_id": "kosu-kurgu",
+             "role": "implementer", "status": "implemented",
+             "summary": "kurgu", "next_action": "await_acceptance"}
+    assert not Draft202012Validator(
+        schemas.CLAUDE_TRANSPORT_SCHEMA).is_valid(reply)
+
+
+@pytest.mark.parametrize("status,action", [
+    ("implemented", "await_acceptance"),
+    ("blocked", "stop"),
+    ("failed", "stop"),
+])
+def test_every_implementer_status_projects_to_its_authoritative_action(
+        status, action):
+    payload = {"protocol_version": "1.0", "run_id": "kosu-kurgu",
+               "role": "implementer", "status": status, "summary": "kurgu"}
+    if status != "implemented":
+        payload["stop_reason"] = "preflight_failed"
+    original = json.loads(json.dumps(payload))
+    projected = schemas.project_implementer_fields(payload)
+    assert projected["next_action"] == action
+    # PURE: the caller's document is not touched
+    assert payload == original
+    assert "next_action" not in payload
+
+
+def test_the_implementer_projection_adds_only_the_derived_field():
+    payload = {"protocol_version": "1.0", "run_id": "kosu-kurgu",
+               "role": "implementer", "status": "implemented",
+               "summary": "kurgu"}
+    projected = schemas.project_implementer_fields(payload)
+    assert set(projected) - set(payload) == {"next_action"}
+    assert all(projected[name] == value for name, value in payload.items())
+
+
+@pytest.mark.parametrize("payload,issue,field", [
+    ({"role": "implementer"}, "required", "status"),
+    ({"role": "implementer", "status": 7}, "type", "status"),
+    ({"role": "implementer", "status": "kurgu"}, "enum", "status"),
+    ({"role": "implementer", "status": "implemented",
+      "next_action": "stop"}, "additional_properties", "next_action"),
+])
+def test_a_reply_the_implementer_projection_cannot_complete_is_refused(
+        payload, issue, field):
+    """Four refusals, four CLOSED reasons -- and a model-supplied field is
+    REFUSED rather than overwritten: silently replacing it would hide a
+    model that had stopped obeying the instruction, and the refusal is
+    the only way anybody learns that."""
+    with pytest.raises(schemas.ProjectionError) as ret:
+        schemas.project_implementer_fields(payload)
+    assert ret.value.schema_issue == issue
+    assert ret.value.schema_field == field
+    assert issue in contract.ALL_SCHEMA_ISSUES
+    assert field in contract.ALL_SCHEMA_FIELDS
+
+
+def test_the_b7_shape_fails_the_authority_but_passes_after_projection():
+    """THE REGRESSION, with the two controls that make it mean anything.
+
+    The document the model may now send -- a status and no next_action --
+    is refused by the authority on its own and accepted once the adapter
+    has derived the field. If the first assertion ever stops holding, the
+    projection has stopped being load-bearing and this test would pass
+    for free."""
+    sent = {"protocol_version": "1.0", "run_id": "kosu-kurgu",
+            "role": "implementer", "status": "implemented",
+            "summary": "kurgu"}
+    authority = Draft202012Validator(schemas.IMPLEMENTER_RESULT_SCHEMA)
+    assert not authority.is_valid(sent), "projeksiyon olmadan da geciyor"
+    assert Draft202012Validator(
+        schemas.CLAUDE_TRANSPORT_SCHEMA).is_valid(sent)
+    assert authority.is_valid(schemas.project_implementer_fields(sent))
+
+
+def test_a_wrong_next_action_cannot_be_smuggled_past_the_authority():
+    """The projection is not a way to make any reply acceptable. A reply
+    that writes the field itself is refused by the projection, and the
+    authority would have refused the value anyway on the const it has
+    always had."""
+    payload = {"protocol_version": "1.0", "run_id": "kosu-kurgu",
+               "role": "implementer", "status": "implemented",
+               "summary": "kurgu", "next_action": "stop"}
+    assert not Draft202012Validator(
+        schemas.IMPLEMENTER_RESULT_SCHEMA).is_valid(payload)
+    with pytest.raises(schemas.ProjectionError):
+        schemas.project_implementer_fields(payload)
+
+
+def test_the_projection_hides_no_other_authoritative_violation():
+    """Deriving one field must not make the rest of the document pass:
+    `blocked` still owes a `stop_reason`."""
+    payload = {"protocol_version": "1.0", "run_id": "kosu-kurgu",
+               "role": "implementer", "status": "blocked",
+               "summary": "kurgu"}
+    projected = schemas.project_implementer_fields(payload)
+    assert projected["next_action"] == "stop"
+    assert not Draft202012Validator(
+        schemas.IMPLEMENTER_RESULT_SCHEMA).is_valid(projected)
+
+
+def test_the_evaluator_road_is_unchanged_by_the_implementer_derivation():
+    """The two roads share helpers now, so the evaluator's behaviour is
+    asserted here rather than assumed."""
+    assert dict(schemas.EVALUATOR_NEXT_ACTION) == {
+        "approved": "stop", "changes_requested": "await_repair",
+        "blocked": "stop", "failed": "stop"}
+    assert schemas.DERIVED_EVALUATOR_FIELDS == ("next_action",)
+    assert "next_action" in schemas.CODE_AUDIT_RESULT_SCHEMA["properties"]
+    assert "next_action" not in \
+        schemas.CODE_AUDIT_TRANSPORT_SCHEMA["properties"]

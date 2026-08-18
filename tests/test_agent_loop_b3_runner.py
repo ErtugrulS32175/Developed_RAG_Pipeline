@@ -38,7 +38,7 @@ import test_agent_loop_b2_changes as legacy
 import test_agent_loop_contract as base
 from tools.agent_loop import (acceptance, application, audit, changes,
                               contract, execution, flat_workspace, runner,
-                              runner_events)
+                              runner_events, schemas)
 from tools.agent_loop import process as process_module
 
 REPO = Path(__file__).resolve().parent.parent
@@ -1463,3 +1463,53 @@ def test_the_two_roads_never_share_a_code(tmp_path, world, monkeypatch):
                        in contract.FAILURE_CODES.items() if module == "audit"}
     assert implementer_codes and evaluator_codes
     assert not implementer_codes & evaluator_codes
+
+
+# =====================================================================
+# B7-R1 -- BOTH IMPLEMENTER ROADS CARRY THE NEW TRANSPORT
+#
+# The initial implementation and the verified repair reach the model
+# through the SAME adapter (`changes.py` calls `execution.run_implementer`
+# on both), so one change covers both. That is a claim about wiring, and
+# a claim about wiring is worth an assertion rather than a reading.
+# =====================================================================
+
+def test_both_implementer_roads_send_the_projected_transport_schema(world):
+    """A repair round really happens here, so the argv of the SECOND
+    implementer call is evidence about the repair road rather than a
+    repetition of the first."""
+    evaluator(world, base._emits(base._code_audit_reply(
+        status=contract.Status.CHANGES_REQUESTED,
+        findings=[base._code_finding(mechanism_id="kurgu-mekanizma-a")],
+        next_action="await_repair")))
+    run(world)
+
+    argvs = implementer_calls(world)
+    assert len(argvs) >= 2, f"onarim yolu kosulmadi: {len(argvs)}"
+    for index, call in enumerate(argvs):
+        argv = call["argv"]
+        token = argv[argv.index("--json-schema") + 1]
+        sent = json.loads(token)
+        assert sent == schemas.CLAUDE_TRANSPORT_SCHEMA, \
+            f"{index}. cagri eski semayi tasidi"
+        # the field the adapter derives is not asked of the model on
+        # EITHER road
+        assert "next_action" not in sent["properties"]
+        assert "next_action" not in sent.get("required", ())
+
+
+def test_both_implementer_roads_carry_the_protocol_matrix(world):
+    """The instruction that replaces the removed field must reach the
+    child on the repair road too -- a repair that never heard it would
+    write the field and be refused."""
+    evaluator(world, base._emits(base._code_audit_reply(
+        status=contract.Status.CHANGES_REQUESTED,
+        findings=[base._code_finding(mechanism_id="kurgu-mekanizma-a")],
+        next_action="await_repair")))
+    run(world)
+
+    prompts = [call["stdin"] for call in implementer_calls(world)]
+    assert len(prompts) >= 2, "onarim yolu kosulmadi"
+    for index, prompt in enumerate(prompts):
+        for line in execution.PROTOCOL_MATRIX:
+            assert line in prompt, f"{index}. cagri protokol satirini tasimadi"

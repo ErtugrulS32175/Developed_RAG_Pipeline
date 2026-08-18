@@ -155,9 +155,16 @@ def _git(repo, *args):
 
 
 def _reply(**overrides):
+    """One implementer reply, in the protocol the TRANSPORT asks for.
+
+    NO `next_action` (B7-R1). The field left the transport schema because
+    its conditional `const` rules cannot survive the provider subset, and
+    the adapter derives it from `status` before the authority judges the
+    reply. A stub that still sent it would be speaking a protocol no
+    schema asks for -- and would be REFUSED, which is the point."""
     payload = {"protocol_version": contract.PROTOCOL_VERSION, "run_id": RUN,
                "role": "implementer", "status": "implemented",
-               "summary": "kurgu ozet", "next_action": "await_acceptance"}
+               "summary": "kurgu ozet"}
     payload.update(overrides)
     return payload
 
@@ -449,7 +456,7 @@ def test_a_reply_naming_another_run_is_refused(tmp_path, gate):
 def test_a_blocked_reply_that_edited_files_yields_no_verified_set(
         tmp_path, gate):
     binary = _stub(tmp_path, ops=[_write("pipeline/kurgu.py")],
-                   reply=_reply(status="blocked", next_action="stop",
+                   reply=_reply(status="blocked",
                                 stop_reason="interrupted",
                                 changed_files=["pipeline/kurgu.py"]))
     with pytest.raises(changes.DeclarationMismatch):

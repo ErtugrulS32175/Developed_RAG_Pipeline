@@ -350,6 +350,47 @@ def _canonical_limits(timeout_seconds, max_output_bytes):
     return timeout_seconds, max_output_bytes
 
 
+# B7-R1. Built FROM the derived table rather than typed out again: a
+# second hard-coded copy is exactly what goes stale when a rule changes,
+# and the model would then be told something the authority contradicts.
+# The statuses come FROM the derived table, so the matrix cannot go
+# stale about which ones exist. The ACTIONS are deliberately not named:
+# the model must not write the field at all, and printing the value it
+# would have written is an invitation to try. The evaluator road makes
+# the same choice.
+PROTOCOL_MATRIX = (
+    "SOZLESME (kapali):",
+    "  - next_action YAZMA; adapter onu status'tan turetir",
+    "  - status su kapali kumeden biri olmali: "
+    + ", ".join(sorted(schemas.IMPLEMENTER_NEXT_ACTION)),
+    "  - status=blocked veya failed -> stop_reason bos olamaz",
+)
+
+
+def _with_protocol(prompt):
+    """The caller's prompt plus the closed protocol matrix.
+
+    Appended rather than merged: the runner owns what the task IS, this
+    module owns what a valid ANSWER is, and the two must not be able to
+    contradict each other inside one shared string.
+
+    THE CALLER'S HALF IS JUDGED FIRST, and that ordering is load-bearing
+    rather than tidy: appending the matrix makes any prompt non-empty, so
+    an empty one would sail through the emptiness check below carrying
+    nothing but this module's own text -- an instruction the implementer
+    was never given, in a call somebody paid for."""
+    if type(prompt) is not str:
+        raise LimitRefused("istem bir metin degil")
+    if not prompt:
+        raise LimitRefused("istem bos")
+    # EMPTINESS IS CHECKED WITHOUT ENCODING, and that is not a shortcut:
+    # a prompt carrying a lone surrogate cannot be encoded at all, and
+    # encoding here to measure it would escape as `UnicodeEncodeError`
+    # instead of this module's typed refusal. `_prompt_bytes` owns the
+    # encoding question and already answers it with `LimitRefused`.
+    return "\n".join([prompt, *PROTOCOL_MATRIX])
+
+
 def _prompt_bytes(prompt):
     """Encoded and measured before launch.
 
@@ -782,6 +823,24 @@ def _parse_reply(raw, measurements, validator):
             schema_issue=contract.SchemaIssue.WRONG_ROOT_TYPE,
             schema_field=contract.SchemaField.ROOT, **measurements)
     payload = _envelope_payload(payload, measurements)
+    # THE DERIVATION, BEFORE THE AUTHORITY (B7-R1). The transport no
+    # longer asks the model for `next_action` -- the conditional `const`
+    # rules cannot survive the provider subset, so demanding the field
+    # meant demanding a value whose rule the model had never been shown.
+    # It is filled in here from `status`, out of the table derived from
+    # the authority itself, and the authority then judges the completed
+    # document exactly as before. This adds a VALUE, never a verdict.
+    try:
+        payload = schemas.project_implementer_fields(payload)
+    except schemas.ProjectionError as refused_projection:
+        # the closed words come from the projection, which is the one
+        # thing that knows why it refused; the reply's own values never
+        # travel into a refusal
+        raise SchemaViolation(
+            "yanit turetilebilir bir durum tasimiyor",
+            schema_issue=refused_projection.schema_issue,
+            schema_field=refused_projection.schema_field,
+            **measurements) from None
     refusal = None
     try:
         validator.validate(payload)
@@ -859,7 +918,10 @@ def _canonical_call(binary, *, repo, state_dir, run_id, workspace_id,
     try:
         return _CanonicalImplementerCall(
             binary=_usable_binary(binary),
-            prompt_bytes=_prompt_bytes(prompt),
+            # the matrix is appended HERE, so both roads that reach this
+            # constructor -- the initial implementation and the verified
+            # repair -- carry it without either having to remember
+            prompt_bytes=_prompt_bytes(_with_protocol(prompt)),
             budget_usd=canonical_budget,
             timeout_seconds=canonical_timeout,
             max_output_bytes=canonical_output,

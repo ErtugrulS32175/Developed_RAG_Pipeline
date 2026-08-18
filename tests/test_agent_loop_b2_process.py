@@ -66,10 +66,12 @@ def _envelope(**overrides):
     `claude --print --output-format json` never answers with a bare
     implementer payload, so a stub that printed one would be proving
     containment against a protocol no binary speaks."""
+    # NO `next_action` (B7-R1): the transport no longer asks for it and
+    # the adapter derives it from `status`.
     payload = {
         "protocol_version": "1.0", "run_id": "kurgu-run-1",
         "role": "implementer", "status": "implemented",
-        "summary": "kurgu", "next_action": "await_acceptance"}
+        "summary": "kurgu"}
     payload.update(overrides)
     return json.dumps({
         "type": "result", "subtype": "success", "is_error": False,

@@ -540,13 +540,14 @@ MUTATIONS = [
     # 2. A reply that wrote the field itself is REFUSED, never
     #    overwritten: a silent overwrite hides a model that stopped
     #    following the instruction, including one that got it wrong.
+    # RETARGETED in B7-R1, intent unchanged. The two roads now share one
+    # projection, so the guard moved into `_project_action` and the raise
+    # became multi-line; the pattern below is the CONDITION, which is
+    # specific enough to keep this entry about the evaluator road while
+    # `b7r1-sessiz-ustune-yazma` disables the loop for the implementer.
     ("b4r17-sessiz-ustune-yazma", "schemas",
-     "        if name in payload:" + NL
-     + '            raise ProjectionError("yanit turetilen bir alani '
-     'kendisi yazdi")',
-     "        if False:" + NL
-     + '            raise ProjectionError("yanit turetilen bir alani '
-     'kendisi yazdi")',
+     "        if name in payload:",
+     "        if False:",
      "test_a_reply_the_projection_cannot_complete_is_refused"),
     # 3. The derivation must actually RUN, and before the authority
     #    judges: without it every compliant reply is missing a required
@@ -1193,6 +1194,75 @@ MUTATIONS = [
     ("b6r2-kaynak-yeniden-olcum", "finalization",
      "        _verify_sources_unchanged(verify)", "        pass",
      "test_a_source_that_drifts_during_archiving_stops_everything"),
+    # ----------------------------------------------------------------
+    # B7-R1 -- the implementer's `next_action` is DERIVED, not demanded.
+    # MEASURED on run `kosu-cb554917f660c70c3016beac`: the transport
+    # drops `if`/`then`, so the authority's conditional `const` rules
+    # never reached the model -- while the field stayed REQUIRED there.
+    # The model had to guess, and the authority refused the guess.
+    # ----------------------------------------------------------------
+    # 1. The table stops being derived and becomes a hand-typed twin.
+    #    A twin is what goes stale when a rule changes, and then the
+    #    adapter pairs a status with an action the gate refuses.
+    ("b7r1-turetme-yerine-sabit-tablo", "schemas",
+     "IMPLEMENTER_NEXT_ACTION = MappingProxyType(" + NL
+     + "    derive_next_action_table(AUTHORITATIVE_RESULT_SCHEMA))",
+     "IMPLEMENTER_NEXT_ACTION = MappingProxyType(" + NL
+     + '    {"implemented": "stop", "blocked": "stop", "failed": "stop"})',
+     "test_the_implementer_action_table_is_derived_from_the_authority"),
+    # 2. A status with no branch silently gets an action anyway.
+    ("b7r1-eksik-dal-varsayilani", "schemas",
+     "    if set(table) != set(statuses):", "    if False:",
+     "test_a_schema_the_action_table_cannot_be_derived_from_is_refused"),
+    # 3. Two branches for one status stop being a contradiction.
+    ("b7r1-cift-dal", "schemas",
+     "        if status in table:" + NL
+     + '            raise TransportSchemaError("durum icin birden fazla '
+     'dal var")',
+     "        if False:" + NL
+     + '            raise TransportSchemaError("durum icin birden fazla '
+     'dal var")',
+     "test_a_schema_the_action_table_cannot_be_derived_from_is_refused"),
+    # 4. The field is left in the document the model receives -- which
+    #    is the defect B7 died of, reintroduced exactly.
+    ("b7r1-tasimada-kalan-alan", "schemas",
+     "    return claude_transport_schema(" + NL
+     + "        _without_fields(authoritative, DERIVED_IMPLEMENTER_FIELDS))",
+     "    return claude_transport_schema(authoritative)",
+     "test_the_derived_field_is_absent_from_the_implementer_transport"),
+    # 5. A model-supplied field is overwritten instead of refused, so a
+    #    model that stopped obeying the instruction is never noticed.
+    # The loop never runs, so a model-supplied field is OVERWRITTEN
+    # instead of refused. A different line from `b4r17-sessiz-ustune-
+    # yazma` on purpose: one mechanism, proven on each road by its own
+    # target test rather than by one entry standing in for both.
+    ("b7r1-sessiz-ustune-yazma", "schemas",
+     "    for name in fields:", "    for name in ():",
+     "test_a_reply_the_implementer_projection_cannot_complete_is_refused"),
+    # 6. An unknown status falls through to an action rather than being
+    #    refused -- the silent-default shape this project keeps finding.
+    ("b7r1-bilinmeyen-durum-varsayilani", "schemas",
+     "    if status not in table:", "    if False and status not in table:",
+     "test_a_reply_the_implementer_projection_cannot_complete_is_refused"),
+    # 7. The projection is skipped, so the authority judges a document
+    #    that is missing the field it requires.
+    ("b7r1-projeksiyon-atlandi", "execution",
+     "        payload = schemas.project_implementer_fields(payload)",
+     "        payload = dict(payload)",
+     "test_the_b7_shape_now_completes_through_the_adapter"),
+    # 8. The prompt stops carrying the closed protocol note, so the model
+    #    is never told the field is not its to write.
+    ("b7r1-protokol-matrisi", "execution",
+     '    return "' + BS + 'n".join([prompt, *PROTOCOL_MATRIX])',
+     "    return prompt",
+     "test_the_protocol_matrix_travels_with_every_implementer_call"),
+    # 9. The empty-prompt gate judges the matrix instead of the caller's
+    #    half, so an empty prompt becomes a paid call carrying only this
+    #    module's own text.
+    ("b7r1-bos-istem-kapisi", "execution",
+     "    if not prompt:" + NL + '        raise LimitRefused("istem bos")',
+     "    if False:" + NL + '        raise LimitRefused("istem bos")',
+     "test_the_protocol_matrix_never_rescues_an_unusable_caller_prompt"),
 ]
 
 

@@ -70,6 +70,10 @@ def main():
     elif mode == "consume":
         received = sys.stdin.buffer.read()
         Path(cfg["record"]).write_text(str(len(received)), encoding="ascii")
+        if cfg.get("prompt_record"):
+            # the TEXT the child actually read, for the one claim a byte
+            # count cannot make: that a specific instruction arrived
+            Path(cfg["prompt_record"]).write_bytes(received)
         sys.stdout.buffer.write(bytes.fromhex(cfg["hex"]))
         sys.stdout.buffer.flush()
     elif mode == "flood":
@@ -135,7 +139,10 @@ def _valid_reply(**overrides):
         "role": "implementer",
         "status": "implemented",
         "summary": "kurgu ozet",
-        "next_action": "await_acceptance",
+        # NO `next_action` (B7-R1): the field left the transport because
+        # its conditional `const` rules cannot survive the provider
+        # subset, and the adapter derives it from `status`. A stub still
+        # sending it is REFUSED -- pinned separately below.
         "changed_files": ["pipeline/kurgu.py"],
     }
     payload.update(overrides)
@@ -486,7 +493,11 @@ def test_a_valid_reply_comes_back_as_structured_data(tmp_path, bound):
     reply = _valid_reply()
     result = _run_with_stdout(tmp_path, bound,
                               _emit(_success_envelope(reply)))
-    assert result.reply == reply
+    # what comes back is the reply the model sent PLUS the field the
+    # adapter derived (B7-R1) -- compared through the same seam rather
+    # than restated, so the two cannot drift
+    assert result.reply == schemas.project_implementer_fields(reply)
+    assert result.reply["next_action"] == "await_acceptance"
     assert result.exit_code == 0
     assert result.event == contract.EventCode.MODEL_CALL_FINISHED
     assert isinstance(result.duration_ms, int)
@@ -511,13 +522,19 @@ def test_output_that_is_not_a_json_object_is_refused(tmp_path, bound, label,
     [("rol", _valid_reply(role="evaluator")),
      ("durum", _valid_reply(status="approved")),
      ("protokol", _valid_reply(protocol_version="0.9")),
+     # `summary` rather than `next_action` since B7-R1: the adapter now
+     # DERIVES next_action, so its absence is the ordinary case and no
+     # longer proves anything about a missing required field.
      ("eksik-alan", {k: v for k, v in _valid_reply().items()
-                     if k != "next_action"}),
+                     if k != "summary"}),
      ("fazla-alan", dict(_valid_reply(), gizli_alan="kurgu")),
      ("serbest-metin", dict(_valid_reply(), summary="x" * 2001)),
-     ("uydurma-eylem", _valid_reply(next_action="uydurma"))],
+     # a reply that writes the derived field itself is refused too --
+     # by the projection rather than by the schema, which is why the
+     # closed words are pinned separately below
+     ("turetilen-alani-yazdi", _valid_reply(next_action="await_acceptance"))],
     ids=["yanlis-rol", "yanlis-durum", "yanlis-protokol", "eksik-alan",
-         "fazla-alan", "asiri-uzun-ozet", "sozluk-disi-eylem"])
+         "fazla-alan", "asiri-uzun-ozet", "turetilen-alani-yazdi"])
 def test_a_reply_outside_the_frozen_schema_is_refused(tmp_path, bound, label,
                                                       reply):
     """The schema is the contract. Nothing here repairs, coerces or
@@ -1204,7 +1221,13 @@ def test_a_reply_is_judged_by_the_authority_not_by_the_argv_schema(
     argv = only_fake_binaries_may_run[0]
     extracted = json.loads(argv[argv.index("--json-schema") + 1])
     assert extracted == schemas.CLAUDE_TRANSPORT_SCHEMA
-    Draft202012Validator(extracted).validate(result.reply)
+    # WHAT THE MODEL SENT satisfies the transport; what comes BACK does
+    # not, because the adapter added the derived field the transport
+    # forbids (B7-R1). That asymmetry is the split, stated directly.
+    Draft202012Validator(extracted).validate(good)
+    assert not Draft202012Validator(extracted).is_valid(result.reply)
+    Draft202012Validator(schemas.IMPLEMENTER_RESULT_SCHEMA).validate(
+        result.reply)
 
     # accepted by what travelled, refused by what decides.
     #
@@ -1574,7 +1597,12 @@ def test_a_deceptive_prompt_never_reaches_stdin(
 def test_the_validated_prompt_bytes_are_what_the_child_receives(
         tmp_path, bound):
     """The accepted direction, asserted on the bytes the CHILD counted
-    rather than on the adapter's own bookkeeping."""
+    rather than on the adapter's own bookkeeping.
+
+    The VALIDATED bytes are the caller's prompt plus the closed protocol
+    matrix (B7-R1), and that is exactly what must arrive -- so the
+    expectation is computed through the same seam the adapter uses
+    rather than restated here."""
     kayit = tmp_path / "alinan.txt"
     istem = "K" * 5000
     binary = _fake_binary(
@@ -1584,7 +1612,9 @@ def test_the_validated_prompt_bytes_are_what_the_child_receives(
         binary, **bound.identity, prompt=istem, budget_usd=1.0,
         timeout_seconds=60, max_output_bytes=65536)
     assert result.reply["status"] == "implemented"
-    assert kayit.read_text(encoding="ascii") == str(len(istem.encode()))
+    beklenen = len(execution._with_protocol(istem).encode("utf-8"))
+    assert kayit.read_text(encoding="ascii") == str(beklenen)
+    assert beklenen > len(istem.encode()), "matris hic eklenmedi"
 
 
 @pytest.mark.parametrize(
@@ -1843,7 +1873,7 @@ def test_the_measured_success_envelope_is_accepted(tmp_path, bound):
     """POSITIVE CONTROL: the exact shape the real CLI returned."""
     reply = _valid_reply()
     result = _run_with_stdout(tmp_path, bound, _emit(_success_envelope(reply)))
-    assert result.reply == reply
+    assert result.reply == schemas.project_implementer_fields(reply)
     assert result.exit_code == 0
     assert result.event == contract.EventCode.MODEL_CALL_FINISHED
     assert result.schema_sha256 == schemas.IMPLEMENTER_SCHEMA_BINDING.sha256
@@ -1929,11 +1959,11 @@ def test_two_payloads_that_disagree_are_refused(tmp_path, bound):
 
     # agreement -- what the CLI actually emits -- is accepted
     result = _run_with_stdout(tmp_path, bound, _emit(_success_envelope(inner)))
-    assert result.reply == inner
+    assert result.reply == schemas.project_implementer_fields(inner)
     # and ordinary prose in `result` is not a competing payload at all
     result = _run_with_stdout(tmp_path, bound, _emit(_success_envelope(
         inner, result="Gorevi tamamladim.")))
-    assert result.reply == inner
+    assert result.reply == schemas.project_implementer_fields(inner)
 
 
 def test_no_envelope_prose_or_identifier_reaches_the_result_or_the_error(
@@ -1947,7 +1977,7 @@ def test_no_envelope_prose_or_identifier_reaches_the_result_or_the_error(
         inner, result=json.dumps(inner), session_id=marker,
         total_cost_usd=0.99, usage={"input_tokens": 1, "gizli": marker})
     result = _run_with_stdout(tmp_path, bound, _emit(envelope))
-    assert result.reply == inner
+    assert result.reply == schemas.project_implementer_fields(inner)
     assert marker not in repr(result)
     assert not hasattr(result, "session_id")
     assert not hasattr(result, "total_cost_usd")
@@ -2145,19 +2175,21 @@ def test_a_missing_required_field_is_named_from_the_schema(tmp_path, bound):
     """The missing name is computed from the AUTHORITY's own `required`
     list against the payload's keys -- never parsed out of the exception
     message, which embeds the value."""
+    # `summary` since B7-R1: `next_action` is DERIVED now, so removing it
+    # is what every healthy reply already does and would prove nothing.
     reply = _valid_reply()
-    reply.pop("next_action")
+    reply.pop("summary")
     failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
     assert failure.schema_issue == contract.SchemaIssue.REQUIRED
-    assert failure.schema_field == contract.SchemaField.NEXT_ACTION
+    assert failure.schema_field == contract.SchemaField.SUMMARY
 
 
 def test_several_missing_required_fields_report_multiple(tmp_path, bound):
     """Two absent fields is not one diagnosis. `multiple` says look at
     the reply as a whole rather than sending an operator to one field."""
     reply = _valid_reply()
-    reply.pop("next_action")
     reply.pop("summary")
+    reply.pop("run_id")
     failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
     assert failure.schema_issue == contract.SchemaIssue.REQUIRED
     assert failure.schema_field == contract.SchemaField.MULTIPLE
@@ -2165,12 +2197,15 @@ def test_several_missing_required_fields_report_multiple(tmp_path, bound):
 
 @pytest.mark.parametrize(
     "reply_overrides, field",
-    [({"next_action": "kurgu-eylem"}, "next_action"),
-     ({"status": "kurgu-durum"}, "status"),
+    # `next_action` is gone from this list since B7-R1: a reply carrying
+    # it never reaches the schema at all, because the PROJECTION refuses
+    # it first. That refusal names the same field and is pinned by its
+    # own test below, so the claim is kept rather than dropped.
+    [({"status": "kurgu-durum"}, "status"),
      ({"protocol_version": "0.9"}, "protocol_version"),
      ({"changed_files": "pipeline/kurgu.py"}, "changed_files"),
      ({"run_id": "GECERSIZ KIMLIK"}, "run_id")],
-    ids=["next-action", "status", "protocol", "changed-files", "run-id"])
+    ids=["status", "protocol", "changed-files", "run-id"])
 def test_a_broken_rule_names_the_declared_field_it_broke(
         tmp_path, bound, reply_overrides, field):
     """The field is read from the failure PATH, which is made of names
@@ -2277,3 +2312,110 @@ def test_the_classification_never_persists_the_envelope(tmp_path, bound):
     assert "error_max_budget_usd" not in blob, "vendor subtype disari sizdi"
     assert "0.94" not in blob and "total_cost_usd" not in blob
     assert str(tmp_path) not in blob
+
+
+# =====================================================================
+# B7-R1 -- THE ADAPTER DERIVES `next_action`
+#
+# Measured on run `kosu-cb554917f660c70c3016beac`: the CLI exited 0,
+# four allowed files were really edited, and the reply was refused with
+# `schema_issue=const`, `schema_field=next_action`. The transport had
+# demanded a field whose rule it could not carry -- `claude_transport_
+# schema` drops `if`/`then` -- so the model was asked to guess.
+# =====================================================================
+
+def test_the_b7_shape_now_completes_through_the_adapter(tmp_path, bound):
+    """THE regression, end to end through the real adapter.
+
+    A reply carrying `status` and NO `next_action` -- exactly what the
+    transport now asks for -- is accepted, and the derived action is the
+    one the authority's own branch states."""
+    reply = _valid_reply()
+    assert "next_action" not in reply, "fikstur hala alani yolluyor"
+    outcome = _run_with_stdout(tmp_path, bound,
+                               _emit(_success_envelope(reply)))
+    assert outcome.reply["status"] == "implemented"
+    assert outcome.reply["next_action"] == "await_acceptance"
+
+
+def test_a_reply_that_writes_the_derived_field_is_refused_with_closed_words(
+        tmp_path, bound):
+    """Refused rather than overwritten. Overwriting would hide a model
+    that had stopped obeying the instruction, and the two closed words
+    are what reaches the journal."""
+    reply = _valid_reply(next_action="await_acceptance")
+    failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert failure.schema_field == contract.SchemaField.NEXT_ACTION
+    assert failure.schema_issue == contract.SchemaIssue.ADDITIONAL_PROPERTIES
+
+
+@pytest.mark.parametrize("overrides,issue,field", [
+    ({"status": None}, contract.SchemaIssue.TYPE, contract.SchemaField.STATUS),
+    ({"status": "kurgu"}, contract.SchemaIssue.ENUM,
+     contract.SchemaField.STATUS),
+])
+def test_a_status_the_table_cannot_use_is_refused_with_closed_words(
+        tmp_path, bound, overrides, issue, field):
+    reply = _valid_reply(**overrides)
+    failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert failure.schema_issue == issue
+    assert failure.schema_field == field
+
+
+def test_a_missing_status_is_refused_before_the_authority(tmp_path, bound):
+    reply = {k: v for k, v in _valid_reply().items() if k != "status"}
+    failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert failure.schema_issue == contract.SchemaIssue.REQUIRED
+    assert failure.schema_field == contract.SchemaField.STATUS
+
+
+def test_the_projection_hides_no_other_authoritative_violation(tmp_path,
+                                                               bound):
+    """Deriving one field must not make the rest of the reply pass:
+    `blocked` still owes a `stop_reason`, and the AUTHORITY says so."""
+    reply = _valid_reply(status="blocked")
+    reply.pop("changed_files")
+    failure = _violation(tmp_path, bound, _emit(_success_envelope(reply)))
+    assert failure.schema_field in contract.ALL_SCHEMA_FIELDS
+    assert failure.schema_issue in contract.ALL_SCHEMA_ISSUES
+
+
+def test_the_protocol_matrix_travels_with_every_implementer_call(tmp_path,
+                                                                 bound):
+    """The instruction the child ACTUALLY receives, read back from what
+    the stub was handed -- not from the string this test built."""
+    okunan = tmp_path / "istem.txt"
+    binary = _fake_binary(
+        tmp_path, name="yutan-istem", mode="consume",
+        record=str(tmp_path / "uzunluk.txt"), prompt_record=str(okunan),
+        hex=_emit(_success_envelope()).hex())
+    execution.run_implementer(
+        binary, **bound.identity, prompt="KURGU GOREV METNI",
+        budget_usd=1.0, timeout_seconds=60, max_output_bytes=65536)
+
+    seen = okunan.read_text(encoding="utf-8")
+    assert "KURGU GOREV METNI" in seen, "cagiranin istemi kayboldu"
+    for line in execution.PROTOCOL_MATRIX:
+        assert line in seen, f"protokol satiri gitmedi: {line!r}"
+    # it tells the model NOT to write the derived field, and never names
+    # a value for it -- printing the value would invite the attempt
+    assert "next_action YAZMA" in seen
+    assert "next_action=" not in seen
+    # the closed status set comes from the DERIVED table, not a copy
+    for status in schemas.IMPLEMENTER_NEXT_ACTION:
+        assert status in seen
+
+
+@pytest.mark.parametrize("empty", ["", None, 7])
+def test_the_protocol_matrix_never_rescues_an_unusable_caller_prompt(
+        tmp_path, bound, empty):
+    """THE ORDERING that makes the matrix safe: appending it would make
+    any prompt non-empty, so the caller's half is judged FIRST. An empty
+    prompt must not become a paid call carrying only this module's own
+    text."""
+    binary = _fake_binary(tmp_path, name="hic-calismamali", mode="raw",
+                          hex=_emit(_success_envelope()).hex())
+    with pytest.raises(execution.LimitRefused):
+        execution.run_implementer(
+            binary, **bound.identity, prompt=empty, budget_usd=1.0,
+            timeout_seconds=60, max_output_bytes=65536)
