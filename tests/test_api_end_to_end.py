@@ -979,12 +979,18 @@ def _wire_inventory(monkeypatch, api, rows=INVENTORY):
 
     It returns the ``limit + 1`` window the real helper returns, so the
     endpoint's `has_more` is computed from the same evidence in the test
-    as in production."""
+    as in production -- and, like the real helper, it filters BEFORE it
+    pages, so offset and the sentinel walk the filtered sequence."""
     asked = []
 
-    def list_documents(_conn, limit, offset):
-        asked.append((limit, offset))
-        return [dict(row) for row in rows[offset:offset + limit + 1]]
+    def list_documents(_conn, limit, offset, status=None, file_type=None):
+        asked.append((limit, offset, status, file_type))
+        matched = [
+            dict(row) for row in rows
+            if (status is None or row["status"] == status)
+            and (file_type is None or row["file_type"] == file_type)
+        ]
+        return matched[offset:offset + limit + 1]
 
     monkeypatch.setattr(api.db, "list_documents", list_documents)
     return asked
@@ -1007,7 +1013,8 @@ def test_the_document_inventory_pages_with_a_limit_plus_one_probe(
     assert (body["limit"], body["offset"], body["has_more"]) == (2, 0, True)
     # the sentinel row is EVIDENCE, not content -- it is not published
     assert len(body["documents"]) == 2
-    assert asked == [(2, 0)]
+    # an unfiltered listing sends NO filter to the query seam
+    assert asked == [(2, 0, None, None)]
 
     last = client.get("/documents?limit=2&offset=2", headers=_headers(api))
 
@@ -1050,8 +1057,96 @@ def test_the_inventory_defaults_to_the_first_twenty(monkeypatch, tmp_path):
 
     body = client.get("/documents", headers=_headers(api)).json()
 
-    assert asked == [(20, 0)]
+    assert asked == [(20, 0, None, None)]
     assert (body["limit"], body["offset"], body["has_more"]) == (20, 0, False)
+
+
+# Variety on BOTH filter columns, so each filter provably discards rows
+# the other would keep. Values are invented, like everything else here --
+# neither column has a closed vocabulary in the schema.
+FILTERED_INVENTORY = [
+    _inventory_row("kurgu-dort", f"{999:04d}-04-04T00:00:00+00:00",
+                   status="done", file_type="pdf"),
+    _inventory_row("kurgu-uc", f"{999:04d}-03-03T00:00:00+00:00",
+                   status="partial", file_type="pdf"),
+    _inventory_row("kurgu-iki", f"{999:04d}-02-02T00:00:00+00:00",
+                   status="done", file_type="docx"),
+    _inventory_row("kurgu-bir", f"{999:04d}-01-01T00:00:00+00:00",
+                   status="done", file_type="pdf"),
+]
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_ids", "expected_ask"),
+    [
+        ("status=done",
+         ["kurgu-dort", "kurgu-iki", "kurgu-bir"],
+         (20, 0, "done", None)),
+        ("file_type=pdf",
+         ["kurgu-dort", "kurgu-uc", "kurgu-bir"],
+         (20, 0, None, "pdf")),
+        # both together are AND: pdf alone keeps kurgu-uc, done alone
+        # keeps kurgu-iki, and each is discarded by the OTHER filter
+        ("status=done&file_type=pdf",
+         ["kurgu-dort", "kurgu-bir"],
+         (20, 0, "done", "pdf")),
+        # no vocabulary anywhere: an unknown value is a valid filter that
+        # simply matches nothing, never an error
+        ("status=kurgu-bilinmeyen",
+         [],
+         (20, 0, "kurgu-bilinmeyen", None)),
+    ],
+)
+def test_the_inventory_filters_by_exact_equality(
+        monkeypatch, tmp_path, query, expected_ids, expected_ask):
+    """Each filter alone narrows the listing; together they AND. The
+    endpoint forwards the values to the query seam and invents nothing."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=FILTERED_INVENTORY)
+
+    response = client.get(f"/documents?{query}", headers=_headers(api))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [doc["document_id"] for doc in body["documents"]] == expected_ids
+    assert body["has_more"] is False
+    assert asked == [expected_ask]
+    for document in body["documents"]:
+        assert set(document) == {
+            "document_id", "filename", "file_type", "uploaded_at",
+            "status", "status_note", "active_generation"}
+
+
+def test_filters_are_applied_before_pagination(monkeypatch, tmp_path):
+    """`offset`, `limit` and `has_more` all walk the FILTERED sequence:
+    page one of status=done carries the sentinel's evidence that a done
+    row follows, and page two starts where the filtered page ended --
+    not two rows into the raw table."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=FILTERED_INVENTORY)
+
+    first = client.get("/documents?status=done&limit=2",
+                       headers=_headers(api))
+
+    assert first.status_code == 200
+    body = first.json()
+    assert [doc["document_id"] for doc in body["documents"]] == [
+        "kurgu-dort", "kurgu-iki"]
+    assert (body["limit"], body["offset"], body["has_more"]) == (2, 0, True)
+    # the limit+1 probe was asked WITH the filter, of the same scan
+    assert asked == [(2, 0, "done", None)]
+
+    last = client.get("/documents?status=done&limit=2&offset=2",
+                      headers=_headers(api))
+
+    assert last.status_code == 200
+    tail = last.json()
+    # offset 2 skips two FILTERED rows -- the partial kurgu-uc between
+    # them does not consume any of the offset
+    assert [doc["document_id"] for doc in tail["documents"]] == ["kurgu-bir"]
+    assert (tail["limit"], tail["offset"], tail["has_more"]) == (2, 2, False)
 
 
 @pytest.mark.parametrize(
@@ -1085,6 +1180,105 @@ def test_an_unsized_page_is_refused_before_the_database_is_touched(
     assert response.status_code == 422
     assert borrowed == []
     assert queried == []
+
+
+@pytest.mark.parametrize(
+    ("query", "offender"),
+    [
+        ("status=", "status"),                        # empty: below min_length
+        ("file_type=", "file_type"),
+        # two parameters supplied, one of them empty: the refusal still
+        # names only the offender, and the well-formed one buys nothing
+        ("status=done&file_type=", "file_type"),
+    ],
+)
+def test_a_malformed_filter_is_refused_before_the_database_is_touched(
+        monkeypatch, tmp_path, query, offender):
+    """EMPTY is the only malformed shape there is. A filter that is
+    present but empty cannot mean anything, so its shape lives in the
+    signature and FastAPI refuses it with 422 before the body -- and
+    therefore before any connection checkout or statement -- runs. The
+    refusal is pinned to the offending parameter, and a well-formed
+    filter through the identical wiring reaches the query seam, so the
+    422 provably comes from this parameter's declared bound and not
+    from some earlier gate.
+
+    LENGTH IS NOT A SHAPE HERE: both columns are unbounded `text`, so
+    there is no long-value case in this list -- see
+    test_a_long_filter_value_is_a_valid_filter."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    borrowed = []
+    queried = []
+
+    @contextmanager
+    def recording_conn():
+        borrowed.append(1)
+        yield object()
+
+    monkeypatch.setattr(api, "db_conn", recording_conn)
+    monkeypatch.setattr(
+        api.db, "list_documents",
+        lambda *a, **k: queried.append((a, k)) or [])
+
+    refused = client.get(f"/documents?{query}", headers=_headers(api))
+
+    assert refused.status_code == 422
+    # zero cost: no pooled connection was borrowed, no SQL was executed
+    assert borrowed == []
+    assert queried == []
+    # the refusal names the malformed QUERY parameter, nothing else
+    assert [tuple(err["loc"]) for err in refused.json()["detail"]] == [
+        ("query", offender)]
+
+    # control: a well-formed value passes the same gate and the body runs
+    allowed = client.get(
+        f"/documents?{offender}=kurgu-deger", headers=_headers(api))
+
+    assert allowed.status_code == 200
+    assert borrowed == [1]
+    assert len(queried) == 1
+    assert queried[0][1][offender] == "kurgu-deger"
+
+
+@pytest.mark.parametrize("parameter", ["status", "file_type"])
+def test_a_long_filter_value_is_a_valid_filter(monkeypatch, tmp_path,
+                                               parameter):
+    """A REGRESSION, not a bound: `documents.status` and `file_type` are
+    unbounded `text`, so a 128-character value is an ordinary value the
+    database can hold. It must reach the query seam intact -- character
+    for character, neither truncated nor rejected -- and travel from
+    there as a parameter, exactly like a short one.
+
+    The API layer once declared a 64-character cap of its own, which made
+    every longer-but-valid row unfilterable through this endpoint while
+    the db seam happily accepted it. This test is what would fail if that
+    cap came back."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    queried = []
+
+    monkeypatch.setattr(
+        api.db, "list_documents",
+        lambda *a, **k: queried.append((a, k)) or [])
+
+    long_value = "kurgu-" + "u" * 122
+    assert len(long_value) == 128
+
+    response = client.get(f"/documents?{parameter}={long_value}",
+                          headers=_headers(api))
+
+    assert response.status_code == 200
+    # it arrived intact: the same characters, the same length, no
+    # truncation at 64 or anywhere else
+    assert queried[0][1][parameter] == long_value
+    assert len(queried[0][1][parameter]) == 128
+    # and the other filter is still absent, as an unsupplied filter is
+    other = "file_type" if parameter == "status" else "status"
+    assert queried[0][1][other] is None
+    # the response shape is untouched by the length of a filter
+    assert set(response.json()) == {"documents", "limit", "offset",
+                                    "has_more"}
 
 
 def test_the_inventory_sits_behind_the_same_key_as_the_other_document_routes(

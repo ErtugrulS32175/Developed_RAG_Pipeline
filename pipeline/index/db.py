@@ -641,8 +641,21 @@ def get_document(conn, document_id: str) -> dict | None:
     return row
 
 
-def list_documents(conn, limit: int, offset: int) -> list[dict]:
+def list_documents(conn, limit: int, offset: int,
+                   status: str | None = None,
+                   file_type: str | None = None) -> list[dict]:
     """One page of the document inventory, newest first.
+
+    TWO OPTIONAL FILTERS, both exact equality, combined with AND when
+    both are given. Neither column has a closed vocabulary -- `status`
+    is free text with no CHECK constraint and `file_type` is whatever
+    suffix the upload carried -- so no value set is enforced here: an
+    unknown value simply matches nothing. A filter that was not supplied
+    appears NEITHER in the statement NOR in the params dict; the WHERE
+    clause is assembled only from this function's own static pieces, and
+    every supplied value travels as a parameter. Filters narrow the scan
+    BEFORE LIMIT/OFFSET, so the page, the offset and the `limit + 1`
+    sentinel all describe the filtered sequence.
 
     THE PROJECTION IS THE GATE. Only the columns an inventory may show are
     selected at all, so ``content_sha256`` and ``candidate_id`` -- the
@@ -671,14 +684,33 @@ def list_documents(conn, limit: int, offset: int) -> list[dict]:
         raise ValueError("limit 1 veya daha buyuk bir tamsayi olmali")
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise ValueError("offset 0 veya daha buyuk bir tamsayi olmali")
+    # The same courtesy for the filters: the API refuses a malformed one
+    # in its own signature, this refuses it for every OTHER caller --
+    # before any statement is built, so a refused call executes nothing.
+    for name, value in (("status", status), ("file_type", file_type)):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(name + " bos olmayan bir metin olmali")
+    # Only these static pieces are ever assembled into the statement; the
+    # VALUES never are -- each supplied filter adds its clause here and
+    # its value to the params dict, and an unsupplied one adds neither.
+    clauses = []
+    params = {"limit": limit + 1, "offset": offset}
+    if status is not None:
+        clauses.append("status = %(status)s")
+        params["status"] = status
+    if file_type is not None:
+        clauses.append("file_type = %(file_type)s")
+        params["file_type"] = file_type
+    where_sql = "WHERE " + " AND ".join(clauses) + " " if clauses else ""
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             "SELECT id, filename, file_type, uploaded_at, status, "
             "status_note, active_generation "
             "FROM documents "
+            + where_sql +
             "ORDER BY uploaded_at DESC, id DESC "
             "LIMIT %(limit)s OFFSET %(offset)s",
-            {"limit": limit + 1, "offset": offset})
+            params)
         rows = cur.fetchall()
     listed = []
     for row in rows:

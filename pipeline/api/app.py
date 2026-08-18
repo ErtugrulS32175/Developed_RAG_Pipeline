@@ -661,6 +661,18 @@ DOCUMENT_LIST_FIELDS = (
 DOCUMENT_PAGE_DEFAULT = 20
 DOCUMENT_PAGE_MAX = 100
 
+# The inventory filters are OPEN text by design: `documents.status` has no
+# CHECK constraint (the closed done/error/partial/superseded set belongs to
+# the ATTEMPTS table) and `file_type` is whatever suffix an upload carried.
+# BOTH COLUMNS ARE UNBOUNDED `text`, so a length cap declared here would be
+# a policy this layer invented: it would refuse a value the database itself
+# stores and would diverge from the db seam, which enforces no such cap.
+# The only shape asked for is therefore the one the filter needs to mean
+# anything -- present or absent, and non-empty when present -- refused with
+# 422 before a connection is ever borrowed. The value itself is a
+# parameterized exact-equality filter, and an unknown one simply matches
+# nothing.
+
 
 def _document_summary(row):
     """Project one listing row onto the published field set.
@@ -678,8 +690,15 @@ def _document_summary(row):
 def list_documents(
     limit: int = Query(DOCUMENT_PAGE_DEFAULT, ge=1, le=DOCUMENT_PAGE_MAX),
     offset: int = Query(0, ge=0),
+    status: str | None = Query(None, min_length=1),
+    file_type: str | None = Query(None, min_length=1),
 ):
     """One page of the document inventory, newest first.
+
+    `status` and `file_type` narrow the inventory by exact equality --
+    each may stand alone, together they AND -- and they narrow it BEFORE
+    pagination, so `offset`, the page and `has_more` all describe the
+    filtered sequence.
 
     `has_more` comes from the query itself: the database is asked for
     ``limit + 1`` rows and the extra one, if it exists, is the evidence
@@ -689,11 +708,12 @@ def list_documents(
 
     The bounds are declared on the parameters, which means FastAPI
     refuses a bad page with 422 BEFORE this body runs: `db_conn()` is
-    below the validation, so a limit of 0, 101 or a negative offset
-    costs no pooled connection and no scan.
+    below the validation, so a limit of 0, 101, a negative offset or a
+    malformed filter costs no pooled connection and no scan.
     """
     with db_conn() as conn:
-        rows = db.list_documents(conn, limit=limit, offset=offset)
+        rows = db.list_documents(conn, limit=limit, offset=offset,
+                                 status=status, file_type=file_type)
     return {
         "documents": [_document_summary(row) for row in rows[:limit]],
         "limit": limit,

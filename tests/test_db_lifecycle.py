@@ -277,6 +277,10 @@ def test_the_listing_query_is_parameterized_and_totally_ordered():
     # swap places between pages, showing one twice and never showing the
     # other. The id tie-break makes the sequence total.
     assert "ORDER BY uploaded_at DESC, id DESC" in sql
+    # no filter was supplied, so no filter appears ANYWHERE: not as a
+    # clause in the statement and not as a key in the params dict
+    assert "WHERE" not in sql
+    assert "status" not in params and "file_type" not in params
 
 
 def test_the_listing_query_asks_for_one_row_beyond_the_page():
@@ -330,3 +334,107 @@ def test_the_listing_refuses_a_page_it_cannot_size(limit, offset):
     with pytest.raises(ValueError):
         db.list_documents(conn, limit=limit, offset=offset)
     assert conn.cur.executed == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "clause", "key"),
+    [
+        ({"status": "kurgu-durum"}, "status = %(status)s", "status"),
+        ({"file_type": "kurgu-tur"}, "file_type = %(file_type)s",
+         "file_type"),
+    ],
+)
+def test_a_single_filter_travels_only_as_a_parameter(kwargs, clause, key):
+    """One filter alone: its static clause joins the statement, its VALUE
+    never does -- it reaches the database only through the params dict.
+    The other filter appears nowhere, in neither statement nor params."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, **kwargs)
+
+    sql, params = conn.cur.executed[0]
+    value = kwargs[key]
+    assert clause in sql
+    assert value not in sql
+    assert params == {"limit": 6, "offset": 0, key: value}
+    other = "file_type" if key == "status" else "status"
+    assert f"{other} = " not in sql and other not in params
+    # the filter narrows the scan BEFORE the page is cut from it, and the
+    # total order survives filtering
+    assert sql.index("WHERE") < sql.index("ORDER BY")
+    assert "ORDER BY uploaded_at DESC, id DESC" in sql
+    assert sql.index("ORDER BY") < sql.index("LIMIT")
+
+
+def test_both_filters_combine_with_and_fully_parameterized():
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0,
+                      status="kurgu-durum", file_type="kurgu-tur")
+
+    sql, params = conn.cur.executed[0]
+    assert "WHERE status = %(status)s AND file_type = %(file_type)s" in sql
+    assert params == {"limit": 6, "offset": 0,
+                      "status": "kurgu-durum", "file_type": "kurgu-tur"}
+    assert "kurgu-durum" not in sql and "kurgu-tur" not in sql
+    assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT")
+
+
+def test_a_quoting_hostile_filter_value_cannot_reach_the_statement_text():
+    """The scenario an interpolated fragment would fall to: a value
+    carrying quote syntax. It goes through exactly like any other value
+    -- into the params dict, never into the SQL -- so the statement the
+    server would prepare is the same closed text every call sends."""
+    from pipeline.index import db
+
+    hostile = "kurgu' OR uploaded_at > 'epoch"
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, status=hostile)
+
+    sql, params = conn.cur.executed[0]
+    assert hostile not in sql and "'" not in sql
+    assert params["status"] == hostile
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"status": ""}, {"file_type": ""}, {"status": 5},
+     {"file_type": b"pdf"}, {"status": True}],
+)
+def test_the_listing_refuses_a_filter_it_cannot_read(kwargs):
+    """The db seam mirrors the API's refusal for every OTHER caller: a
+    filter that is not a non-empty string raises before any statement is
+    built, so the refused call executes nothing at all."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    with pytest.raises(ValueError):
+        db.list_documents(conn, limit=5, offset=0, **kwargs)
+    assert conn.cur.executed == []
+
+
+@pytest.mark.parametrize("key", ["status", "file_type"])
+def test_a_long_filter_value_travels_as_a_parameter_like_any_other(key):
+    """LENGTH IS NOT A SHAPE. Both columns are unbounded `text` in the
+    schema, so a 128-character filter is an ordinary non-empty string:
+    the seam accepts it, the clause it joins is the same static one, and
+    the value goes to the database through the params dict without ever
+    entering the statement text. The seam has never capped a filter's
+    length, and this pins that -- the API layer's short-lived 64-character
+    cap was the divergence, not this."""
+    from pipeline.index import db
+
+    long_value = "kurgu-" + "u" * 122
+    assert len(long_value) == 128
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, **{key: long_value})
+
+    sql, params = conn.cur.executed[0]
+    assert f"{key} = %({key})s" in sql
+    assert long_value not in sql
+    # intact, not truncated at 64 or anywhere else
+    assert params == {"limit": 6, "offset": 0, key: long_value}
+    assert len(params[key]) == 128
