@@ -11,6 +11,7 @@ import json
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -974,21 +975,44 @@ INVENTORY = [
 ]
 
 
+class _InventoryCalls(list):
+    """The four page/equality arguments per call, positionally -- exactly
+    the record this fixture always kept -- with the two date bounds of the
+    same calls alongside in `.dates`.
+
+    The window was added WITHOUT moving what the older assertions read: a
+    test that pinned `[(20, 0, None, None)]` still pins it, because the
+    new pair went next to that record rather than into it."""
+
+    def __init__(self):
+        super().__init__()
+        self.dates = []
+
+
 def _wire_inventory(monkeypatch, api, rows=INVENTORY):
     """Replace the query with one that records how it was CALLED.
 
     It returns the ``limit + 1`` window the real helper returns, so the
     endpoint's `has_more` is computed from the same evidence in the test
     as in production -- and, like the real helper, it filters BEFORE it
-    pages, so offset and the sentinel walk the filtered sequence."""
-    asked = []
+    pages, so offset and the sentinel walk the filtered sequence.
 
-    def list_documents(_conn, limit, offset, status=None, file_type=None):
+    The date bounds are applied here the way the SQL applies them: both
+    EXCLUSIVE, so a row sitting exactly on a bound is filtered out."""
+    asked = _InventoryCalls()
+
+    def list_documents(_conn, limit, offset, status=None, file_type=None,
+                       uploaded_after=None, uploaded_before=None):
         asked.append((limit, offset, status, file_type))
+        asked.dates.append((uploaded_after, uploaded_before))
         matched = [
             dict(row) for row in rows
             if (status is None or row["status"] == status)
             and (file_type is None or row["file_type"] == file_type)
+            and (uploaded_after is None
+                 or row["uploaded_at"] > uploaded_after)
+            and (uploaded_before is None
+                 or row["uploaded_at"] < uploaded_before)
         ]
         return matched[offset:offset + limit + 1]
 
@@ -1147,6 +1171,356 @@ def test_filters_are_applied_before_pagination(monkeypatch, tmp_path):
     # them does not consume any of the offset
     assert [doc["document_id"] for doc in tail["documents"]] == ["kurgu-bir"]
     assert (tail["limit"], tail["offset"], tail["has_more"]) == (2, 2, False)
+
+
+# --- the upload window ---------------------------------------------------
+#
+# Four instants, one per row, a month apart. They are written as OBJECTS
+# because an object is what the endpoint must hand the query seam; the
+# query strings in the tests below are merely TEXTS that denote them, and
+# several different texts denote the same one.
+
+INSTANT_BIR = datetime(999, 1, 1, tzinfo=timezone.utc)
+INSTANT_IKI = datetime(999, 2, 2, tzinfo=timezone.utc)
+INSTANT_UC = datetime(999, 3, 3, tzinfo=timezone.utc)
+INSTANT_DORT = datetime(999, 4, 4, tzinfo=timezone.utc)
+
+DATED_INVENTORY = [
+    _inventory_row("kurgu-dort", INSTANT_DORT),
+    _inventory_row("kurgu-uc", INSTANT_UC, status="partial"),
+    _inventory_row("kurgu-iki", INSTANT_IKI, file_type="docx"),
+    _inventory_row("kurgu-bir", INSTANT_BIR),
+]
+
+
+def _recording_gates(monkeypatch, api):
+    """Wire the two probes that measure what a refusal COST.
+
+    A `db_conn` that records every borrow and a query seam that records
+    every call, so "refused before the database is touched" is a
+    measurement -- zero checkouts, zero statements -- and not an
+    inference from the status code.
+    """
+    borrowed = []
+    queried = []
+
+    @contextmanager
+    def recording_conn():
+        borrowed.append(1)
+        yield object()
+
+    monkeypatch.setattr(api, "db_conn", recording_conn)
+    monkeypatch.setattr(
+        api.db, "list_documents",
+        lambda *a, **k: queried.append((a, k)) or [])
+    return borrowed, queried
+
+
+@pytest.mark.parametrize(
+    ("params", "expected_ids", "expected_bounds"),
+    [
+        # after alone: STRICTLY greater, so kurgu-iki -- sitting exactly
+        # on the bound -- is outside the window it names
+        ({"uploaded_after": "0999-02-02T00:00:00Z"},
+         ["kurgu-dort", "kurgu-uc"], (INSTANT_IKI, None)),
+        # before alone: strictly less, so kurgu-uc is excluded the same way
+        ({"uploaded_before": "0999-03-03T00:00:00Z"},
+         ["kurgu-iki", "kurgu-bir"], (None, INSTANT_UC)),
+        # both together are AND, and both ends are open: the two rows
+        # ON the bounds go, the two strictly inside stay
+        ({"uploaded_after": "0999-01-01T00:00:00Z",
+          "uploaded_before": "0999-04-04T00:00:00Z"},
+         ["kurgu-uc", "kurgu-iki"], (INSTANT_BIR, INSTANT_DORT)),
+    ],
+)
+def test_the_inventory_window_on_uploaded_at_excludes_both_bounds(
+        monkeypatch, tmp_path, params, expected_ids, expected_bounds):
+    """Each bound may stand alone, together they AND, and neither is
+    inclusive -- a row whose `uploaded_at` IS the bound is not in the
+    window. That is what makes two adjoining windows a partition instead
+    of a pair that both claim the row on the seam."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=DATED_INVENTORY)
+
+    response = client.get("/documents", params=params, headers=_headers(api))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [doc["document_id"] for doc in body["documents"]] == expected_ids
+    assert body["has_more"] is False
+    # the other four arguments are untouched by a date filter
+    assert asked == [(20, 0, None, None)]
+    # the bounds reached the seam as the instants they denote, and an
+    # unsupplied one reached it as None
+    assert asked.dates == [expected_bounds]
+    for bound in asked.dates[0]:
+        assert bound is None or (isinstance(bound, datetime)
+                                 and bound.utcoffset() is not None)
+    # the window changes WHICH rows are listed, never what a row shows
+    assert set(response.json()) == {"documents", "limit", "offset",
+                                    "has_more"}
+    for document in body["documents"]:
+        assert set(document) == {
+            "document_id", "filename", "file_type", "uploaded_at",
+            "status", "status_note", "active_generation"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "0999-02-02T00:00:00Z",         # UTC written with a trailing Z
+        "0999-02-02T03:00:00+03:00",    # a positive offset
+        "0999-02-01T19:00:00-05:00",    # a negative offset, previous day
+    ],
+)
+def test_an_upload_bound_is_the_instant_it_denotes_not_the_text_typed(
+        monkeypatch, tmp_path, text):
+    """Three different texts, three different wall clocks, ONE instant.
+
+    The window they select is therefore identical, and the value that
+    reaches the query seam compares equal in all three cases -- the
+    comparison is by absolute instant, and the text is only how the
+    caller spelled it."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=DATED_INVENTORY)
+
+    response = client.get("/documents", params={"uploaded_after": text},
+                          headers=_headers(api))
+
+    assert response.status_code == 200
+    assert [doc["document_id"] for doc in response.json()["documents"]] == [
+        "kurgu-dort", "kurgu-uc"]
+    bound = asked.dates[0][0]
+    # not the text, and not a wall clock: the instant, whatever offset it
+    # was written with
+    assert isinstance(bound, datetime)
+    assert bound == INSTANT_IKI
+    assert bound.utcoffset() is not None
+
+
+@pytest.mark.parametrize(
+    ("params", "offender"),
+    [
+        # naive: no offset and no Z names a wall clock, not an instant
+        ({"uploaded_after": "0999-02-02T00:00:00"}, "uploaded_after"),
+        ({"uploaded_before": "0999-02-02T00:00:00"}, "uploaded_before"),
+        # date-only: the same gap, spelled shorter
+        ({"uploaded_after": "0999-02-02"}, "uploaded_after"),
+        # a well-formed filter next to it buys the naive one nothing
+        ({"status": "done", "uploaded_before": "0999-02-02T00:00:00"},
+         "uploaded_before"),
+    ],
+)
+def test_a_naive_upload_bound_is_refused_before_the_database_is_touched(
+        monkeypatch, tmp_path, params, offender):
+    """`uploaded_at` is `timestamptz`: comparing it against a value with
+    no offset means silently choosing a timezone for the caller. The
+    aware constraint is declared on the PARAMETER, so FastAPI refuses
+    before the body -- and therefore before any checkout or statement --
+    runs.
+
+    The refusal is pinned three ways: the parameter-declared SHAPE (a
+    list of loc/type objects, not the text `detail` an HTTPException
+    carries), the offending parameter, and the `timezone_aware` type
+    that names this specific gate rather than some earlier one."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    borrowed, queried = _recording_gates(monkeypatch, api)
+
+    refused = client.get("/documents", params=params, headers=_headers(api))
+
+    assert refused.status_code == 422
+    # zero cost: no pooled connection was borrowed, no SQL was executed
+    assert borrowed == []
+    assert queried == []
+    detail = refused.json()["detail"]
+    assert isinstance(detail, list)
+    assert [tuple(err["loc"]) for err in detail] == [("query", offender)]
+    assert [err["type"] for err in detail] == ["timezone_aware"]
+
+    # control: the same value WITH an offset passes the identical wiring
+    # and the body runs, so the 422 came from the aware constraint on
+    # this parameter and not from a gate in front of it
+    allowed = client.get("/documents",
+                         params={offender: "0999-02-02T00:00:00Z"},
+                         headers=_headers(api))
+
+    assert allowed.status_code == 200
+    assert borrowed == [1]
+    assert len(queried) == 1
+    assert queried[0][1][offender] == INSTANT_IKI
+
+
+@pytest.mark.parametrize("offender", ["uploaded_after", "uploaded_before"])
+def test_a_malformed_upload_bound_is_refused_before_the_database_is_touched(
+        monkeypatch, tmp_path, offender):
+    """Text that denotes no datetime at all fails at the same declared
+    gate, with the same parameter-declared shape and the same zero cost.
+    The error type is not `timezone_aware` here -- there was nothing to
+    check an offset on -- but it still comes from the datetime
+    declaration, which is what pins the source of this 422."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    borrowed, queried = _recording_gates(monkeypatch, api)
+
+    refused = client.get("/documents",
+                         params={offender: "kurgu-tarih-degil"},
+                         headers=_headers(api))
+
+    assert refused.status_code == 422
+    assert borrowed == []
+    assert queried == []
+    detail = refused.json()["detail"]
+    assert isinstance(detail, list)
+    assert [tuple(err["loc"]) for err in detail] == [("query", offender)]
+    assert detail[0]["type"].startswith("datetime")
+
+    # control: well-formed text through the identical wiring runs the body
+    allowed = client.get("/documents",
+                         params={offender: "0999-02-02T00:00:00Z"},
+                         headers=_headers(api))
+
+    assert allowed.status_code == 200
+    assert borrowed == [1]
+    assert len(queried) == 1
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        # equal, written identically
+        {"uploaded_after": "0999-02-02T00:00:00Z",
+         "uploaded_before": "0999-02-02T00:00:00Z"},
+        # equal as INSTANTS while the texts differ: 03:00+03:00 is the
+        # same moment as midnight Z, so the refusal cannot be a string
+        # comparison dressed up as a range check
+        {"uploaded_after": "0999-02-02T00:00:00Z",
+         "uploaded_before": "0999-02-02T03:00:00+03:00"},
+        # reversed
+        {"uploaded_after": "0999-03-03T00:00:00Z",
+         "uploaded_before": "0999-02-02T00:00:00Z"},
+    ],
+)
+def test_an_impossible_upload_window_is_refused_before_the_database_is_touched(
+        monkeypatch, tmp_path, params):
+    """`after < before` is a statement about BOTH values, so no parameter
+    declaration can carry it -- a declaration sees only its own value.
+    It is checked as the first thing in the body, above `db_conn()`, so
+    an empty or reversed window still costs zero checkouts and zero
+    statements.
+
+    THE SHAPE HERE IS THE OTHER ONE. This gate raises `HTTPException`,
+    whose 422 carries a TEXT detail, where the declared gate above
+    carries a list of loc/type objects. Each test pins the shape its own
+    gate produces; neither shape covers both."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    borrowed, queried = _recording_gates(monkeypatch, api)
+
+    refused = client.get("/documents", params=params, headers=_headers(api))
+
+    assert refused.status_code == 422
+    assert borrowed == []
+    assert queried == []
+    detail = refused.json()["detail"]
+    assert isinstance(detail, str)
+    assert "uploaded_after" in detail and "uploaded_before" in detail
+
+    # the gate reached is provably THIS one: each value on its own clears
+    # the declared constraint and runs the body, so what was refused is
+    # the pair, not either bound's own shape
+    for name, value in params.items():
+        alone = client.get("/documents", params={name: value},
+                           headers=_headers(api))
+        assert alone.status_code == 200
+
+    assert borrowed == [1, 1]
+    assert len(queried) == 2
+
+
+def test_the_upload_window_ands_with_the_status_and_file_type_filters(
+        monkeypatch, tmp_path):
+    """All four filters at once. Each provably discards something the
+    others would keep: the window drops kurgu-bir, `status=done` drops
+    the partial kurgu-uc, `file_type=pdf` drops the docx kurgu-iki."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=DATED_INVENTORY)
+
+    windowed = client.get(
+        "/documents",
+        params={"uploaded_after": "0999-01-01T00:00:00Z"},
+        headers=_headers(api))
+
+    # the window alone keeps three of the four rows
+    assert [doc["document_id"] for doc in windowed.json()["documents"]] == [
+        "kurgu-dort", "kurgu-uc", "kurgu-iki"]
+
+    response = client.get(
+        "/documents",
+        params={"uploaded_after": "0999-01-01T00:00:00Z",
+                "uploaded_before": "0999-05-05T00:00:00Z",
+                "status": "done", "file_type": "pdf"},
+        headers=_headers(api))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [doc["document_id"] for doc in body["documents"]] == ["kurgu-dort"]
+    assert asked[1] == (20, 0, "done", "pdf")
+    assert asked.dates[1] == (INSTANT_BIR, datetime(999, 5, 5,
+                                                    tzinfo=timezone.utc))
+
+
+def test_the_window_is_applied_before_pagination(monkeypatch, tmp_path):
+    """`limit + 1`, `offset` and `has_more` all walk the WINDOWED
+    sequence: page one carries the sentinel's evidence that a third
+    windowed row follows, and page two starts where the windowed page
+    ended -- not two rows into the raw table."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=DATED_INVENTORY)
+    window = {"uploaded_after": "0999-01-01T00:00:00Z"}
+
+    first = client.get("/documents", params={**window, "limit": 2},
+                       headers=_headers(api))
+
+    assert first.status_code == 200
+    body = first.json()
+    assert [doc["document_id"] for doc in body["documents"]] == [
+        "kurgu-dort", "kurgu-uc"]
+    assert (body["limit"], body["offset"], body["has_more"]) == (2, 0, True)
+    # the limit+1 probe was asked WITH the window, of the same scan
+    assert asked == [(2, 0, None, None)]
+    assert asked.dates == [(INSTANT_BIR, None)]
+
+    last = client.get("/documents",
+                      params={**window, "limit": 2, "offset": 2},
+                      headers=_headers(api))
+
+    assert last.status_code == 200
+    tail = last.json()
+    # offset 2 skips two WINDOWED rows; kurgu-bir, excluded by the bound,
+    # consumes none of the offset and never appears
+    assert [doc["document_id"] for doc in tail["documents"]] == ["kurgu-iki"]
+    assert (tail["limit"], tail["offset"], tail["has_more"]) == (2, 2, False)
+
+
+def test_an_inventory_without_a_window_sends_no_date_bound(
+        monkeypatch, tmp_path):
+    """The unfiltered listing is unchanged: neither bound is invented,
+    both reach the seam as None, and the page is the whole inventory."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=DATED_INVENTORY)
+
+    body = client.get("/documents", headers=_headers(api)).json()
+
+    assert [doc["document_id"] for doc in body["documents"]] == [
+        "kurgu-dort", "kurgu-uc", "kurgu-iki", "kurgu-bir"]
+    assert asked == [(20, 0, None, None)]
+    assert asked.dates == [(None, None)]
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@ commit/rollback behaviour belongs to psycopg_pool; what is ours is that every
 caller goes through it and holds nothing across requests.
 """
 from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone, tzinfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -438,3 +439,200 @@ def test_a_long_filter_value_travels_as_a_parameter_like_any_other(key):
     # intact, not truncated at 64 or anywhere else
     assert params == {"limit": 6, "offset": 0, key: long_value}
     assert len(params[key]) == 128
+
+
+# --- the upload window at the same seam ---------------------------------
+#
+# `documents.uploaded_at` is `timestamptz`, and psycopg adapts an aware
+# datetime to it natively. The two properties a date filter can quietly
+# get wrong are therefore: a timestamp RENDERED into the statement text
+# (where the server would re-parse it under its own timezone setting),
+# and a bound that is not an instant at all being compared as if it were.
+# Both are checked here, at the cursor seam, where the statement and its
+# parameters are still separable.
+
+UTC = timezone.utc
+INSTANT_ONCE = datetime(999, 1, 1, tzinfo=UTC)
+INSTANT_SONRA = datetime(999, 4, 4, tzinfo=UTC)
+
+
+class OffsetlessZone(tzinfo):
+    """A tzinfo that is ATTACHED and still names no offset.
+
+    Python calls such a value naive, and it is exactly as uncomparable as
+    one carrying no tzinfo at all -- which is why the seam asks
+    `utcoffset()` rather than `tzinfo is not None`. This class is what
+    would slip through the weaker check."""
+
+    def utcoffset(self, _dt):
+        return None
+
+    def dst(self, _dt):
+        return None
+
+    def tzname(self, _dt):
+        return "KURGU"
+
+
+@pytest.mark.parametrize(
+    ("key", "clause"),
+    [
+        ("uploaded_after", "uploaded_at > %(uploaded_after)s"),
+        ("uploaded_before", "uploaded_at < %(uploaded_before)s"),
+    ],
+)
+def test_a_single_date_bound_travels_only_as_a_parameter(key, clause):
+    """One bound alone: its static clause joins the statement -- with the
+    EXCLUSIVE operator -- and its value never does, in any rendering. It
+    reaches the database as the datetime OBJECT, through the params dict.
+    The other bound appears nowhere at all."""
+    from pipeline.index import db
+
+    # a non-UTC offset on purpose: what travels is the instant, not the
+    # spelling, and neither spelling may reach the statement text
+    bound = datetime(999, 2, 2, 3, 0, tzinfo=timezone(timedelta(hours=3)))
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, **{key: bound})
+
+    sql, params = conn.cur.executed[0]
+    assert clause in sql
+    for rendering in (str(bound), repr(bound), bound.isoformat(),
+                      str(bound.astimezone(UTC)),
+                      bound.astimezone(UTC).isoformat(), "999", "0999"):
+        assert rendering not in sql
+    # the OBJECT itself, not a copy of its text
+    assert params == {"limit": 6, "offset": 0, key: bound}
+    assert params[key] is bound
+    assert isinstance(params[key], datetime)
+    other = "uploaded_before" if key == "uploaded_after" else "uploaded_after"
+    assert other not in sql and other not in params
+    # the window narrows the scan BEFORE the page is cut from it, and the
+    # total order survives it
+    assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT")
+    assert "ORDER BY uploaded_at DESC, id DESC" in sql
+    # `limit + 1` is asked of the WINDOWED query
+    assert params["limit"] == 6
+
+
+def test_all_four_filters_combine_with_and_fully_parameterized():
+    """Every filter this seam has, at once: four static clauses ANDed in
+    the statement, four values in the params dict, none of them anywhere
+    in the SQL text."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0,
+                      status="kurgu-durum", file_type="kurgu-tur",
+                      uploaded_after=INSTANT_ONCE,
+                      uploaded_before=INSTANT_SONRA)
+
+    sql, params = conn.cur.executed[0]
+    assert ("WHERE status = %(status)s AND file_type = %(file_type)s "
+            "AND uploaded_at > %(uploaded_after)s "
+            "AND uploaded_at < %(uploaded_before)s " in sql)
+    assert params == {"limit": 6, "offset": 0,
+                      "status": "kurgu-durum", "file_type": "kurgu-tur",
+                      "uploaded_after": INSTANT_ONCE,
+                      "uploaded_before": INSTANT_SONRA}
+    assert "kurgu-durum" not in sql and "kurgu-tur" not in sql
+    for instant in (INSTANT_ONCE, INSTANT_SONRA):
+        assert str(instant) not in sql
+        assert instant.isoformat() not in sql
+    assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT")
+
+
+def test_an_unsupplied_date_bound_appears_in_neither_statement_nor_params():
+    """An absent bound adds no clause and no key -- checked next to a
+    filter that IS supplied, so the statement provably still assembles."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, status="kurgu-durum")
+
+    sql, params = conn.cur.executed[0]
+    assert "uploaded_at >" not in sql and "uploaded_at <" not in sql
+    assert "uploaded_after" not in sql and "uploaded_before" not in sql
+    assert params == {"limit": 6, "offset": 0, "status": "kurgu-durum"}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        # TEXT is refused, not parsed: turning a string into an instant
+        # needs a timezone policy, that policy belongs to the layer
+        # talking to the caller, and a second one here would be a second
+        # answer to the same question
+        {"uploaded_after": "0999-01-01T00:00:00Z"},
+        {"uploaded_before": "0999-01-01T00:00:00+00:00"},
+        # naive: nobody said which instant this is
+        {"uploaded_after": datetime(999, 1, 1)},
+        {"uploaded_before": datetime(999, 1, 1)},
+        # tzinfo attached, no offset answered -- naive by every rule that
+        # matters, and what `tzinfo is not None` would have admitted
+        {"uploaded_after": datetime(999, 1, 1, tzinfo=OffsetlessZone())},
+        {"uploaded_before": datetime(999, 1, 1, tzinfo=OffsetlessZone())},
+        # a date is not a datetime, and a number is not either
+        {"uploaded_after": date(999, 1, 1)},
+        {"uploaded_before": 0},
+    ],
+)
+def test_the_listing_refuses_a_date_bound_it_cannot_read(kwargs):
+    """The seam takes None or an AWARE datetime and nothing else. The
+    refusal happens before any statement is built, so the refused call
+    executes nothing at all."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    with pytest.raises(ValueError):
+        db.list_documents(conn, limit=5, offset=0, **kwargs)
+    assert conn.cur.executed == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        # equal: both bounds are exclusive, so this window can hold no row
+        {"uploaded_after": INSTANT_ONCE, "uploaded_before": INSTANT_ONCE},
+        # the same instant carried by a different offset -- equality here
+        # is between INSTANTS, so a differing spelling changes nothing
+        {"uploaded_after": INSTANT_ONCE,
+         "uploaded_before": INSTANT_ONCE.astimezone(
+             timezone(timedelta(hours=-5)))},
+        # reversed
+        {"uploaded_after": INSTANT_SONRA, "uploaded_before": INSTANT_ONCE},
+    ],
+)
+def test_the_listing_refuses_an_empty_or_reversed_window(kwargs):
+    """A window that can match nothing is a mistake to report, not an
+    empty page to hand back -- and it is reported before a statement is
+    built, so the refused call executes nothing."""
+    from pipeline.index import db
+
+    # the premise of each case, stated rather than assumed
+    assert kwargs["uploaded_after"] >= kwargs["uploaded_before"]
+
+    conn = RecordingConn([_listing_row()])
+    with pytest.raises(ValueError):
+        db.list_documents(conn, limit=5, offset=0, **kwargs)
+    assert conn.cur.executed == []
+
+
+def test_a_window_whose_bounds_are_spelled_differently_is_still_one_window():
+    """The positive half of the rule above: the same two instants written
+    with different offsets are accepted when they really do bound a
+    window, and each reaches the database as its own object."""
+    from pipeline.index import db
+
+    after = INSTANT_ONCE.astimezone(timezone(timedelta(hours=3)))
+    before = INSTANT_SONRA.astimezone(timezone(timedelta(hours=-5)))
+    assert after == INSTANT_ONCE and before == INSTANT_SONRA
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0,
+                      uploaded_after=after, uploaded_before=before)
+
+    sql, params = conn.cur.executed[0]
+    assert ("WHERE uploaded_at > %(uploaded_after)s "
+            "AND uploaded_at < %(uploaded_before)s " in sql)
+    assert params == {"limit": 6, "offset": 0,
+                      "uploaded_after": after, "uploaded_before": before}

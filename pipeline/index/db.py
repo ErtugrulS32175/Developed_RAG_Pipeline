@@ -1,6 +1,7 @@
 import os
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 import psycopg
@@ -643,19 +644,35 @@ def get_document(conn, document_id: str) -> dict | None:
 
 def list_documents(conn, limit: int, offset: int,
                    status: str | None = None,
-                   file_type: str | None = None) -> list[dict]:
+                   file_type: str | None = None,
+                   uploaded_after: datetime | None = None,
+                   uploaded_before: datetime | None = None) -> list[dict]:
     """One page of the document inventory, newest first.
 
-    TWO OPTIONAL FILTERS, both exact equality, combined with AND when
-    both are given. Neither column has a closed vocabulary -- `status`
-    is free text with no CHECK constraint and `file_type` is whatever
-    suffix the upload carried -- so no value set is enforced here: an
-    unknown value simply matches nothing. A filter that was not supplied
-    appears NEITHER in the statement NOR in the params dict; the WHERE
-    clause is assembled only from this function's own static pieces, and
-    every supplied value travels as a parameter. Filters narrow the scan
-    BEFORE LIMIT/OFFSET, so the page, the offset and the `limit + 1`
-    sentinel all describe the filtered sequence.
+    FOUR OPTIONAL FILTERS. `status` and `file_type` are exact equality;
+    neither column has a closed vocabulary -- `status` is free text with
+    no CHECK constraint and `file_type` is whatever suffix the upload
+    carried -- so no value set is enforced here: an unknown value simply
+    matches nothing. `uploaded_after` and `uploaded_before` bound
+    `uploaded_at`, both EXCLUSIVELY (`>` and `<`), so a row sitting
+    exactly on a bound falls outside the window and two adjoining
+    windows can never both claim it. Any subset may be given and they
+    combine with AND. A filter that was not supplied appears NEITHER in
+    the statement NOR in the params dict; the WHERE clause is assembled
+    only from this function's own static pieces, and every supplied
+    value travels as a parameter. Filters narrow the scan BEFORE
+    LIMIT/OFFSET, so the page, the offset and the `limit + 1` sentinel
+    all describe the filtered sequence.
+
+    THE DATE BOUNDS ARRIVE AS DATETIME OBJECTS, NOT TEXT. `uploaded_at`
+    is `timestamptz`, psycopg adapts an aware datetime to it natively,
+    and an instant is only an instant if it carries an offset -- so this
+    seam takes `None` or an AWARE datetime and nothing else. A string is
+    refused rather than parsed: turning text into an instant needs a
+    timezone policy, that policy belongs to the layer talking to the
+    caller, and a second one down here would be a second answer to the
+    same question. A naive datetime is refused for the same reason it
+    cannot be compared: nobody said which instant it is.
 
     THE PROJECTION IS THE GATE. Only the columns an inventory may show are
     selected at all, so ``content_sha256`` and ``candidate_id`` -- the
@@ -690,6 +707,28 @@ def list_documents(conn, limit: int, offset: int,
     for name, value in (("status", status), ("file_type", file_type)):
         if value is not None and (not isinstance(value, str) or not value):
             raise ValueError(name + " bos olmayan bir metin olmali")
+    # A bound that is not an aware datetime is not a bound. `utcoffset()`
+    # rather than `tzinfo is not None`: a tzinfo may be attached and still
+    # answer None for this instant, which leaves the value exactly as
+    # uncomparable as a naive one. Text is refused here rather than
+    # parsed -- see the docstring.
+    for name, value in (("uploaded_after", uploaded_after),
+                        ("uploaded_before", uploaded_before)):
+        if value is None:
+            continue
+        if not isinstance(value, datetime) or value.utcoffset() is None:
+            raise ValueError(
+                name + " zaman dilimi bilgisi tasiyan bir datetime olmali")
+    # An empty window (equal bounds, both exclusive) and a reversed one
+    # can match no row at all, so they are a mistake to report rather than
+    # an empty page to hand back. Comparing two AWARE datetimes compares
+    # the instants, so the same moment written with two different offsets
+    # is refused as equal -- as it should be, whatever the texts looked
+    # like.
+    if (uploaded_after is not None and uploaded_before is not None
+            and uploaded_after >= uploaded_before):
+        raise ValueError(
+            "uploaded_after, uploaded_before'dan kesin olarak once olmali")
     # Only these static pieces are ever assembled into the statement; the
     # VALUES never are -- each supplied filter adds its clause here and
     # its value to the params dict, and an unsupplied one adds neither.
@@ -701,6 +740,16 @@ def list_documents(conn, limit: int, offset: int,
     if file_type is not None:
         clauses.append("file_type = %(file_type)s")
         params["file_type"] = file_type
+    # The datetime OBJECT goes into params; psycopg adapts it to
+    # timestamptz itself. Rendering it to text here would hand the server
+    # a string to re-parse under ITS timezone setting -- the one thing the
+    # aware requirement above exists to avoid.
+    if uploaded_after is not None:
+        clauses.append("uploaded_at > %(uploaded_after)s")
+        params["uploaded_after"] = uploaded_after
+    if uploaded_before is not None:
+        clauses.append("uploaded_at < %(uploaded_before)s")
+        params["uploaded_before"] = uploaded_before
     where_sql = "WHERE " + " AND ".join(clauses) + " " if clauses else ""
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(

@@ -13,7 +13,7 @@ from fastapi import (
     Depends, FastAPI, Header, HTTPException, Query, Response, UploadFile, File,
 )
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel
 from dotenv import load_dotenv
 
 from pipeline.index import db
@@ -673,6 +673,27 @@ DOCUMENT_PAGE_MAX = 100
 # parameterized exact-equality filter, and an unknown one simply matches
 # nothing.
 
+# THE DATE WINDOW IS THE OPPOSITE CASE: `documents.uploaded_at` is
+# `timestamptz NOT NULL DEFAULT now()` -- the database writes it, this code
+# never does -- so an instant on that column is only comparable if the
+# caller says WHICH instant they mean. A value with no offset and no `Z`
+# does not; it is a wall-clock reading whose meaning depends on a timezone
+# nobody sent. `AwareDatetime` is therefore declared on the parameters, in
+# the same style as the page bounds above, and it refuses a naive value, a
+# date-only value and malformed text with 422 before the body runs. A bare
+# `datetime` annotation would NOT: it accepts a naive value and hands the
+# body a `tzinfo` of None, which is how a wall-clock reading ends up being
+# compared against absolute instants.
+#
+# ONE RULE CANNOT LIVE IN A PARAMETER DECLARATION: `after < before` is a
+# statement about BOTH values, and a declaration only ever sees its own. It
+# is checked as the first thing in the body -- above `db_conn()` -- so an
+# empty or reversed window still costs no pooled connection and no scan.
+# That refusal is an `HTTPException(422)` and therefore carries a text
+# `detail`, where a parameter-declared refusal carries a list of
+# `loc`/`type` error objects. The two 422 shapes differ on purpose: they
+# come from different gates.
+
 
 def _document_summary(row):
     """Project one listing row onto the published field set.
@@ -692,6 +713,8 @@ def list_documents(
     offset: int = Query(0, ge=0),
     status: str | None = Query(None, min_length=1),
     file_type: str | None = Query(None, min_length=1),
+    uploaded_after: AwareDatetime | None = Query(None),
+    uploaded_before: AwareDatetime | None = Query(None),
 ):
     """One page of the document inventory, newest first.
 
@@ -699,6 +722,18 @@ def list_documents(
     each may stand alone, together they AND -- and they narrow it BEFORE
     pagination, so `offset`, the page and `has_more` all describe the
     filtered sequence.
+
+    `uploaded_after` and `uploaded_before` narrow the same sequence to a
+    window on `uploaded_at`. Both bounds are EXCLUSIVE: a row sitting
+    exactly on a bound is outside the window, so the two halves of a
+    split never both claim it. Each may stand alone, together they AND,
+    and they AND with `status` and `file_type` as well -- all four are
+    applied before pagination like the two above.
+
+    Each bound must carry an offset (`Z`, `+03:00`, `-05:00` are all
+    fine), and two spellings of the same absolute instant are the same
+    bound: the comparison here and in the database is between instants,
+    never between the texts that were typed.
 
     `has_more` comes from the query itself: the database is asked for
     ``limit + 1`` rows and the extra one, if it exists, is the evidence
@@ -708,12 +743,25 @@ def list_documents(
 
     The bounds are declared on the parameters, which means FastAPI
     refuses a bad page with 422 BEFORE this body runs: `db_conn()` is
-    below the validation, so a limit of 0, 101, a negative offset or a
-    malformed filter costs no pooled connection and no scan.
+    below the validation, so a limit of 0, 101, a negative offset, a
+    malformed filter or a naive timestamp costs no pooled connection and
+    no scan.
     """
+    # The one rule no declaration can carry, checked where it still costs
+    # nothing: an empty window (the bounds are exclusive, so equal bounds
+    # can never match a row) and a reversed one are refused above the
+    # checkout, not answered with an empty page the caller has to explain.
+    if (uploaded_after is not None and uploaded_before is not None
+            and uploaded_after >= uploaded_before):
+        raise HTTPException(
+            status_code=422,
+            detail="uploaded_after, uploaded_before'dan kesin olarak once "
+                   "olmali")
     with db_conn() as conn:
         rows = db.list_documents(conn, limit=limit, offset=offset,
-                                 status=status, file_type=file_type)
+                                 status=status, file_type=file_type,
+                                 uploaded_after=uploaded_after,
+                                 uploaded_before=uploaded_before)
     return {
         "documents": [_document_summary(row) for row in rows[:limit]],
         "limit": limit,
