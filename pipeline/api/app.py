@@ -715,6 +715,7 @@ def list_documents(
     file_type: str | None = Query(None, min_length=1),
     uploaded_after: AwareDatetime | None = Query(None),
     uploaded_before: AwareDatetime | None = Query(None),
+    q: str | None = Query(None, min_length=1),
 ):
     """One page of the document inventory, newest first.
 
@@ -734,6 +735,27 @@ def list_documents(
     fine), and two spellings of the same absolute instant are the same
     bound: the comparison here and in the database is between instants,
     never between the texts that were typed.
+
+    `q` searches ONE column -- `filename` -- case-insensitively, for a
+    LITERAL substring. It ANDs with the four filters above and is
+    applied before pagination just as they are, so `offset`, the page
+    and `has_more` describe the searched sequence. Literal means what it
+    says: `%` and `_` are LIKE's metacharacters, not the caller's
+    wildcards, so a search for `%` finds the names that really carry one
+    rather than every document. The escaping that makes that true lives
+    at the query seam, next to the clause that names the escape
+    character; this layer forwards the value and invents nothing.
+
+    ONLY THE SHAPE IS DECLARED HERE, and only the one shape the search
+    needs to mean anything -- present and non-empty, or absent -- which
+    FastAPI refuses with 422 before this body, and therefore before any
+    checkout or statement, runs. No length cap: `filename` is unbounded
+    `text`, so a limit declared here would refuse a name the database
+    stores. And `_safe_upload_filename` is NOT reused as a validator: it
+    is an UPLOAD gate, and it rejects slashes, colons, control
+    characters and trailing spaces -- all of them legitimate things to
+    search FOR, so reusing it would narrow the search silently instead
+    of protecting anything.
 
     `has_more` comes from the query itself: the database is asked for
     ``limit + 1`` rows and the extra one, if it exists, is the evidence
@@ -761,7 +783,8 @@ def list_documents(
         rows = db.list_documents(conn, limit=limit, offset=offset,
                                  status=status, file_type=file_type,
                                  uploaded_after=uploaded_after,
-                                 uploaded_before=uploaded_before)
+                                 uploaded_before=uploaded_before,
+                                 q=q)
     return {
         "documents": [_document_summary(row) for row in rows[:limit]],
         "limit": limit,

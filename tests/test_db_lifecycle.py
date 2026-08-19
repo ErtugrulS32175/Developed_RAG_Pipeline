@@ -636,3 +636,433 @@ def test_a_window_whose_bounds_are_spelled_differently_is_still_one_window():
             "AND uploaded_at < %(uploaded_before)s " in sql)
     assert params == {"limit": 6, "offset": 0,
                       "uploaded_after": after, "uploaded_before": before}
+
+
+# --- the filename search at the same seam --------------------------------
+#
+# MEASURED: no live PostgreSQL is reachable in this loop -- the local
+# Docker daemon is down and CI declares no database service -- so the real
+# server's `ILIKE ... ESCAPE` semantics execute NOWHERE here. Asserting on
+# the statement text alone would therefore prove only that some string was
+# assembled, never that the pattern MEANS what it must.
+#
+# `_ilike` is the missing half. It is an INDEPENDENT model of the SUBSET
+# of the operator these fixtures exercise, written from the operator's
+# rules and knowing nothing about the transform under test: the escape
+# character consumes the next character literally, `%` is any run of
+# characters, `_` is exactly one, the match is anchored, and ASCII letters
+# compare case-insensitively. Feeding it the pattern the PRODUCTION seam
+# actually built is a real round-trip -- the transform is proven THROUGH a
+# LIKE interpreter, not against a hard-coded string.
+#
+# WHAT IT DOES NOT PROVE, and must not be read as proving: it is not
+# PostgreSQL. Case folding here is Python's, under the process's own
+# rules; the server's is decided by the column's collation, which this
+# model neither knows nor consults. So the metacharacter, escape and
+# anchoring behaviour it pins is trustworthy for the ASCII fixtures in
+# this battery, and any claim about real collation or full Unicode case
+# folding is NOT established here and waits on a live server.
+
+
+def _ilike(value, pattern, escape="!"):
+    """`value ILIKE pattern ESCAPE escape`, over the ASCII subset.
+
+    Models the pattern language -- escape, `%`, `_`, anchoring -- plus
+    ASCII case-insensitivity. It is NOT a PostgreSQL implementation: the
+    server folds case by the column's collation, this folds it by
+    Python's rules. See the note above the definition."""
+    import re
+
+    parts = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == escape:
+            index += 1
+            if index >= len(pattern):
+                # the server's own error: a pattern may not end on a lone
+                # escape character
+                raise ValueError("LIKE deseni kacis karakteriyle bitemez")
+            parts.append(re.escape(pattern[index]))
+        elif char == "%":
+            parts.append("(?s:.)*")
+        elif char == "_":
+            parts.append("(?s:.)")
+        else:
+            parts.append(re.escape(char))
+        index += 1
+    return re.fullmatch("".join(parts), value, re.IGNORECASE) is not None
+
+
+def _pattern_sent(q):
+    """The pattern the PRODUCTION seam puts in the params dict for `q`.
+
+    Everything below reads the pattern from a real call rather than
+    rebuilding it, so the substring wrapping is part of what is proven
+    and not part of the test's own assumptions."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, q=q)
+    return conn.cur.executed[0][1]["filename_search"]
+
+
+def _escape_last(value):
+    """The order this contract REFUSES: `%` and `_` first, the escape
+    character last -- which re-escapes the escape characters the earlier
+    steps just inserted."""
+    return value.replace("%", "!%").replace("_", "!_").replace("!", "!!")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("kurgu", "kurgu"),                 # nothing to escape
+        ("%", "!%"),
+        ("_", "!_"),
+        ("!", "!!"),                        # the escape character itself
+        ("!%_", "!!!%!_"),
+        ("kurgu%100_rapor!", "kurgu!%100!_rapor!!"),
+    ],
+)
+def test_the_search_escape_helper_is_pure_and_returns_a_new_value(
+        value, expected):
+    """One helper, no side effects: it reads its argument, returns a new
+    value, and leaves the argument exactly as it was. Being directly
+    callable is the point -- the transform is the part that can be got
+    subtly wrong, so it is testable without a statement, a cursor or a
+    connection anywhere near it."""
+    from pipeline.index import db
+
+    before = "".join(value)
+    result = db.escape_like_pattern(value)
+
+    assert result == expected
+    assert value == before                  # the input was not mutated
+    if expected != value:
+        assert result is not value          # a NEW value came back
+
+
+def test_a_single_exclamation_becomes_a_doubled_one():
+    """The escape character is not exempt from escaping: a caller looking
+    for `!` in a name means the character, and an unescaped one in the
+    pattern would instead swallow whatever follows it."""
+    from pipeline.index import db
+
+    assert db.escape_like_pattern("!") == "!!"
+    assert db.escape_like_pattern("kurgu!") == "kurgu!!"
+
+
+def test_escaping_the_escape_character_last_would_break_a_literal_search():
+    """THE ORDER TEST. Exclamation, then percent, then underscore -- and
+    this fails if that changes.
+
+    MEASURED: doing the escape character LAST double-escapes what the
+    earlier steps inserted. `%` becomes `!%` and then `!!%`, which the
+    server reads as a literal `!` followed by the WILDCARD -- so the
+    search silently matches on `!` instead of `%`, or finds nothing at
+    all. Both orders are run through the interpreter here, so the
+    difference is a demonstrated match/no-match rather than two strings
+    that merely differ."""
+    from pipeline.index import db
+
+    assert db.escape_like_pattern("%") == "!%"
+    assert _escape_last("%") == "!!%"
+    assert db.escape_like_pattern("%") != _escape_last("%")
+
+    carries_percent = "kurgu-%100-rapor.pdf"
+    carries_bang = "kurgu-!100-rapor.pdf"
+
+    right = _pattern_sent("%")
+    assert right == "%!%%"
+    assert _ilike(carries_percent, right)
+    assert not _ilike(carries_bang, right)
+
+    # the refused order, through the same interpreter: it stops matching
+    # the percent it was asked about and starts matching an exclamation
+    # nobody searched for
+    wrong = "%" + _escape_last("%") + "%"
+    assert not _ilike(carries_percent, wrong)
+    assert _ilike(carries_bang, wrong)
+
+
+NAMES = [
+    "kurgu-rapor.pdf",          # none of the three characters
+    "kurgu-%100-rapor.pdf",     # a real percent
+    "kurgu_100_rapor.pdf",      # a real underscore
+    "kurgu-!100-rapor.pdf",     # a real exclamation
+]
+
+
+@pytest.mark.parametrize(
+    ("q", "matching"),
+    [
+        ("%", ["kurgu-%100-rapor.pdf"]),
+        ("_", ["kurgu_100_rapor.pdf"]),
+        ("!", ["kurgu-!100-rapor.pdf"]),
+    ],
+)
+def test_a_metacharacter_search_matches_only_that_literal_character(
+        q, matching):
+    """Proven THROUGH the interpreter, which is the only place the
+    operator's semantics exist in this loop.
+
+    `%` must not match every name, `_` must not match an arbitrary single
+    character, and `!` -- the escape character -- must find itself. Each
+    case is checked positively AND negatively against the same four
+    names, so "matches only these" is measured rather than asserted."""
+    pattern = _pattern_sent(q)
+
+    matched = [name for name in NAMES if _ilike(name, pattern)]
+
+    assert matched == matching
+    assert len(matched) < len(NAMES)        # it did not match everything
+
+
+def test_a_combined_metacharacter_value_is_matched_character_for_character():
+    """All three at once, in one value: the pattern is the literal run
+    and nothing else -- not the same characters in another order, and not
+    a wildcard standing in for any of them."""
+    pattern = _pattern_sent("!%_")
+
+    assert pattern == "%!!!%!_%"
+    assert _ilike("kurgu-!%_-rapor.pdf", pattern)
+    assert not _ilike("kurgu-%_!-rapor.pdf", pattern)      # another order
+    assert not _ilike("kurgu-!x_-rapor.pdf", pattern)      # `%` as wildcard
+    assert not _ilike("kurgu-rapor.pdf", pattern)
+
+
+def test_a_search_that_already_looks_escaped_stays_literal():
+    """`!%` is what an escaped percent looks like in a PATTERN, but as
+    INPUT it is two ordinary characters. It must not be read as an escape
+    the caller wrote, and it must not be un-escaped: the value is data,
+    the pattern is ours."""
+    pattern = _pattern_sent("!%")
+
+    assert pattern == "%!!!%%"
+    assert _ilike("kurgu-!%-rapor.pdf", pattern)
+    assert not _ilike("kurgu-%-rapor.pdf", pattern)        # the `!` is real
+    assert not _ilike("kurgu-!-rapor.pdf", pattern)        # so is the `%`
+
+
+def test_a_search_travels_only_as_a_parameter():
+    """The clause is static text: the column, the operator and the escape
+    character are written in the code. The VALUE reaches the database
+    only as the transformed pattern in the params dict, and the raw one
+    appears nowhere in the statement."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, q="Kurgu-Rapor")
+
+    sql, params = conn.cur.executed[0]
+    assert "filename ILIKE %(filename_search)s ESCAPE '!'" in sql
+    assert "Kurgu-Rapor" not in sql
+    assert params == {"limit": 6, "offset": 0,
+                      "filename_search": "%Kurgu-Rapor%"}
+    # the search narrows the scan BEFORE the page is cut from it, the
+    # total order survives it, and `limit + 1` is asked of the SEARCHED
+    # query
+    assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT")
+    assert "ORDER BY uploaded_at DESC, id DESC" in sql
+    assert params["limit"] == 6
+    # the projection is untouched by a search
+    assert "content_sha256" not in sql and "candidate_id" not in sql
+
+
+def test_the_escape_character_and_the_clause_are_pinned_separately():
+    """The clause is ONE literal string, so it no longer derives from the
+    constant the transform uses -- and two things that must agree but do
+    not derive from each other can drift. Each is therefore pinned on its
+    own: the constant the escaping applies, and the exact clause text the
+    server is asked to read it with. If either is edited alone, this
+    fails."""
+    from pipeline.index import db
+
+    assert db.DOCUMENT_SEARCH_ESCAPE == "!"
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, q="kurgu")
+
+    sql, _ = conn.cur.executed[0]
+    assert "filename ILIKE %(filename_search)s ESCAPE '!'" in sql
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "kurgu' OR uploaded_at > 'epoch",   # quote syntax
+        "kurgu\\ters",                      # a backslash
+        "kurgu'; DROP TABLE documents; --",
+    ],
+)
+def test_a_hostile_search_value_cannot_reach_the_statement_text(hostile):
+    """Parameterization stops injection; escaping fixes pattern meaning.
+    This is the first half: whatever the value carries, the statement the
+    server would prepare is the same closed text every call sends.
+
+    The BACKSLASH case is the one worth naming -- the escape authority
+    here is the exclamation mark and nothing else, so a backslash is an
+    ordinary character that is neither doubled nor consumed."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, q=hostile)
+
+    sql, params = conn.cur.executed[0]
+    assert hostile not in sql
+    assert "'" not in sql.replace("ESCAPE '!'", "")
+    # What this test pins is CARRIAGE, not the escape algorithm: the
+    # value reaches the database as a parameter and nothing else. So the
+    # expectation is built through the production helper rather than
+    # assuming the raw text survives -- one of these values contains an
+    # underscore, which IS a LIKE metacharacter and is escaped exactly as
+    # the dedicated escape tests require. The backslash is not: the
+    # escape authority here is the exclamation mark and nothing else.
+    assert params["filename_search"] == "%" + db.escape_like_pattern(
+        hostile) + "%"
+    assert _ilike("kurgu" + hostile + ".pdf", params["filename_search"])
+
+
+def test_a_non_ascii_search_travels_safely_through_the_params_dict():
+    """`filename` is `text` and the API already accepts non-ASCII names,
+    so a search for one is an ordinary search: it is not transformed, not
+    normalised and not refused -- it reaches the database as a value.
+
+    THAT CARRIAGE IS THE WHOLE CLAIM. How the server would match this
+    value is decided by the column's collation and its Unicode case
+    folding, neither of which runs here; the round-trip below differs
+    only in ASCII case, so it exercises carriage and anchoring rather
+    than Unicode folding. Non-ASCII matching semantics wait on a live
+    server."""
+    from pipeline.index import db
+
+    q = "belge-özet-Şubat"
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, q=q)
+
+    sql, params = conn.cur.executed[0]
+    assert q not in sql
+    assert params["filename_search"] == "%belge-özet-Şubat%"
+    assert _ilike("KURGU belge-özet-Şubat raporu.pdf",
+                  params["filename_search"])
+
+
+def test_a_long_search_value_is_a_valid_search():
+    """LENGTH IS NOT A SHAPE HERE EITHER. MEASURED: there is no length
+    authority for `filename` anywhere -- the column is unbounded `text`,
+    the upload validator has no length check, and UPLOAD_MAX_BYTES is a
+    body cap. So no maximum is invented for `q`."""
+    from pipeline.index import db
+
+    long_value = "kurgu-" + "u" * 250
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, q=long_value)
+
+    _sql, params = conn.cur.executed[0]
+    assert params["filename_search"] == "%" + long_value + "%"
+    assert len(params["filename_search"]) == 258
+
+
+@pytest.mark.parametrize(
+    "q",
+    ["", 5, b"kurgu", True, ["kurgu"], 0.5],
+)
+def test_the_listing_refuses_a_search_it_cannot_read(q):
+    """The seam takes None or a NON-EMPTY STRING and nothing else, and it
+    refuses before any statement is built -- so the refused call executes
+    nothing at all. That matters more here than for the equality filters:
+    the value is about to be TRANSFORMED into a pattern, and a transform
+    on a value nobody checked is how a non-string reaches `.replace`.
+
+    The refusal is pinned to THIS gate by its message, so a test that
+    passes because some earlier check (the page bounds, the window)
+    happened to fire is not mistaken for this one -- and the control at
+    the end runs the identical call with a well-formed search, which
+    reaches the cursor exactly once."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    with pytest.raises(ValueError, match="^q "):
+        db.list_documents(conn, limit=5, offset=0, q=q)
+    # nothing was built and nothing was executed: zero statements
+    assert conn.cur.executed == []
+
+    control = RecordingConn([_listing_row()])
+    db.list_documents(control, limit=5, offset=0, q="kurgu")
+    assert len(control.cur.executed) == 1
+
+
+def test_an_unsupplied_search_appears_in_neither_statement_nor_params():
+    """No `q` means no filename clause and no filename key -- checked
+    next to a filter that IS supplied, so the statement provably still
+    assembles."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, status="kurgu-durum")
+
+    sql, params = conn.cur.executed[0]
+    assert "ILIKE" not in sql and "ESCAPE" not in sql
+    assert "filename_search" not in sql
+    assert params == {"limit": 6, "offset": 0, "status": "kurgu-durum"}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "clause"),
+    [
+        ({"status": "kurgu-durum"}, "status = %(status)s"),
+        ({"file_type": "kurgu-tur"}, "file_type = %(file_type)s"),
+        ({"uploaded_after": INSTANT_ONCE}, "uploaded_at > %(uploaded_after)s"),
+        ({"uploaded_before": INSTANT_SONRA},
+         "uploaded_at < %(uploaded_before)s"),
+    ],
+)
+def test_a_search_ands_with_each_existing_filter(kwargs, clause):
+    """One existing filter at a time, each ANDed with the search: both
+    clauses are in the statement, both values are in the params dict, and
+    neither value is in the SQL."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, q="kurgu", **kwargs)
+
+    sql, params = conn.cur.executed[0]
+    assert clause + " AND filename ILIKE %(filename_search)s ESCAPE '!'" in sql
+    assert params["filename_search"] == "%kurgu%"
+    for key, value in kwargs.items():
+        assert params[key] == value
+        assert str(value) not in sql
+    assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT")
+
+
+def test_all_five_filters_combine_with_and_fully_parameterized():
+    """Every filter this seam has, at once: five static clauses ANDed in
+    the statement, five values in the params dict, none of them anywhere
+    in the SQL text. The date bounds keep their EXCLUSIVE operators next
+    to the search, so the boundary behaviour is unchanged by it."""
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0,
+                      status="kurgu-durum", file_type="kurgu-tur",
+                      uploaded_after=INSTANT_ONCE,
+                      uploaded_before=INSTANT_SONRA,
+                      q="kurgu%rapor")
+
+    sql, params = conn.cur.executed[0]
+    assert ("WHERE status = %(status)s AND file_type = %(file_type)s "
+            "AND uploaded_at > %(uploaded_after)s "
+            "AND uploaded_at < %(uploaded_before)s "
+            "AND filename ILIKE %(filename_search)s ESCAPE '!' " in sql)
+    assert params == {"limit": 6, "offset": 0,
+                      "status": "kurgu-durum", "file_type": "kurgu-tur",
+                      "uploaded_after": INSTANT_ONCE,
+                      "uploaded_before": INSTANT_SONRA,
+                      "filename_search": "%kurgu!%rapor%"}
+    assert "kurgu-durum" not in sql and "kurgu-tur" not in sql
+    assert "kurgu%rapor" not in sql
+    for instant in (INSTANT_ONCE, INSTANT_SONRA):
+        assert str(instant) not in sql
+        assert instant.isoformat() not in sql
+    assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT")

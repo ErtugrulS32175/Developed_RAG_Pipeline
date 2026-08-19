@@ -642,14 +642,59 @@ def get_document(conn, document_id: str) -> dict | None:
     return row
 
 
+# The ONE escape character every LIKE pattern in this module is built
+# with. It is a literal in the code and is NEVER taken from a caller: an
+# operator or an escape character chosen by input would be a fragment of
+# the statement chosen by input, which is exactly what parameterization
+# exists to prevent. `!` rather than the SQL default backslash, so a
+# filename carrying a backslash needs no second layer of reasoning --
+# here a backslash is an ordinary character with no meaning at all.
+DOCUMENT_SEARCH_ESCAPE = "!"
+
+
+def escape_like_pattern(value: str) -> str:
+    """Neutralise LIKE's own metacharacters in a value meant LITERALLY.
+
+    PARAMETERIZATION AND ESCAPING ANSWER TWO DIFFERENT QUESTIONS, and
+    both are required. psycopg adapts a `str` as a VALUE only -- measured:
+    percent, underscore, exclamation, a quote and a backslash all travel
+    byte-identical, with no quoting and no SQL fragment -- so injection is
+    already closed by the parameter. What a parameter does NOT decide is
+    what the value MEANS to `LIKE`: there `%` is still "any run of
+    characters" and `_` is still "any one character", so a caller
+    searching for a literal `%` would otherwise match every row. This
+    fixes the PATTERN's meaning; the parameter keeps it a value.
+
+    THE ORDER IS THE WHOLE CONTRACT: the escape character FIRST, then
+    `%`, then `_`. Measured: escaping the escape character LAST
+    double-escapes what the earlier steps just inserted -- `%` becomes
+    `!%` and then `!!%`, which the server reads as a literal `!` followed
+    by the wildcard, so a literal-percent search silently finds NOTHING.
+    Only this order round-trips.
+
+    Pure: it reads its argument, mutates nothing, and returns a new
+    value. There is no length rule here on purpose -- `documents.filename`
+    is unbounded `text`, so a cap declared at this seam would refuse a
+    value the database itself stores.
+    """
+    if not isinstance(value, str):
+        raise TypeError("escape_like_pattern yalnizca metin alir")
+    escape = DOCUMENT_SEARCH_ESCAPE
+    return (value
+            .replace(escape, escape + escape)
+            .replace("%", escape + "%")
+            .replace("_", escape + "_"))
+
+
 def list_documents(conn, limit: int, offset: int,
                    status: str | None = None,
                    file_type: str | None = None,
                    uploaded_after: datetime | None = None,
-                   uploaded_before: datetime | None = None) -> list[dict]:
+                   uploaded_before: datetime | None = None,
+                   q: str | None = None) -> list[dict]:
     """One page of the document inventory, newest first.
 
-    FOUR OPTIONAL FILTERS. `status` and `file_type` are exact equality;
+    FIVE OPTIONAL FILTERS. `status` and `file_type` are exact equality;
     neither column has a closed vocabulary -- `status` is free text with
     no CHECK constraint and `file_type` is whatever suffix the upload
     carried -- so no value set is enforced here: an unknown value simply
@@ -663,6 +708,27 @@ def list_documents(conn, limit: int, offset: int,
     value travels as a parameter. Filters narrow the scan BEFORE
     LIMIT/OFFSET, so the page, the offset and the `limit + 1` sentinel
     all describe the filtered sequence.
+
+    `q` IS THE FIFTH, AND THE ONLY ONE THAT IS NOT EQUALITY: it searches
+    `documents.filename` ALONE, case-insensitively, for a LITERAL
+    substring -- `ILIKE` against the pattern wrapped in `%` on both
+    sides. LITERAL is the part that takes work, because `%` and `_` are
+    LIKE's own metacharacters: the raw value goes through
+    `escape_like_pattern` first and the clause names the escape
+    character, so a search for `%` finds the rows whose name really
+    carries one instead of every row in the table. The RAW value never
+    enters the statement -- only the transformed pattern enters the
+    params dict -- and the operator, the wrapping `%` and the escape
+    character are static text here, never anything a caller sent.
+
+    NO LENGTH RULE AND NO CHARACTER RULE IS INVENTED FOR `q`. `filename`
+    is unbounded `text`, so a cap declared here would refuse a value the
+    column itself stores. And the UPLOAD validator is not reusable as
+    one: it rejects slashes, colons, control characters and trailing
+    spaces -- every one of them a legitimate thing to SEARCH for, so
+    reusing it would silently narrow the search rather than protect
+    anything. The only shape asked for is the one the filter needs to
+    mean anything: absent, or a non-empty string.
 
     THE DATE BOUNDS ARRIVE AS DATETIME OBJECTS, NOT TEXT. `uploaded_at`
     is `timestamptz`, psycopg adapts an aware datetime to it natively,
@@ -704,7 +770,11 @@ def list_documents(conn, limit: int, offset: int,
     # The same courtesy for the filters: the API refuses a malformed one
     # in its own signature, this refuses it for every OTHER caller --
     # before any statement is built, so a refused call executes nothing.
-    for name, value in (("status", status), ("file_type", file_type)):
+    # `q` is checked HERE, with them, for exactly that reason: the
+    # transform below turns a value into a PATTERN, and a transform is
+    # arithmetic on a value nobody checked unless the check comes first.
+    for name, value in (("status", status), ("file_type", file_type),
+                        ("q", q)):
         if value is not None and (not isinstance(value, str) or not value):
             raise ValueError(name + " bos olmayan bir metin olmali")
     # A bound that is not an aware datetime is not a bound. `utcoffset()`
@@ -750,6 +820,23 @@ def list_documents(conn, limit: int, offset: int,
     if uploaded_before is not None:
         clauses.append("uploaded_at < %(uploaded_before)s")
         params["uploaded_before"] = uploaded_before
+    # THE SEARCH CLAUSE IS ONE LITERAL STRING -- column, operator and
+    # escape character all spelled out, nothing interpolated at all. It
+    # used to be assembled with an f-string around the module constant;
+    # the value substituted was code-owned and constant, so it was safe,
+    # but it was still SQL text being built at runtime and that is the
+    # shape a later reader copies. The constant and the clause must
+    # therefore agree, and a test pins each of them separately rather
+    # than one deriving from the other.
+    #
+    # What the caller sent reaches the database only as the value of
+    # `%(filename_search)s`, wrapped into a substring pattern AFTER
+    # escaping -- the two wrapping `%` are ours and are meant as
+    # wildcards, every `%` inside the value is the caller's and has been
+    # made literal.
+    if q is not None:
+        clauses.append("filename ILIKE %(filename_search)s ESCAPE '!'")
+        params["filename_search"] = "%" + escape_like_pattern(q) + "%"
     where_sql = "WHERE " + " AND ".join(clauses) + " " if clauses else ""
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(

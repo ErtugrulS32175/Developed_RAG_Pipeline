@@ -978,15 +978,58 @@ INVENTORY = [
 class _InventoryCalls(list):
     """The four page/equality arguments per call, positionally -- exactly
     the record this fixture always kept -- with the two date bounds of the
-    same calls alongside in `.dates`.
+    same calls alongside in `.dates` and the search value in `.searches`.
 
-    The window was added WITHOUT moving what the older assertions read: a
-    test that pinned `[(20, 0, None, None)]` still pins it, because the
-    new pair went next to that record rather than into it."""
+    Each addition went NEXT TO that record rather than into it: a test
+    that pinned `[(20, 0, None, None)]` still pins it, whether the call
+    also carried a window, a search, both or neither."""
 
     def __init__(self):
         super().__init__()
         self.dates = []
+        self.searches = []
+
+
+def _like_matches(value, pattern, escape="!"):
+    """`value ILIKE pattern ESCAPE escape`, over the ASCII subset.
+
+    MEASURED: no live PostgreSQL is reachable in this loop -- the local
+    Docker daemon is down and CI declares no database service -- so the
+    real operator runs NOWHERE here, and a fixture that merely compared
+    substrings would pass whatever the escaping did or failed to do. This
+    models the operator's PATTERN LANGUAGE, written from the definition
+    and knowing nothing about the transform it is used to judge: the
+    escape character consumes the next character literally, `%` is any
+    run of characters, `_` is exactly one, the match is anchored, and
+    ASCII letters compare case-insensitively.
+
+    WHAT IT DOES NOT PROVE: it is not PostgreSQL. Case folding here is
+    Python's; the server's is decided by the column's collation, which
+    this model neither knows nor consults. The metacharacter, escape and
+    anchoring behaviour it pins holds for the ASCII fixtures in this
+    battery; real collation and full Unicode case folding are NOT
+    established here and wait on a live server."""
+    import re
+
+    parts = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == escape:
+            index += 1
+            if index >= len(pattern):
+                # the server's own error: a pattern may not end on a lone
+                # escape character
+                raise ValueError("LIKE deseni kacis karakteriyle bitemez")
+            parts.append(re.escape(pattern[index]))
+        elif char == "%":
+            parts.append("(?s:.)*")
+        elif char == "_":
+            parts.append("(?s:.)")
+        else:
+            parts.append(re.escape(char))
+        index += 1
+    return re.fullmatch("".join(parts), value, re.IGNORECASE) is not None
 
 
 def _wire_inventory(monkeypatch, api, rows=INVENTORY):
@@ -998,13 +1041,23 @@ def _wire_inventory(monkeypatch, api, rows=INVENTORY):
     pages, so offset and the sentinel walk the filtered sequence.
 
     The date bounds are applied here the way the SQL applies them: both
-    EXCLUSIVE, so a row sitting exactly on a bound is filtered out."""
+    EXCLUSIVE, so a row sitting exactly on a bound is filtered out.
+
+    `q` is applied the way the SQL applies THAT: the production transform
+    builds the pattern -- it is the code under test and is not reimplemented
+    here -- and `_like_matches` interprets it exactly as the server would.
+    So a search's behaviour is decided by the real escaping run through a
+    real LIKE model, which is the strongest evidence available without a
+    live server."""
     asked = _InventoryCalls()
 
     def list_documents(_conn, limit, offset, status=None, file_type=None,
-                       uploaded_after=None, uploaded_before=None):
+                       uploaded_after=None, uploaded_before=None, q=None):
         asked.append((limit, offset, status, file_type))
         asked.dates.append((uploaded_after, uploaded_before))
+        asked.searches.append(q)
+        pattern = (None if q is None
+                   else "%" + api.db.escape_like_pattern(q) + "%")
         matched = [
             dict(row) for row in rows
             if (status is None or row["status"] == status)
@@ -1013,6 +1066,8 @@ def _wire_inventory(monkeypatch, api, rows=INVENTORY):
                  or row["uploaded_at"] > uploaded_after)
             and (uploaded_before is None
                  or row["uploaded_at"] < uploaded_before)
+            and (pattern is None
+                 or _like_matches(row["filename"], pattern))
         ]
         return matched[offset:offset + limit + 1]
 
@@ -1521,6 +1576,356 @@ def test_an_inventory_without_a_window_sends_no_date_bound(
         "kurgu-dort", "kurgu-uc", "kurgu-iki", "kurgu-bir"]
     assert asked == [(20, 0, None, None)]
     assert asked.dates == [(None, None)]
+
+
+# --- the filename search --------------------------------------------------
+#
+# Six rows whose NAMES are the subject. Three carry the word being
+# searched for in a different position and a different case; the other
+# three each carry exactly one of LIKE's three interesting characters, so
+# a search for `%`, `_` or `!` has both a row it must find and rows it
+# must not.
+
+INSTANT_BES = datetime(999, 5, 5, tzinfo=timezone.utc)
+INSTANT_ALTI = datetime(999, 6, 6, tzinfo=timezone.utc)
+
+SEARCHED_INVENTORY = [
+    _inventory_row("kurgu-alti", INSTANT_ALTI,
+                   filename="Zeta-Rapor-2029.pdf"),
+    _inventory_row("kurgu-bes", INSTANT_BES,
+                   filename="yillik-zeta-ozeti.docx", file_type="docx"),
+    _inventory_row("kurgu-dort", INSTANT_DORT,
+                   filename="butce-notlari-zeta.pdf", status="partial"),
+    _inventory_row("kurgu-uc", INSTANT_UC,
+                   filename="kurgu-%100-tablo.pdf"),
+    _inventory_row("kurgu-iki", INSTANT_IKI,
+                   filename="kurgu_100_tablo.pdf"),
+    _inventory_row("kurgu-bir", INSTANT_BIR,
+                   filename="kurgu-!100-tablo.pdf"),
+]
+
+
+@pytest.mark.parametrize(
+    ("q", "expected_ids"),
+    [
+        # a plain literal substring, and the SAME query in three cases:
+        # the search is case-insensitive in both directions -- lower-case
+        # text finds the upper-case name, upper-case text finds the
+        # lower-case ones
+        ("zeta", ["kurgu-alti", "kurgu-bes", "kurgu-dort"]),
+        ("ZETA", ["kurgu-alti", "kurgu-bes", "kurgu-dort"]),
+        ("Zeta", ["kurgu-alti", "kurgu-bes", "kurgu-dort"]),
+        # the START of a filename
+        ("zeta-rapor", ["kurgu-alti"]),
+        # the MIDDLE
+        ("-notlari-", ["kurgu-dort"]),
+        # the END, including the extension
+        ("tablo.pdf", ["kurgu-uc", "kurgu-iki", "kurgu-bir"]),
+        # a substring of no filename at all: an empty list, never an error
+        ("kurgu-hicbir-yerde-yok", []),
+    ],
+)
+def test_the_inventory_searches_filenames_by_literal_substring(
+        monkeypatch, tmp_path, q, expected_ids):
+    """One column, case-insensitively, anywhere in the name.
+
+    The match is decided by the production escaping run through a LIKE
+    interpreter (see `_like_matches`), so these are not substring
+    comparisons dressed up as a search."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=SEARCHED_INVENTORY)
+
+    response = client.get("/documents", params={"q": q},
+                          headers=_headers(api))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [doc["document_id"] for doc in body["documents"]] == expected_ids
+    assert body["has_more"] is False
+    # the search reached the seam as the RAW value; the endpoint invents
+    # nothing and transforms nothing
+    assert asked.searches == [q]
+    # the other four arguments are untouched by a search
+    assert asked == [(20, 0, None, None)]
+    assert asked.dates == [(None, None)]
+    # the search changes WHICH rows are listed, never what a row shows
+    assert set(body) == {"documents", "limit", "offset", "has_more"}
+    for document in body["documents"]:
+        assert set(document) == {
+            "document_id", "filename", "file_type", "uploaded_at",
+            "status", "status_note", "active_generation"}
+
+
+@pytest.mark.parametrize(
+    ("q", "expected_ids"),
+    [
+        # `%` is LIKE's "any run of characters". Searched for literally it
+        # must find the ONE name that carries one -- not all six
+        ("%", ["kurgu-uc"]),
+        # `_` is LIKE's "any single character". Literally, it must not
+        # match an arbitrary one
+        ("_", ["kurgu-iki"]),
+        # the escape character itself, which must still find itself
+        ("!", ["kurgu-bir"]),
+        # and in longer runs, where a wildcard reading would widen the
+        # result instead of narrowing it
+        ("%100", ["kurgu-uc"]),
+        ("u_1", ["kurgu-iki"]),
+        ("-!100-", ["kurgu-bir"]),
+    ],
+)
+def test_a_metacharacter_search_matches_only_that_literal_character(
+        monkeypatch, tmp_path, q, expected_ids):
+    """The wildcard cases, proven THROUGH the in-memory LIKE model.
+
+    MEASURED: no live PostgreSQL is reachable and CI declares no database
+    service, so this fixture is the only place the operator's semantics
+    exist in this loop. Each case names the rows it must find AND is
+    checked against six rows it could have matched, so "only the literal
+    character" is a measurement rather than a claim."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    _wire_inventory(monkeypatch, api, rows=SEARCHED_INVENTORY)
+
+    response = client.get("/documents", params={"q": q},
+                          headers=_headers(api))
+
+    assert response.status_code == 200
+    listed = [doc["document_id"] for doc in response.json()["documents"]]
+    assert listed == expected_ids
+    assert len(listed) < len(SEARCHED_INVENTORY)     # not every document
+
+
+@pytest.mark.parametrize(
+    ("q", "expected_ids"),
+    [
+        # all three metacharacters in one value, matched character for
+        # character: the name that carries the run is found, and the one
+        # carrying the same characters in another order is not
+        ("!100-tablo", ["kurgu-bir"]),
+        ("%100-tablo", ["kurgu-uc"]),
+        ("u_100_t", ["kurgu-iki"]),
+    ],
+)
+def test_a_combined_metacharacter_search_is_matched_literally(
+        monkeypatch, tmp_path, q, expected_ids):
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    _wire_inventory(monkeypatch, api, rows=SEARCHED_INVENTORY)
+
+    response = client.get("/documents", params={"q": q},
+                          headers=_headers(api))
+
+    assert response.status_code == 200
+    assert [doc["document_id"]
+            for doc in response.json()["documents"]] == expected_ids
+
+
+def test_an_empty_search_is_refused_before_the_database_is_touched(
+        monkeypatch, tmp_path):
+    """A search that is present but empty cannot mean anything: as a
+    pattern it would be `%%`, which is every row wearing the costume of a
+    filter. Its shape lives in the signature, so FastAPI refuses it with
+    422 before the body -- and therefore before any connection checkout
+    or statement -- runs.
+
+    The gate reached is pinned three ways: the parameter-declared SHAPE
+    (a list of loc/type objects, not the text `detail` an HTTPException
+    carries), the offending parameter, and a control that clears exactly
+    this constraint through the identical wiring and runs the body."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    borrowed, queried = _recording_gates(monkeypatch, api)
+
+    refused = client.get("/documents", params={"q": ""},
+                         headers=_headers(api))
+
+    assert refused.status_code == 422
+    # zero cost: no pooled connection was borrowed, no SQL was executed
+    assert borrowed == []
+    assert queried == []
+    detail = refused.json()["detail"]
+    assert isinstance(detail, list)
+    assert [tuple(err["loc"]) for err in detail] == [("query", "q")]
+    assert detail[0]["type"] == "string_too_short"
+
+    # control: one character clears the bound and the body runs, so the
+    # 422 came from THIS parameter's declared shape and not from a gate
+    # in front of it
+    allowed = client.get("/documents", params={"q": "z"},
+                         headers=_headers(api))
+
+    assert allowed.status_code == 200
+    assert borrowed == [1]
+    assert len(queried) == 1
+    assert queried[0][1]["q"] == "z"
+
+
+@pytest.mark.parametrize(
+    ("params", "expected_ids"),
+    [
+        # each existing filter, ANDed with the search: the search alone
+        # keeps three rows, and each filter provably discards some of them
+        ({"q": "zeta", "status": "done"}, ["kurgu-alti", "kurgu-bes"]),
+        ({"q": "zeta", "file_type": "pdf"}, ["kurgu-alti", "kurgu-dort"]),
+        ({"q": "zeta", "uploaded_after": "0999-04-04T00:00:00Z"},
+         ["kurgu-alti", "kurgu-bes"]),
+        ({"q": "zeta", "uploaded_before": "0999-06-06T00:00:00Z"},
+         ["kurgu-bes", "kurgu-dort"]),
+        # and all five at once
+        ({"q": "zeta", "status": "done", "file_type": "pdf",
+          "uploaded_after": "0999-01-01T00:00:00Z",
+          "uploaded_before": "0999-12-12T00:00:00Z"},
+         ["kurgu-alti"]),
+    ],
+)
+def test_the_search_ands_with_every_existing_filter(
+        monkeypatch, tmp_path, params, expected_ids):
+    """`q` narrows what the others left, and they narrow what it left --
+    the combination is AND, in every pairing and all together.
+
+    The date cases also pin that the EXCLUSIVE bounds are unchanged by a
+    search next to them: the row sitting exactly on each bound is
+    outside the window, which is why `kurgu-dort` and `kurgu-alti` drop
+    out of their respective cases."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=SEARCHED_INVENTORY)
+
+    response = client.get("/documents", params=params, headers=_headers(api))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [doc["document_id"] for doc in body["documents"]] == expected_ids
+    # every supplied filter reached the seam, each in its own argument
+    assert asked.searches == ["zeta"]
+    assert asked[0][2] == params.get("status")
+    assert asked[0][3] == params.get("file_type")
+    for bound, sent in zip(("uploaded_after", "uploaded_before"),
+                           asked.dates[0]):
+        if bound in params:
+            assert isinstance(sent, datetime) and sent.utcoffset() is not None
+        else:
+            assert sent is None
+
+
+def test_the_search_is_applied_before_pagination(monkeypatch, tmp_path):
+    """`limit + 1`, `offset` and `has_more` all walk the SEARCHED
+    sequence: page one carries the sentinel's evidence that a third
+    matching row follows, and page two starts where the searched page
+    ended -- not two rows into the raw table."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=SEARCHED_INVENTORY)
+
+    first = client.get("/documents", params={"q": "zeta", "limit": 2},
+                       headers=_headers(api))
+
+    assert first.status_code == 200
+    body = first.json()
+    assert [doc["document_id"] for doc in body["documents"]] == [
+        "kurgu-alti", "kurgu-bes"]
+    assert (body["limit"], body["offset"], body["has_more"]) == (2, 0, True)
+    # the limit+1 probe was asked WITH the search, of the same scan
+    assert asked == [(2, 0, None, None)]
+    assert asked.searches == ["zeta"]
+
+    last = client.get("/documents",
+                      params={"q": "zeta", "limit": 2, "offset": 2},
+                      headers=_headers(api))
+
+    assert last.status_code == 200
+    tail = last.json()
+    # offset 2 skips two MATCHING rows; the three names that do not carry
+    # "zeta" consume none of the offset and never appear
+    assert [doc["document_id"] for doc in tail["documents"]] == ["kurgu-dort"]
+    assert (tail["limit"], tail["offset"], tail["has_more"]) == (2, 2, False)
+
+
+def test_an_inventory_without_a_search_sends_no_q(monkeypatch, tmp_path):
+    """The unfiltered listing is unchanged: no search value is invented,
+    it reaches the seam as None, and the page is the whole inventory in
+    the order it always had."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=SEARCHED_INVENTORY)
+
+    body = client.get("/documents", headers=_headers(api)).json()
+
+    assert [doc["document_id"] for doc in body["documents"]] == [
+        "kurgu-alti", "kurgu-bes", "kurgu-dort", "kurgu-uc", "kurgu-iki",
+        "kurgu-bir"]
+    assert asked == [(20, 0, None, None)]
+    assert asked.dates == [(None, None)]
+    assert asked.searches == [None]
+
+
+@pytest.mark.parametrize(
+    "q",
+    [
+        "alt/klasor",                   # a slash
+        "kurgu:ek",                     # a colon
+        "kurgu ",                       # a trailing space
+        "..",
+        "kurgu' OR 1=1 --",             # quote syntax
+        "kurgu\\ters",                  # a backslash
+        "belge-özet-Şubat",             # non-ASCII
+        "kurgu-" + "u" * 250,           # long
+    ],
+)
+def test_a_search_is_not_validated_as_an_upload_filename(
+        monkeypatch, tmp_path, q):
+    """MEASURED: `_safe_upload_filename` is an UPLOAD validator and is NOT
+    reused here. It rejects slashes, colons, control characters and
+    trailing spaces -- every one of them a legitimate thing to SEARCH
+    for -- so reusing it would silently narrow the search instead of
+    protecting anything. There is no length authority for `filename`
+    anywhere either (the column is unbounded `text`,
+    `_safe_upload_filename` has no length check, and UPLOAD_MAX_BYTES is
+    a body cap), so no maximum is invented for `q`.
+
+    Each of these is therefore an ordinary search: accepted, forwarded
+    character for character, and answered with a page."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows=SEARCHED_INVENTORY)
+
+    response = client.get("/documents", params={"q": q},
+                          headers=_headers(api))
+
+    assert response.status_code == 200
+    assert asked.searches == [q]
+    assert len(asked.searches[0]) == len(q)     # intact, never truncated
+    assert response.json()["documents"] == []
+    assert set(response.json()) == {"documents", "limit", "offset",
+                                    "has_more"}
+
+
+def test_a_searched_listing_publishes_only_the_safe_document_fields(
+        monkeypatch, tmp_path):
+    """The projection does not widen because a search narrowed: the
+    recorded candidate's bytes and its immutable identity stay out of the
+    response, exactly as in an unsearched listing."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    _wire_inventory(monkeypatch, api, rows=SEARCHED_INVENTORY)
+
+    response = client.get("/documents", params={"q": "zeta"},
+                          headers=_headers(api))
+
+    assert response.status_code == 200
+    documents = response.json()["documents"]
+    assert len(documents) == 3
+    for document in documents:
+        assert set(document) == {
+            "document_id", "filename", "file_type", "uploaded_at",
+            "status", "status_note", "active_generation"}
+    # not merely absent as keys: the VALUES never appear in the response
+    assert "content_sha256" not in response.text
+    assert "candidate_id" not in response.text
+    assert "KURGU_SHA_" not in response.text
+    assert "KURGU_ADAY_" not in response.text
 
 
 @pytest.mark.parametrize(
