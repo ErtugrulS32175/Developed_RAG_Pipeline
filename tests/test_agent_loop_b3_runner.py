@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import json
 import subprocess
 import sys
+import textwrap
 import time
 import types
 from pathlib import Path
@@ -283,16 +285,25 @@ def _two_round_evaluator(finding=None, **overrides):
 
 
 def _two_file_implementer():
-    """Round 0 edits one file, the repair ADDS another.
+    """Round 0 edits TWO files; the repair re-edits only ONE of them.
 
-    The two rounds must move DIFFERENT files, or the repair's delta
-    cannot be told apart from the first round's work -- and telling them
-    apart is the whole point of the candidate-versus-delta test below."""
-    first = base._implementer_reply(changed_files=[_FIRST])
+    The delta and the cumulative set have to be DIFFERENT sets or the
+    candidate-versus-delta test below proves nothing: here the repair's
+    delta is `{_SECOND}` while the candidate is `{_FIRST, _SECOND}`, so
+    applying the delta would silently leave the first round's file
+    behind.
+
+    RETARGETED FOR B10-R1, intent unchanged. The earlier shape had the
+    repair ADD a file the first round never touched, which the repair
+    scope gate now refuses on purpose -- a repair may narrow a candidate,
+    never widen it. Making the first round touch both files keeps the two
+    sets distinct without asking for the thing that is now forbidden."""
+    first = base._implementer_reply(changed_files=[_FIRST, _SECOND])
     second = base._implementer_reply(changed_files=[_SECOND])
     return ("if in_run():\n"
             "    if round_index() == 0:\n"
             f"        edit({_FIRST!r}, 'VALUE = 2\\n')\n"
+            f"        edit({_SECOND!r}, 'VALUE = 3\\n')\n"
             "    else:\n"
             f"        edit({_SECOND!r}, 'VALUE = 9\\n')\n"
             "reply = " + repr([first, second]) + "\n"
@@ -462,12 +473,19 @@ def test_a_pending_receipt_never_reaches_the_checkout(world, monkeypatch):
 def test_a_failing_acceptance_gate_never_reaches_the_audit_or_the_checkout(
         world, spy):
     """A red gate ends the run. It is not a finding for the evaluator to
-    weigh and it is not something a repair round may argue with: the
-    commands the task named are the contract, and a candidate that fails
-    them is not a candidate."""
+    weigh: the commands the task named are the contract, and a candidate
+    that fails them is not a candidate.
+
+    RETARGETED FOR B10-R1, intent unchanged. The scenario now breaks the
+    file so pytest cannot even COLLECT it, which is a failure shape the
+    diagnostic classifier refuses on purpose. That keeps this test about
+    the class it has always been about: a red gate nobody can classify
+    ends the run, with no audit and nothing applied. The repairable class
+    -- ordinary FAILED nodes -- takes the repair road and is proven in
+    section H below."""
     implementer(world, "if in_run():\n"
                        "    edit('pipeline/test_gecer.py',"
-                       " 'def test_kurgu():\\n    assert False\\n')\n"
+                       " 'def test_kurgu( :\\n')\n"
                 + base._emits(base._implementer_reply(
                     changed_files=["pipeline/test_gecer.py"])))
     before = (world.repo / "pipeline" / "test_gecer.py").read_text(
@@ -1513,3 +1531,371 @@ def test_both_implementer_roads_carry_the_protocol_matrix(world):
     for index, prompt in enumerate(prompts):
         for line in execution.PROTOCOL_MATRIX:
             assert line in prompt, f"{index}. cagri protokol satirini tasimadi"
+
+
+# =====================================================================
+# H. B10-R1 -- ONE REPAIR FOR A PROVEN PYTEST ACCEPTANCE FAILURE
+#
+# The budget is ONE repair and it now has TWO possible spenders. Every
+# test here is about the same question from a different side: can the two
+# spenders ever add up to two patches.
+# =====================================================================
+
+_TEST_FILE = "pipeline/test_gecer.py"
+_ACCEPTANCE_SENTINEL = "KURGU-SIZINTI-4711-GIZLI-DEGER"
+
+
+def _failing_then_fixed_implementer(sentinel=_ACCEPTANCE_SENTINEL):
+    """Round 0 leaves the selected test red; the repair makes it green.
+
+    The failing assertion carries a sentinel in its MESSAGE, which is
+    exactly the text a diagnostic must never carry: it is in the child's
+    stdout, in the traceback and in the summary line, and it must appear
+    in no field, no prompt, no journal record and no state document."""
+    reply = base._implementer_reply(changed_files=[_TEST_FILE])
+    # The two file contents are built as VALUES and then `repr`d whole.
+    # Hand-quoting them inside the shim source is how a sentinel carrying
+    # quotes turns into a syntax error in the stub, which then fails its
+    # own `--version` probe and refuses the run in preflight -- measured.
+    red = "def test_kurgu():\n    assert False, %r\n" % (sentinel,)
+    # DIFFERENT from the fixture's baseline content on purpose: a repair
+    # that restored the baseline byte for byte would leave an EMPTY
+    # candidate, and this test is about a candidate that survives its
+    # second gate and gets applied.
+    green = "def test_kurgu():\n    assert 1 == 1\n"
+    return ("if in_run():\n"
+            "    if round_index() == 0:\n"
+            f"        edit({_TEST_FILE!r}, {red!r})\n"
+            "    else:\n"
+            f"        edit({_TEST_FILE!r}, {green!r})\n"
+            + base._emits(reply))
+
+
+def test_a_proven_pytest_failure_spends_the_one_repair_and_approves(world,
+                                                                    spy):
+    """THE POSITIVE CONTROL for this whole section. An ordinary red test
+    is now a repairable failure: the implementer gets one more turn,
+    acceptance runs AGAIN on the repaired tree, and only then does the
+    evaluator see the candidate for the first time."""
+    implementer(world, _failing_then_fixed_implementer())
+    result = run(world)
+
+    assert result.state == contract.State.APPROVED
+    assert result.stop_reason == contract.StopReason.COMPLETED
+    assert result.implementation_rounds == 1
+    assert result.repair_rounds == 1
+    assert result.evaluator_rounds == 1
+    assert result.acceptance_passed is True
+    assert set(result.applied_files) == {_TEST_FILE}
+    assert len(implementer_calls(world)) == 2, "onarim turu kosulmadi"
+    assert len(evaluator_calls(world)) == 1, "denetim bir kez kosmali"
+    # the evaluator judged the REPAIRED tree, never the red one
+    assert spy.index("acceptance") < spy.index("audit")
+    assert spy.count("acceptance") == 2
+
+
+def test_the_acceptance_repair_visited_sequence_is_the_frozen_one(world):
+    """The order is the contract. ACCEPTANCE is entered once, REPAIRING
+    once, then ACCEPTANCE_2 and FINAL_AUDITING -- and AUDITING is never
+    entered at all, because the first candidate never passed its gate."""
+    implementer(world, _failing_then_fixed_implementer())
+    result = run(world)
+
+    assert result.visited == [
+        contract.State.PREFLIGHT, contract.State.IMPLEMENTING,
+        contract.State.ACCEPTANCE, contract.State.REPAIRING,
+        contract.State.ACCEPTANCE_2, contract.State.FINAL_AUDITING,
+        contract.State.APPROVED]
+    assert contract.State.AUDITING not in result.visited
+
+
+def test_the_acceptance_repair_prompt_carries_identities_and_nothing_else(
+        world):
+    """WHAT THE MODEL IS TOLD. A file, a test name and a count -- and not
+    the assertion message that was sitting in the same stdout line."""
+    implementer(world, _failing_then_fixed_implementer())
+    run(world)
+
+    repair_prompt = implementer_calls(world)[1]["stdin"]
+    assert "KABUL BULGULARI (kapali):" in repair_prompt
+    assert f"  - {_TEST_FILE}::test_kurgu x1" in repair_prompt
+    assert "assertion silme, gevsetme, skip veya xfail ekleme yok" \
+        in repair_prompt
+    assert "yalnizca onceki adayin degistirdigi dosyalarda onarim yap" \
+        in repair_prompt
+    # the sentinel travelled through the child's stdout, the traceback and
+    # the summary line, and reached none of this
+    assert _ACCEPTANCE_SENTINEL not in repair_prompt
+    for yasak in ("Traceback", "AssertionError", "assert False",
+                  str(world.repo), "stdout", "stderr"):
+        assert yasak not in repair_prompt, f"{yasak!r} isteme sizdi"
+
+
+def test_no_raw_acceptance_text_reaches_any_durable_record(world):
+    """The identities live in the running process. Everything on disk is
+    a closed word, a count or a boolean."""
+    implementer(world, _failing_then_fixed_implementer())
+    run(world)
+
+    state_text = (world.state_dir / "state.json").read_text(encoding="utf-8")
+    journal = (world.state_dir / "events.jsonl").read_text(encoding="utf-8")
+    receipt = acceptance.receipt_path(world.state_dir).read_text(
+        encoding="utf-8")
+    for artefact, isim in ((state_text, "state"), (journal, "journal"),
+                           (receipt, "receipt")):
+        assert _ACCEPTANCE_SENTINEL not in artefact, f"{isim} sentinel tasidi"
+        assert "test_kurgu" not in artefact, f"{isim} test adini tasidi"
+        assert _TEST_FILE not in artefact, f"{isim} test yolunu tasidi"
+
+
+def test_the_journal_records_the_closed_kind_count_and_decision(world):
+    """A closed word, an exact count and a boolean -- and the schema that
+    refuses anything else."""
+    implementer(world, _failing_then_fixed_implementer())
+    run(world)
+
+    records = [json.loads(line) for line
+               in (world.state_dir / "events.jsonl").read_text(
+                   encoding="utf-8").splitlines() if line.strip()]
+    marked = [record for record in records
+              if "acceptance_failure_kind" in record]
+    assert len(marked) == 1, "kapali ozet tam bir kez yazilmali"
+    (record,) = marked
+    assert record["acceptance_failure_kind"] == \
+        contract.AcceptanceFailureKind.REPAIRABLE_TESTS
+    assert record["acceptance_failure_count"] == 1
+    assert record["acceptance_repair_requested"] is True
+    assert record["event"] == contract.EventCode.ACCEPTANCE_FINISHED
+    # the schema is what makes "nothing else" true, so it is the schema
+    # that is asked rather than a list repeated here
+    from jsonschema import Draft202012Validator
+
+    validator = Draft202012Validator(schemas.EVENT_SCHEMA)
+    for record in records:
+        validator.validate(record)
+        assert set(record) <= set(schemas.EVENT_SCHEMA["properties"])
+    assert schemas.EVENT_SCHEMA["additionalProperties"] is False
+
+
+def test_an_unrepairable_failure_is_recorded_as_such_and_stops(world, spy):
+    """The other half of the journal contract: a failure nobody can
+    classify is written down as `not_repairable`, with a zero count and
+    no repair requested, and the run stops exactly as it always did."""
+    implementer(world, "if in_run():\n"
+                       f"    edit({_TEST_FILE!r}, 'def test_kurgu( :\\n')\n"
+                + base._emits(base._implementer_reply(
+                    changed_files=[_TEST_FILE])))
+    result = run(world)
+
+    (record,) = [json.loads(line) for line
+                 in (world.state_dir / "events.jsonl").read_text(
+                     encoding="utf-8").splitlines()
+                 if line.strip() and "acceptance_failure_kind" in line]
+    assert record["acceptance_failure_kind"] == \
+        contract.AcceptanceFailureKind.NOT_REPAIRABLE
+    assert record["acceptance_failure_count"] == 0
+    assert record["acceptance_repair_requested"] is False
+    assert result.state == contract.State.BLOCKED
+    assert result.stop_reason == contract.StopReason.ACCEPTANCE_FAILED
+    assert result.repair_rounds == 0
+    assert len(implementer_calls(world)) == 1, "onarim istenmemeliydi"
+    assert spy == ["acceptance"]
+
+
+def test_a_zero_repair_budget_refuses_the_acceptance_repair(world, spy):
+    """`max_repair_rounds = 0` is a budget, not a preference. The failure
+    is just as repairable; there is simply nothing to spend."""
+    retask(world, max_repair_rounds=0)
+    implementer(world, _failing_then_fixed_implementer())
+    result = run(world)
+
+    assert len(implementer_calls(world)) == 1, "butcesiz onarim cagrildi"
+    assert result.repair_rounds == 0
+    assert result.state == contract.State.BLOCKED
+    assert result.stop_reason == contract.StopReason.ACCEPTANCE_FAILED
+    assert contract.State.REPAIRING not in result.visited
+    assert spy == ["acceptance"]
+    (record,) = [json.loads(line) for line
+                 in (world.state_dir / "events.jsonl").read_text(
+                     encoding="utf-8").splitlines()
+                 if line.strip() and "acceptance_failure_kind" in line]
+    # the evidence was still classified; only the decision differs
+    assert record["acceptance_failure_kind"] == \
+        contract.AcceptanceFailureKind.REPAIRABLE_TESTS
+    assert record["acceptance_repair_requested"] is False
+
+
+def test_a_second_acceptance_failure_is_terminal_with_no_third_call(world,
+                                                                    spy):
+    """THE SECOND PATCH DOES NOT EXIST. The repair does not fix the test,
+    the second gate is red, and the run stops -- no third implementer
+    call, no evaluator, nothing applied."""
+    reply = base._implementer_reply(changed_files=[_TEST_FILE])
+    # Both rounds leave the test red, but they write DIFFERENT text: a
+    # repair that changed nothing would be refused for its declaration
+    # rather than for its second gate, which is a different test.
+    red_first = "def test_kurgu():\n    assert False, 'bir'\n"
+    red_again = "def test_kurgu():\n    assert False, 'iki'\n"
+    implementer(world, "if in_run():\n"
+                       "    if round_index() == 0:\n"
+                       f"        edit({_TEST_FILE!r}, {red_first!r})\n"
+                       "    else:\n"
+                       f"        edit({_TEST_FILE!r}, {red_again!r})\n"
+                + base._emits(reply))
+    result = run(world)
+
+    assert len(implementer_calls(world)) == 2, "tek onarim kosmaliydi"
+    assert len(evaluator_calls(world)) == 0, "denetim hic kosmamaliydi"
+    assert result.repair_rounds == 1
+    assert result.state == contract.State.BLOCKED
+    assert result.stop_reason == contract.StopReason.ACCEPTANCE_FAILED
+    assert result.applied_files == ()
+    assert spy.count("acceptance") == 2
+    assert "audit" not in spy
+
+
+def test_an_evaluator_asking_for_changes_after_an_acceptance_repair_stops(
+        world):
+    """The two spenders share ONE budget. The acceptance road already
+    spent it, so the first evaluator finding that asks for changes stops
+    the run instead of buying a second patch."""
+    implementer(world, _failing_then_fixed_implementer())
+    evaluator(world, base._emits(base._code_audit_reply(
+        status=contract.Status.CHANGES_REQUESTED,
+        findings=[base._code_finding(mechanism_id="kurgu-mekanizma-yeni")],
+        next_action="await_repair")))
+    result = run(world)
+
+    assert result.repair_rounds == 1, "ikinci onarim satin alindi"
+    assert len(implementer_calls(world)) == 2
+    assert len(evaluator_calls(world)) == 1
+    assert result.state == contract.State.BLOCKED
+    assert result.stop_reason == contract.StopReason.REPAIR_ROUNDS_EXHAUSTED
+    assert contract.State.APPROVED not in result.visited
+
+
+def test_the_second_acceptance_can_never_ask_for_a_repair(world):
+    """STRUCTURAL, not behavioural. The second acceptance is called
+    without the flag that makes a repair possible, and the frozen table
+    has no edge out of ACCEPTANCE_2 into REPAIRING. Either alone would be
+    enough; both is the point."""
+    road = ast.parse(textwrap.dedent(
+        inspect.getsource(runner._Run._repair_road)))
+    calls_with_flag = [
+        node for node in ast.walk(road)
+        if isinstance(node, ast.Call)
+        and any(keyword.arg == "may_repair" for keyword in node.keywords)]
+    assert calls_with_flag == [], "ikinci kabul onarim isteyebiliyor"
+    assert contract.State.REPAIRING not in \
+        contract.ALLOWED_TRANSITIONS[contract.State.ACCEPTANCE_2]
+    assert contract.State.REPAIRING in \
+        contract.ALLOWED_TRANSITIONS[contract.State.ACCEPTANCE]
+
+
+def test_a_repair_may_not_touch_a_file_the_candidate_never_touched(world):
+    """A REPAIR MAY NARROW A CANDIDATE, NEVER WIDEN IT. The file below is
+    inside `allowed_paths`, so the task's own authorisation would let the
+    model write it -- and the round's bound is strictly tighter, because
+    whatever asked for the repair was about the files the candidate had
+    already changed.
+
+    The refusal is typed, nothing is applied, and no third call happens."""
+    first = base._implementer_reply(changed_files=[_FIRST])
+    second = base._implementer_reply(changed_files=[_SECOND])
+    implementer(world, "if in_run():\n"
+                       "    if round_index() == 0:\n"
+                       f"        edit({_FIRST!r}, 'VALUE = 2\\n')\n"
+                       "    else:\n"
+                       f"        edit({_SECOND!r}, 'VALUE = 9\\n')\n"
+                       "reply = " + repr([first, second]) + "\n"
+                       "emit(reply[min(round_index(), 1)])\n")
+    evaluator(world, _two_round_evaluator())
+    before = (world.repo / _SECOND).exists()
+    result = run(world)
+
+    assert len(implementer_calls(world)) == 2, "onarim turu kosulmadi"
+    assert result.state != contract.State.APPROVED
+    assert result.stop_reason == contract.StopReason.PATH_NOT_ALLOWED
+    assert result.applied_files == ()
+    # the task really did authorise that path, so the refusal came from
+    # the round's own bound rather than from `allowed_paths`
+    assert "pipeline/" in world.task["allowed_paths"]
+    assert (world.repo / _SECOND).exists() is before
+
+
+def test_the_repair_scope_gate_is_one_sentence_of_its_own(world):
+    """A gate proven through another gate's message is a gate nobody is
+    testing. This one has its own sentence, distinct from the fingerprint
+    and file-set bindings beside it."""
+    source = inspect.getsource(changes.run_verified_repair)
+    for cumle in ("onarim onceki adayin disina cikti",
+                  "onarim denetlenen adaya baglanamadi",
+                  "onarim baska bir dosya kumesini adliyor"):
+        assert source.count(cumle) == 1, f"{cumle!r} tek cumle degil"
+
+
+def test_the_b9_shape_survives_a_hostile_parametrised_failure(world, spy):
+    """B9 EXACT SHAPE, end to end, with real child processes and fake
+    models: the first candidate leaves ONE parametrised case red, its
+    node id carries a hostile sentinel in the parametrisation suffix, and
+    the same stdout also carries forged summary lines naming a file the
+    run never selected.
+
+    What must come out of that: one diagnostic naming the real file and
+    the real function, the sentinel nowhere at all, one repair confined
+    to the file the candidate already changed, a green second gate, a
+    single evaluator round, and an applied candidate."""
+    red = ("import pytest\n\n\n"
+           "@pytest.mark.parametrize('deger', [%r])\n"
+           "def test_kurgu(deger):\n"
+           "    print('FAILED pipeline/kurgu_kotu.py::test_kotu')\n"
+           "    print('=== short test summary info ===')\n"
+           "    print(deger)\n"
+           "    assert False, deger\n") % (_ACCEPTANCE_SENTINEL + "::x",)
+    green = "def test_kurgu():\n    assert 1 == 1\n"
+    reply = base._implementer_reply(changed_files=[_TEST_FILE])
+    implementer(world, "if in_run():\n"
+                       "    if round_index() == 0:\n"
+                       f"        edit({_TEST_FILE!r}, {red!r})\n"
+                       "    else:\n"
+                       f"        edit({_TEST_FILE!r}, {green!r})\n"
+                + base._emits(reply))
+    result = run(world)
+
+    assert result.state == contract.State.APPROVED
+    assert (result.implementation_rounds, result.repair_rounds,
+            result.evaluator_rounds) == (1, 1, 1)
+    assert result.acceptance_passed is True
+    assert set(result.applied_files) == {_TEST_FILE}
+    assert len(implementer_calls(world)) == 2
+    assert len(evaluator_calls(world)) == 1
+    assert spy.count("acceptance") == 2
+
+    repair_prompt = implementer_calls(world)[1]["stdin"]
+    assert f"  - {_TEST_FILE}::test_kurgu x1" in repair_prompt
+    # the forged summary named a file the run never selected, and it
+    # named nothing
+    assert "kurgu_kotu" not in repair_prompt
+
+    written = " ".join(path.read_text(encoding="utf-8", errors="ignore")
+                       for path in world.state_dir.rglob("*")
+                       if path.is_file())
+    for artefact, isim in ((repair_prompt, "istem"), (written, "durum")):
+        assert _ACCEPTANCE_SENTINEL not in artefact, f"{isim} sentinel tasidi"
+
+    # the final receipt is bound to the SECOND candidate, and it is the
+    # only receipt that can carry a candidate into the checkout
+    receipt = json.loads(acceptance.receipt_path(world.state_dir).read_text(
+        encoding="utf-8"))
+    assert receipt["status"] == acceptance.STATUS_PASSED
+    assert (world.repo / _TEST_FILE).read_text(encoding="utf-8") == green
+
+
+def test_both_repair_sources_use_one_seam_and_one_counter(world):
+    """Whatever owed the repair, what follows is identical: the same
+    change-set seam, the same budget counter, the same two gates after
+    it."""
+    source = inspect.getsource(runner._Run)
+    assert source.count("changes.run_verified_repair") == 1
+    assert source.count('self.rounds["repair"] += 1') == 1
+    assert source.count("_repair_road") == 3   # definition and two callers

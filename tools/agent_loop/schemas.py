@@ -38,6 +38,7 @@ from types import MappingProxyType
 from jsonschema import Draft202012Validator
 
 from tools.agent_loop.contract import (
+    ALL_ACCEPTANCE_FAILURE_KINDS,
     ALL_AUDIT_KINDS,
     ALL_EVENT_CODES,
     ALL_FAILURE_CODES,
@@ -53,6 +54,7 @@ from tools.agent_loop.contract import (
     CONTROL_PLANE_PATHS,
     DEFAULTS,
     IDENTIFIER_PATTERN,
+    MAX_DIAGNOSTICS,
     OPAQUE_ID_PATTERN,
     PROTOCOL_VERSION,
     AuditKind,
@@ -509,6 +511,16 @@ EVENT_SCHEMA = {
         # absent from `required` rather than nullable.
         "schema_issue": {"enum": list(ALL_SCHEMA_ISSUES)},
         "schema_field": {"enum": list(ALL_SCHEMA_FIELDS)},
+        # B10-R1: whether a failed acceptance gate was repairable, how
+        # many test functions it named, and whether the run then spent its
+        # one repair on it. A CLOSED word, an exact count and a boolean --
+        # no test name, no path, no message. The identities that drive the
+        # repair live in the running process and are never written here.
+        "acceptance_failure_kind": {
+            "enum": list(ALL_ACCEPTANCE_FAILURE_KINDS)},
+        "acceptance_failure_count": {"type": "integer", "minimum": 0,
+                                     "maximum": MAX_DIAGNOSTICS},
+        "acceptance_repair_requested": {"type": "boolean"},
     },
 }
 

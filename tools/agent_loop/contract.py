@@ -141,7 +141,12 @@ TERMINAL_STATES = (State.APPROVED, State.BLOCKED, State.FAILED)
 ALLOWED_TRANSITIONS = {
     State.PREFLIGHT: (State.IMPLEMENTING, State.BLOCKED, State.FAILED),
     State.IMPLEMENTING: (State.ACCEPTANCE, State.BLOCKED, State.FAILED),
-    State.ACCEPTANCE: (State.AUDITING, State.BLOCKED, State.FAILED),
+    # REPAIRING is reachable from the FIRST acceptance (B10-R1) and from
+    # the audit, and from nowhere else. Both edges spend the SAME single
+    # repair budget, so adding this one did not add a patch -- it added a
+    # second reason the one patch may be spent.
+    State.ACCEPTANCE: (State.AUDITING, State.REPAIRING, State.BLOCKED,
+                       State.FAILED),
     State.AUDITING: (State.APPROVED, State.REPAIRING, State.BLOCKED,
                      State.FAILED),
     State.REPAIRING: (State.ACCEPTANCE_2, State.BLOCKED, State.FAILED),
@@ -418,6 +423,37 @@ class FailureCode:
 ALL_FAILURE_CODES = tuple(
     value for name, value in vars(FailureCode).items()
     if not name.startswith("_") and isinstance(value, str))
+
+
+class AcceptanceFailureKind:
+    """WHY a failed acceptance gate was, or was not, repairable (B10-R1).
+
+    THE JOURNAL GETS THIS AND NOTHING ELSE. A repair round is driven by
+    test identities that live only in the running process; what is
+    persisted is this word plus a count, because a file name in a journal
+    is a file name in whatever prints the journal, and because the
+    interesting question months later is "did the loop decide to repair,
+    and on what class of evidence" rather than "which test was red".
+
+    Two values, deliberately. Naming each refusal shape separately -- one
+    code for a timeout, one for an overflow, one for a collection error --
+    would put the classifier's internal taxonomy into a permanent record
+    that later versions cannot change without rewriting history."""
+
+    REPAIRABLE_TESTS = "repairable_tests"
+    NOT_REPAIRABLE = "not_repairable"
+
+
+ALL_ACCEPTANCE_FAILURE_KINDS = tuple(
+    value for name, value in vars(AcceptanceFailureKind).items()
+    if not name.startswith("_") and isinstance(value, str))
+
+# The ceiling on how many failing test functions may be described at all.
+# It lives HERE rather than in the classifier because the journal schema
+# bounds the same number and the two must not be able to disagree; a
+# repair prompt longer than this is a broken candidate rather than a
+# wrong expectation, and it keeps the human gate.
+MAX_DIAGNOSTICS = 20
 
 # The table the runner reads, keyed by (MODULE LEAF, CLASS NAME).
 #

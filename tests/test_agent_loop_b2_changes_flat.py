@@ -601,15 +601,23 @@ def test_the_repair_seam_names_a_workspace_and_never_a_path():
 
 def test_a_repair_returns_the_whole_candidate_not_its_own_delta(
         tmp_path, gate, only_fake_models_may_run):
-    """POSITIVE CONTROL and the central claim at once. Round one adds one
-    file, the repair adds another, and what comes back describes the
-    REFERENCE-to-final distance -- both files. Returning this call's
-    delta here is how half a candidate reaches the operator."""
-    previous = _first(tmp_path, gate, [_write("pipeline/bir.py")],
-                      ["pipeline/bir.py"])
-    assert previous.changed_files == ("pipeline/bir.py",)
+    """POSITIVE CONTROL and the central claim at once. Round one adds two
+    files, the repair re-edits ONE of them, and what comes back describes
+    the REFERENCE-to-final distance -- both files. Returning this call's
+    delta here is how half a candidate reaches the operator.
 
-    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+    RETARGETED FOR B10-R1, intent unchanged. The scenario used to have
+    the repair ADD a file round one never touched, which the repair scope
+    gate now refuses on purpose: a repair may narrow a candidate, never
+    widen it. Having round one touch both files keeps the delta and the
+    cumulative set DIFFERENT, which is the only thing this test needs."""
+    previous = _first(tmp_path, gate,
+                      [_write("pipeline/bir.py"), _write("pipeline/iki.py")],
+                      ["pipeline/bir.py", "pipeline/iki.py"])
+    assert previous.changed_files == ("pipeline/bir.py", "pipeline/iki.py")
+
+    binary = _repair_stub(tmp_path,
+                          [_write("pipeline/iki.py", "ONARIM")],
                           ["pipeline/iki.py"])
     verified = _repair(binary, gate, previous)
 
@@ -624,11 +632,19 @@ def test_a_first_round_change_the_repair_never_touched_stays(
         tmp_path, gate, only_fake_models_may_run):
     """The repair declares only what IT did; the candidate still carries
     what round one did. A seam that compared the declaration against the
-    cumulative set would refuse this entirely honest repair."""
+    cumulative set would refuse this entirely honest repair.
+
+    RETARGETED FOR B10-R1, intent unchanged: the repair now re-edits one
+    of the files round one touched instead of adding a third, because a
+    repair may narrow a candidate and never widen it. What is proven is
+    the same -- the two files the repair did NOT mention are still in the
+    candidate."""
     previous = _first(tmp_path, gate,
-                      [_write("pipeline/kurgu.py"), _write("pipeline/bir.py")],
-                      ["pipeline/kurgu.py", "pipeline/bir.py"])
-    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+                      [_write("pipeline/kurgu.py"), _write("pipeline/bir.py"),
+                       _write("pipeline/iki.py")],
+                      ["pipeline/kurgu.py", "pipeline/bir.py",
+                       "pipeline/iki.py"])
+    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py", "ONARIM")],
                           ["pipeline/iki.py"])
     verified = _repair(binary, gate, previous)
 
@@ -792,10 +808,19 @@ def test_a_repair_that_touches_the_main_checkout_is_refused(
 def test_a_repair_declaration_is_compared_against_its_own_delta(
         tmp_path, gate, only_fake_models_may_run):
     """The model reports what THIS call did. A declaration that does not
-    match the delta is a reply about a different piece of work."""
-    previous = _first(tmp_path, gate, [_write("pipeline/bir.py")],
-                      ["pipeline/bir.py"])
-    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py")],
+    match the delta is a reply about a different piece of work.
+
+    RETARGETED FOR B10-R1, intent unchanged, and the retarget makes the
+    test SHARPER. The repair now edits a file round one already touched,
+    so the scope gate is satisfied and this refusal can only have come
+    from the declaration comparison. The old scenario edited a fresh file
+    and would now be refused one gate earlier, which is exactly the
+    'two gates closing on one door' shape this project has been burned by
+    before."""
+    previous = _first(tmp_path, gate,
+                      [_write("pipeline/bir.py"), _write("pipeline/iki.py")],
+                      ["pipeline/bir.py", "pipeline/iki.py"])
+    binary = _repair_stub(tmp_path, [_write("pipeline/iki.py", "ONARIM")],
                           ["pipeline/uc.py"])
     with pytest.raises(changes.DeclarationMismatch):
         _repair(binary, gate, previous)

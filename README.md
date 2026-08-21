@@ -168,6 +168,13 @@ cannot install, fetch or commit anything, and the acceptance commands are run by
 the runner rather than by the model. That split is what makes the gates mean
 something.
 
+A run gets exactly one repair attempt. It can be spent either by the evaluator
+asking for changes, or by the first acceptance run failing on ordinary test
+failures the runner can identify. Anything it cannot identify, such as a
+collection error, a timeout or a truncated output, still stops the run for a
+person to look at. After a repair, acceptance and the evaluator both run again
+before anything is applied.
+
 `RunResult` gives you identities, counts and closed codes, never raw model output
 or a patch. The durable record sits in `.agent-loop/`: `state.json` for where the
 run got to, `events.jsonl` for the transitions, `findings.json` for what the

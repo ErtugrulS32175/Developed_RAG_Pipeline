@@ -1603,11 +1603,71 @@ def test_a_locked_reply_is_bound_to_the_ids_the_runner_issued():
 
 def test_the_state_machine_has_no_third_patch_edge():
     """THE point of the loop. FINAL_AUDITING may end approved or blocked
-    -- never back to REPAIRING, because that edge IS the third patch."""
+    -- never back to REPAIRING, because that edge IS the third patch.
+
+    ACCEPTANCE_2 is the same rule from the other side (B10-R1): the first
+    acceptance may now buy the one repair, so the second one must not be
+    able to buy another. Exactly TWO states may enter REPAIRING, and both
+    of them are first-round gates."""
     assert contract.State.REPAIRING not in contract.ALLOWED_TRANSITIONS[
         contract.State.FINAL_AUDITING]
+    assert contract.State.REPAIRING not in contract.ALLOWED_TRANSITIONS[
+        contract.State.ACCEPTANCE_2]
+    enters_repair = {state for state, targets
+                     in contract.ALLOWED_TRANSITIONS.items()
+                     if contract.State.REPAIRING in targets}
+    assert enters_repair == {contract.State.ACCEPTANCE,
+                             contract.State.AUDITING}
     for terminal in contract.TERMINAL_STATES:
         assert contract.ALLOWED_TRANSITIONS[terminal] == ()
+
+
+def test_the_acceptance_failure_vocabulary_is_closed_and_small():
+    """Two words, and the journal schema may say nothing else.
+
+    Naming each refusal shape separately -- a code for a timeout, one for
+    an overflow, one for a collection error -- would freeze the
+    classifier's internal taxonomy into a permanent record that later
+    versions could not change without rewriting history."""
+    assert set(contract.ALL_ACCEPTANCE_FAILURE_KINDS) == {
+        contract.AcceptanceFailureKind.REPAIRABLE_TESTS,
+        contract.AcceptanceFailureKind.NOT_REPAIRABLE}
+    assert contract.MAX_DIAGNOSTICS == 20
+
+    properties = schemas.EVENT_SCHEMA["properties"]
+    assert properties["acceptance_failure_kind"]["enum"] == \
+        list(contract.ALL_ACCEPTANCE_FAILURE_KINDS)
+    assert properties["acceptance_failure_count"] == {
+        "type": "integer", "minimum": 0,
+        "maximum": contract.MAX_DIAGNOSTICS}
+    assert properties["acceptance_repair_requested"] == {"type": "boolean"}
+    # the journal stays closed, so nothing outside the list can reach it
+    assert schemas.EVENT_SCHEMA["additionalProperties"] is False
+    for banned in ("test_file", "test_name", "diagnostics", "stdout",
+                   "message", "detail"):
+        assert banned not in properties
+
+
+def test_a_journal_record_may_not_carry_a_test_identity():
+    """The schema is the guard, not a convention. A record carrying a
+    file or a name is refused by the validator itself."""
+    validator = Draft202012Validator(schemas.EVENT_SCHEMA)
+    good = {"ts": "2026-01-01T00:00:00Z", "run_id": "kosu-" + "a" * 24,
+            "event": contract.EventCode.ACCEPTANCE_FINISHED,
+            "acceptance_failure_kind":
+                contract.AcceptanceFailureKind.REPAIRABLE_TESTS,
+            "acceptance_failure_count": 1,
+            "acceptance_repair_requested": True}
+    validator.validate(good)
+
+    for bad in ({"test_file": "tests/test_x.py"},
+                {"test_name": "test_kurgu"},
+                {"acceptance_failure_kind": "kurgu-yeni-sinif"},
+                {"acceptance_failure_count": contract.MAX_DIAGNOSTICS + 1},
+                {"acceptance_failure_count": -1},
+                {"acceptance_repair_requested": "evet"}):
+        with pytest.raises(ValidationError):
+            validator.validate({**good, **bad})
 
 
 def test_the_loop_never_runs_an_arbitrary_shell():

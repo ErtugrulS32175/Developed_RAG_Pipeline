@@ -1381,7 +1381,19 @@ def test_every_mutation_still_applies_to_the_current_source():
     # tracked-manifest refusal, archive containment, the pending-application
     # gate, the exact-name allowlist, the candidate's derived scope, and
     # the second measurement of every source after the copy loop.
-    assert len(tool.MUTATIONS) == 148
+    # 148 -> 161 in B10-R1: one repair for a PROVEN pytest acceptance
+    # failure. Nine entries guard the classifier, whose input is a
+    # child's stdout and therefore a candidate's to write -- the summary
+    # banner (so a forged line before it is not evidence), the
+    # parametrisation suffix being dropped rather than carried, the
+    # selected-path allowlist, the AST binding, pytest's own total, the
+    # refusal of any summary line this parser does not understand, the
+    # ceiling on failures rather than on functions, the parser never
+    # running on an overflowed read, and a passing command carrying no
+    # actionable list. Four guard the single repair budget: the zero
+    # budget, the second acceptance never asking for a repair, the one
+    # counter both sources spend, and the round's own file-scope bound.
+    assert len(tool.MUTATIONS) == 161
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1424,6 +1436,11 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b7r1-sessiz-ustune-yazma', 'b7r1-bilinmeyen-durum-varsayilani',
         'b7r1-projeksiyon-atlandi', 'b7r1-protokol-matrisi',
         'b7r1-bos-istem-kapisi',
+        'b10-sahte-ozet', 'b10-param-tasima', 'b10-secilmemis-yol',
+        'b10-ast-bagi', 'b10-sayim-uyumu', 'b10-bilinmeyen-satir',
+        'b10-tavan', 'b10-tasma-parser', 'b10-gecen-komut',
+        'b10-sifir-butce', 'b10-ikinci-onarim', 'b10-butce-sayaci',
+        'b10-onarim-kapsami',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

@@ -941,7 +941,22 @@ def run_verified_repair(binary, *, repo, state_dir, task_path,
         for change in total:
             _authorize(change.path, allowed=allowed, forbidden=forbidden,
                        task_relative=task_relative)
-        return _semantic_changes(implementer_before, implementer_after), total
+        delta = _semantic_changes(implementer_before, implementer_after)
+        # A REPAIR MAY NARROW THE CANDIDATE, NEVER WIDEN IT (B10-R1).
+        # `allowed_paths` is the task's authorisation for the RUN; this is
+        # the round's own bound, and it is strictly tighter: the only files
+        # a repair may touch are the ones the candidate it is repairing
+        # already touched. Whatever asked for the repair -- an evaluator
+        # finding, which can only cite a changed file, or a failing test in
+        # a selected file the candidate edited -- was about THOSE files, so
+        # a repair reaching a fresh one is doing something nobody asked
+        # for, on a tree nobody has audited, with the budget already spent.
+        outside = sorted({_fold(change.path) for change in delta}
+                         - expected_paths)
+        if outside:
+            raise UnsafeChange("onarim onceki adayin disina cikti",
+                               reason=contract.StopReason.PATH_NOT_ALLOWED)
+        return delta, total
 
     failure = None
     try:

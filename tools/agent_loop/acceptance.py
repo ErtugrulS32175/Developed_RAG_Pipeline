@@ -42,6 +42,7 @@ operating system's own error text.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -94,6 +95,244 @@ _EVENTS = {COMPLETED: contract.EventCode.ACCEPTANCE_FINISHED,
 # nothing is discovered inside the mirror and no task can choose an
 # interpreter.
 _PROGRAM_SUFFIXES = ("", ".exe", ".cmd", ".bat") if os.name == "nt" else ("",)
+
+
+# ---------------------------------------------------------------------
+# THE CLOSED ACCEPTANCE DIAGNOSTIC (B10-R1)
+# ---------------------------------------------------------------------
+#
+# A failing acceptance gate used to be a single word: `acceptance_failed`.
+# That word is enough for a human, who can open the mirror and read the
+# output -- but a repair round cannot be given the output, and without
+# something it CAN be given, an ordinary wrong test expectation costs a
+# whole run.
+#
+# So exactly one shape becomes repairable, and it is the narrowest one
+# that carries no free text at all: which test function failed, in which
+# already-selected test file, how many of its parametrised cases failed.
+# Nothing else survives the boundary. The assertion text, the expected
+# and actual values, the parametrisation values, the traceback, the
+# fixture contents and the temporary paths all stay inside the buffer
+# they were read into and die with it.
+#
+# THE PARSER IS THE ATTACK SURFACE, so it is fail-closed in every
+# direction. Its input is the child's stdout: a candidate can print
+# whatever it likes there, including lines shaped exactly like pytest's
+# own. Every gate below exists because some spelling of "trust the
+# terminal" would otherwise become a way to name a file, a path or a
+# test the run never selected.
+
+DIAGNOSTIC_FAILED = "failed"
+ALL_DIAGNOSTIC_OUTCOMES = (DIAGNOSTIC_FAILED,)
+
+# A repair prompt is a list a person could read. The ceiling is the
+# contract's, not this module's: the journal schema bounds the same
+# number, and one authority means the two cannot disagree.
+MAX_DIAGNOSTICS = contract.MAX_DIAGNOSTICS
+
+# The only command whose output this package will read. `leak_scan`,
+# `p0_gate` and `pytest_full` are deliberately absent: each fails for
+# reasons a test-node list cannot describe.
+REPAIRABLE_COMMAND_ID = "pytest_selected"
+
+# pytest's own banner. Anything before the LAST one is ignored, which is
+# what makes a candidate printing a fake `FAILED` line harmless.
+_SUMMARY_BANNER = "short test summary info"
+_FAILED_PREFIX = "FAILED "
+_COUNT_LINE = re.compile(r"(?:^|\s)(\d+) failed(?:,|\s|$)")
+_TEST_NAME = re.compile(r"^test_[A-Za-z0-9_]{1,127}$")
+_PARAM_SUFFIX = re.compile(r"\[.*\]$", re.DOTALL)
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceDiagnostic:
+    """One failing test function, as closed identifiers and a count.
+
+    THERE IS NO FIELD A PASSAGE COULD TRAVEL IN. That is the whole
+    design: not "we remember not to copy the message", but "there is
+    nowhere to put it". `case_count` collapses every parametrised case of
+    one function into a number, so the parametrisation values -- the most
+    likely place for a hostile string to hide -- are dropped rather than
+    sanitised."""
+
+    command_id: str
+    test_file: str
+    test_name: str
+    case_count: int
+    outcome: str
+
+
+def _split_node(node):
+    """`(file, name)` for an ordinary test node, or `None`.
+
+    THE PARAMETRISATION SUFFIX IS CUT FIRST, before anything is split on
+    `::`. Measured: a parametrised value is arbitrary text, so it can
+    itself contain `::` -- and splitting first turned a perfectly ordinary
+    failure into a refusal, which is fail-closed but also exactly the case
+    this feature exists for. Cutting the suffix first means a hostile
+    parameter value cannot change which file or function is named; it can
+    only be discarded."""
+    bare = _PARAM_SUFFIX.sub("", node)
+    parts = bare.split("::")
+    if len(parts) != 2:
+        # a bare file, or a class-based node this package does not claim
+        # to support yet
+        return None
+    raw_file, raw_name = parts
+    if not _TEST_NAME.match(raw_name):
+        # a name carrying a path separator, a quote or a control
+        # character never becomes a field
+        return None
+    return raw_file, raw_name
+
+
+def _defines_test(tree, name):
+    """Whether `name` is a function this module actually defines.
+
+    Walked rather than scanned at the top level so a test inside a class
+    still binds, and `ast` rather than text so a name that only appears
+    in a string or a comment does not."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == name:
+            return True
+    return False
+
+
+def classify_pytest_failures(data, *, command_id, selected, tree) -> tuple:
+    """The bounded stdout of one `pytest_selected` run, as diagnostics.
+
+    Returns a tuple of `AcceptanceDiagnostic`, or the EMPTY tuple for
+    every shape this package refuses to repair. An empty answer is not an
+    error here: it means "a human decides", which is the existing
+    behaviour and therefore the safe default.
+
+    `selected` is the repo-relative test paths the resolved argv actually
+    named, and `tree` is the mirror the command ran in. Both are
+    authorities the terminal cannot forge: a node id naming a file
+    outside `selected` is refused, and a name the file's own AST does not
+    define is refused even when `selected` allows the file."""
+    if command_id != REPAIRABLE_COMMAND_ID:
+        return ()
+    try:
+        text = bytes(data).decode("utf-8")
+    except (UnicodeDecodeError, TypeError, ValueError):
+        # invalid UTF-8 is not a test list; it is an output nobody can
+        # read, and guessing at it is exactly what this function must not
+        # do
+        return ()
+    lines = text.splitlines()
+    banner = None
+    for index, line in enumerate(lines):
+        if _SUMMARY_BANNER in line:
+            banner = index
+    if banner is None:
+        return ()
+    # EVERYTHING BEFORE THE LAST BANNER IS NOT EVIDENCE. A candidate can
+    # print a line reading `FAILED tests/x.py::test_y` from its own test
+    # body; pytest prints its summary after this banner, and only that
+    # region is read.
+    body = [line.strip() for line in lines[banner + 1:] if line.strip()]
+
+    total = None
+    nodes = []
+    for line in body:
+        if line.startswith(_FAILED_PREFIX):
+            rest = line[len(_FAILED_PREFIX):].strip()
+            # `-q` appends ` - <message>` to a summary line; the message
+            # is cut here and never looked at again
+            nodes.append(rest.split(" - ", 1)[0].strip())
+            continue
+        match = _COUNT_LINE.search(line)
+        if match is not None:
+            if total is not None:
+                # two count lines is an output shape this parser does not
+                # understand, and an ambiguous total cannot police a
+                # parsed list
+                return ()
+            total = int(match.group(1))
+            continue
+        # ANY other line in the summary region is a refusal: a collection
+        # error, an `ERROR` node, an internal error or a shape this
+        # version has never seen. None of them is an ordinary wrong
+        # expectation, and all of them keep the human gate.
+        return ()
+    if total is None or not nodes:
+        return ()
+    # THE CEILING IS ON FAILURES, NOT ON FUNCTIONS. Measured: bounding
+    # only the number of distinct functions let a single parametrised test
+    # arrive with any number of red cases, so twenty-one failures passed a
+    # gate meant to stop them. The journal schema bounds the same number.
+    if total > MAX_DIAGNOSTICS:
+        return ()
+
+    counts = {}
+    order = []
+    for node in nodes:
+        split = _split_node(node)
+        if split is None:
+            return ()
+        raw_file, name = split
+        if raw_file not in selected:
+            # the ONLY files whose names may travel are the ones the
+            # resolved argv selected -- which is also why a traversing or
+            # absolute path can never appear here
+            return ()
+        key = (raw_file, name)
+        if key not in counts:
+            counts[key] = 0
+            order.append(key)
+        counts[key] += 1
+
+    if sum(counts.values()) != total:
+        # pytest's own total is the authority. A parsed list that does not
+        # add up means some failure was not understood, and repairing half
+        # a failure list is worse than not repairing at all.
+        return ()
+    if not 1 <= len(order) <= MAX_DIAGNOSTICS:
+        return ()
+
+    root = Path(tree)
+    for raw_file, name in order:
+        source = root / raw_file
+        try:
+            parsed = ast.parse(source.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+            return ()
+        if not _defines_test(parsed, name):
+            return ()
+
+    return tuple(
+        AcceptanceDiagnostic(command_id=command_id, test_file=raw_file,
+                             test_name=name, case_count=counts[(raw_file,
+                                                                name)],
+                             outcome=DIAGNOSTIC_FAILED)
+        for raw_file, name in order)
+
+
+@dataclass(frozen=True, slots=True)
+class _DiagnosticPolicy:
+    """What `_run_command` is allowed to ask of one command's output.
+
+    Built by `_walk` from the RESOLVED argv, so the selected paths are
+    the ones that actually ran rather than the ones a manifest asked
+    for."""
+
+    command_id: str
+    selected: tuple
+    tree: object
+
+    def classify(self, data) -> tuple:
+        """Never raises: a parser that throws inside the one function
+        holding the raw buffer would carry that buffer's text out in an
+        exception. Any failure is an empty answer, which is the human
+        gate."""
+        try:
+            return classify_pytest_failures(
+                data, command_id=self.command_id, selected=self.selected,
+                tree=self.tree)
+        except BaseException:                   # noqa: BLE001 -- consumed
+            return ()
 
 
 # ---------------------------------------------------------------------
@@ -227,6 +466,11 @@ class AcceptanceCommandResult:
     stdout_bytes: int
     stderr_bytes: int
     event: str
+    # CLOSED DIAGNOSTICS, never bytes and never text (B10-R1). Empty for
+    # every command that passed, for every command that is not
+    # `pytest_selected`, and for every failure shape this package refuses
+    # to repair.
+    diagnostics: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +504,17 @@ class AcceptanceReport:
     candidate_fingerprint: str
     command_plan_digest: str
     receipt_id: str
+
+    @property
+    def diagnostics(self) -> tuple:
+        """Every command's closed diagnostics, in command order.
+
+        IN MEMORY ONLY. This is what a repair prompt may be built from
+        during the run that produced it; the receipt, the journal and the
+        state document carry counts and a closed kind, never these."""
+        return tuple(diagnostic
+                     for result in self.command_results
+                     for diagnostic in result.diagnostics)
 
 
 def command_plan_digest(references) -> str:
@@ -488,7 +743,11 @@ def _resolve(reference):
                                             paths=paths)
     except cli.UnsafeInvocation:
         raise AcceptanceRefused("kabul komutu cozumlenemedi") from None
-    return command_id, tuple(argv)
+    # THE SELECTED PATHS TRAVEL BESIDE THE ARGV, not sliced back out of
+    # it: the diagnostic parser's file allowlist has to be what the
+    # registry accepted, and re-deriving it by counting fixed flags would
+    # be a second opinion that a flag change could silently break.
+    return command_id, tuple(argv), tuple(paths)
 
 
 # ---------------------------------------------------------------------
@@ -591,7 +850,7 @@ def _assert_programs(commands, env) -> None:
     """Every program a resolved argv names has to exist inside the
     closed PATH before anything runs. A command that cannot start is a
     gate that never ran, and a gate that never ran is not a pass."""
-    for _, argv in commands:
+    for _, argv, _paths in commands:
         if _locate(argv[0], env["PATH"]) is None:
             raise AcceptanceRefused("kabul ortami gerekli programi bulamadi")
 
@@ -632,7 +891,7 @@ def _reclaim(child, container, started_streams, grace):
     return proven
 
 
-def _run_command(argv, *, cwd, env, deadline, max_output_bytes):
+def _run_command(argv, *, cwd, env, deadline, max_output_bytes, policy=None):
     """Start `argv` inside a container that already exists, read both
     pipes to their own ceiling, and prove the container empty.
 
@@ -651,8 +910,17 @@ def _run_command(argv, *, cwd, env, deadline, max_output_bytes):
     Nothing is decided in a `finally` here: the primary error and the
     cleanup verdict are held in named variables and judged afterwards.
 
-    Returns `(outcome, exit_code, stdout_bytes, stderr_bytes)` and never
-    the bytes themselves."""
+    Returns `(outcome, exit_code, stdout_bytes, stderr_bytes, diagnostics)`
+    and never the bytes themselves.
+
+    `policy` is the ONLY way anything reads the buffer, and it is asked
+    exactly once, in exactly one place: after the container is proven
+    empty, after both readers are joined, after the timeout and overflow
+    verdicts are settled, and only on the branch where both readers
+    completed. Every earlier `return` and every `raise` leaves the
+    diagnostics empty, so a timed-out, overflowed, unread or uncontained
+    command cannot produce one -- and the git preparation, which passes
+    no policy, never parses anything at all."""
     try:
         child, container = process.launch_contained(list(argv), cwd=str(cwd),
                                                     env=env)
@@ -715,17 +983,25 @@ def _run_command(argv, *, cwd, env, deadline, max_output_bytes):
             raise ProcessTreeSurvived(
                 "kabul sureci kapsayicisi bosaltilamadi")
         if timed_out:
-            answer = (TIMED_OUT, None) + counts
+            answer = (TIMED_OUT, None) + counts + ((),)
         elif any(stream.overflowed for stream in streams):
-            answer = (OVERFLOWED, None) + counts
+            answer = (OVERFLOWED, None) + counts + ((),)
         # A READER THAT FAILED IS NOT A SHORT ANSWER, and neither is one
         # still alive: an answer taken while a reader has not finished is
         # an answer about a moment that has not ended.
         elif not joined or any(stream.outcome != process.READ_COMPLETED
                                for stream in streams):
-            answer = (READ_FAILED, None) + counts
+            answer = (READ_FAILED, None) + counts + ((),)
         else:
-            answer = (COMPLETED, child.wait()) + counts
+            # THE ONE PLACE THE BUFFER IS READ, and the last thing this
+            # function does with it. Everything the verdict depends on is
+            # already decided above, so the parser cannot influence any of
+            # it -- it can only describe an output that has already been
+            # judged complete.
+            diagnostics = ()
+            if policy is not None:
+                diagnostics = policy.classify(streams[0].buffer)
+            answer = (COMPLETED, child.wait()) + counts + (diagnostics,)
     except BaseException as raised:
         # CAPTURED, not handled here. Every raise below stands OUTSIDE
         # this handler, because `raise X from None` clears `__cause__`
@@ -813,7 +1089,8 @@ def run_acceptance(*, repo, state_dir, task_path, manifest_digest, run_id,
     workspace = flat_workspace.assert_binding(
         repo_path, state_dir=state_path, run_id=run_id,
         workspace_id=workspace_id, baseline_sha=baseline_sha)
-    wants_corpus = any(command_id == "leak_scan" for command_id, _ in commands)
+    wants_corpus = any(command_id == "leak_scan"
+                       for command_id, _, _ in commands)
 
     # THE RECEIPT IS WRITTEN BEFORE ANYTHING RUNS, and it is written
     # PENDING. Two things follow, both deliberate: an earlier `passed`
@@ -923,7 +1200,9 @@ def _prepare_git(mirror, env, deadline, max_output_bytes) -> None:
     the mirror, from a fixed argv under the same bounded, contained
     transport every acceptance command uses. The operator's repository is
     never named, never linked and never opened."""
-    outcome, exit_code, _, _ = _run_command(
+    # NO POLICY: this is not an acceptance command and its output is not
+    # a test list. The parser is never reached from here.
+    outcome, exit_code, _, _, _ = _run_command(
         ("git", "init", "-q"), cwd=mirror.tree, env=env, deadline=deadline,
         max_output_bytes=max_output_bytes)
     if outcome != COMPLETED or exit_code != 0:
@@ -940,19 +1219,30 @@ def _walk(commands, *, mirror, env, deadline, max_output_bytes, task_file,
     instead of the first, and the manifest is re-checked before each one
     because the manifest is what chose them."""
     results = []
-    for command_id, argv in commands:
+    for command_id, argv, paths in commands:
         _assert_manifest(task_file, digest)
         started = time.monotonic()
-        outcome, exit_code, out_bytes, err_bytes = _run_command(
+        # ONE policy per command, built from the paths the registry
+        # actually accepted for THIS command. A command that takes no
+        # paths gets a policy whose allowlist is empty, so nothing it
+        # prints can name a file.
+        policy = _DiagnosticPolicy(command_id=command_id, selected=paths,
+                                   tree=mirror.tree)
+        outcome, exit_code, out_bytes, err_bytes, diagnostics = _run_command(
             argv, cwd=mirror.tree, env=env, deadline=deadline,
-            max_output_bytes=max_output_bytes)
+            max_output_bytes=max_output_bytes, policy=policy)
+        passed = outcome == COMPLETED and exit_code == 0
         results.append(AcceptanceCommandResult(
             command_id=command_id,
-            passed=outcome == COMPLETED and exit_code == 0,
+            passed=passed,
             exit_code=exit_code,
             duration_ms=int((time.monotonic() - started) * 1000),
             stdout_bytes=out_bytes, stderr_bytes=err_bytes,
-            event=_EVENTS[outcome]))
+            event=_EVENTS[outcome],
+            # A PASSING COMMAND CARRIES NONE. The parser only ever
+            # describes a failure, and keeping a list beside a green
+            # result would be an invitation to act on it.
+            diagnostics=() if passed else diagnostics))
         if not results[-1].passed:
             break
     return results

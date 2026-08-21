@@ -295,7 +295,14 @@ def test_the_report_and_command_results_are_frozen_and_textless(tmp_path):
     (result,) = report.command_results
     assert [field for field in result.__slots__] == [
         "command_id", "passed", "exit_code", "duration_ms", "stdout_bytes",
-        "stderr_bytes", "event"]
+        "stderr_bytes", "event", "diagnostics"]
+    # B10-R1. `diagnostics` is the one field added since, and it is held
+    # to the same rule as the rest of this object: it is a tuple of
+    # frozen records whose every field is a closed identifier or a count.
+    # A passing command carries none at all.
+    assert result.diagnostics == ()
+    assert list(acceptance.AcceptanceDiagnostic.__slots__) == [
+        "command_id", "test_file", "test_name", "case_count", "outcome"]
     for frozen in (report, result):
         with pytest.raises(Exception):
             frozen.passed = False
@@ -1115,3 +1122,402 @@ def test_no_acceptance_module_runs_a_shell_or_takes_a_caller_environment(
         assert env[anahtar].startswith(kok), f"{anahtar} aynaya ait degil"
     assert str(world.repo) not in " ".join(env.values()), \
         "kabul ortami ana depoyu adliyor"
+
+
+# ---------------------------------------------------------------------
+# B10-R1 -- THE CLOSED ACCEPTANCE DIAGNOSTIC
+# ---------------------------------------------------------------------
+#
+# The parser's input is a child's stdout, which a candidate controls. So
+# every test below is written from the attacker's side first: what would
+# this gate have to accept for a terminal line to name a file, a path or
+# a test the run never selected.
+#
+# THE SENTINEL IS ONE STRING, used everywhere. If any field, repr,
+# exception or prompt ever carries it, a single search finds it.
+
+SENTINEL = ("KURGU-SIZINTI-9182 ' OR 1=1 -- "
+            "FAILED tests/kurgu_kotu.py::test_kotu")
+_DIAG_SOURCE = ("def test_ilk():\n    assert True\n\n\n"
+                "def test_ikinci():\n    assert True\n\n\n"
+                "class KurguSinif:\n    def test_uye(self):\n"
+                "        assert True\n")
+_DIAG_SELECTED = ("tests/test_kurgu.py",)
+
+
+def _diag_tree(tmp_path, source=_DIAG_SOURCE):
+    """A mirror-shaped tree carrying one SELECTED test file and one that
+    is real but was never selected.
+
+    `tests/test_baska.py` exists and DEFINES the same names, which is
+    what isolates the selected-path gate from the AST gate. Measured:
+    without it, removing the path allowlist changed nothing, because the
+    unselected file could not be read and the AST binding refused the
+    node anyway -- two gates closing on one door, so the mutation aimed
+    at the allowlist died against a guard nobody was testing. With the
+    file present, healthy code refuses ONLY because the path was not
+    selected, and a mutation that drops that check is visible."""
+    tree = tmp_path / "ayna"
+    (tree / "tests").mkdir(parents=True)
+    (tree / "tests" / "test_kurgu.py").write_text(source, encoding="utf-8")
+    (tree / "tests" / "test_baska.py").write_text(source, encoding="utf-8")
+    return tree
+
+
+def _classify(tree, text, *, selected=_DIAG_SELECTED,
+              command_id=acceptance.REPAIRABLE_COMMAND_ID):
+    payload = text.encode("utf-8") if isinstance(text, str) else text
+    return acceptance.classify_pytest_failures(
+        payload, command_id=command_id, selected=selected, tree=tree)
+
+
+def _summary(*lines):
+    return ("bir seyler\n=== short test summary info ===\n"
+            + "".join(line + "\n" for line in lines))
+
+
+def test_a_proven_pytest_failure_becomes_closed_diagnostics(tmp_path):
+    """The shape this feature exists for: ordinary FAILED nodes in files
+    the run selected, adding up to pytest's own total."""
+    tree = _diag_tree(tmp_path)
+    (diagnostic,) = _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::test_ikinci - AssertionError: kurgu",
+        "1 failed, 3 passed in 0.4s"))
+
+    assert diagnostic.command_id == acceptance.REPAIRABLE_COMMAND_ID
+    assert diagnostic.test_file == "tests/test_kurgu.py"
+    assert diagnostic.test_name == "test_ikinci"
+    assert diagnostic.case_count == 1
+    assert diagnostic.outcome == acceptance.DIAGNOSTIC_FAILED
+    # the closed vocabulary is the only outcome this package can produce
+    assert acceptance.ALL_DIAGNOSTIC_OUTCOMES == (
+        acceptance.DIAGNOSTIC_FAILED,)
+
+
+def test_parametrised_cases_of_one_test_collapse_into_a_count(tmp_path):
+    """Two cases of one function are ONE record and a count of two --
+    which is also how the parametrisation values stop existing."""
+    tree = _diag_tree(tmp_path)
+    (diagnostic,) = _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::test_ikinci[bir]",
+        "FAILED tests/test_kurgu.py::test_ikinci[iki]",
+        "2 failed, 1 passed"))
+
+    assert (diagnostic.test_name, diagnostic.case_count) == ("test_ikinci", 2)
+
+
+def test_the_parametrisation_suffix_never_reaches_a_field(tmp_path):
+    """A hostile parameter value is DROPPED, not escaped and not
+    recorded -- including when it carries `::` and a whole fake node id
+    of its own, which is the shape that would otherwise redirect the
+    file this diagnostic names."""
+    tree = _diag_tree(tmp_path)
+    (diagnostic,) = _classify(tree, _summary(
+        f"FAILED tests/test_kurgu.py::test_ikinci[{SENTINEL}]",
+        "1 failed"))
+
+    assert diagnostic.test_file == "tests/test_kurgu.py"
+    assert diagnostic.test_name == "test_ikinci"
+    for field in (diagnostic.command_id, diagnostic.test_file,
+                  diagnostic.test_name, diagnostic.outcome,
+                  repr(diagnostic), str(diagnostic)):
+        assert SENTINEL not in str(field), "sentinel bir alana sizdi"
+    assert "kurgu_kotu" not in repr(diagnostic)
+
+
+def test_a_fake_summary_line_before_the_banner_is_not_evidence(tmp_path):
+    """A candidate can print a line shaped exactly like pytest's own from
+    inside its own test body. Only the region after the LAST banner is
+    read, so the forged line names nothing."""
+    tree = _diag_tree(tmp_path)
+    text = ("FAILED tests/kurgu_kotu.py::test_kotu\n"
+            f"{SENTINEL}\n"
+            "=== short test summary info ===\n"
+            "FAILED tests/test_kurgu.py::test_ilk\n"
+            "1 failed\n")
+    (diagnostic,) = _classify(tree, text)
+
+    assert diagnostic.test_file == "tests/test_kurgu.py"
+    assert diagnostic.test_name == "test_ilk"
+
+
+@pytest.mark.parametrize(
+    ("etiket", "node"),
+    [
+        ("secilmemis", "tests/test_baska.py::test_ilk"),
+        ("gezinme", "../../etc/test_kurgu.py::test_ilk"),
+        ("mutlak", "/tmp/test_kurgu.py::test_ilk"),
+        ("bos-dosya", "::test_ilk"),
+    ],
+)
+def test_a_node_naming_an_unselected_file_is_refused(tmp_path, etiket, node):
+    """The selected paths are the authority, not the terminal. A file the
+    resolved argv never named cannot be described, which is also why a
+    traversing or absolute path can never appear in a diagnostic.
+
+    THE FIRST CASE IS THE ISOLATED ONE. `tests/test_baska.py` really
+    exists in the tree and really defines that name, so every gate AFTER
+    the allowlist would let it through: the only thing standing between
+    that terminal line and a diagnostic is the allowlist itself."""
+    tree = _diag_tree(tmp_path)
+    assert (tree / "tests" / "test_baska.py").is_file(), "senaryo kurulmadi"
+    assert _classify(tree, _summary(f"FAILED {node}", "1 failed")) == ()
+    # control: the SAME shape naming a selected file is accepted, so the
+    # refusal above is about the path and not about the shape
+    assert _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::test_ilk", "1 failed")) != ()
+
+
+def test_a_name_the_source_does_not_define_is_refused(tmp_path):
+    """Being in a selected file is not enough. The name has to be a
+    function that file's own AST defines, so a terminal cannot invent a
+    test and have it travel into a repair prompt."""
+    tree = _diag_tree(tmp_path)
+    assert _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::test_hic_yok", "1 failed")) == ()
+    # control: the identical shape with a name the source DOES define is
+    # accepted, so the refusal above came from the AST binding
+    assert _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::test_ilk", "1 failed")) != ()
+
+
+def test_a_source_that_cannot_be_parsed_is_refused(tmp_path):
+    """A selected file whose AST cannot be built proves nothing about any
+    name in it."""
+    tree = _diag_tree(tmp_path, source="def test_ilk( :\n")
+    assert _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::test_ilk", "1 failed")) == ()
+
+
+@pytest.mark.parametrize(
+    ("etiket", "lines"),
+    [
+        ("toplama-hatasi", ("ERROR tests/test_kurgu.py", "1 error")),
+        ("error-node", ("ERROR tests/test_kurgu.py::test_ilk", "1 error")),
+        ("karisik", ("FAILED tests/test_kurgu.py::test_ilk",
+                     "ERROR tests/test_kurgu.py", "1 failed, 1 error")),
+        ("ic-hata", ("INTERNALERROR> bir sey patladi", "1 failed")),
+        ("bilinmeyen", ("XPASS tests/test_kurgu.py::test_ilk", "1 failed")),
+    ],
+)
+def test_a_summary_this_parser_does_not_understand_is_refused(
+        tmp_path, etiket, lines):
+    """Collection errors, ERROR nodes, internal errors and shapes this
+    version has never seen are NOT ordinary wrong expectations. Each one
+    keeps the human gate it has always had."""
+    tree = _diag_tree(tmp_path)
+    assert _classify(tree, _summary(*lines)) == ()
+
+
+def test_a_class_based_node_is_refused(tmp_path):
+    """Supported one day, perhaps; claimed today, no. A three-part node
+    id is refused rather than guessed at, even though the class and its
+    method really do exist in the selected file."""
+    tree = _diag_tree(tmp_path)
+    assert _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::KurguSinif::test_uye", "1 failed")) == ()
+
+
+def test_a_summary_count_mismatch_is_refused(tmp_path):
+    """pytest's own total is the authority. A parsed list that does not
+    add up means some failure was not understood, and repairing half a
+    list is worse than not repairing."""
+    tree = _diag_tree(tmp_path)
+    assert _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::test_ilk", "2 failed")) == ()
+    # control: the same line with a truthful total is accepted
+    assert _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::test_ilk", "1 failed")) != ()
+
+
+def test_two_count_lines_are_refused(tmp_path):
+    """An ambiguous total cannot police a parsed list."""
+    tree = _diag_tree(tmp_path)
+    assert _classify(tree, _summary(
+        "FAILED tests/test_kurgu.py::test_ilk", "1 failed", "3 failed")) == ()
+
+
+def test_more_failures_than_the_ceiling_are_refused(tmp_path):
+    """THE CEILING IS ON FAILURES, NOT ON FUNCTIONS. Measured: bounding
+    only the number of distinct functions let one parametrised test
+    arrive with any number of red cases."""
+    tree = _diag_tree(tmp_path)
+    ceiling = acceptance.MAX_DIAGNOSTICS
+    over = _summary(*[f"FAILED tests/test_kurgu.py::test_ilk[{i}]"
+                      for i in range(ceiling + 1)],
+                    f"{ceiling + 1} failed")
+    assert _classify(tree, over) == ()
+    # control: exactly at the ceiling is still accepted
+    at = _summary(*[f"FAILED tests/test_kurgu.py::test_ilk[{i}]"
+                    for i in range(ceiling)], f"{ceiling} failed")
+    (diagnostic,) = _classify(tree, at)
+    assert diagnostic.case_count == ceiling
+    assert acceptance.MAX_DIAGNOSTICS == contract.MAX_DIAGNOSTICS
+
+
+@pytest.mark.parametrize(
+    ("etiket", "payload"),
+    [
+        ("gecersiz-utf8", b"\xff\xfe short test summary info \n"
+                          b"FAILED tests/test_kurgu.py::test_ilk\n1 failed\n"),
+        ("banner-yok", b"FAILED tests/test_kurgu.py::test_ilk\n1 failed\n"),
+        ("sayim-yok", b"= short test summary info =\n"
+                      b"FAILED tests/test_kurgu.py::test_ilk\n"),
+        ("dugum-yok", b"= short test summary info =\n1 failed\n"),
+        ("bos", b""),
+    ],
+)
+def test_an_output_that_is_not_a_test_list_is_refused(tmp_path, etiket,
+                                                      payload):
+    tree = _diag_tree(tmp_path)
+    assert _classify(tree, payload) == ()
+
+
+def test_only_the_pytest_command_is_ever_parsed(tmp_path):
+    """`leak_scan`, `p0_gate` and `pytest_full` fail for reasons a test
+    node list cannot describe, so their output is never read."""
+    tree = _diag_tree(tmp_path)
+    text = _summary("FAILED tests/test_kurgu.py::test_ilk", "1 failed")
+    for command_id in ("leak_scan", "p0_gate", "pytest_full", ""):
+        assert _classify(tree, text, command_id=command_id) == ()
+    assert _classify(tree, text) != (), "kanit kurulmadi"
+
+
+def test_a_command_that_takes_no_paths_can_name_no_file(tmp_path):
+    """A policy built for a command with an empty path list has an empty
+    allowlist, so nothing it prints can name a file."""
+    tree = _diag_tree(tmp_path)
+    text = _summary("FAILED tests/test_kurgu.py::test_ilk", "1 failed")
+    assert _classify(tree, text, selected=()) == ()
+
+
+def test_the_policy_swallows_a_parser_failure(tmp_path, monkeypatch):
+    """A parser that threw inside the one function holding the raw buffer
+    would carry that buffer's text out in an exception. The policy's
+    answer to any failure is the empty tuple, which is the human gate."""
+    tree = _diag_tree(tmp_path)
+
+    def patlayan(*args, **kwargs):
+        raise RuntimeError(SENTINEL)
+
+    monkeypatch.setattr(acceptance, "classify_pytest_failures", patlayan)
+    policy = acceptance._DiagnosticPolicy(
+        command_id=acceptance.REPAIRABLE_COMMAND_ID,
+        selected=_DIAG_SELECTED, tree=tree)
+
+    assert policy.classify(b"herhangi") == ()
+
+
+def test_run_command_never_returns_raw_bytes():
+    """The signature and the source both: five values out, and the only
+    thing that ever touches the buffer is a policy."""
+    source = inspect.getsource(acceptance._run_command)
+    assert "policy" in inspect.signature(acceptance._run_command).parameters
+    # exactly one read of the buffer, and it is handed to the policy
+    assert source.count(".buffer") == 1
+    assert "policy.classify(streams[0].buffer)" in source
+    for isim in ("AcceptanceCommandResult", "AcceptanceReport",
+                 "AcceptanceDiagnostic"):
+        alanlar = getattr(acceptance, isim).__dataclass_fields__
+        assert not any(ad in alanlar for ad in
+                       ("stdout", "stderr", "output", "buffer", "text",
+                        "message", "detail"))
+
+
+def test_the_parser_runs_only_on_a_completed_bounded_read(tmp_path):
+    """Timeout, overflow and read failure each return BEFORE the branch
+    that calls the policy, so a command whose output was never fully read
+    can never produce a diagnostic. Proven from the source, because the
+    three branches are what the ordering contract is."""
+    source = inspect.getsource(acceptance._run_command)
+    govde = source[source.index("if not drained"):]
+    policy_at = govde.index("policy.classify")
+    for isaret in ("TIMED_OUT", "OVERFLOWED", "READ_FAILED"):
+        assert govde.index(isaret) < policy_at, \
+            f"{isaret} hukmu parser'dan sonra veriliyor"
+    assert govde.count("policy.classify") == 1
+
+
+def test_a_failing_pytest_command_yields_closed_diagnostics(tmp_path):
+    """END TO END, with a real child process: a real failing test in the
+    mirror, read through the real bounded transport, becomes exactly one
+    closed record."""
+    failing = ("def test_gecen():\n    assert True\n\n\n"
+               "def test_kalan():\n    assert False\n")
+    world = build_world(
+        tmp_path, seed=[("pipeline/test_kalan.py", failing)],
+        acceptance_commands=_commands(_selected("pipeline/test_kalan.py")))
+
+    report = run(world)
+
+    assert report.passed is False
+    (result,) = report.command_results
+    (diagnostic,) = report.diagnostics
+    assert result.diagnostics == report.diagnostics
+    assert diagnostic.test_file == "pipeline/test_kalan.py"
+    assert diagnostic.test_name == "test_kalan"
+    assert diagnostic.case_count == 1
+    assert diagnostic.outcome == acceptance.DIAGNOSTIC_FAILED
+
+
+def test_a_passing_command_carries_no_diagnostics(tmp_path, monkeypatch):
+    """Keeping a list beside a green result would be an invitation to act
+    on it.
+
+    THE GUARD IS ISOLATED HERE, and it has to be. A real passing run
+    prints no summary block at all, so the classifier returns nothing
+    anyway -- measured: with only the end-to-end half below, removing the
+    guard changed nothing observable, because the parser's own emptiness
+    was closing the same door. So the second half FORCES the impossible
+    combination: a command that exited zero whose reader nonetheless
+    produced diagnostics. Healthy code drops them because the command
+    passed; that is the only thing standing there."""
+    world = build_world(tmp_path)
+    report = run(world)
+
+    assert report.passed is True
+    assert report.diagnostics == ()
+    assert all(result.diagnostics == () for result in report.command_results)
+
+    # now the isolated half, on a second world so the first stays honest
+    forged = acceptance.AcceptanceDiagnostic(
+        command_id=acceptance.REPAIRABLE_COMMAND_ID,
+        test_file=GECER, test_name="test_kurgu", case_count=1,
+        outcome=acceptance.DIAGNOSTIC_FAILED)
+    gercek = acceptance._run_command
+
+    def izleyen(argv, **kwargs):
+        outcome, exit_code, out_bytes, err_bytes, _ = gercek(argv, **kwargs)
+        if argv[0] == "git":
+            return outcome, exit_code, out_bytes, err_bytes, ()
+        return outcome, exit_code, out_bytes, err_bytes, (forged,)
+
+    monkeypatch.setattr(acceptance, "_run_command", izleyen)
+    second = build_world(tmp_path, index=1)
+    forced = run(second)
+
+    assert forced.passed is True, "senaryo kurulmadi: komut gecmeliydi"
+    (result,) = forced.command_results
+    assert result.diagnostics == (), "gecen komut eyleme cagiran liste tasidi"
+    assert forced.diagnostics == ()
+
+
+def test_the_git_preparation_is_never_parsed(tmp_path, monkeypatch):
+    """The mirror's git metadata is not an acceptance command and its
+    output is not a test list, so no policy reaches it."""
+    gorulen = []
+    gercek = acceptance._run_command
+
+    def izleyen(argv, **kwargs):
+        gorulen.append((argv[0], kwargs.get("policy")))
+        return gercek(argv, **kwargs)
+
+    monkeypatch.setattr(acceptance, "_run_command", izleyen)
+    world = build_world(tmp_path)
+    run(world)
+
+    git_calls = [policy for program, policy in gorulen if program == "git"]
+    assert git_calls, "git hazirligi hic calismadi"
+    assert all(policy is None for policy in git_calls)
+    others = [policy for program, policy in gorulen if program != "git"]
+    assert others and all(policy is not None for policy in others)

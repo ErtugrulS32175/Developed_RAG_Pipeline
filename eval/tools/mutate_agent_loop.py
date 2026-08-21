@@ -959,8 +959,15 @@ MUTATIONS = [
      "            if changes.canonical_path(cited) not in changed:",
      "            if False:",
      "test_a_finding_about_a_file_this_run_did_not_change_blocks"),
+    # RETARGETED IN B10-R1, intent unchanged: a failed acceptance gate
+    # must stop the run. The guard used to read `if not report.passed`;
+    # the failure path now first classifies the failure and asks whether
+    # the one repair can pay for it, so the sentence that stops the run
+    # is `if not repairing`. Same mechanism, same target test -- whose
+    # scenario is a failure no classifier will touch, so `repairing` is
+    # False there and removing this gate lets a red gate walk on.
     ("b3-kabul-hukmu", "runner",
-     "        if not report.passed:", "        if False:",
+     "        if not repairing:", "        if False:",
      "test_a_failing_acceptance_gate_never_reaches_the_audit_or_the_checkout"),
     # Both of these are caught by the WORKSPACE, not by the stop reason:
     # the adapters refuse a spent budget and an out-of-range timeout too,
@@ -1263,6 +1270,65 @@ MUTATIONS = [
      "    if not prompt:" + NL + '        raise LimitRefused("istem bos")',
      "    if False:" + NL + '        raise LimitRefused("istem bos")',
      "test_the_protocol_matrix_never_rescues_an_unusable_caller_prompt"),
+
+    # -----------------------------------------------------------------
+    # B10-R1 -- one repair for a PROVEN pytest acceptance failure.
+    #
+    # The parser's input is a child's stdout, which a candidate controls.
+    # Every entry below removes one gate that stands between a terminal
+    # line and a repair prompt, or one gate that keeps the single repair
+    # budget single.
+    # -----------------------------------------------------------------
+    ("b10-sahte-ozet", "acceptance",
+     "    body = [line.strip() for line in lines[banner + 1:] "
+     "if line.strip()]",
+     "    body = [line.strip() for line in lines if line.strip()]",
+     "test_a_fake_summary_line_before_the_banner_is_not_evidence"),
+    ("b10-param-tasima", "acceptance",
+     '    bare = _PARAM_SUFFIX.sub("", node)',
+     "    bare = node",
+     "test_the_parametrisation_suffix_never_reaches_a_field"),
+    ("b10-secilmemis-yol", "acceptance",
+     "        if raw_file not in selected:", "        if False:",
+     "test_a_node_naming_an_unselected_file_is_refused"),
+    ("b10-ast-bagi", "acceptance",
+     "        if not _defines_test(parsed, name):", "        if False:",
+     "test_a_name_the_source_does_not_define_is_refused"),
+    ("b10-sayim-uyumu", "acceptance",
+     "    if sum(counts.values()) != total:", "    if False:",
+     "test_a_summary_count_mismatch_is_refused"),
+    ("b10-bilinmeyen-satir", "acceptance",
+     "        # expectation, and all of them keep the human gate." + NL
+     + "        return ()",
+     "        # expectation, and all of them keep the human gate." + NL
+     + "        continue",
+     "test_a_summary_this_parser_does_not_understand_is_refused"),
+    ("b10-tavan", "acceptance",
+     "    if total > MAX_DIAGNOSTICS:", "    if False:",
+     "test_more_failures_than_the_ceiling_are_refused"),
+    ("b10-tasma-parser", "acceptance",
+     "            answer = (OVERFLOWED, None) + counts + ((),)",
+     "            answer = (OVERFLOWED, None) + counts + ("
+     "(policy.classify(streams[0].buffer) if policy else ()),)",
+     "test_the_parser_runs_only_on_a_completed_bounded_read"),
+    ("b10-gecen-komut", "acceptance",
+     "            diagnostics=() if passed else diagnostics))",
+     "            diagnostics=diagnostics))",
+     "test_a_passing_command_carries_no_diagnostics"),
+    ("b10-sifir-butce", "runner",
+     '            and self.rounds["repair"] < self.max_repair_rounds',
+     "            and True",
+     "test_a_zero_repair_budget_refuses_the_acceptance_repair"),
+    ("b10-ikinci-onarim", "runner",
+     "        report = self._accept(verified)",
+     "        report = self._accept(verified, may_repair=True)",
+     "test_the_second_acceptance_can_never_ask_for_a_repair"),
+    ("b10-butce-sayaci", "runner",
+     '        self.rounds["repair"] += 1', '        self.rounds["repair"] += 0',
+     "test_an_evaluator_asking_for_changes_after_an_acceptance_repair_stops"),
+    ("b10-onarim-kapsami", "changes",
+     "        if outside:", "        if False:",
+     "test_a_repair_may_not_touch_a_file_the_candidate_never_touched"),
 ]
 
 

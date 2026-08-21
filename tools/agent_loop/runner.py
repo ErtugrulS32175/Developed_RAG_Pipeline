@@ -527,6 +527,11 @@ class _Run:
         self.pending_approval = ()
         self.recovered_applications = ()
         self.acceptance_passed = False
+        # THE ONLY PLACE ACCEPTANCE DIAGNOSTICS LIVE (B10-R1). In memory,
+        # on this object, for the length of one run: they reach the repair
+        # prompt and nothing else. No state document, receipt, journal
+        # record or archive ever carries them.
+        self.acceptance_diagnostics = ()
         self.applied_files = ()
         self.max_implementation_rounds = MAX_IMPLEMENTATION_ROUNDS
         self.max_repair_rounds = MAX_REPAIR_ROUNDS
@@ -603,8 +608,18 @@ class _Run:
         self._checkpoint(contract.State.IMPLEMENTING)
 
         self._advance(contract.State.ACCEPTANCE)
-        report = self._accept(verified)
+        report = self._accept(verified, may_repair=True)
         self._checkpoint(contract.State.ACCEPTANCE)
+        if report is None:
+            # THE ACCEPTANCE-SOURCED REPAIR. It spends the SAME budget the
+            # evaluator road spends, so the two can never add up to two
+            # patches: `_repair` increments `rounds["repair"]`, and the
+            # final audit's own budget check then refuses a
+            # `changes_requested` with `repair_rounds_exhausted`. The
+            # evaluator runs for the FIRST time below, on the repaired
+            # candidate -- nothing is applied on a tree it never saw.
+            return self._repair_road(verified,
+                                     source=contract.State.ACCEPTANCE)
 
         self._advance(contract.State.AUDITING)
         approved = self._audit(contract.State.AUDITING)
@@ -612,11 +627,26 @@ class _Run:
         if approved:
             return self._approve(verified, report)
 
+        return self._repair_road(verified, source=contract.State.AUDITING)
+
+    def _repair_road(self, verified, *, source):
+        """The one repair, then the gates that must both pass after it.
+
+        SHARED BY BOTH SOURCES on purpose. Whether the repair was owed to
+        an evaluator finding or to a proven pytest failure, what follows
+        is identical: acceptance runs again on the repaired tree, the
+        evaluator judges that tree, and only then can anything be applied.
+        Writing this once is what makes "there is no second patch" a
+        property of the shape rather than of two similar paragraphs."""
         self._advance(contract.State.REPAIRING)
-        verified = self._repair(verified)
+        verified = self._repair(verified, source=source)
         self._checkpoint(contract.State.REPAIRING)
 
         self._advance(contract.State.ACCEPTANCE_2)
+        # NO `may_repair` HERE, EVER. This is the structural half of "one
+        # patch": the second acceptance cannot ask for a repair because it
+        # does not pass the flag, and the frozen table has no edge from
+        # ACCEPTANCE_2 to REPAIRING either.
         report = self._accept(verified)
         self._checkpoint(contract.State.ACCEPTANCE_2)
 
@@ -624,8 +654,10 @@ class _Run:
         # A `changes_requested` here never returns: `_audit` raises, with
         # `repeated_mechanism_failure` when the mechanism is one this run
         # has already seen and `repair_rounds_exhausted` when it is a new
-        # one the budget cannot pay for. THERE IS NO SECOND REPAIR EDGE,
-        # in this method or in the frozen transition table.
+        # one the budget cannot pay for -- and after an acceptance-sourced
+        # repair the budget is ALREADY spent, so the first evaluator
+        # finding that asks for changes stops the run. THERE IS NO SECOND
+        # REPAIR EDGE, in this method or in the frozen transition table.
         self._audit(contract.State.FINAL_AUDITING)
         self._checkpoint(contract.State.FINAL_AUDITING)
         return self._approve(verified, report)
@@ -971,12 +1003,17 @@ class _Run:
         self.candidate_files = verified.changed_files
         return verified
 
-    def _repair(self, previous):
-        """ONE repair, bound to the candidate the evaluator audited.
+    def _repair(self, previous, *, source):
+        """ONE repair, bound to the candidate that was judged.
 
         The previous fingerprint AND the previous file set travel into
         the seam: a repair aimed at a workspace whose contents moved
-        since the audit is a repair of something nobody reviewed."""
+        since the audit is a repair of something nobody reviewed.
+
+        `source` chooses the PROMPT and nothing else -- same seam, same
+        gates, same budget. An acceptance-sourced repair is handed closed
+        test identities; an audit-sourced one is handed the findings the
+        journal already reduced."""
         budget = self._assert_budget()
         seconds = self._model_seconds()
         self._assert_plan_only()
@@ -987,7 +1024,7 @@ class _Run:
                     self.binaries["implementer"], **self.identity,
                     previous_fingerprint=previous.fingerprint,
                     previous_changed_files=previous.changed_files,
-                    prompt=self._repair_prompt(), budget_usd=budget,
+                    prompt=self._prompt_for(source), budget_usd=budget,
                     timeout_seconds=seconds,
                     max_output_bytes=self.task["max_output_bytes"],
                     model=self._model("implementer"))
@@ -1002,12 +1039,20 @@ class _Run:
     # acceptance
     # -----------------------------------------------------------------
 
-    def _accept(self, verified):
+    def _accept(self, verified, *, may_repair=False):
         """The frozen commands, in a disposable mirror, EVERY round.
 
         A second candidate is a second question: the repair's acceptance
         run invalidates the first receipt the moment it begins and writes
-        a new one for the tree that actually exists now."""
+        a new one for the tree that actually exists now.
+
+        Returns the report when the gate passed. Returns `None` -- and
+        only from the FIRST acceptance, and only when `may_repair` -- to
+        say "this failure is repairable and the budget can pay for it".
+        Every other failure raises exactly as it always did, so a
+        timeout, an overflow, an unread pipe, a `leak_scan` failure and
+        every summary shape the classifier does not understand keep the
+        human gate they have always had."""
         self.acceptance_passed = False
         seconds = self._acceptance_seconds()
         self._event(contract.EventCode.ACCEPTANCE_STARTED, state=self.state)
@@ -1016,13 +1061,33 @@ class _Run:
                 **self.identity, verified_changes=verified,
                 timeout_seconds=seconds,
                 max_output_bytes=self.task["max_output_bytes"])
+        if report.passed:
+            self._event(contract.EventCode.ACCEPTANCE_FINISHED,
+                        state=self.state,
+                        duration_ms=report.total_duration_ms)
+            self.acceptance_passed = True
+            return report
+        # `may_repair` is the STRUCTURAL half and the diagnostics are the
+        # evidential half. ACCEPTANCE_2 passes neither, which is why there
+        # is no second repair to close off: the caller never asks.
+        diagnostics = tuple(report.diagnostics) if may_repair else ()
+        repairing = bool(diagnostics) \
+            and self.rounds["repair"] < self.max_repair_rounds
         self._event(contract.EventCode.ACCEPTANCE_FINISHED, state=self.state,
-                    duration_ms=report.total_duration_ms)
-        if not report.passed:
+                    duration_ms=report.total_duration_ms,
+                    # CLOSED WORD, EXACT COUNT, BOOLEAN. Nothing here can
+                    # carry a test name or a path.
+                    acceptance_failure_kind=(
+                        contract.AcceptanceFailureKind.REPAIRABLE_TESTS
+                        if diagnostics
+                        else contract.AcceptanceFailureKind.NOT_REPAIRABLE),
+                    acceptance_failure_count=len(diagnostics),
+                    acceptance_repair_requested=repairing)
+        if not repairing:
             raise _Stop(contract.StopReason.ACCEPTANCE_FAILED,
                         state=contract.State.BLOCKED)
-        self.acceptance_passed = True
-        return report
+        self.acceptance_diagnostics = diagnostics
+        return None
 
     # -----------------------------------------------------------------
     # the audit
@@ -1289,6 +1354,47 @@ class _Run:
             "  - komut calistirma; dogrulamayi kosucu yapar",
             "  - yaniti sozlesme semasina gore ver",
         ])
+
+    def _prompt_for(self, source):
+        """Which repair prompt this round gets, by the state that owed it.
+
+        A closed two-way choice, not a flag a caller can widen: an
+        acceptance-sourced repair is the only thing that may see the test
+        identities, and an audit-sourced one is the only thing that may
+        see the findings."""
+        if source == contract.State.ACCEPTANCE:
+            return self._acceptance_repair_prompt()
+        return self._repair_prompt()
+
+    def _acceptance_repair_prompt(self):
+        """The failing tests, as identities and counts. NOTHING ELSE.
+
+        WHAT IS NOT HERE, and the absence is the whole point: no
+        assertion text, no expected or actual value, no parametrisation
+        value, no traceback, no exception message, no stdout, no stderr,
+        no working directory and no temporary path. The identities were
+        already bound to the selected paths and to the candidate's own
+        AST before they reached this method, so what the model reads is a
+        list it could have produced by running the tests itself.
+
+        The test identity is a HINT about where to look, never an
+        approval: acceptance runs again afterwards, and the evaluator has
+        not seen this candidate at all yet."""
+        lines = ["ROL: implementer (onarim)", *self._common_prompt(),
+                 "KABUL BULGULARI (kapali):"]
+        for diagnostic in self.acceptance_diagnostics:
+            lines.append(f"  - {diagnostic.test_file}::"
+                         f"{diagnostic.test_name} x{diagnostic.case_count}")
+        lines += [
+            "KURALLAR:",
+            "  - yalnizca onceki adayin degistirdigi dosyalarda onarim yap",
+            "  - assertion silme, gevsetme, skip veya xfail ekleme yok",
+            "  - test beklentisi yalnizca urun sozlesmesiyle celisiyorsa "
+            "duzeltilebilir",
+            "  - testi gecirmek icin uretim davranisini daraltma yok",
+            "  - yalnizca bir onarim turu var; kapsam genisletme",
+            "  - komut calistirma yok"]
+        return "\n".join(lines)
 
     def _repair_prompt(self):
         """The findings, as the boundary allows them to travel.
