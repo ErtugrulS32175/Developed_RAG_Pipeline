@@ -466,7 +466,7 @@ def test_table_model_keeps_its_separate_service_route(monkeypatch):
     monkeypatch.setattr(
         api.owui_chat,
         "tables_reply",
-        lambda _messages: "KURGU_TABLE_CEVABI",
+        lambda _messages, **_kwargs: "KURGU_TABLE_CEVABI",
     )
     response = TestClient(api.app).post(
         "/v1/chat/completions",
