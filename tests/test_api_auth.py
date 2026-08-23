@@ -61,6 +61,7 @@ def test_every_data_endpoint_is_covered(secured):
         ("get", "/ingest-jobs/22222222-2222-2222-2222-222222222222"),
         ("delete", "/ingest-jobs/22222222-2222-2222-2222-222222222222"),
         ("get", "/documents/abc"),
+        ("get", "/files/guessed.xlsx"),
     ]:
         r = getattr(secured, method)(path)
         assert r.status_code == 401, f"{method.upper()} {path} korumasiz"
@@ -103,11 +104,12 @@ def test_readiness_reports_status_without_leaking_connection_detail(monkeypatch)
     assert "gizli" not in r.text and "db-host" not in r.text
 
 
-def test_the_download_link_stays_open(secured):
-    """The xlsx link is opened by the user's browser, which cannot send a bearer
-    header. The filename is a sha256 prefix, so knowing the URL is the
-    capability -- but the route must still reject a traversal attempt."""
-    assert secured.get("/files/..%2Fsecret.xlsx").status_code in (400, 404)
+def test_the_download_link_is_not_a_public_filename_capability(secured):
+    assert secured.get("/files/guessed.xlsx").status_code == 401
+    assert secured.get(
+        "/files/..%2Fsecret.xlsx",
+        headers={"Authorization": "Bearer zeta-gamma-test-key"},
+    ).status_code in (400, 404)
 
 
 # --- with no key configured ---

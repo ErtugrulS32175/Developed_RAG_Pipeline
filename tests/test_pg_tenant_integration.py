@@ -98,6 +98,19 @@ def test_service_context_sees_both_tenants_without_changing_row_ownership(
             (TENANT_A, DOCUMENT_A), (TENANT_B, DOCUMENT_B)]
 
 
+def test_snapshot_scope_keys_do_not_collapse_same_named_tenant_documents(
+        tenant_database):
+    _tenant(tenant_database, TENANT_A)
+    assert db.lock_retrieval_scope_keys(tenant_database) == [
+        f"{TENANT_A}:{DOCUMENT_A}"]
+    tenant_database.rollback()
+
+    _tenant(tenant_database, TENANT_B)
+    assert db.lock_retrieval_scope_keys(tenant_database) == [
+        f"{TENANT_B}:{DOCUMENT_B}"]
+    tenant_database.rollback()
+
+
 def test_composite_foreign_keys_refuse_cross_tenant_membership(tenant_database):
     collection = uuid.UUID("10000000-0000-0000-0000-000000000030")
     _tenant(tenant_database, TENANT_A, service=True)

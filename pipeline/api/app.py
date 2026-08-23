@@ -569,10 +569,14 @@ def _safe_upload_filename(filename):
 # generation currently being served.
 
 
-@app.get("/files/{name}")
+@app.get("/files/{name}", dependencies=AUTH)
 def download_export(name: str):
-    """Serve a generated xlsx. Linked from the chat reply, so this is opened by
-    the user's browser rather than by OpenWebUI itself."""
+    """Serve an export only to an authenticated API principal.
+
+    A guessed or leaked filename is not authorization. Actor-bound browser
+    tickets are added with the OpenWebUI identity bridge; until then the normal
+    API credential is required.
+    """
     if not owui_chat.EXPORT_NAME_RE.match(name):
         raise HTTPException(status_code=400, detail="gecersiz dosya adi")
     path = owui_chat.EXPORT_DIR / name

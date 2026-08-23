@@ -1637,6 +1637,23 @@ def test_snapshot_retrieval_locks_exactly_its_active_authority(
     assert sent == params
 
 
+def test_snapshot_scope_keys_bind_tenant_and_document_identity():
+    from pipeline.index import db
+
+    key = ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:"
+           "11111111-1111-1111-1111-111111111111")
+    conn = NameConn([(key,)])
+
+    assert db.lock_retrieval_scope_keys(conn, (IC_BELGE,)) == [key]
+    sql, params = conn.cur.executed[0]
+    assert sql.startswith(
+        "SELECT tenant_id::text || ':' || id::text AS scope_key")
+    assert "FROM documents" in sql
+    assert "archived_at IS NULL" in sql
+    assert params == ([IC_BELGE],)
+    assert key not in sql and IC_BELGE not in sql
+
+
 def test_an_unresolvable_identifier_resolves_to_no_name_at_all():
     """An empty list is an EMPTY SCOPE, never "no scope" -- the caller is
     the one that must not widen, and it cannot widen what it never got."""

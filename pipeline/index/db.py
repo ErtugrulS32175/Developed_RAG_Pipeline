@@ -96,6 +96,17 @@ def reset_execution_tenant(token):
     _EXECUTION_TENANT.reset(token)
 
 
+def current_execution_tenant():
+    """Return the request/worker tenant binding without exposing the ContextVar.
+
+    Snapshot-backed retrieval cannot inherit PostgreSQL RLS automatically, so
+    it needs to bind every borrowed connection explicitly.  Keeping this read
+    seam here prevents retrieval adapters from reaching into a private context
+    variable or inventing a second tenant authority.
+    """
+    return _EXECUTION_TENANT.get()
+
+
 def get_conn(*, service=False) -> psycopg.Connection:
     conn = psycopg.connect(PG_DSN)
     register_vector(conn)
@@ -1906,6 +1917,30 @@ def lock_retrieval_filenames(conn, document_ids=None) -> list[str]:
         cur.execute(
             "SELECT filename FROM documents WHERE " + where
             + " ORDER BY filename FOR SHARE",
+            params)
+        return sorted({str(row[0]) for row in cur.fetchall()})
+
+
+def lock_retrieval_scope_keys(conn, document_ids=None) -> list[str]:
+    """Lock active documents and return tenant-qualified snapshot keys.
+
+    ``filename`` is unique only inside one tenant.  A global external vector
+    snapshot therefore cannot use it as an authorization key: two tenants may
+    legitimately upload the same name.  The key below is closed, deterministic
+    metadata derived from the row's two real authorities.  RLS still decides
+    which rows this request may resolve, and the caller keeps the share locks
+    until retrieval and its post-return verification are complete.
+    """
+    params = None
+    where = "archived_at IS NULL"
+    if document_ids is not None:
+        where += " AND id = ANY(%s::uuid[])"
+        params = (list(document_ids),)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT tenant_id::text || ':' || id::text AS scope_key "
+            "FROM documents WHERE " + where
+            + " ORDER BY tenant_id, id FOR SHARE",
             params)
         return sorted({str(row[0]) for row in cur.fetchall()})
 

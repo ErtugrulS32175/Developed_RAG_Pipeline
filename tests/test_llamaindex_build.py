@@ -63,7 +63,9 @@ def _wire_db(monkeypatch, events, shadow_count=1):
             events.append(("sql", self._last))
 
         def fetchall(self):
-            return [("kurgu metin", 1, "text", "kurgu.pdf")]
+            return [("kurgu metin", 1, "text", "kurgu.pdf",
+                     "00000000-0000-0000-0000-000000000001:"
+                     "11111111-1111-1111-1111-111111111111")]
 
         def fetchone(self):
             return (shadow_count,)
@@ -81,7 +83,11 @@ def _wire_db(monkeypatch, events, shadow_count=1):
     monkeypatch.setattr(rag_llamaindex, "_configure_models", lambda: None)
     monkeypatch.setattr(rag_llamaindex, "_store",
                         lambda table_name=None: object())
-    monkeypatch.setattr(db, "get_conn", lambda: Conn())
+    def get_conn(**kwargs):
+        events.append(("baglam", kwargs))
+        return Conn()
+
+    monkeypatch.setattr(db, "get_conn", get_conn)
     return rag_llamaindex
 
 
@@ -111,6 +117,7 @@ def test_build_lands_in_a_shadow_and_swaps_after_the_write(
     assert shadow in events[rename_at][1] and target in events[rename_at][1]
     # and the connection's whole life is bounded
     assert events[-1] == ("kapat", None)
+    assert ("baglam", {"service": True}) in events
 
 
 def test_a_failed_write_leaves_the_old_index_untouched(
@@ -157,33 +164,34 @@ def test_the_copy_reads_only_the_active_generation(monkeypatch, fake_llama):
     assert "c.generation = d.active_generation" in select
     assert "d.archived_at IS NULL" in select
     assert select.index("d.archived_at IS NULL") < select.index("WHERE")
-    assert "c.document_id IS NULL OR d.id IS NOT NULL" in select
+    assert "JOIN documents d ON c.document_id = d.id" in select
+    assert "d.tenant_id::text || ':' || d.id::text AS scope_key" in select
 
 
-def test_the_index_metadata_carries_no_document_identifier(
+def test_the_index_metadata_carries_tenant_qualified_scope_authority(
         monkeypatch, fake_llama):
-    """THE MEASUREMENT THE ROUTE RESTS ON. A node here knows its page, its
-    type and its FILENAME -- and no document id. That is why a scope stated
-    in ids is resolved to names instead of matched against an id that is
-    not there, and why an index built BEFORE the scope existed can be
-    scoped without being rebuilt."""
+    """A global snapshot never treats a tenant-local filename as authority."""
     events, _core = fake_llama
     rag_llamaindex = _wire_db(monkeypatch, events)
 
     rag_llamaindex.build_index()
 
     metadata = [meta for kind, meta in events if kind == "meta"]
-    assert metadata == [{"page": 1, "type": "text",
-                         "filename": "kurgu.pdf"}]
+    assert metadata == [{
+        "page": 1,
+        "type": "text",
+        "filename": "kurgu.pdf",
+        "scope_key": ("00000000-0000-0000-0000-000000000001:"
+                      "11111111-1111-1111-1111-111111111111"),
+    }]
     for meta in metadata:
-        assert set(meta) == {"page", "type", "filename"}
-        assert not any("id" == key or key.endswith("_id") for key in meta)
+        assert set(meta) == {"page", "type", "filename", "scope_key"}
 
 
 # --- scoping the alternative engine --------------------------------------
 #
 # The route is fixed by the measurement above: resolve the identifiers to
-# filenames through `documents`, then filter on filename metadata AT
+# tenant-qualified keys through `documents`, then filter on that metadata AT
 # CONSTRUCTION. These tests use the same fake-module strategy as the build
 # tests -- no optional package is installed, and nothing is skipped or
 # xfailed.
@@ -227,9 +235,14 @@ def fake_filters(monkeypatch):
 
 
 class FakeNode:
-    def __init__(self, text, filename, page=1):
+    def __init__(self, text, filename, page=1, scope_key=None):
         self.text = text
-        self.metadata = {"page": page, "type": "text", "filename": filename}
+        self.metadata = {
+            "page": page,
+            "type": "text",
+            "filename": filename,
+            "scope_key": filename if scope_key is None else scope_key,
+        }
 
     def get_content(self):
         return self.text
@@ -272,7 +285,7 @@ class Mode:
 def _wire_scope(monkeypatch, index=None, names=(), nodes=None):
     """The engine with its index and its database seam replaced.
 
-    The REAL `db.lock_retrieval_filenames` runs against a recording cursor,
+    The REAL `db.lock_retrieval_scope_keys` runs against a recording cursor,
     so the resolution statement and its lifecycle lock are production code.
     """
     from contextlib import contextmanager
@@ -302,6 +315,9 @@ def _wire_scope(monkeypatch, index=None, names=(), nodes=None):
         def cursor(self, row_factory=None):
             return Cursor()
 
+        def commit(self):
+            pass
+
     class Pool:
         @contextmanager
         def connection(self):
@@ -314,6 +330,8 @@ def _wire_scope(monkeypatch, index=None, names=(), nodes=None):
     if index is None:
         index = FakeIndex(nodes if nodes is not None else [])
     monkeypatch.setattr(db, "get_pool", lambda: Pool())
+    monkeypatch.setattr(db, "set_tenant_context", lambda *_a, **_k: None)
+    monkeypatch.setattr(db, "clear_tenant_context", lambda *_a, **_k: None)
     monkeypatch.setattr(rag_llamaindex, "_index", lambda: (index, Mode))
     return rag_llamaindex, index, statements
 
@@ -322,16 +340,11 @@ def test_a_scoped_query_is_filtered_at_construction_not_afterwards(
         monkeypatch, fake_filters):
     """THE WHOLE ROUTE, in one test.
 
-    The identifiers are resolved to filenames through `documents`, and the
+    The identifiers are resolved to scope keys through `documents`, and the
     resulting metadata filter is handed to the retriever WHEN IT IS BUILT.
-    The fake store then answers with a node the filter would have excluded,
-    and that node comes back untouched -- which is the proof that nothing
-    here re-filters a returned node list. Scoping is the query's job; if it
-    were done in Python after top_k, a scoped document with matches could
-    come back empty merely because other documents filled the pool.
+    The returned nodes are then checked against the same live authority.
     """
-    nodes = [FakeNode("kapsam icindeki pasaj", "kapsam-icinde.pdf"),
-             FakeNode("kapsam disindaki pasaj", "kapsam-disinda.pdf")]
+    nodes = [FakeNode("kapsam icindeki pasaj", "kapsam-icinde.pdf")]
     rag_llamaindex, index, statements = _wire_scope(
         monkeypatch, names=("kapsam-icinde.pdf",), nodes=nodes)
 
@@ -341,26 +354,22 @@ def test_a_scoped_query_is_filtered_at_construction_not_afterwards(
     # the filter reached CONSTRUCTION
     filters = index.constructed[0]["filters"]
     assert [(f.key, f.value, f.operator) for f in filters.filters] == [
-        ("filename", ["kapsam-icinde.pdf"], fake_filters.FilterOperator.IN)]
+        ("scope_key", ["kapsam-icinde.pdf"], fake_filters.FilterOperator.IN)]
     # ... and the retriever kept the object it was handed
     assert index.retrievers[0].filters is filters
     assert index.retrievers[0].asked == ["kurgu soru"]
-    # ... and the RETURNED nodes were not second-guessed here
-    assert [chunk["filename"] for chunk in chunks] == [
-        "kapsam-icinde.pdf", "kapsam-disinda.pdf"]
+    assert [chunk["filename"] for chunk in chunks] == ["kapsam-icinde.pdf"]
     # resolution went through `documents`, as a parameterised SELECT
     assert len(statements) == 1
     sql, params = statements[0]
-    assert sql.startswith("SELECT filename FROM documents")
+    assert sql.startswith("SELECT tenant_id::text || ':' || id::text")
     assert params == ([IC_BELGE],)
     assert IC_BELGE not in sql
 
 
-def test_the_resolved_names_are_exact_filter_values_only(
+def test_the_resolved_scope_keys_are_exact_filter_values_only(
         monkeypatch, fake_filters):
-    """A name is a VALUE: never a pattern, never text assembled into a
-    statement. `documents.filename` is unique, so exact membership over
-    names is exactly the set of ids it came from."""
+    """A scope key is a value, never text assembled into a statement."""
     rag_llamaindex, index, statements = _wire_scope(
         monkeypatch, names=("kapsam-icinde.pdf", "ikinci-belge.pdf"))
 
@@ -382,7 +391,24 @@ def test_the_resolved_names_are_exact_filter_values_only(
         assert "kapsam-icinde.pdf" not in sql
 
 
-def test_an_unscoped_query_uses_live_active_names_not_the_stale_snapshot(
+def test_a_returned_node_outside_the_live_scope_fails_closed(
+        monkeypatch, fake_filters):
+    """A buggy/hostile vector store cannot bypass the construction filter."""
+    nodes = [FakeNode(
+        "baska tenant pasaji",
+        "ayni-ad.pdf",
+        scope_key="baska-tenant:ayni-belge")]
+    rag_llamaindex, index, _statements = _wire_scope(
+        monkeypatch,
+        names=("bu-tenant:bu-belge",),
+        nodes=nodes)
+
+    with pytest.raises(RuntimeError, match="yetki kapsami disinda"):
+        rag_llamaindex.retrieve("kurgu soru", document_ids=(IC_BELGE,))
+    assert index.retrievers[0].asked == ["kurgu soru"]
+
+
+def test_an_unscoped_query_uses_live_scope_keys_not_the_stale_snapshot(
         monkeypatch, fake_filters):
     """Archive can change after build, so every query carries live authority."""
     rag_llamaindex, index, statements = _wire_scope(
@@ -395,8 +421,9 @@ def test_an_unscoped_query_uses_live_active_names_not_the_stale_snapshot(
     assert filters.filters[0].value == ["kurgu.pdf"]
     assert index.retrievers[0].filters is filters
     assert statements == [(
-        "SELECT filename FROM documents "
-        "WHERE archived_at IS NULL ORDER BY filename FOR SHARE", None)]
+        "SELECT tenant_id::text || ':' || id::text AS scope_key "
+        "FROM documents WHERE archived_at IS NULL "
+        "ORDER BY tenant_id, id FOR SHARE", None)]
 
 
 def test_no_active_document_means_no_snapshot_query(monkeypatch, fake_filters):
@@ -406,7 +433,7 @@ def test_no_active_document_means_no_snapshot_query(monkeypatch, fake_filters):
     assert rag_llamaindex.retrieve("kurgu soru") == []
     assert index.constructed == []
     assert statements[0][0].endswith(
-        "WHERE archived_at IS NULL ORDER BY filename FOR SHARE")
+        "WHERE archived_at IS NULL ORDER BY tenant_id, id FOR SHARE")
 
 
 def test_lifecycle_lock_is_held_until_snapshot_nodes_are_projected(
@@ -417,9 +444,9 @@ def test_lifecycle_lock_is_held_until_snapshot_nodes_are_projected(
     projected_while_locked = []
     original = rag_llamaindex._as_chunks
 
-    def project(nodes):
+    def project(nodes, allowed_scope_keys):
         projected_while_locked.append(statements.authority_open)
-        return original(nodes)
+        return original(nodes, allowed_scope_keys)
 
     monkeypatch.setattr(rag_llamaindex, "_as_chunks", project)
 

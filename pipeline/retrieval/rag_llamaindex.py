@@ -86,7 +86,7 @@ def _require_filters():
     return FilterOperator, MetadataFilter, MetadataFilters
 
 
-def _lifecycle_filenames(document_ids):
+def _lifecycle_scope_keys(document_ids):
     """Hold lifecycle authority until the snapshot query has completed."""
     from contextlib import contextmanager
 
@@ -95,23 +95,24 @@ def _lifecycle_filenames(document_ids):
     @contextmanager
     def locked():
         with db.get_pool().connection() as conn:
-            yield db.lock_retrieval_filenames(conn, document_ids)
+            tenant_id, service = db.current_execution_tenant()
+            if service:
+                raise RuntimeError(
+                    "servis baglami kullanici retrieval kapsami olamaz")
+            db.set_tenant_context(conn, tenant_id, service=False)
+            try:
+                yield db.lock_retrieval_scope_keys(conn, document_ids)
+            finally:
+                db.clear_tenant_context(conn)
 
     return locked()
 
 
-def _scope_filters(filenames):
-    """An EXACT-match metadata filter over the resolved names.
-
-    The names are filter VALUES and nothing else: never a pattern, never
-    text assembled into a statement. `documents.filename` is `text NOT NULL
-    UNIQUE`, so exact equality against the stored name is an exact document
-    match -- which is what makes an IN filter over names equivalent to the
-    set of ids it came from.
-    """
+def _scope_filters(scope_keys):
+    """An exact metadata filter over tenant-qualified document authority."""
     FilterOperator, MetadataFilter, MetadataFilters = _require_filters()
     return MetadataFilters(filters=[
-        MetadataFilter(key="filename", value=list(filenames),
+        MetadataFilter(key="scope_key", value=list(scope_keys),
                        operator=FilterOperator.IN),
     ])
 
@@ -227,7 +228,10 @@ def build_index():
     shadow = f"{TABLE}_kurulum"
     store = _store(shadow)
 
-    conn = db.get_conn()
+    # A snapshot contains every tenant and is never itself an authorization
+    # boundary.  Query-time RLS-derived scope keys are.  Only the internal
+    # service connection may perform this cross-tenant copy.
+    conn = db.get_conn(service=True)
     try:
         with conn.cursor() as cur:
             # a dead previous attempt's shadow must not pollute this build
@@ -242,19 +246,21 @@ def build_index():
             # saw only the served generation -- and the A/B comparison
             # silently stopped measuring retrieval strategy.
             cur.execute(
-                "SELECT c.text, c.page, c.type, d.filename "
-                "FROM chunks c LEFT JOIN documents d ON c.document_id = d.id "
+                "SELECT c.text, c.page, c.type, d.filename, "
+                "d.tenant_id::text || ':' || d.id::text AS scope_key "
+                "FROM chunks c JOIN documents d ON c.document_id = d.id "
                 "AND c.generation = d.active_generation "
                 "AND d.archived_at IS NULL "
-                "WHERE c.document_id IS NULL OR d.id IS NOT NULL"
+                "WHERE d.id IS NOT NULL"
             )
             rows = cur.fetchall()
 
         docs = [
             Document(text=text,
                      metadata={"page": page, "type": ctype,
-                               "filename": filename})
-            for text, page, ctype, filename in rows
+                               "filename": filename,
+                               "scope_key": scope_key})
+            for text, page, ctype, filename, scope_key in rows
         ]
         print(f"[LLAMAINDEX] {len(docs)} chunk golge tabloya aktariliyor "
               f"({len(rows)} satir); eski indeks takasa kadar hizmette")
@@ -284,12 +290,17 @@ def build_index():
         conn.close()
 
 
-def _as_chunks(nodes):
+def _as_chunks(nodes, allowed_scope_keys):
     """Map LlamaIndex nodes back to the shape the rest of the project uses, so
     the same context builder and the same eval harness work unchanged."""
     out = []
+    allowed = frozenset(allowed_scope_keys)
     for n in nodes:
         meta = n.metadata or {}
+        scope_key = meta.get("scope_key")
+        if type(scope_key) is not str or scope_key not in allowed:
+            raise RuntimeError(
+                "LlamaIndex yetki kapsami disinda dugum dondurdu")
         out.append({
             "text": n.get_content(),
             "page": meta.get("page", 0),
@@ -304,7 +315,7 @@ def _as_chunks(nodes):
 def retrieve(question, top_k=TOP_K, *, document_ids=None):
     """Retrieve active documents, optionally scoped to a requested set.
 
-    THE SCOPE IS PART OF THE QUERY. It is resolved to filenames, turned
+    THE SCOPE IS PART OF THE QUERY. It is resolved to tenant-qualified keys, turned
     into a metadata filter and handed to the retriever AT CONSTRUCTION, so
     the store answers the scoped question itself. Nothing is filtered out
     of the returned node list: that would answer a scoped question with
@@ -313,13 +324,13 @@ def retrieve(question, top_k=TOP_K, *, document_ids=None):
     pool first.
 
     The vector table is a snapshot but archive/restore is live metadata, so
-    an otherwise unscoped query still resolves the current active filenames
+    an otherwise unscoped query still resolves the current active scope keys
     and filters at construction. Legacy snapshot nodes without a document
     authority are excluded fail-closed on this comparison engine.
 
     Three fail-closed refusals, all before a node is fetched: the filter API
     is unavailable, the retriever did not take the filter, or the authority
-    resolves to no active filename. The last returns an empty result rather
+    resolves to no active document. The last returns an empty result rather
     than querying the stale snapshot unscoped.
     """
     index, VectorStoreQueryMode = _index()
@@ -327,12 +338,12 @@ def retrieve(question, top_k=TOP_K, *, document_ids=None):
     # authority must refuse before it does work that looks like answering.
     # The vector table is a snapshot, while archive/restore is live metadata;
     # even an
-    # otherwise unscoped query therefore carries the current active names.
+    # otherwise unscoped query therefore carries the current active keys.
     _require_filters()
-    with _lifecycle_filenames(document_ids) as filenames:
-        if not filenames:
+    with _lifecycle_scope_keys(document_ids) as scope_keys:
+        if not scope_keys:
             return []
-        scope = _scope_filters(filenames)
+        scope = _scope_filters(scope_keys)
         retriever = index.as_retriever(
             similarity_top_k=top_k,
             vector_store_query_mode=VectorStoreQueryMode.HYBRID,
@@ -340,7 +351,7 @@ def retrieve(question, top_k=TOP_K, *, document_ids=None):
         )
         if not _scope_reached(retriever, scope):
             raise RuntimeError(_SCOPE_UNSUPPORTED)
-        return _as_chunks(retriever.retrieve(question))
+        return _as_chunks(retriever.retrieve(question), scope_keys)
 
 
 def answer(question):
