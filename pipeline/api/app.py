@@ -217,6 +217,11 @@ DocumentScope = Annotated[
     list[UUID],
     Field(min_length=1, max_length=DOCUMENT_SCOPE_MAX),
 ]
+TagName = Annotated[str, Field(min_length=1)]
+TagScope = Annotated[
+    list[TagName],
+    Field(min_length=1, max_length=DOCUMENT_SCOPE_MAX),
+]
 
 
 class ChatRequest(BaseModel):
@@ -227,6 +232,16 @@ class ChatRequest(BaseModel):
     stream: bool = False
     # Absent means what it has always meant: the whole corpus, unchanged.
     document_ids: DocumentScope | None = None
+    collection_ids: DocumentScope | None = None
+    tags: TagScope | None = None
+
+
+class CollectionRequest(BaseModel):
+    name: str = Field(min_length=1)
+
+
+class DocumentTagsRequest(BaseModel):
+    tags: list[TagName] = Field(max_length=DOCUMENT_SCOPE_MAX)
 
 
 @app.get("/v1/models", dependencies=AUTH)
@@ -265,6 +280,21 @@ def _document_scope(document_ids):
     return tuple(sorted({str(document_id) for document_id in document_ids}))
 
 
+def _chat_document_scope(req: ChatRequest, is_table: bool):
+    """Resolve every RAG scope dimension through the document table once."""
+    direct = _document_scope(req.document_ids)
+    if is_table or (req.collection_ids is None and req.tags is None):
+        return direct
+    collections = _document_scope(req.collection_ids)
+    try:
+        with db_conn() as conn:
+            return db.resolve_document_scope(
+                conn, document_ids=direct, collection_ids=collections,
+                tags=req.tags)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
 @app.post("/v1/chat/completions", dependencies=AUTH)
 def chat_completions(req: ChatRequest):
     """OpenAI-compatible wrapper with a checked publication boundary.
@@ -289,7 +319,7 @@ def chat_completions(req: ChatRequest):
     # Settled BEFORE the first backend call, and outside the closure, so
     # both branches ask the same question of the same set. The table route
     # reads none of this: it keeps its separate service path unchanged.
-    document_ids = _document_scope(req.document_ids)
+    document_ids = _chat_document_scope(req, is_table)
 
     def ask_checked():
         question = owui_chat.message_text(req.messages[-1].content)
@@ -786,6 +816,8 @@ def list_documents(
     uploaded_before: AwareDatetime | None = Query(None),
     q: str | None = Query(None, min_length=1),
     archived: bool = Query(False),
+    collection_id: UUID | None = Query(None),
+    tag: str | None = Query(None, min_length=1),
 ):
     """One page of the document inventory, newest first.
 
@@ -854,18 +886,101 @@ def list_documents(
             status_code=422,
             detail="uploaded_after, uploaded_before'dan kesin olarak once "
                    "olmali")
-    with db_conn() as conn:
-        rows = db.list_documents(conn, limit=limit, offset=offset,
-                                 status=status, file_type=file_type,
-                                 uploaded_after=uploaded_after,
-                                 uploaded_before=uploaded_before,
-                                 q=q, archived=archived)
+    try:
+        with db_conn() as conn:
+            filters = {"status": status, "file_type": file_type,
+                       "uploaded_after": uploaded_after,
+                       "uploaded_before": uploaded_before,
+                       "q": q, "archived": archived}
+            if collection_id is not None:
+                filters["collection_id"] = str(collection_id)
+            if tag is not None:
+                filters["tag"] = tag
+            rows = db.list_documents(conn, limit=limit, offset=offset, **filters)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
     return {
         "documents": [_document_summary(row) for row in rows[:limit]],
         "limit": limit,
         "offset": offset,
         "has_more": len(rows) > limit,
     }
+
+
+@app.post("/collections", dependencies=AUTH)
+def create_collection(request: CollectionRequest):
+    try:
+        with db_conn() as conn:
+            return db.create_collection(conn, request.name)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@app.get("/collections", dependencies=AUTH)
+def list_collections():
+    with db_conn() as conn:
+        return {"collections": db.list_collections(conn)}
+
+
+@app.get("/tags", dependencies=AUTH)
+def list_tags():
+    with db_conn() as conn:
+        return {"tags": db.list_tags(conn)}
+
+
+@app.delete("/tags/{tag_id}", dependencies=AUTH)
+def delete_tag(tag_id: UUID):
+    with db_conn() as conn:
+        deleted = db.delete_tag(conn, str(tag_id))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="tag not found")
+    return Response(status_code=204)
+
+
+@app.delete("/collections/{collection_id}", dependencies=AUTH)
+def delete_collection(collection_id: UUID):
+    with db_conn() as conn:
+        deleted = db.delete_collection(conn, str(collection_id))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="collection not found")
+    return Response(status_code=204)
+
+
+def _set_collection_membership(collection_id: UUID, document_id: UUID,
+                               present: bool):
+    with db_conn() as conn:
+        result = db.set_collection_document(
+            conn, str(collection_id), str(document_id), present)
+    if result is None:
+        raise HTTPException(status_code=404,
+                            detail="collection or document not found")
+    return {"collection_id": str(collection_id),
+            "document_id": str(document_id), "present": result}
+
+
+@app.put("/collections/{collection_id}/documents/{document_id}",
+         dependencies=AUTH)
+def add_collection_document(collection_id: UUID, document_id: UUID):
+    return _set_collection_membership(collection_id, document_id, True)
+
+
+@app.delete("/collections/{collection_id}/documents/{document_id}",
+            dependencies=AUTH)
+def remove_collection_document(collection_id: UUID, document_id: UUID):
+    return _set_collection_membership(collection_id, document_id, False)
+
+
+@app.put("/documents/{document_id}/tags", dependencies=AUTH)
+def replace_document_tags(document_id: UUID, request: DocumentTagsRequest):
+    try:
+        with db_conn() as conn:
+            result = db.replace_document_tags(
+                conn, str(document_id), request.tags)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    if result is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    return result
 
 
 def _set_document_lifecycle(document_id: str, archived: bool):

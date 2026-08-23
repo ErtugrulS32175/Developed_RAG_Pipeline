@@ -10,6 +10,42 @@ CREATE TABLE IF NOT EXISTS documents (
     status      text NOT NULL DEFAULT 'pending'
 );
 
+-- Human organisation is independent of ingest identity. Display names keep
+-- their spelling; name_key is the one case-folded authority supplied by the
+-- application, so case variants cannot create two logical collections/tags.
+CREATE TABLE IF NOT EXISTS collections (
+    id         uuid PRIMARY KEY,
+    name       text NOT NULL,
+    name_key   text NOT NULL UNIQUE,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id         uuid PRIMARY KEY,
+    name       text NOT NULL,
+    name_key   text NOT NULL UNIQUE,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS collection_documents (
+    collection_id uuid NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    document_id   uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (collection_id, document_id)
+);
+
+CREATE INDEX IF NOT EXISTS collection_documents_document_idx
+    ON collection_documents(document_id);
+
+CREATE TABLE IF NOT EXISTS document_tags (
+    document_id uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    tag_id      uuid NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (document_id, tag_id)
+);
+
+CREATE INDEX IF NOT EXISTS document_tags_tag_idx ON document_tags(tag_id);
+
 -- fastembed's Qdrant/bm25 has no fixed vocabulary: it hashes tokens with
 -- MurmurHash3 (abs() of a signed 32-bit hash), giving raw indices up to
 -- ~2.15 billion -- past pgvector's sparsevec dimension cap (1e9). Every

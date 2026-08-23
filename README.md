@@ -150,6 +150,26 @@ authority is checked again while the ingest lease is taken and is held through
 snapshot-backed LlamaIndex retrieval, so a concurrent request cannot publish a
 document halfway through its archive transition.
 
+### Collections and tags
+
+Collections and tags organise documents without copying or owning them. Create
+and list collections with `POST /collections` and `GET /collections`; attach or
+detach a document with `PUT` or `DELETE` on
+`/collections/{collection_id}/documents/{document_id}`. Delete a collection
+with `DELETE /collections/{collection_id}`. None of these operations deletes
+the documents or their chunks. Replace a document's complete tag set with
+`PUT /documents/{document_id}/tags` and a JSON body such as
+`{"tags":["finance","urgent"]}`; an empty list clears it.
+`GET /tags` lists the shared vocabulary and `DELETE /tags/{tag_id}` removes one
+tag and its memberships without removing a document.
+
+`GET /documents` accepts `collection_id` and `tag` filters. Chat requests may
+carry `collection_ids` and `tags` beside `document_ids`: collection ids use ANY
+semantics, tags use ALL semantics, and the three dimensions intersect. Names
+are case-insensitive identities while preserving their first display spelling.
+Archived documents never resolve into a chat scope, and an empty resolved scope
+stays empty rather than widening to the whole corpus.
+
 ## Controlled task runs (agent-loop)
 
 `tools/agent_loop` runs a coding task through an implementer model and an

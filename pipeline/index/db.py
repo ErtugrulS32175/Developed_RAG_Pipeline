@@ -651,6 +651,191 @@ def get_document(conn, document_id: str) -> dict | None:
     return row
 
 
+def _canonical_label(value: str, field: str = "name") -> tuple[str, str]:
+    """Return one display spelling and its case-insensitive identity."""
+    if not isinstance(value, str):
+        raise ValueError(field + " metin olmali")
+    display = value.strip()
+    if not display:
+        raise ValueError(field + " bos olmayan bir metin olmali")
+    if any(ord(char) < 32 or ord(char) == 127 for char in display):
+        raise ValueError(field + " kontrol karakteri iceremez")
+    return display, display.casefold()
+
+
+def create_collection(conn, name: str) -> dict:
+    """Create one logical collection, idempotently across case variants."""
+    display, name_key = _canonical_label(name)
+    collection_id = str(uuid.uuid4())
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "INSERT INTO collections (id, name, name_key) "
+            "VALUES (%(id)s, %(name)s, %(name_key)s) "
+            "ON CONFLICT (name_key) DO UPDATE SET name = collections.name "
+            "RETURNING id, name, created_at",
+            {"id": collection_id, "name": display, "name_key": name_key})
+        row = cur.fetchone()
+    conn.commit()
+    return {"collection_id": str(row["id"]), "name": row["name"],
+            "created_at": row["created_at"]}
+
+
+def list_collections(conn) -> list[dict]:
+    """List collections with their active membership count."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT c.id, c.name, c.created_at, "
+            "COUNT(d.id) FILTER (WHERE d.archived_at IS NULL) AS document_count "
+            "FROM collections c "
+            "LEFT JOIN collection_documents cd ON cd.collection_id = c.id "
+            "LEFT JOIN documents d ON d.id = cd.document_id "
+            "GROUP BY c.id, c.name, c.created_at "
+            "ORDER BY c.name_key, c.id")
+        rows = cur.fetchall()
+    return [{"collection_id": str(row["id"]), "name": row["name"],
+             "created_at": row["created_at"],
+             "document_count": int(row["document_count"])}
+            for row in rows]
+
+
+def list_tags(conn) -> list[dict]:
+    """List the shared tag vocabulary with active document counts."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT t.id, t.name, t.created_at, "
+            "COUNT(d.id) FILTER (WHERE d.archived_at IS NULL) AS document_count "
+            "FROM tags t LEFT JOIN document_tags dt ON dt.tag_id = t.id "
+            "LEFT JOIN documents d ON d.id = dt.document_id "
+            "GROUP BY t.id, t.name, t.created_at ORDER BY t.name_key, t.id")
+        rows = cur.fetchall()
+    return [{"tag_id": str(row["id"]), "name": row["name"],
+             "created_at": row["created_at"],
+             "document_count": int(row["document_count"])}
+            for row in rows]
+
+
+def delete_tag(conn, tag_id: str) -> bool:
+    """Delete one tag and its memberships, never any document."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM tags WHERE id = %s", (tag_id,))
+        deleted = cur.rowcount == 1
+    conn.commit()
+    return deleted
+
+
+def delete_collection(conn, collection_id: str) -> bool:
+    """Delete organisation metadata, never the member documents."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM collections WHERE id = %s", (collection_id,))
+        deleted = cur.rowcount == 1
+    conn.commit()
+    return deleted
+
+
+def set_collection_document(conn, collection_id: str, document_id: str,
+                            present: bool) -> bool | None:
+    """Idempotently attach/detach a document without changing the document."""
+    if not isinstance(present, bool):
+        raise ValueError("present bir boolean olmali")
+    with conn.cursor() as cur:
+        # Hold both referenced rows through the membership write.  Otherwise a
+        # concurrent collection delete can pass between an EXISTS check and the
+        # INSERT and turn an idempotent metadata operation into an FK race.
+        cur.execute("SELECT id FROM collections WHERE id = %s FOR KEY SHARE",
+                    (collection_id,))
+        collection_exists = cur.fetchone() is not None
+        cur.execute("SELECT id FROM documents WHERE id = %s FOR KEY SHARE",
+                    (document_id,))
+        document_exists = cur.fetchone() is not None
+        if not collection_exists or not document_exists:
+            conn.rollback()
+            return None
+        if present:
+            cur.execute(
+                "INSERT INTO collection_documents (collection_id, document_id) "
+                "VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (collection_id, document_id))
+        else:
+            cur.execute(
+                "DELETE FROM collection_documents "
+                "WHERE collection_id = %s AND document_id = %s",
+                (collection_id, document_id))
+    conn.commit()
+    return present
+
+
+def replace_document_tags(conn, document_id: str, tags) -> dict | None:
+    """Replace a document's complete tag set under one document row lock."""
+    if not isinstance(tags, (list, tuple)):
+        raise ValueError("tags bir liste olmali")
+    canonical = {}
+    for value in tags:
+        display, name_key = _canonical_label(value, "tag")
+        canonical.setdefault(name_key, display)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT id FROM documents WHERE id = %s FOR UPDATE",
+                    (document_id,))
+        if cur.fetchone() is None:
+            conn.rollback()
+            return None
+        tag_ids = []
+        for name_key, display in sorted(canonical.items()):
+            tag_id = str(uuid.uuid4())
+            cur.execute(
+                "INSERT INTO tags (id, name, name_key) "
+                "VALUES (%(id)s, %(name)s, %(name_key)s) "
+                "ON CONFLICT (name_key) DO UPDATE SET name = tags.name "
+                "RETURNING id, name",
+                {"id": tag_id, "name": display, "name_key": name_key})
+            row = cur.fetchone()
+            tag_ids.append((str(row["id"]), row["name"]))
+        cur.execute("DELETE FROM document_tags WHERE document_id = %s",
+                    (document_id,))
+        if tag_ids:
+            cur.executemany(
+                "INSERT INTO document_tags (document_id, tag_id) VALUES (%s, %s)",
+                [(document_id, tag_id) for tag_id, _name in tag_ids])
+    conn.commit()
+    return {"document_id": str(document_id),
+            "tags": [name for _tag_id, name in tag_ids]}
+
+
+def resolve_document_scope(conn, *, document_ids=None, collection_ids=None,
+                           tags=None) -> tuple[str, ...] | None:
+    """Intersect scope dimensions into active ids; collections ANY, tags ALL."""
+    if document_ids is None and collection_ids is None and tags is None:
+        return None
+    params = {}
+    clauses = ["d.archived_at IS NULL"]
+    if document_ids is not None:
+        if not isinstance(document_ids, (list, tuple)) or not document_ids:
+            raise ValueError("document_ids bos olmayan bir liste olmali")
+        params["document_ids"] = list(document_ids)
+        clauses.append("d.id = ANY(%(document_ids)s::uuid[])")
+    if collection_ids is not None:
+        if not isinstance(collection_ids, (list, tuple)) or not collection_ids:
+            raise ValueError("collection_ids bos olmayan bir liste olmali")
+        params["collection_ids"] = list(collection_ids)
+        clauses.append(
+            "EXISTS (SELECT 1 FROM collection_documents cd "
+            "WHERE cd.document_id = d.id "
+            "AND cd.collection_id = ANY(%(collection_ids)s::uuid[]))")
+    if tags is not None:
+        if not isinstance(tags, (list, tuple)) or not tags:
+            raise ValueError("tags bos olmayan bir liste olmali")
+        tag_keys = sorted({_canonical_label(tag, "tag")[1] for tag in tags})
+        params["tag_keys"] = tag_keys
+        params["tag_count"] = len(tag_keys)
+        clauses.append(
+            "(SELECT COUNT(DISTINCT t.name_key) FROM document_tags dt "
+            "JOIN tags t ON t.id = dt.tag_id WHERE dt.document_id = d.id "
+            "AND t.name_key = ANY(%(tag_keys)s::text[])) = %(tag_count)s")
+    with conn.cursor() as cur:
+        cur.execute("SELECT d.id FROM documents d WHERE "
+                    + " AND ".join(clauses) + " ORDER BY d.id", params)
+        return tuple(str(row[0]) for row in cur.fetchall())
+
+
 # The ONE escape character every LIKE pattern in this module is built
 # with. It is a literal in the code and is NEVER taken from a caller: an
 # operator or an escape character chosen by input would be a fragment of
@@ -701,7 +886,9 @@ def list_documents(conn, limit: int, offset: int,
                    uploaded_after: datetime | None = None,
                    uploaded_before: datetime | None = None,
                    q: str | None = None,
-                   archived: bool = False) -> list[dict]:
+                   archived: bool = False,
+                   collection_id: str | None = None,
+                   tag: str | None = None) -> list[dict]:
     """One page of the document inventory, newest first.
 
     SIX FILTERS. `archived=False` is the fail-closed default: the normal
@@ -791,9 +978,11 @@ def list_documents(conn, limit: int, offset: int,
     # transform below turns a value into a PATTERN, and a transform is
     # arithmetic on a value nobody checked unless the check comes first.
     for name, value in (("status", status), ("file_type", file_type),
-                        ("q", q)):
+                         ("q", q), ("collection_id", collection_id)):
         if value is not None and (not isinstance(value, str) or not value):
             raise ValueError(name + " bos olmayan bir metin olmali")
+    if tag is not None:
+        _display_tag, tag_key = _canonical_label(tag, "tag")
     # A bound that is not an aware datetime is not a bound. `utcoffset()`
     # rather than `tzinfo is not None`: a tzinfo may be attached and still
     # answer None for this instant, which leaves the value exactly as
@@ -855,6 +1044,17 @@ def list_documents(conn, limit: int, offset: int,
     if q is not None:
         clauses.append("filename ILIKE %(filename_search)s ESCAPE '!'")
         params["filename_search"] = "%" + escape_like_pattern(q) + "%"
+    if collection_id is not None:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM collection_documents cd "
+            "WHERE cd.document_id = documents.id "
+            "AND cd.collection_id = %(collection_id)s::uuid)")
+        params["collection_id"] = collection_id
+    if tag is not None:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM document_tags dt JOIN tags t ON t.id = dt.tag_id "
+            "WHERE dt.document_id = documents.id AND t.name_key = %(tag_key)s)")
+        params["tag_key"] = tag_key
     where_sql = "WHERE " + " AND ".join(clauses) + " " if clauses else ""
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(

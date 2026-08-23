@@ -258,3 +258,59 @@ def test_snapshot_retrieval_lock_orders_a_concurrent_real_archive(
     finally:
         real_scope_connection.rollback()
         other.close()
+
+
+def test_real_collection_and_tag_scopes_intersect_before_retrieval(
+        real_scope_connection):
+    finance = db.create_collection(real_scope_connection, "Finance")
+    same = db.create_collection(real_scope_connection, "  FINANCE  ")
+    research = db.create_collection(real_scope_connection, "Research")
+    assert same["collection_id"] == finance["collection_id"]
+    assert same["name"] == "Finance"
+
+    try:
+        assert db.set_collection_document(
+            real_scope_connection, finance["collection_id"], INSIDE, True)
+        assert db.set_collection_document(
+            real_scope_connection, research["collection_id"], OUTSIDE, True)
+        assert db.replace_document_tags(
+            real_scope_connection, INSIDE, ["Urgent", "Finance", "urgent"]
+        )["tags"] == ["Finance", "Urgent"]
+        db.replace_document_tags(real_scope_connection, OUTSIDE, ["Finance"])
+        assert [(row["name"], row["document_count"])
+                for row in db.list_tags(real_scope_connection)] == [
+                    ("Finance", 2), ("Urgent", 1)]
+
+        assert db.resolve_document_scope(
+            real_scope_connection,
+            collection_ids=(finance["collection_id"],
+                            research["collection_id"]),
+            tags=("FINANCE", "urgent")) == (str(INSIDE),)
+        assert db.resolve_document_scope(
+            real_scope_connection, document_ids=(OUTSIDE,),
+            collection_ids=(finance["collection_id"],
+                            research["collection_id"]),
+            tags=("finance",)) == (str(OUTSIDE),)
+
+        inventory = db.list_documents(
+            real_scope_connection, limit=10, offset=0,
+            collection_id=finance["collection_id"], tag="FINANCE")
+        assert [row["document_id"] for row in inventory] == [str(INSIDE)]
+
+        db.set_document_archived(real_scope_connection, INSIDE, True)
+        assert db.resolve_document_scope(
+            real_scope_connection,
+            collection_ids=(finance["collection_id"],)) == ()
+        assert db.list_documents(
+            real_scope_connection, limit=10, offset=0,
+            collection_id=finance["collection_id"]) == []
+    finally:
+        db.set_document_archived(real_scope_connection, INSIDE, False)
+        db.replace_document_tags(real_scope_connection, INSIDE, [])
+        db.replace_document_tags(real_scope_connection, OUTSIDE, [])
+        for tag in db.list_tags(real_scope_connection):
+            db.delete_tag(real_scope_connection, tag["tag_id"])
+        db.delete_collection(real_scope_connection, finance["collection_id"])
+        db.delete_collection(real_scope_connection, research["collection_id"])
+
+    assert db.get_document(real_scope_connection, INSIDE) is not None
