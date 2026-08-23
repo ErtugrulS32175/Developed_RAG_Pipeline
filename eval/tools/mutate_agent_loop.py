@@ -116,7 +116,7 @@ MUTATIONS = [
      "well_formed_but_wrong_typed_lock_record"),
     ("degismez-alanlar", "state",
      'IMMUTABLE_STATE_FIELDS = ("protocol_version", "run_id", "started_at",'
-     + NL + '                          "baseline_sha")',
+     + NL + '                          "baseline_sha", "requested_models")',
      "IMMUTABLE_STATE_FIELDS = ()",
      "legal_transition_cannot_rewrite"),
     ("sonlu-sayi", "state",
@@ -1329,6 +1329,35 @@ MUTATIONS = [
     ("b10-onarim-kapsami", "changes",
      "        if outside:", "        if False:",
      "test_a_repair_may_not_touch_a_file_the_candidate_never_touched"),
+    # B11-P1 -- requested model evidence. These mutations distinguish a
+    # configured request from a provider-reported/effective-model claim:
+    # only the value bound into argv may reach the closed records.
+    ("b11-model-durum-kaydi", "runner",
+     "        if requested:" + NL
+     + '            payload["requested_models"] = requested',
+     "        if False:" + NL
+     + '            payload["requested_models"] = requested',
+     "test_requested_models_reach_argv_state_and_the_closed_journal"),
+    ("b11-model-argv-bagi", "runner",
+     "                    prompt=self._implementer_prompt(), "
+     "budget_usd=budget," + NL
+     + "                    timeout_seconds=seconds," + NL
+     + '                    max_output_bytes=self.task["max_output_bytes"],'
+     + NL + "                    model=model)",
+     "                    prompt=self._implementer_prompt(), "
+     "budget_usd=budget," + NL
+     + "                    timeout_seconds=seconds," + NL
+     + '                    max_output_bytes=self.task["max_output_bytes"],'
+     + NL + "                    model=None)",
+     "test_requested_models_reach_argv_state_and_the_closed_journal"),
+    ("b11-model-olay-kaydi", "runner",
+     "                    requested_models="
+     "{contract.Role.EVALUATOR: model}",
+     "                    requested_models=None",
+     "test_requested_models_reach_argv_state_and_the_closed_journal"),
+    ("b11-model-arsiv-kaydi", "finalization",
+     '    if state.get("requested_models"):', "    if False:",
+     "test_finalize_carries_requested_models_without_claiming_effective_models"),
 ]
 
 

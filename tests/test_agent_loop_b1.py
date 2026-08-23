@@ -773,7 +773,8 @@ def test_an_empty_state_directory_is_a_fresh_run(repo, task, binaries,
 @pytest.mark.parametrize(
     ("field", "value"),
     [("run_id", "bambaska-kosu"), ("baseline_sha", "b" * 40),
-     ("started_at", "t99"), ("protocol_version", "0.0")])
+     ("started_at", "t99"), ("protocol_version", "0.0"),
+     ("requested_models", {"implementer": "sonnet"})])
 def test_a_legal_transition_cannot_rewrite_the_runs_identity(state_dir, field,
                                                              value):
     """`advance` merged every keyword straight over the document, so a
@@ -1393,7 +1394,10 @@ def test_every_mutation_still_applies_to_the_current_source():
     # actionable list. Four guard the single repair budget: the zero
     # budget, the second acceptance never asking for a repair, the one
     # counter both sources spend, and the round's own file-scope bound.
-    assert len(tool.MUTATIONS) == 161
+    # 161 -> 165 in B11-P1: the requested model is persisted at run open,
+    # the same value reaches argv, the evaluator call records its own
+    # role-keyed request, and finalize carries the closed state fact.
+    assert len(tool.MUTATIONS) == 165
     labels = {label for label, *_ in tool.MUTATIONS}
     assert len(labels) == len(tool.MUTATIONS), "yinelenen mutasyon adi"
     assert labels == {
@@ -1441,6 +1445,8 @@ def test_every_mutation_still_applies_to_the_current_source():
         'b10-tavan', 'b10-tasma-parser', 'b10-gecen-komut',
         'b10-sifir-butce', 'b10-ikinci-onarim', 'b10-butce-sayaci',
         'b10-onarim-kapsami',
+        'b11-model-durum-kaydi', 'b11-model-argv-bagi',
+        'b11-model-olay-kaydi', 'b11-model-arsiv-kaydi',
         'b2bc2-ekleme-carpismasi', 'b2bc2-geri-alma-atlama',
         'b2bc2-makbuz-otoritesi',
         'b2bc2-rapor-parmak-izi', 'b2bc2-son-fark-kontrolu',

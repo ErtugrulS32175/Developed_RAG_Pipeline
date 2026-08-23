@@ -331,11 +331,23 @@ EVALUATOR_RESULT_SCHEMAS = {
 # A model configuration a task may express. Deliberately tiny: anything
 # richer becomes a way to smuggle CLI flags past validation, which is
 # what a free-form object was.
+_MODEL_NAME = {"type": "string", "maxLength": 60,
+               "pattern": r"^[a-z0-9][a-z0-9._-]{1,59}$"}
+
 _MODEL_CONFIG = {
     "type": "object",
     "additionalProperties": False,
-    "properties": {"model": {"type": "string", "maxLength": 60,
-                             "pattern": r"^[a-z0-9][a-z0-9._-]{1,59}$"}},
+    "properties": {"model": _MODEL_NAME},
+}
+
+_REQUESTED_MODELS = {
+    "type": "object",
+    "additionalProperties": False,
+    "minProperties": 1,
+    "properties": {
+        "implementer": _MODEL_NAME,
+        "evaluator": _MODEL_NAME,
+    },
 }
 
 _COMMAND_REFERENCE = {
@@ -423,6 +435,11 @@ STATE_SCHEMA = {
         "updated_at": {"type": "string", "maxLength": 40},
         "heartbeat_at": {"type": "string", "maxLength": 40},
         "baseline_sha": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
+        # What the operator asked the adapters to place on their argv.
+        # This is NOT a claim about which model the provider ultimately
+        # served: neither CLI returns a trustworthy effective-model field
+        # through the bounded adapter contract.
+        "requested_models": _REQUESTED_MODELS,
         "rounds": {
             "type": "object",
             "additionalProperties": False,
@@ -502,6 +519,7 @@ EVENT_SCHEMA = {
         # nothing outside this list can ever reach the journal.
         "failure_code": {"enum": list(ALL_FAILURE_CODES)},
         "role": {"enum": list(ALL_ROLES)},
+        "requested_models": _REQUESTED_MODELS,
         "stdout_bytes": {"type": "integer", "minimum": 0},
         "stderr_bytes": {"type": "integer", "minimum": 0},
         "cleanup_complete": {"type": "boolean"},

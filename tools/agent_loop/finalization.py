@@ -65,7 +65,7 @@ from jsonschema import Draft202012Validator, ValidationError
 
 from tools.agent_loop import application
 from tools.agent_loop import application_transport as transport
-from tools.agent_loop import changes, contract, flat_workspace, locking
+from tools.agent_loop import changes, contract, flat_workspace, locking, schemas
 from tools.agent_loop import runner_events
 from tools.agent_loop import state as state_module
 
@@ -249,7 +249,8 @@ MANIFEST_FIELDS = (
     "stop_reason", "baseline_sha", "manifest_digest", "workspace_id",
     "receipt_id", "receipt_status", "candidate_fingerprint",
     "evaluator_status", "evaluator_finding_count", "shipment",
-    "shipped_commit", "ci_run_id", "files", "absent", "file_count",
+    "shipped_commit", "ci_run_id", "requested_models", "files", "absent",
+    "file_count",
 )
 
 _FILE_ENTRY_SCHEMA = {
@@ -285,6 +286,8 @@ ARCHIVE_MANIFEST_SCHEMA = {
         "shipment": {"enum": list(ALL_SHIPMENTS)},
         "shipped_commit": {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
         "ci_run_id": {"type": "string", "pattern": r"^[0-9]{1,32}$"},
+        "requested_models": schemas.STATE_SCHEMA["properties"]
+        ["requested_models"],
         "files": {"type": "array", "items": _FILE_ENTRY_SCHEMA,
                   "maxItems": 4096},
         "absent": {"type": "array", "maxItems": 64,
@@ -1128,6 +1131,8 @@ def _manifest_payload(state, binding, terminal, run_id, workspace_id, entries,
         payload["shipped_commit"] = shipped_commit
     if ci_run_id is not None:
         payload["ci_run_id"] = ci_run_id
+    if state.get("requested_models"):
+        payload["requested_models"] = dict(state["requested_models"])
     for field, key in (("evaluator_status", "evaluator_status"),
                        ("evaluator_finding_count", "finding_count")):
         value = state.get(key)

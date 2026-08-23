@@ -3133,3 +3133,43 @@ def test_the_evaluator_road_is_unchanged_by_the_implementer_derivation():
     assert "next_action" in schemas.CODE_AUDIT_RESULT_SCHEMA["properties"]
     assert "next_action" not in \
         schemas.CODE_AUDIT_TRANSPORT_SCHEMA["properties"]
+
+
+# =====================================================================
+# B11-P1 -- REQUESTED MODEL EVIDENCE, WITHOUT AN EFFECTIVE-MODEL CLAIM
+# =====================================================================
+
+def test_requested_model_evidence_is_closed_optional_and_backward_compatible():
+    model_name = schemas.TASK_SCHEMA["properties"]["implementer"][
+        "properties"]["model"]
+    state_models = schemas.STATE_SCHEMA["properties"]["requested_models"]
+    event_models = schemas.EVENT_SCHEMA["properties"]["requested_models"]
+    assert state_models["additionalProperties"] is False
+    assert state_models["minProperties"] == 1
+    assert state_models["properties"]["implementer"] == model_name
+    assert state_models["properties"]["evaluator"] == model_name
+    assert event_models == state_models
+
+    state = {
+        "protocol_version": contract.PROTOCOL_VERSION,
+        "run_id": "kosu-000000000000000000000000",
+        "state": contract.State.PREFLIGHT,
+        "started_at": "2026-08-22T00:00:00Z",
+        "updated_at": "2026-08-22T00:00:00Z",
+        "rounds": {"implementation": 0, "repair": 0, "evaluator": 0},
+        "budget": {"max_usd": 3.0, "spent_usd": 0.0},
+    }
+    validator = Draft202012Validator(schemas.STATE_SCHEMA)
+    validator.validate(state)  # an old state remains valid
+    validator.validate({**state, "requested_models": {"implementer": "opus"}})
+    for bad in ({}, {"provider": "opus"}, {"implementer": "OPUS"}):
+        with pytest.raises(ValidationError):
+            validator.validate({**state, "requested_models": bad})
+
+    event = {"ts": "2026-08-22T00:00:00Z", "run_id": state["run_id"],
+             "event": contract.EventCode.MODEL_CALL_STARTED,
+             "requested_models": {"implementer": "opus"}}
+    Draft202012Validator(schemas.EVENT_SCHEMA).validate(event)
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schemas.EVENT_SCHEMA).validate(
+            {**event, "reported_model": "opus"})

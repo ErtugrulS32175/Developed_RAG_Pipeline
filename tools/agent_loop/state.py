@@ -43,7 +43,7 @@ BINDING_FILENAME = "binding.json"
 # middle of an otherwise valid move -- and the resulting file still
 # validated, because the schema constrains shapes, not continuity.
 IMMUTABLE_STATE_FIELDS = ("protocol_version", "run_id", "started_at",
-                          "baseline_sha")
+                          "baseline_sha", "requested_models")
 
 # What a run is pinned to. Owned by B1; the frozen STATE_SCHEMA is
 # untouched.

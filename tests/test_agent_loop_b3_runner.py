@@ -1009,7 +1009,8 @@ def test_the_failure_event_carries_no_free_text_and_no_path(world):
     # it stays an ALLOWLIST, and the event schema closes the record too.
     allowed = {"ts", "run_id", "event", "state", "command_id", "exit_code",
                "duration_ms", "bytes_truncated", "failure_code", "role",
-               "stdout_bytes", "stderr_bytes", "cleanup_complete"}
+               "requested_models", "stdout_bytes", "stderr_bytes",
+               "cleanup_complete"}
     for entry in _journal(world):
         assert set(entry) <= allowed, sorted(set(entry) - allowed)
 
@@ -1899,3 +1900,32 @@ def test_both_repair_sources_use_one_seam_and_one_counter(world):
     assert source.count("changes.run_verified_repair") == 1
     assert source.count('self.rounds["repair"] += 1') == 1
     assert source.count("_repair_road") == 3   # definition and two callers
+
+
+def test_requested_models_reach_argv_state_and_the_closed_journal(world):
+    """The evidence says REQUESTED, not effective. Both persisted copies
+    and each argv are fed from the same role-specific model value."""
+    retask(world, implementer={"model": "opus"},
+           evaluator={"model": "gpt-5.4"})
+
+    result = run(world)
+    assert result.state == contract.State.APPROVED
+    state_doc = json.loads((world.state_dir / "state.json").read_text(
+        encoding="utf-8"))
+    assert state_doc["requested_models"] == {
+        "implementer": "opus", "evaluator": "gpt-5.4"}
+
+    starts = [entry for entry in _journal(world)
+              if entry["event"] == contract.EventCode.MODEL_CALL_STARTED]
+    assert [entry["requested_models"] for entry in starts] == [
+        {"implementer": "opus"}, {"evaluator": "gpt-5.4"}]
+    implementer_argv = implementer_calls(world)[0]["argv"]
+    evaluator_argv = evaluator_calls(world)[0]["argv"]
+    assert implementer_argv[implementer_argv.index("--model") + 1] == "opus"
+    assert evaluator_argv[evaluator_argv.index("--model") + 1] == "gpt-5.4"
+
+    persisted = (world.state_dir / "state.json").read_text(encoding="utf-8")
+    persisted += runner_events.events_path(world.state_dir).read_text(
+        encoding="utf-8")
+    assert "reported_model" not in persisted
+    assert "effective_model" not in persisted

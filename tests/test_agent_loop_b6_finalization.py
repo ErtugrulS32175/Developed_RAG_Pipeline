@@ -1122,3 +1122,27 @@ def test_a_failed_cleanup_never_loses_the_operators_bytes(tmp_path):
     for name, data in before.items():
         in_archive = any(value == data for value in archived.values())
         assert name in still or in_archive, f"bayt kayboldu: {name}"
+
+
+def test_finalize_carries_requested_models_without_claiming_effective_models(
+        tmp_path):
+    world = _run_world(
+        tmp_path, implementer={"model": "opus"},
+        evaluator={"model": "gpt-5.4"})
+    result = world_module.run(world)
+    assert result.state == contract.State.APPROVED
+    root = archive_root(tmp_path)
+
+    outcome = finalize(world, root, task_path=world.task_path)
+    manifest = manifest_of(root, outcome)
+    assert manifest["requested_models"] == {
+        "implementer": "opus", "evaluator": "gpt-5.4"}
+    text = json.dumps(manifest, sort_keys=True)
+    assert "reported_model" not in text
+    assert "effective_model" not in text
+
+    # An archive written before this optional evidence existed remains a
+    # valid closed document; backward compatibility is explicit.
+    old_manifest = dict(manifest)
+    old_manifest.pop("requested_models")
+    finalization.assert_manifest(old_manifest)

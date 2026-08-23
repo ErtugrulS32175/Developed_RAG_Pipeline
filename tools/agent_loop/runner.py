@@ -684,7 +684,11 @@ class _Run:
                    "baseline_sha": self.baseline,
                    "rounds": dict(self.rounds),
                    "budget": {"max_usd": self.task["max_budget_usd"],
-                              "spent_usd": 0.0}}
+                               "spent_usd": 0.0}}
+        requested = {role: model for role in contract.ALL_ROLES
+                     if (model := self._model(role)) is not None}
+        if requested:
+            payload["requested_models"] = requested
         state_module.write_state(self.state_dir, payload)
         runner_events.save_state_backup(self.state_dir, payload)
         self._event(contract.EventCode.PREFLIGHT_OK,
@@ -985,8 +989,11 @@ class _Run:
                         state=contract.State.BLOCKED)
         budget = self._assert_budget()
         seconds = self._model_seconds()
+        model = self._model(contract.Role.IMPLEMENTER)
         self._assert_plan_only()
-        self._event(contract.EventCode.MODEL_CALL_STARTED, state=self.state)
+        self._event(contract.EventCode.MODEL_CALL_STARTED, state=self.state,
+                    requested_models={contract.Role.IMPLEMENTER: model}
+                    if model is not None else None)
         with self._guard():
             with self._model_environment(self.rounds["implementation"]):
                 verified = changes.run_verified_implementation(
@@ -994,7 +1001,7 @@ class _Run:
                     prompt=self._implementer_prompt(), budget_usd=budget,
                     timeout_seconds=seconds,
                     max_output_bytes=self.task["max_output_bytes"],
-                    model=self._model("implementer"))
+                    model=model)
         self._apply_test_edit()
         self.rounds["implementation"] += 1
         self._event(contract.EventCode.MODEL_CALL_FINISHED, state=self.state,
@@ -1016,8 +1023,11 @@ class _Run:
         journal already reduced."""
         budget = self._assert_budget()
         seconds = self._model_seconds()
+        model = self._model(contract.Role.IMPLEMENTER)
         self._assert_plan_only()
-        self._event(contract.EventCode.MODEL_CALL_STARTED, state=self.state)
+        self._event(contract.EventCode.MODEL_CALL_STARTED, state=self.state,
+                    requested_models={contract.Role.IMPLEMENTER: model}
+                    if model is not None else None)
         with self._guard():
             with self._model_environment(self.rounds["repair"] + 1):
                 verified = changes.run_verified_repair(
@@ -1027,7 +1037,7 @@ class _Run:
                     prompt=self._prompt_for(source), budget_usd=budget,
                     timeout_seconds=seconds,
                     max_output_bytes=self.task["max_output_bytes"],
-                    model=self._model("implementer"))
+                    model=model)
         self.rounds["repair"] += 1
         self._event(contract.EventCode.MODEL_CALL_FINISHED, state=self.state,
                     exit_code=verified.exit_code,
@@ -1139,6 +1149,7 @@ class _Run:
         round_index = self.rounds["evaluator"]
         self._assert_budget()
         seconds = self._model_seconds()
+        model = self._model(contract.Role.EVALUATOR)
         issued = (self._locked_ids()
                   if self.audit_kind == contract.AuditKind.LOCKED else None)
 
@@ -1151,7 +1162,9 @@ class _Run:
         # guard stays total (nothing under `.agent-loop/` is excused)
         # precisely because nothing is written while it is open.
         self._assert_plan_only()
-        self._event(contract.EventCode.MODEL_CALL_STARTED, state=self.state)
+        self._event(contract.EventCode.MODEL_CALL_STARTED, state=self.state,
+                    requested_models={contract.Role.EVALUATOR: model}
+                    if model is not None else None)
         policy = changes.freeze_main_policy(self.repo)
         main_key = secrets.token_bytes(fs_evidence.KEY_BYTES)
         with self._guard():
@@ -1177,7 +1190,7 @@ class _Run:
                         else (),
                         issued_mechanism_ids=issued["mechanism_ids"] if issued
                         else (),
-                        model=self._model("evaluator"))
+                        model=model)
         except BaseException as raised:
             failure = raised
             raise
