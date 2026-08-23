@@ -396,6 +396,12 @@ def test_the_native_public_path_returns_only_a_checked_result(monkeypatch):
     assert result.status == ANSWERED
     assert result.answer == reply["cevap"]
     assert result.diagnostics == ()
+    assert result.trace.backend == "native"
+    assert result.trace.retrieved_count == len(CHUNKS)
+    assert result.trace.reranked_count == len(CHUNKS)
+    assert result.trace.context_passage_count == len(CHUNKS)
+    assert tuple(stage.name for stage in result.trace.stages) == (
+        "retrieve", "rerank", "context", "generate", "validate")
 
 
 def test_the_llamaindex_public_path_returns_only_a_checked_result(monkeypatch):
@@ -417,6 +423,12 @@ def test_the_llamaindex_public_path_returns_only_a_checked_result(monkeypatch):
     assert result.status == ANSWERED
     assert result.answer == reply["cevap"]
     assert result.diagnostics == ()
+    assert result.trace.backend == "llamaindex"
+    assert result.trace.retrieved_count == len(CHUNKS)
+    assert result.trace.reranked_count is None
+    assert result.trace.context_passage_count == len(CHUNKS)
+    assert tuple(stage.name for stage in result.trace.stages) == (
+        "retrieve", "context", "generate", "validate")
 
 
 def test_the_plain_path_is_untouched(monkeypatch):

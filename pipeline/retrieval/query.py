@@ -1,4 +1,5 @@
 import os
+from dataclasses import replace
 
 import requests
 from dotenv import load_dotenv
@@ -7,6 +8,7 @@ from pipeline.generation import answer as gen
 from pipeline.index import db
 from pipeline.index.embeddings import embed_dense, embed_sparse
 from pipeline.retrieval.context import Passage, RagContext
+from pipeline.retrieval.trace import TraceStage, clock, elapsed_ms, new_trace
 
 load_dotenv()
 
@@ -211,11 +213,33 @@ def ask_checked(question: str, *, document_ids=None):
     # that replace this seam (the evaluation harness, the structured-answer
     # tests) declare the signature they have always been handed.
     scope = {} if document_ids is None else {"document_ids": document_ids}
+    started = clock()
     chunks = retrieve(question, **scope)
+    stages = [TraceStage("retrieve", elapsed_ms(started))]
+    retrieved_count = len(chunks)
+    started = clock()
     chunks = rerank(question, chunks)
+    stages.append(TraceStage("rerank", elapsed_ms(started)))
+    reranked_count = len(chunks)
+    started = clock()
     context = build_rag_context(chunks, numbered=True)
+    stages.append(TraceStage("context", elapsed_ms(started)))
+    started = clock()
     reply = gen.generate_structured(question, context.model_text)
-    return validate_structured(reply, context)
+    stages.append(TraceStage("generate", elapsed_ms(started)))
+    started = clock()
+    result = validate_structured(reply, context)
+    stages.append(TraceStage("validate", elapsed_ms(started)))
+    trace = new_trace(
+        backend="native",
+        scope_document_count=(None if document_ids is None
+                              else len(document_ids)),
+        retrieved_count=retrieved_count,
+        reranked_count=reranked_count,
+        context_passage_count=len(context.passages),
+        stages=stages,
+    )
+    return replace(result, trace=trace)
 
 
 # --- Interactive loop ---

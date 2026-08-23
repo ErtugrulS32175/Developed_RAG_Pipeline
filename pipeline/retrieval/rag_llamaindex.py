@@ -364,14 +364,37 @@ def answer_checked(question, *, document_ids=None):
     it: the assembled context and every citation the answer may publish.
     Forwarded only when supplied, so an unscoped question reaches
     ``retrieve`` as the single-argument call it has always been."""
+    from dataclasses import replace
+
     from pipeline.generation.answer import generate_structured
     from pipeline.retrieval.query import build_rag_context
+    from pipeline.retrieval.trace import (
+        TraceStage, clock, elapsed_ms, new_trace,
+    )
     from pipeline.validation.rag.answer_guard import validate_structured
 
     scope = {} if document_ids is None else {"document_ids": document_ids}
-    context = build_rag_context(retrieve(question, **scope), numbered=True)
+    started = clock()
+    chunks = retrieve(question, **scope)
+    stages = [TraceStage("retrieve", elapsed_ms(started))]
+    started = clock()
+    context = build_rag_context(chunks, numbered=True)
+    stages.append(TraceStage("context", elapsed_ms(started)))
+    started = clock()
     reply = generate_structured(question, context.model_text)
-    return validate_structured(reply, context)
+    stages.append(TraceStage("generate", elapsed_ms(started)))
+    started = clock()
+    result = validate_structured(reply, context)
+    stages.append(TraceStage("validate", elapsed_ms(started)))
+    return replace(result, trace=new_trace(
+        backend="llamaindex",
+        scope_document_count=(None if document_ids is None
+                              else len(document_ids)),
+        retrieved_count=len(chunks),
+        reranked_count=None,
+        context_passage_count=len(context.passages),
+        stages=stages,
+    ))
 
 
 if __name__ == "__main__":

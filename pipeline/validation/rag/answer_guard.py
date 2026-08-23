@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 from pipeline.lang.tr_notation import _readings, fold, normalize, number_forms, numbers
 from pipeline.retrieval.context import RagContext
+from pipeline.retrieval.trace import RetrievalTrace
 
 # the citation shape the answer prompt asks the model to produce
 _ANSWER_PAGE = re.compile(r"sayfa\s*\d+", re.IGNORECASE)
@@ -59,6 +60,7 @@ class GuardResult:
     answer: str | None
     diagnostics: tuple
     citations: tuple[PageCitation, ...] = ()
+    trace: RetrievalTrace | None = None
 
 
 def is_abstention(answer):

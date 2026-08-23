@@ -180,6 +180,7 @@ def sse_chunk(
         finish=None,
         rag_status=None,
         rag_citations=None,
+        rag_trace=None,
 ) -> str:
     payload = {
         "id": chat_id,
@@ -196,6 +197,8 @@ def sse_chunk(
         payload["rag_status"] = rag_status
     if rag_citations is not None:
         payload["rag_citations"] = rag_citations
+    if rag_trace is not None:
+        payload["rag_trace"] = rag_trace
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
@@ -230,7 +233,8 @@ def stream_tables(messages, model):
     yield "data: [DONE]\n\n"
 
 
-def stream_text(answer, model, rag_status=None, rag_citations=None):
+def stream_text(answer, model, rag_status=None, rag_citations=None,
+                rag_trace=None):
     """The RAG path has no mid-flight stages worth reporting, so it emits one
     chunk -- enough that OpenWebUI's stream toggle works for both models. The
     checked publication status is repeated on every JSON event so a consumer
@@ -242,6 +246,7 @@ def stream_text(answer, model, rag_status=None, rag_citations=None):
         delta=answer,
         rag_status=rag_status,
         rag_citations=rag_citations,
+        rag_trace=rag_trace,
     )
     yield sse_chunk(
         chat_id,
@@ -249,5 +254,6 @@ def stream_text(answer, model, rag_status=None, rag_citations=None):
         finish="stop",
         rag_status=rag_status,
         rag_citations=rag_citations,
+        rag_trace=rag_trace,
     )
     yield "data: [DONE]\n\n"

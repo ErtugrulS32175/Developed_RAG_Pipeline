@@ -108,6 +108,14 @@ Answers are checked against the exact passage they claim to quote. The result is
 carries publishable answer text. The public API only exposes this checked path,
 and both JSON and streaming replies carry `rag_status`.
 
+Set `include_trace: true` on a chat request when an operator needs to explain
+the retrieval path. Both JSON and streaming responses then carry the same
+`rag_trace`: a random trace id, backend name, requested-scope size, counts after
+retrieval/reranking/context assembly, and per-stage milliseconds. It is a
+closed, content-free record: no question, passage text, score, filename or
+document id is present. The field is omitted by default, so existing
+OpenAI-compatible clients keep their prior response shape.
+
 Quality is measured rather than assumed. `eval/retrieval/rag_eval.py` asks
 whether the answer even reached the context and at what rank;
 `eval/answer/rag_answer_eval.py` asks whether the answer and the cited page are

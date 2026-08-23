@@ -29,6 +29,7 @@ from pipeline.index.attempt_contract import (
 )
 from pipeline.api import owui_chat
 from pipeline.retrieval import rag_backends
+from pipeline.retrieval.trace import RetrievalTrace
 from pipeline.validation.rag.answer_guard import (
     ABSTAINED,
     ANSWERED,
@@ -234,6 +235,7 @@ class ChatRequest(BaseModel):
     document_ids: DocumentScope | None = None
     collection_ids: DocumentScope | None = None
     tags: TagScope | None = None
+    include_trace: bool = False
 
 
 class CollectionRequest(BaseModel):
@@ -337,18 +339,25 @@ def chat_completions(req: ChatRequest):
         except Exception as e:
             _log_rag_failure(e, backend)
             raise HTTPException(status_code=502, detail=RAG_FAILURE_MESSAGE)
-        return _publish_checked(result)
+        published = _publish_checked(result)
+        if req.include_trace and published[3] is None:
+            log.error("RAG backend omitted requested retrieval trace")
+            raise HTTPException(status_code=500,
+                                detail="gecersiz RAG izleme sozlesmesi")
+        return published
 
     if req.stream:
         if is_table:
             gen = owui_chat.stream_tables(req.messages, req.model)
         else:
-            status, answer, citations = ask_checked()
+            status, answer, citations, trace = ask_checked()
             gen = owui_chat.stream_text(
                 answer,
                 req.model,
                 rag_status=status,
                 rag_citations=_citation_payload(citations),
+                rag_trace=(_trace_payload(trace)
+                           if req.include_trace else None),
             )
         return StreamingResponse(gen, media_type="text/event-stream")
 
@@ -358,7 +367,7 @@ def chat_completions(req: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"tablo cikarimi basarisiz: {e}")
     else:
-        status, answer, citations = ask_checked()
+        status, answer, citations, trace = ask_checked()
 
     response = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:10]}",
@@ -372,6 +381,8 @@ def chat_completions(req: ChatRequest):
     if not is_table:
         response["rag_status"] = status
         response["rag_citations"] = _citation_payload(citations)
+        if req.include_trace:
+            response["rag_trace"] = _trace_payload(trace)
     return response
 
 
@@ -380,6 +391,13 @@ def _citation_payload(citations):
         {"page": citation.page, "source": citation.source}
         for citation in citations
     ]
+
+
+def _trace_payload(trace):
+    if not isinstance(trace, RetrievalTrace):
+        raise HTTPException(status_code=500,
+                            detail="gecersiz RAG izleme sozlesmesi")
+    return trace.public()
 
 
 def _publish_checked(result):
@@ -400,6 +418,10 @@ def _publish_checked(result):
         and all(isinstance(citation, PageCitation)
                 for citation in result.citations)
     )
+    if result.trace is not None and not isinstance(result.trace, RetrievalTrace):
+        log.error("RAG backend returned invalid retrieval trace")
+        raise HTTPException(status_code=500,
+                            detail="gecersiz RAG yanit sozlesmesi")
     if not valid_citations:
         log.error("RAG backend returned invalid citation metadata")
         raise HTTPException(status_code=500, detail="gecersiz RAG yanit sozlesmesi")
@@ -409,7 +431,7 @@ def _publish_checked(result):
         and clean
         and not is_abstention(result.answer)
     ):
-        return result.status, result.answer, result.citations
+        return result.status, result.answer, result.citations, result.trace
     if (
         result.status == ABSTAINED
         and has_text
@@ -417,9 +439,9 @@ def _publish_checked(result):
         and is_abstention(result.answer)
         and result.citations == ()
     ):
-        return result.status, result.answer, result.citations
+        return result.status, result.answer, result.citations, result.trace
     if result.status == REVIEW_REQUIRED and result.answer is None:
-        return result.status, REVIEW_MESSAGE, ()
+        return result.status, REVIEW_MESSAGE, (), result.trace
     log.error("RAG backend returned inconsistent checked status")
     raise HTTPException(status_code=500, detail="gecersiz RAG yanit sozlesmesi")
 
