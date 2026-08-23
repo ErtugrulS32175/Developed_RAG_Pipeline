@@ -27,7 +27,11 @@ class FakePool:
 
     @contextmanager
     def connection(self):
-        conn = object()
+        class Conn:
+            def rollback(self):
+                pass
+
+        conn = Conn()
         self.handed_out.append(conn)
         try:
             yield conn
@@ -48,6 +52,8 @@ def pooled(monkeypatch):
 
     monkeypatch.setattr(api.db, "get_pool", lambda: pool)
     monkeypatch.setattr(api.db, "init_schema", lambda conn: None)
+    monkeypatch.setattr(api.db, "set_tenant_context", lambda *a, **k: None)
+    monkeypatch.setattr(api.db, "clear_tenant_context", lambda *a, **k: None)
     monkeypatch.setattr(api.db, "document_publish_lock", publish_lock)
     monkeypatch.setattr(api, "_schema_ready", False)
     return pool

@@ -74,7 +74,15 @@ class UnsafeCanonicalName(ValueError):
     the upload directory. Trusted source, still untrusted input."""
 
 
-def _checked_destination(canonical: str) -> Path:
+def tenant_upload_root(upload_dir, tenant_id=db.DEFAULT_TENANT_ID):
+    """Stable storage namespace; the legacy tenant keeps its old layout."""
+    tenant = uuid.UUID(str(tenant_id))
+    root = Path(upload_dir)
+    return root if tenant == db.DEFAULT_TENANT_ID else root / "tenants" / str(tenant)
+
+
+def _checked_destination(canonical: str,
+                         tenant_id=db.DEFAULT_TENANT_ID) -> Path:
     """The one place a filename becomes a path.
 
     Rejected on sight:
@@ -122,7 +130,7 @@ def _checked_destination(canonical: str) -> Path:
             or any(ord(char) < 32 for char in raw)):
         raise UnsafeCanonicalName(
             "kanonik ad guvenli bir dosya adi degil; disk hedefi kurulmadi")
-    root = Path(UPLOAD_DIR)
+    root = tenant_upload_root(UPLOAD_DIR, tenant_id)
     destination = (root / raw).resolve()
     if destination.parent != root.resolve():
         raise UnsafeCanonicalName(
@@ -130,8 +138,30 @@ def _checked_destination(canonical: str) -> Path:
     return destination
 
 
+def source_path(upload_dir, canonical, tenant_id=db.DEFAULT_TENANT_ID):
+    """Resolve an existing source without changing the module upload root."""
+    raw = str(canonical)
+    stem = raw.split(".", 1)[0].rstrip(" .").casefold()
+    if (not raw or "/" in raw or "\\" in raw or ":" in raw
+            or raw.startswith(".") or raw != Path(raw).name
+            or raw in (".", "..") or raw.rstrip(". ") != raw
+            or raw.strip() != raw
+            or any(char != " " and (char.isspace()
+                   or unicodedata.category(char) in _INVISIBLE_CATEGORIES)
+                   for char in raw)
+            or stem in _WINDOWS_DEVICE_NAMES
+            or any(ord(char) < 32 for char in raw)):
+        raise UnsafeCanonicalName("kanonik ad guvenli degil")
+    root = tenant_upload_root(upload_dir, tenant_id).resolve()
+    candidate = (root / raw).resolve()
+    if candidate.parent != root:
+        raise UnsafeCanonicalName("kanonik ad tenant dizininden cikiyor")
+    return candidate
+
+
 def publish_candidate(conn, filename: str, file_type: str, body: bytes,
-                      allow_replace: bool = False):
+                      allow_replace: bool = False,
+                      tenant_id=db.DEFAULT_TENANT_ID):
     """Stage, put the bytes in place, finalize -- one lock, three steps.
 
     Returns ``(document_id, candidate_id, canonical_filename)``.
@@ -154,7 +184,7 @@ def publish_candidate(conn, filename: str, file_type: str, body: bytes,
             content_sha256=hashlib.sha256(body).hexdigest(),
             allow_replace=allow_replace)
 
-        destination = _checked_destination(canonical)
+        destination = _checked_destination(canonical, tenant_id)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(
             f".{destination.name}.yayin-{uuid.uuid4().hex}")

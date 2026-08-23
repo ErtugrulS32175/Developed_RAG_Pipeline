@@ -219,6 +219,171 @@ ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_key uuid;
 -- a legacy row whose vectors are re-embedded, never trusted.
 ALTER TABLE chunks ADD COLUMN IF NOT EXISTS embedding_fingerprint text;
 
+-- Tenant isolation is enforced by PostgreSQL, not only by remembering a
+-- predicate in each caller. The legacy single-key installation is tenant 1;
+-- a request connection sets rag.tenant_id, while the internal queue worker
+-- sets rag.service=1 for cross-tenant claiming and then binds the claimed
+-- tenant before running ingest.
+CREATE OR REPLACE FUNCTION rag_effective_tenant() RETURNS uuid
+LANGUAGE sql STABLE AS $tenant$
+    SELECT COALESCE(
+        NULLIF(current_setting('rag.tenant_id', true), '')::uuid,
+        '00000000-0000-0000-0000-000000000001'::uuid
+    )
+$tenant$;
+
+CREATE OR REPLACE FUNCTION rag_service_access() RETURNS boolean
+LANGUAGE sql STABLE AS $service$
+    SELECT COALESCE(current_setting('rag.service', true), '') = '1'
+$service$;
+
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
+    DEFAULT rag_effective_tenant();
+ALTER TABLE collections ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
+    DEFAULT rag_effective_tenant();
+ALTER TABLE tags ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
+    DEFAULT rag_effective_tenant();
+ALTER TABLE collection_documents ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
+    DEFAULT rag_effective_tenant();
+ALTER TABLE document_tags ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
+    DEFAULT rag_effective_tenant();
+ALTER TABLE ingest_jobs ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
+    DEFAULT rag_effective_tenant();
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
+    DEFAULT rag_effective_tenant();
+ALTER TABLE attempts ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
+    DEFAULT rag_effective_tenant();
+
+-- Names are identities only inside one tenant. The old global constraints are
+-- removed after every legacy row has received the default tenant.
+ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_filename_key;
+ALTER TABLE collections DROP CONSTRAINT IF EXISTS collections_name_key_key;
+ALTER TABLE tags DROP CONSTRAINT IF EXISTS tags_name_key_key;
+CREATE UNIQUE INDEX IF NOT EXISTS documents_tenant_filename_key
+    ON documents(tenant_id, filename);
+CREATE UNIQUE INDEX IF NOT EXISTS collections_tenant_name_key
+    ON collections(tenant_id, name_key);
+CREATE UNIQUE INDEX IF NOT EXISTS tags_tenant_name_key
+    ON tags(tenant_id, name_key);
+CREATE INDEX IF NOT EXISTS documents_tenant_inventory_idx
+    ON documents(tenant_id, uploaded_at DESC, id DESC);
+
+-- The association rows carry tenant_id for RLS, and these composite keys make
+-- that value part of referential integrity too. Without them a service-role
+-- statement could manufacture a tenant-A membership pointing at a tenant-B
+-- document while still satisfying both single-column foreign keys.
+CREATE UNIQUE INDEX IF NOT EXISTS documents_tenant_id_key
+    ON documents(tenant_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS collections_tenant_id_key
+    ON collections(tenant_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS tags_tenant_id_key
+    ON tags(tenant_id, id);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'collection_documents_tenant_collection_fk') THEN
+        ALTER TABLE collection_documents ADD CONSTRAINT
+            collection_documents_tenant_collection_fk
+            FOREIGN KEY (tenant_id, collection_id)
+            REFERENCES collections(tenant_id, id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'collection_documents_tenant_document_fk') THEN
+        ALTER TABLE collection_documents ADD CONSTRAINT
+            collection_documents_tenant_document_fk
+            FOREIGN KEY (tenant_id, document_id)
+            REFERENCES documents(tenant_id, id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'document_tags_tenant_document_fk') THEN
+        ALTER TABLE document_tags ADD CONSTRAINT document_tags_tenant_document_fk
+            FOREIGN KEY (tenant_id, document_id)
+            REFERENCES documents(tenant_id, id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'document_tags_tenant_tag_fk') THEN
+        ALTER TABLE document_tags ADD CONSTRAINT document_tags_tenant_tag_fk
+            FOREIGN KEY (tenant_id, tag_id)
+            REFERENCES tags(tenant_id, id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ingest_jobs_tenant_document_fk') THEN
+        ALTER TABLE ingest_jobs ADD CONSTRAINT ingest_jobs_tenant_document_fk
+            FOREIGN KEY (tenant_id, document_id)
+            REFERENCES documents(tenant_id, id) ON DELETE CASCADE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'chunks_tenant_document_fk') THEN
+        ALTER TABLE chunks ADD CONSTRAINT chunks_tenant_document_fk
+            FOREIGN KEY (tenant_id, document_id)
+            REFERENCES documents(tenant_id, id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'attempts_tenant_document_fk') THEN
+        ALTER TABLE attempts ADD CONSTRAINT attempts_tenant_document_fk
+            FOREIGN KEY (tenant_id, document_id)
+            REFERENCES documents(tenant_id, id);
+    END IF;
+END
+$$;
+
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE documents FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON documents;
+CREATE POLICY tenant_isolation ON documents
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE collections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE collections FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON collections;
+CREATE POLICY tenant_isolation ON collections
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tags FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON tags;
+CREATE POLICY tenant_isolation ON tags
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE collection_documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE collection_documents FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON collection_documents;
+CREATE POLICY tenant_isolation ON collection_documents
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE document_tags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_tags FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON document_tags;
+CREATE POLICY tenant_isolation ON document_tags
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE ingest_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ingest_jobs FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON ingest_jobs;
+CREATE POLICY tenant_isolation ON ingest_jobs
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chunks FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON chunks;
+CREATE POLICY tenant_isolation ON chunks
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE attempts FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON attempts;
+CREATE POLICY tenant_isolation ON attempts
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
 -- No ANN index yet: this is a small, single-document demo dataset, and a
 -- sequential scan over `dense <=> query` / `sparse <#> query` is effectively
 -- instant at this scale. Add an HNSW index (e.g. `USING hnsw (dense

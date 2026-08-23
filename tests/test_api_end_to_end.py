@@ -1067,7 +1067,7 @@ def test_an_archived_document_cannot_start_processing(monkeypatch, tmp_path):
     assert calls == []
 
 
-def test_lifecycle_routes_use_the_same_api_key_dependency(
+def test_lifecycle_routes_require_the_admin_dependency(
         monkeypatch, tmp_path):
     api, _client, _state, _calls, _upload_dir, _closed = _document_api(
         monkeypatch, tmp_path)
@@ -1079,11 +1079,10 @@ def test_lifecycle_routes_use_the_same_api_key_dependency(
                 return [depends.dependency for depends in route.dependencies]
         raise AssertionError(path)
 
-    detail = dependencies("/documents/{document_id}", "GET")
     assert dependencies(
-        "/documents/{document_id}/archive", "POST") == detail
+        "/documents/{document_id}/archive", "POST") == [api.require_admin]
     assert dependencies(
-        "/documents/{document_id}/restore", "POST") == detail
+        "/documents/{document_id}/restore", "POST") == [api.require_admin]
 
 
 # --- the document inventory --------------------------------------------
@@ -2810,7 +2809,7 @@ def test_the_table_route_is_unaffected_by_the_new_field(monkeypatch):
 
     counted = _refusal_gates(monkeypatch)
     monkeypatch.setattr(api.owui_chat, "tables_reply",
-                        lambda _messages: "KURGU_TABLO_CEVABI")
+                        lambda _messages, **_kwargs: "KURGU_TABLO_CEVABI")
 
     response = _chat(api, "ragtest-table", document_ids=[IC_BELGE])
 

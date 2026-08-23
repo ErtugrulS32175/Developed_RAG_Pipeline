@@ -1,4 +1,5 @@
 import hashlib
+import contextvars
 import os
 import uuid
 from contextlib import contextmanager
@@ -37,6 +38,9 @@ PG_DSN = os.getenv("PG_DSN", "postgresql://rag:CHANGE_ME@localhost:5433/ragdb")
 # is remapped into [1, SPARSE_DIM] before storage or query -- this constant must
 # match the `sparsevec(N)` dimension declared in schema.sql exactly.
 SPARSE_DIM = 999_999_937
+DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+_EXECUTION_TENANT = contextvars.ContextVar(
+    "rag_db_execution_tenant", default=(DEFAULT_TENANT_ID, False))
 
 
 class DocumentLifecycleConflict(RuntimeError):
@@ -51,9 +55,50 @@ class IngestJobOwnershipLost(RuntimeError):
     """A worker tried to update a job it no longer owns."""
 
 
-def get_conn() -> psycopg.Connection:
+def set_tenant_context(conn, tenant_id=DEFAULT_TENANT_ID, *, service=False):
+    """Bind a connection session to one tenant or to the internal worker.
+
+    Session scope is intentional: publication commits between its stage and
+    finalize operations while holding the same connection.  Callers returning
+    a pooled connection must clear the setting first; ``api.db_conn`` owns that
+    finally block.  Worker connections are short-lived and closed after one
+    operation.
+    """
+    try:
+        tenant = uuid.UUID(str(tenant_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("tenant_id gecerli bir UUID olmali") from exc
+    with conn.cursor() as cur:
+        cur.execute("SELECT set_config('rag.tenant_id', %s, false)",
+                    (str(tenant),))
+        cur.execute("SELECT set_config('rag.service', %s, false)",
+                    ("1" if service else "0",))
+
+
+def clear_tenant_context(conn):
+    """Remove request identity before a pooled connection can be reused."""
+    with conn.cursor() as cur:
+        cur.execute("RESET rag.tenant_id")
+        cur.execute("RESET rag.service")
+    conn.commit()
+
+
+def bind_execution_tenant(tenant_id, *, service=False):
+    tenant = uuid.UUID(str(tenant_id))
+    return _EXECUTION_TENANT.set((tenant, bool(service)))
+
+
+def reset_execution_tenant(token):
+    _EXECUTION_TENANT.reset(token)
+
+
+def get_conn(*, service=False) -> psycopg.Connection:
     conn = psycopg.connect(PG_DSN)
     register_vector(conn)
+    tenant, inherited_service = _EXECUTION_TENANT.get()
+    if service or inherited_service or tenant != DEFAULT_TENANT_ID:
+        set_tenant_context(
+            conn, tenant, service=bool(service or inherited_service))
     return conn
 
 
@@ -180,7 +225,7 @@ def upsert_document(conn, filename: str, file_type: str,
             "(id, filename, file_type, status, content_sha256, candidate_id) "
             "VALUES (%(id)s, %(filename)s, %(file_type)s, %(status)s, "
             "%(sha)s, %(cid)s) "
-            "ON CONFLICT (filename) DO UPDATE SET status = %(status)s, "
+            "ON CONFLICT (tenant_id, filename) DO UPDATE SET status = %(status)s, "
             "content_sha256 = COALESCE(%(sha)s, documents.content_sha256), "
             "candidate_id = CASE "
             "  WHEN %(sha)s IS NULL THEN documents.candidate_id "
@@ -276,7 +321,7 @@ def stage_candidate(conn, filename: str, file_type: str,
             " candidate_state) "
             "VALUES (%(id)s, %(filename)s, %(file_type)s, %(sha)s, "
             "%(cid)s, %(staged)s) "
-            "ON CONFLICT (filename) DO UPDATE SET "
+            "ON CONFLICT (tenant_id, filename) DO UPDATE SET "
             "content_sha256 = COALESCE(%(sha)s, documents.content_sha256), "
             "candidate_id = CASE "
             "  WHEN %(sha)s IS NULL THEN documents.candidate_id "
@@ -708,7 +753,7 @@ def create_collection(conn, name: str) -> dict:
         cur.execute(
             "INSERT INTO collections (id, name, name_key) "
             "VALUES (%(id)s, %(name)s, %(name_key)s) "
-            "ON CONFLICT (name_key) DO UPDATE SET name = collections.name "
+            "ON CONFLICT (tenant_id, name_key) DO UPDATE SET name = collections.name "
             "RETURNING id, name, created_at",
             {"id": collection_id, "name": display, "name_key": name_key})
         row = cur.fetchone()
@@ -821,7 +866,7 @@ def replace_document_tags(conn, document_id: str, tags) -> dict | None:
             cur.execute(
                 "INSERT INTO tags (id, name, name_key) "
                 "VALUES (%(id)s, %(name)s, %(name_key)s) "
-                "ON CONFLICT (name_key) DO UPDATE SET name = tags.name "
+                "ON CONFLICT (tenant_id, name_key) DO UPDATE SET name = tags.name "
                 "RETURNING id, name",
                 {"id": tag_id, "name": display, "name_key": name_key})
             row = cur.fetchone()
@@ -870,6 +915,14 @@ def resolve_document_scope(conn, *, document_ids=None, collection_ids=None,
     with conn.cursor() as cur:
         cur.execute("SELECT d.id FROM documents d WHERE "
                     + " AND ".join(clauses) + " ORDER BY d.id", params)
+        return tuple(str(row[0]) for row in cur.fetchall())
+
+
+def active_document_ids(conn) -> tuple[str, ...]:
+    """Return the active corpus visible through the connection's RLS policy."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM documents WHERE archived_at IS NULL ORDER BY id")
         return tuple(str(row[0]) for row in cur.fetchall())
 
 
@@ -1014,6 +1067,7 @@ def claim_ingest_job(conn, worker_id: str, lease_seconds: int = 300,
     conn.commit()
     claimed = _public_job(row)
     claimed.update({
+        "tenant_id": str(row["tenant_id"]),
         "filename": None if document is None else document["filename"],
         "archived_at": None if document is None else document["archived_at"],
         "bound_candidate_id": str(row["candidate_id"]),

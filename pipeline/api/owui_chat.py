@@ -104,7 +104,7 @@ def _cache_put(digest, entry):
     _CACHE[digest] = entry
 
 
-def extract_tables(data_url: str):
+def extract_tables(data_url: str, namespace: str = ""):
     """Run the two-VLM consensus on one attached image and write an xlsx per
     detected table. Returns {"results", "files"} (files parallel to results, an
     entry is None if its export failed), or None if the url wasn't decodable."""
@@ -115,12 +115,17 @@ def extract_tables(data_url: str):
 
     # Content hash doubles as the cache key and the on-disk name, so the same
     # image uploaded twice is neither re-extracted nor re-saved.
+    if (not isinstance(namespace, str)
+            or (namespace and not re.fullmatch(r"[0-9a-f]{32}", namespace))):
+        raise ValueError("table namespace gecersiz")
     digest = hashlib.sha256(raw).hexdigest()[:16]
-    if digest in _CACHE:
-        return _CACHE[digest]
+    cache_key = (namespace, digest)
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    src = UPLOAD_DIR / f"owui-{digest}.{ext}"
+    prefix = f"{namespace}-" if namespace else ""
+    src = UPLOAD_DIR / f"owui-{prefix}{digest}.{ext}"
     if not src.exists():
         src.write_bytes(raw)
 
@@ -128,7 +133,7 @@ def extract_tables(data_url: str):
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     files = []
     for i, r in enumerate(results):
-        name = f"{digest}-{i}.xlsx"
+        name = f"{prefix}{digest}-{i}.xlsx"
         try:
             export_result_xlsx(r, str(EXPORT_DIR / name))
             files.append(name)
@@ -138,7 +143,7 @@ def extract_tables(data_url: str):
             files.append(None)
 
     entry = {"results": results, "files": files}
-    _cache_put(digest, entry)
+    _cache_put(cache_key, entry)
     return entry
 
 
@@ -159,13 +164,13 @@ def render_tables(entry) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
-def tables_reply(messages) -> str:
+def tables_reply(messages, namespace: str = "") -> str:
     """Full non-streaming reply for the table model. Propagates extraction
     failures so the caller can turn them into an HTTP error."""
     url = latest_image_url(messages)
     if url is None:
         return NO_IMAGE_MSG
-    entry = extract_tables(url)
+    entry = extract_tables(url, namespace)
     if entry is None:
         return BAD_IMAGE_MSG
     if not entry["results"]:
@@ -202,7 +207,7 @@ def sse_chunk(
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def stream_tables(messages, model):
+def stream_tables(messages, model, namespace: str = ""):
     """Progress-reporting SSE for the table model. Two VLMs on one image take
     minutes; without ticks an unbroken spinner is indistinguishable from a hang.
     The work runs in a thread so the generator stays free to emit them."""
@@ -213,7 +218,7 @@ def stream_tables(messages, model):
     else:
         yield sse_chunk(chat_id, model, delta="⏳ Görüntü alındı, iki model çalıştırılıyor")
         with ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(extract_tables, url)
+            fut = pool.submit(extract_tables, url, namespace)
             since_tick = 0.0
             while not fut.done():
                 time.sleep(_POLL_SECONDS)

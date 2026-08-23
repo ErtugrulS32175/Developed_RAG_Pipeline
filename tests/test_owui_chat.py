@@ -127,6 +127,28 @@ def test_cache_is_bounded(monkeypatch):
     assert len(owui_chat._CACHE) == 3
 
 
+def test_table_cache_and_files_are_separate_per_tenant(monkeypatch, tmp_path):
+    monkeypatch.setattr(owui_chat, "UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(owui_chat, "EXPORT_DIR", tmp_path / "exports")
+    monkeypatch.setattr(owui_chat, "_CACHE", {})
+    calls = []
+    monkeypatch.setattr(
+        owui_chat, "run_consensus",
+        lambda path: calls.append(path) or [])
+    url = _data_url(b"same-image")
+    first = "1" * 32
+    second = "2" * 32
+
+    owui_chat.extract_tables(url, first)
+    owui_chat.extract_tables(url, first)
+    owui_chat.extract_tables(url, second)
+
+    digest = __import__("hashlib").sha256(b"same-image").hexdigest()[:16]
+    assert len(calls) == 2
+    assert first in calls[0] and second in calls[1]
+    assert set(owui_chat._CACHE) == {(first, digest), (second, digest)}
+
+
 # --- rendering ---
 
 def _entry(needs_review=False, disagreements=(), name="abc-0.xlsx"):
@@ -178,13 +200,15 @@ def test_tables_reply_rejects_non_data_url_image(monkeypatch):
 
 
 def test_tables_reply_reports_when_no_table_found(monkeypatch):
-    monkeypatch.setattr(owui_chat, "extract_tables", lambda url: {"results": [], "files": []})
+    monkeypatch.setattr(
+        owui_chat, "extract_tables",
+        lambda url, namespace="": {"results": [], "files": []})
     messages = [{"role": "user", "content": [_img_part(_data_url())]}]
     assert owui_chat.tables_reply(messages) == owui_chat.NO_TABLE_MSG
 
 
 def test_tables_reply_propagates_extraction_failure(monkeypatch):
-    def boom(url):
+    def boom(url, namespace=""):
         raise RuntimeError("servis kapali")
 
     monkeypatch.setattr(owui_chat, "extract_tables", boom)
@@ -236,7 +260,8 @@ def test_stream_tables_does_not_wait_a_tick_for_a_fast_result(monkeypatch):
     tick interval or every follow-up turn would stall for a full tick."""
     monkeypatch.setattr(owui_chat, "STREAM_TICK_SECONDS", 30.0)
     monkeypatch.setattr(owui_chat, "_POLL_SECONDS", 0.01)
-    monkeypatch.setattr(owui_chat, "extract_tables", lambda url: _entry())
+    monkeypatch.setattr(
+        owui_chat, "extract_tables", lambda url, namespace="": _entry())
 
     messages = [{"role": "user", "content": [_img_part(_data_url())]}]
     started = time.monotonic()
@@ -249,7 +274,8 @@ def test_stream_tables_does_not_wait_a_tick_for_a_fast_result(monkeypatch):
 def test_stream_tables_renders_result_after_progress(monkeypatch):
     monkeypatch.setattr(owui_chat, "STREAM_TICK_SECONDS", 0.01)
     monkeypatch.setattr(owui_chat, "_POLL_SECONDS", 0.01)
-    monkeypatch.setattr(owui_chat, "extract_tables", lambda url: _entry())
+    monkeypatch.setattr(
+        owui_chat, "extract_tables", lambda url, namespace="": _entry())
 
     messages = [{"role": "user", "content": [_img_part(_data_url())]}]
     chunks = list(owui_chat.stream_tables(messages, "m"))
@@ -265,7 +291,7 @@ def test_stream_tables_surfaces_failure_as_text_not_a_crash(monkeypatch):
     monkeypatch.setattr(owui_chat, "STREAM_TICK_SECONDS", 0.01)
     monkeypatch.setattr(owui_chat, "_POLL_SECONDS", 0.01)
 
-    def boom(url):
+    def boom(url, namespace=""):
         raise RuntimeError("servis kapali")
 
     monkeypatch.setattr(owui_chat, "extract_tables", boom)

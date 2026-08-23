@@ -928,7 +928,8 @@ def test_the_publisher_writes_where_the_database_says_not_where_asked(
         return
 
     problem = _signature_matches(
-        publish, ("conn", "filename", "file_type", "body", "allow_replace"),
+        publish, ("conn", "filename", "file_type", "body",
+                  "allow_replace", "tenant_id"),
         "publish_candidate")
     v.require(problem is None, f"publish_candidate: {problem}")
 
@@ -1120,7 +1121,7 @@ def test_the_api_publishes_only_through_the_shared_service(monkeypatch,
               "lock": 0, "upsert": 0}
 
     def counted_publish(_conn, filename, file_type, body,
-                        allow_replace=False):
+                        allow_replace=False, tenant_id=db.DEFAULT_TENANT_ID):
         counts["publish"] += 1
         document_id, candidate_id, canonical = store.stage_candidate(
             None, filename, file_type,
@@ -1270,7 +1271,8 @@ def test_the_frozen_seams_have_exact_signatures():
                      "publication.publish_candidate yok"):
             problem = _signature_matches(
                 publish,
-                ("conn", "filename", "file_type", "body", "allow_replace"),
+                ("conn", "filename", "file_type", "body",
+                 "allow_replace", "tenant_id"),
                 "publish_candidate")
             v.require(problem is None, f"publish_candidate: {problem}")
     v.assert_none()

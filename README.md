@@ -72,6 +72,23 @@ Set `API_KEY` in `.env` and use the same value as the API key on the OpenWebUI
 connection. Every endpoint that reads or adds documents then wants
 `Authorization: Bearer <key>`.
 
+For more than one tenant, set `API_KEYS_JSON` to a JSON list whose entries are
+exactly `key`, `tenant_id` (UUID), and `role`. Roles are cumulative:
+`reader` can query/list, `editor` can also upload, process, tag and queue work,
+and `admin` can also archive/restore or delete organisation metadata. Raw keys
+are hashed during startup and are never written to PostgreSQL or logs.
+`API_KEY`, when retained beside that registry, remains a default-tenant admin
+for backward compatibility.
+
+Tenant separation is enforced in two places: every request binds its tenant to
+the PostgreSQL connection and the core tables use forced row-level-security;
+uploaded source files for non-default tenants live in separate UUID-named
+directories. The ingest worker uses a service context only to claim queued work,
+then binds the claimed tenant while indexing it. An unscoped multi-tenant RAG
+request is converted to the active document ids visible to that tenant before
+either retrieval backend runs, so an external index cannot widen PostgreSQL's
+tenant boundary.
+
 Leave it empty and the API runs open, warning you about it at startup. That is
 fine on localhost and never fine anywhere else. Two endpoints stay open on
 purpose so monitoring can reach them: `/health` says the process is alive,

@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from pipeline.index import db, ingest
+from pipeline.index import db, ingest, publication
 from pipeline.index.attempt_contract import (
     AttemptAlreadyRunning,
     AttemptFenced,
@@ -29,14 +29,17 @@ def _worker_id() -> str:
     return f"{socket.gethostname()}/{os.getpid()}"
 
 
-def _source_path(upload_dir: Path, filename: str) -> Path:
+def _source_path(upload_dir: Path, filename: str,
+                 tenant_id=db.DEFAULT_TENANT_ID) -> Path:
     if (not isinstance(filename, str) or not filename
             or Path(filename).name != filename
             or "/" in filename or "\\" in filename):
         raise StaleIngestJob("stored_filename_invalid")
-    root = upload_dir.resolve()
-    candidate = (root / filename).resolve()
-    if candidate.parent != root or not candidate.is_file():
+    try:
+        candidate = publication.source_path(upload_dir, filename, tenant_id)
+    except (TypeError, ValueError, publication.UnsafeCanonicalName) as exc:
+        raise StaleIngestJob("stored_filename_invalid") from exc
+    if not candidate.is_file():
         raise StaleIngestJob("source_file_unavailable")
     return candidate
 
@@ -44,7 +47,7 @@ def _source_path(upload_dir: Path, filename: str) -> Path:
 def _heartbeat(stop, lost, job_id, worker_id, lease_seconds):
     interval = max(10, lease_seconds // 3)
     while not stop.wait(interval):
-        conn = db.get_conn()
+        conn = db.get_conn(service=True)
         try:
             if not db.heartbeat_ingest_job(
                     conn, job_id, worker_id, lease_seconds):
@@ -83,7 +86,7 @@ def run_one(*, worker_id=None, upload_dir=None, lease_seconds=300,
     """Claim and execute at most one job; return False when the queue is empty."""
     worker_id = worker_id or _worker_id()
     upload_dir = Path(upload_dir or os.getenv("UPLOAD_DIR", "./data/uploads"))
-    conn = db.get_conn()
+    conn = db.get_conn(service=True)
     try:
         db.init_schema(conn)
         job = db.claim_ingest_job(
@@ -95,6 +98,11 @@ def run_one(*, worker_id=None, upload_dir=None, lease_seconds=300,
         return False
 
     job_id = job["job_id"]
+    # Cross-tenant privilege ends at the claim. All candidate/chunk/attempt
+    # work below runs as the claimed tenant; only the heartbeat thread, which
+    # has no inherited ContextVar, uses the narrow service connection needed to
+    # renew this already-bound job id.
+    tenant_token = db.bind_execution_tenant(job["tenant_id"], service=False)
     attempt = None
     stop = threading.Event()
     lost = threading.Event()
@@ -111,7 +119,7 @@ def run_one(*, worker_id=None, upload_dir=None, lease_seconds=300,
         if (job["current_candidate_id"] != job["bound_candidate_id"]
                 or job["current_candidate_sha"] != job["bound_candidate_sha"]):
             raise StaleIngestJob("candidate_changed")
-        path = _source_path(upload_dir, job["filename"])
+        path = _source_path(upload_dir, job["filename"], job["tenant_id"])
         conn = db.get_conn()
         try:
             attempt = db.begin_attempt(
@@ -154,6 +162,7 @@ def run_one(*, worker_id=None, upload_dir=None, lease_seconds=300,
     finally:
         stop.set()
         heartbeat.join(timeout=max(1, min(10, lease_seconds)))
+        db.reset_execution_tenant(tenant_token)
     return True
 
 

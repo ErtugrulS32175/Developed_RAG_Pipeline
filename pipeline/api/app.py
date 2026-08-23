@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import secrets
 import time
 import traceback
 import uuid
@@ -28,6 +27,7 @@ from pipeline.index.attempt_contract import (
     CandidateSuperseded,
 )
 from pipeline.api import owui_chat
+from pipeline.api import auth
 from pipeline.retrieval import rag_backends
 from pipeline.retrieval.trace import RetrievalTrace
 from pipeline.validation.rag.answer_guard import (
@@ -86,7 +86,10 @@ log = logging.getLogger("ragtest.api")
 # development case, where they are useful. Once a key is configured the service
 # is reachable by someone else, and there is no reason to publish its surface to
 # a caller who cannot use any of it.
-_DOCS_OPEN = not os.getenv("API_KEY", "").strip()
+API_KEY = os.getenv("API_KEY", "").strip()
+API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
+AUTH_REGISTRY = auth.load_registry(API_KEY, API_KEYS_JSON)
+_DOCS_OPEN = not AUTH_REGISTRY.configured
 
 
 @asynccontextmanager
@@ -104,6 +107,17 @@ app = FastAPI(
     redoc_url="/redoc" if _DOCS_OPEN else None,
     openapi_url="/openapi.json" if _DOCS_OPEN else None,
 )
+
+
+@app.middleware("http")
+async def bind_request_principal(request, call_next):
+    principal = auth.authenticate(
+        AUTH_REGISTRY, request.headers.get("authorization", ""))
+    token = auth.bind(principal)
+    try:
+        return await call_next(request)
+    finally:
+        auth.reset(token)
 
 
 @app.middleware("http")
@@ -159,34 +173,49 @@ def db_conn():
         if not _schema_ready:
             db.init_schema(conn)
             _schema_ready = True
-        yield conn
+        db.set_tenant_context(conn, auth.current_principal().tenant_id)
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+            db.clear_tenant_context(conn)
 
 
 # Shared-secret auth. Enforced when API_KEY is set; when it is not, the API is
 # open and says so loudly at startup rather than pretending to be protected.
 # That mirrors how vLLM and the rest of this stack behave, and keeps a local
 # run friction-free -- but anything reachable beyond localhost must set it.
-API_KEY = os.getenv("API_KEY", "").strip()
-if not API_KEY:
+if not AUTH_REGISTRY.configured:
     log.warning("API_KEY tanimli degil: ucnoktalar kimlik dogrulamasiz. "
                 "Yerel disinda calistiriyorsan API_KEY ayarla.")
 
 
-def require_api_key(authorization: str = Header(default="")):
-    """Bearer-token check.
+def _require_role(minimum_role, authorization):
+    principal = auth.authenticate(AUTH_REGISTRY, authorization)
+    if principal is None:
+        raise HTTPException(status_code=401,
+                            detail="gecersiz veya eksik API anahtari")
+    if not auth.permits(principal, minimum_role):
+        raise HTTPException(status_code=403, detail="bu islem icin rol yetersiz")
+    return principal
 
-    `compare_digest` rather than `==`: a plain comparison returns as soon as it
-    finds a differing byte, which leaks the key one character at a time to
-    anyone able to time the responses.
-    """
-    if not API_KEY:
-        return
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not secrets.compare_digest(token, API_KEY):
-        raise HTTPException(status_code=401, detail="gecersiz veya eksik API anahtari")
+
+def require_api_key(authorization: str = Header(default="")):
+    """Backward-compatible reader dependency for every data-bearing route."""
+    return _require_role("reader", authorization)
+
+
+def require_editor(authorization: str = Header(default="")):
+    return _require_role("editor", authorization)
+
+
+def require_admin(authorization: str = Header(default="")):
+    return _require_role("admin", authorization)
 
 
 AUTH = [Depends(require_api_key)]
+EDITOR_AUTH = [Depends(require_editor)]
+ADMIN_AUTH = [Depends(require_admin)]
 
 
 class ChatMessage(BaseModel):
@@ -285,11 +314,20 @@ def _document_scope(document_ids):
 def _chat_document_scope(req: ChatRequest, is_table: bool):
     """Resolve every RAG scope dimension through the document table once."""
     direct = _document_scope(req.document_ids)
-    if is_table or (req.collection_ids is None and req.tags is None):
+    if is_table:
         return direct
     collections = _document_scope(req.collection_ids)
+    has_metadata_scope = req.collection_ids is not None or req.tags is not None
+    # The legacy installation preserves its old unscoped fast path. Once more
+    # than one tenant is configured, even an apparently unscoped RAG request
+    # must become the complete *visible* id set: the LlamaIndex store is not a
+    # PostgreSQL table and therefore cannot inherit row-level security itself.
+    if not AUTH_REGISTRY.multi_tenant and not has_metadata_scope:
+        return direct
     try:
         with db_conn() as conn:
+            if direct is None and not has_metadata_scope:
+                return db.active_document_ids(conn)
             return db.resolve_document_scope(
                 conn, document_ids=direct, collection_ids=collections,
                 tags=req.tags)
@@ -330,6 +368,8 @@ def chat_completions(req: ChatRequest):
         # Forwarded only when a scope was asked for: an unscoped request
         # must reach the backend as the call it has always been.
         scope = {} if document_ids is None else {"document_ids": document_ids}
+        tenant_token = db.bind_execution_tenant(
+            auth.current_principal().tenant_id)
         try:
             result = rag_backends.answer_checked(question, backend=backend,
                                                  **scope)
@@ -339,6 +379,8 @@ def chat_completions(req: ChatRequest):
         except Exception as e:
             _log_rag_failure(e, backend)
             raise HTTPException(status_code=502, detail=RAG_FAILURE_MESSAGE)
+        finally:
+            db.reset_execution_tenant(tenant_token)
         published = _publish_checked(result)
         if req.include_trace and published[3] is None:
             log.error("RAG backend omitted requested retrieval trace")
@@ -348,7 +390,9 @@ def chat_completions(req: ChatRequest):
 
     if req.stream:
         if is_table:
-            gen = owui_chat.stream_tables(req.messages, req.model)
+            gen = owui_chat.stream_tables(
+                req.messages, req.model,
+                namespace=auth.current_principal().tenant_id.hex)
         else:
             status, answer, citations, trace = ask_checked()
             gen = owui_chat.stream_text(
@@ -363,7 +407,9 @@ def chat_completions(req: ChatRequest):
 
     if is_table:
         try:
-            answer = owui_chat.tables_reply(req.messages)
+            answer = owui_chat.tables_reply(
+                req.messages,
+                namespace=auth.current_principal().tenant_id.hex)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"tablo cikarimi basarisiz: {e}")
     else:
@@ -527,7 +573,7 @@ def download_export(name: str):
 # holds a database SESSION lock, which serialises across PROCESSES and
 # therefore across every worker, not just this one. A second, weaker lock
 # in front of it fenced nothing the first did not already fence.
-@app.post("/documents/upload", dependencies=AUTH)
+@app.post("/documents/upload", dependencies=EDITOR_AUTH)
 async def upload_document(file: UploadFile = File(...), replace: bool = False):
     """Publish a candidate -- through the SHARED SERVICE and nothing else.
 
@@ -566,7 +612,8 @@ async def upload_document(file: UploadFile = File(...), replace: bool = False):
             document_id, candidate_id, canonical = (
                 publication.publish_candidate(
                     conn, filename, file_type, body,
-                    allow_replace=replace))
+                    allow_replace=replace,
+                    tenant_id=auth.current_principal().tenant_id))
         except CandidateConflict:
             # same name, different bytes, no explicit authority. The
             # refusal is atomic in the database, so nothing was staged
@@ -634,7 +681,7 @@ def _reported_outcome(returned):
     return None
 
 
-@app.post("/documents/{document_id}/process", dependencies=AUTH)
+@app.post("/documents/{document_id}/process", dependencies=EDITOR_AUTH)
 def process_document(document_id: str):
     # Three SHORT borrows instead of one connection held across the whole
     # request: ingest can run for minutes on its own connection, and a pooled
@@ -680,7 +727,8 @@ def process_document(document_id: str):
             detail=DOCUMENT_PROCESSING_FAILURE_MESSAGE,
         )
 
-    path = UPLOAD_DIR / filename
+    path = publication.source_path(
+        UPLOAD_DIR, filename, auth.current_principal().tenant_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="uploaded file missing")
 
@@ -767,7 +815,7 @@ def process_document(document_id: str):
     return response
 
 
-@app.post("/documents/{document_id}/ingest-jobs", dependencies=AUTH,
+@app.post("/documents/{document_id}/ingest-jobs", dependencies=EDITOR_AUTH,
           status_code=202)
 def enqueue_ingest_job(
         document_id: UUID,
@@ -797,7 +845,7 @@ def read_ingest_job(job_id: UUID):
     return job
 
 
-@app.delete("/ingest-jobs/{job_id}", dependencies=AUTH)
+@app.delete("/ingest-jobs/{job_id}", dependencies=EDITOR_AUTH)
 def cancel_ingest_job(job_id: UUID):
     try:
         with db_conn() as conn:
@@ -981,7 +1029,7 @@ def list_documents(
     }
 
 
-@app.post("/collections", dependencies=AUTH)
+@app.post("/collections", dependencies=EDITOR_AUTH)
 def create_collection(request: CollectionRequest):
     try:
         with db_conn() as conn:
@@ -1002,7 +1050,7 @@ def list_tags():
         return {"tags": db.list_tags(conn)}
 
 
-@app.delete("/tags/{tag_id}", dependencies=AUTH)
+@app.delete("/tags/{tag_id}", dependencies=ADMIN_AUTH)
 def delete_tag(tag_id: UUID):
     with db_conn() as conn:
         deleted = db.delete_tag(conn, str(tag_id))
@@ -1011,7 +1059,7 @@ def delete_tag(tag_id: UUID):
     return Response(status_code=204)
 
 
-@app.delete("/collections/{collection_id}", dependencies=AUTH)
+@app.delete("/collections/{collection_id}", dependencies=ADMIN_AUTH)
 def delete_collection(collection_id: UUID):
     with db_conn() as conn:
         deleted = db.delete_collection(conn, str(collection_id))
@@ -1033,18 +1081,18 @@ def _set_collection_membership(collection_id: UUID, document_id: UUID,
 
 
 @app.put("/collections/{collection_id}/documents/{document_id}",
-         dependencies=AUTH)
+         dependencies=EDITOR_AUTH)
 def add_collection_document(collection_id: UUID, document_id: UUID):
     return _set_collection_membership(collection_id, document_id, True)
 
 
 @app.delete("/collections/{collection_id}/documents/{document_id}",
-            dependencies=AUTH)
+            dependencies=EDITOR_AUTH)
 def remove_collection_document(collection_id: UUID, document_id: UUID):
     return _set_collection_membership(collection_id, document_id, False)
 
 
-@app.put("/documents/{document_id}/tags", dependencies=AUTH)
+@app.put("/documents/{document_id}/tags", dependencies=EDITOR_AUTH)
 def replace_document_tags(document_id: UUID, request: DocumentTagsRequest):
     try:
         with db_conn() as conn:
@@ -1070,12 +1118,12 @@ def _set_document_lifecycle(document_id: str, archived: bool):
     return result
 
 
-@app.post("/documents/{document_id}/archive", dependencies=AUTH)
+@app.post("/documents/{document_id}/archive", dependencies=ADMIN_AUTH)
 def archive_document(document_id: str):
     return _set_document_lifecycle(document_id, True)
 
 
-@app.post("/documents/{document_id}/restore", dependencies=AUTH)
+@app.post("/documents/{document_id}/restore", dependencies=ADMIN_AUTH)
 def restore_document(document_id: str):
     return _set_document_lifecycle(document_id, False)
 

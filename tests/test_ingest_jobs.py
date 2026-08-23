@@ -36,6 +36,7 @@ def _public(status="queued"):
 
 def _claimed(path, status="running"):
     return {**_public(status), "filename": path.name, "archived_at": None,
+            "tenant_id": str(db.DEFAULT_TENANT_ID),
             "bound_candidate_id": CANDIDATE, "bound_candidate_sha": "a" * 64,
             "current_candidate_id": CANDIDATE,
             "current_candidate_sha": "a" * 64}
@@ -145,7 +146,8 @@ def _worker_world(monkeypatch, tmp_path, job=None):
     source.write_bytes(b"alpha")
     claimed = _claimed(source) if job is None else job
     calls = []
-    monkeypatch.setattr(job_worker.db, "get_conn", lambda: _Connection())
+    monkeypatch.setattr(job_worker.db, "get_conn",
+                        lambda **_kwargs: _Connection())
     monkeypatch.setattr(job_worker.db, "init_schema", lambda _conn: None)
     monkeypatch.setattr(job_worker.db, "claim_ingest_job",
                         lambda *_args, **_kwargs: claimed)
@@ -213,7 +215,8 @@ def test_transient_worker_failure_requeues_with_only_the_exception_type(
 
 
 def test_empty_queue_does_no_ingest_work(monkeypatch, tmp_path):
-    monkeypatch.setattr(job_worker.db, "get_conn", lambda: _Connection())
+    monkeypatch.setattr(job_worker.db, "get_conn",
+                        lambda **_kwargs: _Connection())
     monkeypatch.setattr(job_worker.db, "init_schema", lambda _conn: None)
     monkeypatch.setattr(job_worker.db, "claim_ingest_job",
                         lambda *_args, **_kwargs: None)
@@ -239,7 +242,8 @@ def test_a_heartbeat_error_is_treated_as_lost_ownership(monkeypatch):
             return False
 
     lost = __import__("threading").Event()
-    monkeypatch.setattr(job_worker.db, "get_conn", lambda: _Connection())
+    monkeypatch.setattr(job_worker.db, "get_conn",
+                        lambda **_kwargs: _Connection())
     monkeypatch.setattr(
         job_worker.db, "heartbeat_ingest_job",
         lambda *_args: (_ for _ in ()).throw(OSError("database unavailable")))
