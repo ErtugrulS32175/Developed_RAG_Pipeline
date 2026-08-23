@@ -54,12 +54,24 @@ def test_schema_migration_serializes_ddl_and_records_the_exact_source_digest():
     assert calls[0][1] == ("ragtest-schema-migration",)
     assert "CREATE EXTENSION" in calls[1][0]
     assert "CREATE TABLE IF NOT EXISTS rag_schema_state" in calls[2][0]
-    assert "INSERT INTO rag_schema_state" in calls[3][0]
+    assert "CREATE TABLE IF NOT EXISTS rag_schema_history" in calls[3][0]
+    assert "SELECT schema_sha256 FROM rag_schema_history" in calls[4][0]
+    assert "INSERT INTO rag_schema_history" in calls[5][0]
+    assert "INSERT INTO rag_schema_state" in calls[6][0]
     version, digest = db.expected_schema_state()
-    assert calls[3][1] == (version, digest)
+    assert calls[4][1] == (version,)
+    assert calls[5][1] == (version, digest)
+    assert calls[6][1] == (version, digest)
     assert digest == hashlib.sha256(
         db.Path(db.__file__).with_name("schema.sql").read_bytes()).hexdigest()
     assert conn.commits == 1
+
+
+def test_schema_version_cannot_be_reused_for_different_bytes():
+    conn = _Connection(("f" * 64,))
+    with pytest.raises(RuntimeError, match="digest"):
+        db.init_schema(conn)
+    assert conn.commits == 0
 
 
 @pytest.mark.parametrize("row, expected", [
@@ -212,7 +224,7 @@ def test_migration_cli_never_reflects_connection_exception_prose(
     assert migrate_db.main() == 1
     output = capsys.readouterr().out
     assert json.loads(output) == {
-        "migration_version": 1, "status": "failed"}
+        "migration_version": 2, "status": "failed"}
     assert "OZEL" not in output
 
 

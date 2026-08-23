@@ -22,6 +22,10 @@ class AuthConfigurationError(RuntimeError):
 class Principal:
     tenant_id: UUID
     role: str
+    subject_id: UUID | None = None
+    source: str = "api_key"
+    position_id: UUID | None = None
+    org_architect: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,3 +137,8 @@ def current_principal():
     if principal is None:
         raise RuntimeError("istek tenant baglami kurulmamisti")
     return principal
+
+
+def bound_principal():
+    """Return the request binding, including ``None`` for an unauthenticated call."""
+    return _CURRENT.get()

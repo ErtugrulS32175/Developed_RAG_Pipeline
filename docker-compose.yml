@@ -36,7 +36,10 @@ services:
       retries: 20
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    # v0.11.0 is the first pinned deployment used by the organization bridge.
+    # The OCI-index digest prevents a mutable tag from silently changing the
+    # identity-header or Event Function contract underneath authorization.
+    image: ghcr.io/open-webui/open-webui:v0.11.0@sha256:72c0ba641ba75e7aa52655cb242570906ececd09b1140fb736483038a22b3228
     container_name: open-webui
     restart: unless-stopped
     ports:
@@ -46,6 +49,15 @@ services:
       - "3000:8080"
     volumes:
       - openwebui:/app/backend/data
+    environment:
+      ENABLE_OLLAMA_API: "false"
+      OPENAI_API_BASE_URL: http://host.docker.internal:8000/v1
+      OPENAI_API_KEY: ${OPENWEBUI_GATEWAY_KEY:?set OPENWEBUI_GATEWAY_KEY}
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
+      FORWARD_USER_INFO_HEADER_JWT_SECRET: ${OPENWEBUI_USER_JWT_SECRET:?set OPENWEBUI_USER_JWT_SECRET}
+      FORWARD_USER_INFO_HEADER_JWT_EXPIRES_SECONDS: "60"
+      RAGTEST_ORG_API_URL: http://host.docker.internal:8000
+      OPENWEBUI_GATEWAY_KEY: ${OPENWEBUI_GATEWAY_KEY:?set OPENWEBUI_GATEWAY_KEY}
     extra_hosts:
       # Open WebUI calls pipeline/api/app.py, which runs on the HOST, not in a
       # container. On Linux this mapping does not exist unless it is declared.

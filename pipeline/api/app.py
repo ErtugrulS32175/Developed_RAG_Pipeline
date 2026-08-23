@@ -1,4 +1,6 @@
 import json
+import hashlib
+import hmac
 import logging
 import os
 import time
@@ -6,11 +8,12 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Annotated, Union
+from typing import Annotated, Literal, Union
 from uuid import UUID
 
 from fastapi import (
-    Depends, FastAPI, Header, HTTPException, Query, Response, UploadFile, File,
+    Depends, FastAPI, Header, HTTPException, Query, Request, Response,
+    UploadFile, File,
 )
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import AwareDatetime, BaseModel, Field
@@ -28,7 +31,9 @@ from pipeline.index.attempt_contract import (
 )
 from pipeline.api import owui_chat
 from pipeline.api import auth
+from pipeline.api import identity
 from pipeline.api import metrics
+from pipeline.api import org_policy
 from pipeline.retrieval import rag_backends
 from pipeline.retrieval.trace import RetrievalTrace
 from pipeline.validation.rag.answer_guard import (
@@ -90,7 +95,37 @@ log = logging.getLogger("ragtest.api")
 API_KEY = os.getenv("API_KEY", "").strip()
 API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
 AUTH_REGISTRY = auth.load_registry(API_KEY, API_KEYS_JSON)
-_DOCS_OPEN = not AUTH_REGISTRY.configured
+OPENWEBUI_GATEWAY_KEY = os.getenv("OPENWEBUI_GATEWAY_KEY", "").strip()
+OPENWEBUI_USER_JWT_SECRET = os.getenv(
+    "OPENWEBUI_USER_JWT_SECRET", "").strip()
+if bool(OPENWEBUI_GATEWAY_KEY) != bool(OPENWEBUI_USER_JWT_SECRET):
+    raise identity.IdentityConfigurationError(
+        "OpenWebUI gateway key ve JWT anahtari birlikte tanimlanmali")
+if OPENWEBUI_GATEWAY_KEY and len(OPENWEBUI_GATEWAY_KEY.encode("utf-8")) < 32:
+    raise identity.IdentityConfigurationError(
+        "OpenWebUI gateway anahtari en az 32 bayt olmali")
+OPENWEBUI_IDENTITY = (
+    identity.Verifier.configured(
+        OPENWEBUI_USER_JWT_SECRET,
+        max_lifetime_seconds=int(os.getenv(
+            "OPENWEBUI_USER_JWT_MAX_SECONDS", "60")),
+        clock_skew_seconds=int(os.getenv(
+            "OPENWEBUI_USER_JWT_CLOCK_SKEW", "5")),
+    ) if OPENWEBUI_GATEWAY_KEY else None
+)
+_GATEWAY_DIGEST = (
+    hashlib.sha256(OPENWEBUI_GATEWAY_KEY.encode("utf-8")).digest()
+    if OPENWEBUI_GATEWAY_KEY else None
+)
+if _GATEWAY_DIGEST is not None:
+    if any(hmac.compare_digest(_GATEWAY_DIGEST, item.digest)
+           for item in AUTH_REGISTRY.credentials):
+        raise identity.IdentityConfigurationError(
+            "OpenWebUI gateway anahtari API anahtariyla ayni olamaz")
+    # Configuring the gateway is a production auth boundary: absence of a
+    # legacy key must not reactivate the local-development open principal.
+    AUTH_REGISTRY = auth.Registry(AUTH_REGISTRY.credentials, None)
+_DOCS_OPEN = not (AUTH_REGISTRY.configured or OPENWEBUI_IDENTITY is not None)
 
 
 @asynccontextmanager
@@ -110,10 +145,74 @@ app = FastAPI(
 )
 
 
+def _gateway_offered(authorization):
+    if _GATEWAY_DIGEST is None or type(authorization) is not str:
+        return False
+    scheme, separator, token = authorization.partition(" ")
+    if separator != " " or scheme.lower() != "bearer" or not token:
+        return False
+    return hmac.compare_digest(
+        _GATEWAY_DIGEST, hashlib.sha256(token.encode("utf-8")).digest())
+
+
+def _resolve_forwarded_principal(assertion):
+    """Resolve a verified subject; display claims never reach this seam."""
+    global _schema_ready
+    conn = db.get_conn(service=True)
+    try:
+        if not _schema_ready:
+            db.init_schema(conn)
+            _schema_ready = True
+        resolved = db.resolve_org_identity(
+            conn, assertion.issuer, assertion.subject)
+    finally:
+        conn.close()
+    if resolved is None:
+        return None
+    return auth.Principal(
+        tenant_id=resolved["tenant_id"],
+        role=resolved["role"],
+        subject_id=resolved["identity_id"],
+        source="openwebui",
+        position_id=resolved["position_id"],
+        org_architect=resolved["org_architect"],
+    )
+
+
+def _request_principal(request):
+    authorizations = request.headers.getlist("authorization")
+    if not authorizations and AUTH_REGISTRY.open_principal is not None:
+        # Local development deliberately keeps the historical open principal.
+        # Configuring either legacy credentials or the OpenWebUI gateway sets
+        # this field to None, so the production boundary cannot enter here.
+        return AUTH_REGISTRY.open_principal
+    if len(authorizations) != 1:
+        return None
+    authorization = authorizations[0]
+    principal = auth.authenticate(AUTH_REGISTRY, authorization)
+    if principal is not None:
+        return principal
+    if OPENWEBUI_IDENTITY is None or not _gateway_offered(authorization):
+        return None
+    forwarded = request.headers.getlist(identity.HEADER_NAME)
+    plain = {
+        name.decode("latin-1").casefold()
+        for name, _value in request.headers.raw
+        if name.decode("latin-1").casefold().startswith("x-openwebui-user-")
+        and name.decode("latin-1").casefold() != identity.HEADER_NAME
+    }
+    if len(forwarded) != 1 or plain:
+        return None
+    try:
+        assertion = OPENWEBUI_IDENTITY.verify(forwarded[0])
+        return _resolve_forwarded_principal(assertion)
+    except (identity.IdentityRefused, ValueError):
+        return None
+
+
 @app.middleware("http")
 async def bind_request_principal(request, call_next):
-    principal = auth.authenticate(
-        AUTH_REGISTRY, request.headers.get("authorization", ""))
+    principal = _request_principal(request)
     token = auth.bind(principal)
     try:
         return await call_next(request)
@@ -131,6 +230,7 @@ async def log_requests(request, call_next):
     The request id makes a single call traceable without recording what it said.
     """
     request_id = uuid.uuid4().hex[:8]
+    request.state.request_id = request_id
     started = time.perf_counter()
     status = 500
 
@@ -201,13 +301,15 @@ def db_conn():
 # open and says so loudly at startup rather than pretending to be protected.
 # That mirrors how vLLM and the rest of this stack behave, and keeps a local
 # run friction-free -- but anything reachable beyond localhost must set it.
-if not AUTH_REGISTRY.configured:
+if not (AUTH_REGISTRY.configured or OPENWEBUI_IDENTITY is not None):
     log.warning("API_KEY tanimli degil: ucnoktalar kimlik dogrulamasiz. "
                 "Yerel disinda calistiriyorsan API_KEY ayarla.")
 
 
 def _require_role(minimum_role, authorization):
-    principal = auth.authenticate(AUTH_REGISTRY, authorization)
+    principal = auth.bound_principal()
+    if principal is None:
+        principal = auth.authenticate(AUTH_REGISTRY, authorization)
     if principal is None:
         raise HTTPException(status_code=401,
                             detail="gecersiz veya eksik API anahtari")
@@ -232,6 +334,25 @@ def require_admin(authorization: str = Header(default="")):
 AUTH = [Depends(require_api_key)]
 EDITOR_AUTH = [Depends(require_editor)]
 ADMIN_AUTH = [Depends(require_admin)]
+
+
+def require_org_identity():
+    """Require a database-resolved OpenWebUI subject, not a legacy API key."""
+    principal = auth.bound_principal()
+    if (principal is None or principal.source != "openwebui"
+            or principal.subject_id is None):
+        raise HTTPException(status_code=403,
+                            detail="organizasyon kimligi gerekli")
+    return principal
+
+
+def require_org_architect(
+        principal=Depends(require_org_identity)):
+    """Topology authority grants no document role by itself."""
+    if not principal.org_architect:
+        raise HTTPException(status_code=403,
+                            detail="organizasyon mimari yetkisi gerekli")
+    return principal
 
 
 class ChatMessage(BaseModel):
@@ -289,6 +410,101 @@ class CollectionRequest(BaseModel):
 
 class DocumentTagsRequest(BaseModel):
     tags: list[TagName] = Field(max_length=DOCUMENT_SCOPE_MAX)
+
+
+class OrgPositionRequest(BaseModel):
+    id: UUID
+    parent_id: UUID | None = None
+    title: str = Field(min_length=1, max_length=200)
+    kind: Literal["root", "manager", "member"]
+    can_monitor_descendants: bool = False
+    protected_from_monitoring: bool = False
+
+
+class OrgMemberRequest(BaseModel):
+    issuer: Literal["open-webui"] = "open-webui"
+    subject: str = Field(min_length=1, max_length=200,
+                         pattern=r"^[\x20-\x7e]+$")
+    position_id: UUID
+    display_label: str = Field(min_length=1, max_length=200)
+    app_role: Literal["reader", "editor", "admin"] = "reader"
+    state: Literal["active", "pending", "suspended"] = "active"
+
+
+class OrgTopologyRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    name: str = Field(min_length=1, max_length=200)
+    positions: list[OrgPositionRequest] = Field(min_length=1, max_length=500)
+    members: list[OrgMemberRequest] = Field(default_factory=list,
+                                             max_length=5000)
+
+
+@app.get("/v1/org/me")
+def organization_me(principal=Depends(require_org_identity)):
+    """Show only the caller's own level and content-free organization facts."""
+    with db_conn() as conn:
+        membership = db.org_context(conn, principal.subject_id)
+    return {
+        "tenant_id": principal.tenant_id,
+        "identity_id": principal.subject_id,
+        "architecture_admin": principal.org_architect,
+        "membership": membership,
+    }
+
+
+@app.get("/v1/org/visible-members")
+def organization_visible_members(
+        request: Request,
+        reason_code: Literal["management_duty", "security_review"] = Query(),
+        principal=Depends(require_org_identity)):
+    """Return strict descendants only; peers, ancestors and protected users stay out."""
+    with db_conn() as conn:
+        members = db.visible_org_members(conn, principal.subject_id)
+        db.record_org_decision(
+            conn, actor_id=principal.subject_id, subject_id=None,
+            action="monitor_view", reason_code=reason_code, allowed=True,
+            request_id=request.state.request_id)
+    return {"members": members}
+
+
+@app.get("/v1/org/admin/topology")
+def organization_topology(
+        request: Request,
+        principal=Depends(require_org_architect)):
+    with db_conn() as conn:
+        topology = db.org_topology(conn)
+        if topology is None:
+            raise HTTPException(status_code=404,
+                                detail="organizasyon bulunamadi")
+        db.record_org_decision(
+            conn, actor_id=principal.subject_id, subject_id=None,
+            action="topology_read", reason_code="system_operation",
+            allowed=True, request_id=request.state.request_id)
+    return topology
+
+
+@app.put("/v1/org/admin/topology")
+def replace_organization_topology(
+        body: OrgTopologyRequest, request: Request,
+        principal=Depends(require_org_architect)):
+    positions = [item.model_dump() for item in body.positions]
+    members = [item.model_dump() for item in body.members]
+    try:
+        ordered, members = org_policy.ordered_topology(positions, members)
+    except org_policy.TopologyRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    try:
+        with db_conn() as conn:
+            version = db.replace_org_topology(
+                conn, expected_version=body.expected_version, name=body.name,
+                positions=ordered, members=members,
+                actor_id=principal.subject_id,
+                request_id=request.state.request_id)
+    except db.OrgVersionConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except db.OrgIdentityConflict as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    return version
 
 
 @app.get("/v1/models", dependencies=AUTH)

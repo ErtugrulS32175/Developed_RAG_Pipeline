@@ -12,11 +12,12 @@ def main() -> int:
         conn = db.get_conn(service=True)
         db.init_schema(conn)
         if not db.schema_is_current(conn):
-            print(json.dumps({"migration_version": 1, "status": "failed"}))
+            print(json.dumps({"migration_version": db.SCHEMA_VERSION,
+                              "status": "failed"}))
             return 1
         version, digest = db.expected_schema_state()
         print(json.dumps({
-            "migration_version": 1,
+            "migration_version": db.SCHEMA_VERSION,
             "status": "current",
             "schema_version": version,
             "schema_sha256": digest,
@@ -25,7 +26,8 @@ def main() -> int:
     except Exception:
         # Connection exceptions commonly include host/user coordinates. The
         # operational result is closed and intentionally omits their prose.
-        print(json.dumps({"migration_version": 1, "status": "failed"},
+        print(json.dumps({"migration_version": db.SCHEMA_VERSION,
+                          "status": "failed"},
                          sort_keys=True))
         return 1
     finally:

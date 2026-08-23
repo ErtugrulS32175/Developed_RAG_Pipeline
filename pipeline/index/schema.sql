@@ -384,6 +384,220 @@ CREATE POLICY tenant_isolation ON attempts
     USING (rag_service_access() OR tenant_id = rag_effective_tenant())
     WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
 
+-- Organisation control plane. Tenant is the customer/company boundary; the
+-- tree below expresses directional visibility inside that boundary. App roles
+-- remain action permissions and never substitute for a tree relationship.
+CREATE TABLE IF NOT EXISTS org_tenants (
+    id                   uuid PRIMARY KEY,
+    name                 text NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
+    architecture_version bigint NOT NULL DEFAULT 1
+                         CHECK (architecture_version > 0),
+    policy_epoch         bigint NOT NULL DEFAULT 1 CHECK (policy_epoch > 0),
+    created_at           timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS org_identities (
+    id         uuid PRIMARY KEY,
+    issuer     text NOT NULL CHECK (length(issuer) BETWEEN 1 AND 100),
+    subject    text NOT NULL CHECK (length(subject) BETWEEN 1 AND 200),
+    state      text NOT NULL DEFAULT 'active'
+               CHECK (state IN ('active', 'pending', 'suspended')),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (issuer, subject)
+);
+
+CREATE TABLE IF NOT EXISTS org_positions (
+    id                          uuid PRIMARY KEY,
+    tenant_id                   uuid NOT NULL REFERENCES org_tenants(id)
+                                ON DELETE CASCADE,
+    parent_id                   uuid,
+    title                       text NOT NULL
+                                CHECK (length(title) BETWEEN 1 AND 200),
+    kind                        text NOT NULL DEFAULT 'member'
+                                CHECK (kind IN ('root', 'manager', 'member')),
+    can_monitor_descendants     boolean NOT NULL DEFAULT false,
+    protected_from_monitoring   boolean NOT NULL DEFAULT false,
+    created_at                  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, id),
+    FOREIGN KEY (tenant_id, parent_id)
+        REFERENCES org_positions(tenant_id, id) ON DELETE RESTRICT,
+    CHECK ((parent_id IS NULL) = (kind = 'root')),
+    CHECK (kind <> 'root' OR
+           (can_monitor_descendants AND protected_from_monitoring)),
+    CHECK (kind <> 'member' OR NOT can_monitor_descendants)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS org_positions_one_root_idx
+    ON org_positions(tenant_id) WHERE parent_id IS NULL;
+CREATE INDEX IF NOT EXISTS org_positions_parent_idx
+    ON org_positions(tenant_id, parent_id);
+
+CREATE TABLE IF NOT EXISTS org_closure (
+    tenant_id    uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    ancestor_id  uuid NOT NULL,
+    descendant_id uuid NOT NULL,
+    depth        integer NOT NULL CHECK (depth >= 0),
+    PRIMARY KEY (tenant_id, ancestor_id, descendant_id),
+    FOREIGN KEY (tenant_id, ancestor_id)
+        REFERENCES org_positions(tenant_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id, descendant_id)
+        REFERENCES org_positions(tenant_id, id) ON DELETE CASCADE,
+    CHECK ((ancestor_id = descendant_id) = (depth = 0))
+);
+
+CREATE TABLE IF NOT EXISTS org_memberships (
+    tenant_id  uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    identity_id uuid NOT NULL REFERENCES org_identities(id) ON DELETE CASCADE,
+    position_id uuid,
+    display_label text NOT NULL CHECK (length(display_label) BETWEEN 1 AND 200),
+    app_role    text NOT NULL DEFAULT 'reader'
+                CHECK (app_role IN ('reader', 'editor', 'admin')),
+    state       text NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('active', 'pending', 'suspended')),
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, identity_id),
+    FOREIGN KEY (tenant_id, position_id)
+        REFERENCES org_positions(tenant_id, id) ON DELETE RESTRICT,
+    CHECK (state <> 'active' OR position_id IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS org_memberships_active_position_idx
+    ON org_memberships(tenant_id, position_id)
+    WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS org_memberships_identity_idx
+    ON org_memberships(identity_id, state);
+
+-- Architecture authority is deliberately separate from business membership.
+-- It can manage topology metadata but grants no document/conversation read.
+CREATE TABLE IF NOT EXISTS org_architects (
+    tenant_id   uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    identity_id uuid NOT NULL REFERENCES org_identities(id) ON DELETE CASCADE,
+    active      boolean NOT NULL DEFAULT true,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, identity_id)
+);
+
+CREATE TABLE IF NOT EXISTS org_audit_events (
+    id           uuid PRIMARY KEY,
+    tenant_id    uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    actor_id     uuid NOT NULL REFERENCES org_identities(id),
+    subject_id   uuid REFERENCES org_identities(id),
+    action       text NOT NULL CHECK (action IN (
+                   'monitor_view', 'topology_read', 'topology_change',
+                   'access_preview')),
+    reason_code  text NOT NULL CHECK (reason_code IN (
+                   'management_duty', 'security_review', 'system_operation',
+                   'policy_preview')),
+    decision     text NOT NULL CHECK (decision IN ('allowed', 'denied')),
+    request_id   text NOT NULL CHECK (length(request_id) BETWEEN 8 AND 64),
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS org_audit_events_tenant_time_idx
+    ON org_audit_events(tenant_id, created_at DESC, id);
+
+CREATE OR REPLACE FUNCTION rag_rebuild_org_closure(target_tenant uuid)
+RETURNS void LANGUAGE plpgsql AS $closure$
+BEGIN
+    DELETE FROM org_closure WHERE tenant_id = target_tenant;
+    INSERT INTO org_closure (tenant_id, ancestor_id, descendant_id, depth)
+    WITH RECURSIVE reach AS (
+        SELECT tenant_id, id AS ancestor_id, id AS descendant_id, 0 AS depth
+        FROM org_positions WHERE tenant_id = target_tenant
+        UNION ALL
+        SELECT reach.tenant_id, reach.ancestor_id, child.id,
+               reach.depth + 1
+        FROM reach JOIN org_positions child
+          ON child.tenant_id = reach.tenant_id
+         AND child.parent_id = reach.descendant_id
+    )
+    SELECT tenant_id, ancestor_id, descendant_id, depth FROM reach;
+END
+$closure$;
+
+CREATE OR REPLACE FUNCTION rag_guard_org_position()
+RETURNS trigger LANGUAGE plpgsql AS $guard$
+BEGIN
+    IF NEW.parent_id = NEW.id THEN
+        RAISE EXCEPTION 'org cycle refused';
+    END IF;
+    IF NEW.parent_id IS NOT NULL AND EXISTS (
+        WITH RECURSIVE lineage AS (
+            SELECT id, parent_id FROM org_positions
+            WHERE tenant_id = NEW.tenant_id AND id = NEW.parent_id
+            UNION ALL
+            SELECT parent.id, parent.parent_id
+            FROM org_positions parent JOIN lineage child
+              ON parent.tenant_id = NEW.tenant_id
+             AND parent.id = child.parent_id
+        )
+        SELECT 1 FROM lineage WHERE id = NEW.id
+    ) THEN
+        RAISE EXCEPTION 'org cycle refused';
+    END IF;
+    RETURN NEW;
+END
+$guard$;
+
+DROP TRIGGER IF EXISTS org_positions_cycle_guard ON org_positions;
+CREATE TRIGGER org_positions_cycle_guard
+BEFORE INSERT OR UPDATE OF tenant_id, parent_id ON org_positions
+FOR EACH ROW EXECUTE FUNCTION rag_guard_org_position();
+
+CREATE OR REPLACE FUNCTION rag_refresh_org_closure()
+RETURNS trigger LANGUAGE plpgsql AS $refresh$
+BEGIN
+    PERFORM rag_rebuild_org_closure(COALESCE(NEW.tenant_id, OLD.tenant_id));
+    RETURN COALESCE(NEW, OLD);
+END
+$refresh$;
+
+DROP TRIGGER IF EXISTS org_positions_closure_refresh ON org_positions;
+CREATE TRIGGER org_positions_closure_refresh
+AFTER INSERT OR UPDATE OR DELETE ON org_positions
+FOR EACH ROW EXECUTE FUNCTION rag_refresh_org_closure();
+
+ALTER TABLE org_tenants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE org_tenants FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON org_tenants;
+CREATE POLICY tenant_isolation ON org_tenants
+    USING (rag_service_access() OR id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR id = rag_effective_tenant());
+
+ALTER TABLE org_positions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE org_positions FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON org_positions;
+CREATE POLICY tenant_isolation ON org_positions
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE org_closure ENABLE ROW LEVEL SECURITY;
+ALTER TABLE org_closure FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON org_closure;
+CREATE POLICY tenant_isolation ON org_closure
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE org_memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE org_memberships FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON org_memberships;
+CREATE POLICY tenant_isolation ON org_memberships
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE org_architects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE org_architects FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON org_architects;
+CREATE POLICY tenant_isolation ON org_architects
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE org_audit_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE org_audit_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON org_audit_events;
+CREATE POLICY tenant_isolation ON org_audit_events
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
 -- No ANN index yet: this is a small, single-document demo dataset, and a
 -- sequential scan over `dense <=> query` / `sparse <#> query` is effectively
 -- instant at this scale. Add an HNSW index (e.g. `USING hnsw (dense

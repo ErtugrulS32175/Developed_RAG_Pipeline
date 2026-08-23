@@ -70,9 +70,16 @@ TABLE_XLSX=out.xlsx python -m pipeline.extraction.table_pipeline path/to/image.p
 
 ### Authentication
 
-Set `API_KEY` in `.env` and use the same value as the API key on the OpenWebUI
-connection. Every endpoint that reads or adds documents then wants
-`Authorization: Bearer <key>`.
+For scripts and direct API clients, set `API_KEY` in `.env`. Every endpoint that
+reads or adds documents then wants `Authorization: Bearer <key>`.
+
+OpenWebUI uses a different, two-part boundary. Generate two different random
+values of at least 32 bytes for `OPENWEBUI_GATEWAY_KEY` and
+`OPENWEBUI_USER_JWT_SECRET`. Compose configures the first as the provider key
+and the second as OpenWebUI's 60-second signed user assertion. The API requires
+both; plain `X-OpenWebUI-User-*` headers, an unsigned user id, and OpenWebUI's
+own `admin` role grant no RAG permission. The deployment pins OpenWebUI v0.11.0
+by OCI digest so this identity contract cannot move under a mutable image tag.
 
 For more than one tenant, set `API_KEYS_JSON` to a JSON list whose entries are
 exactly `key`, `tenant_id` (UUID), and `role`. Roles are cumulative:
@@ -99,6 +106,35 @@ service; `/metrics` publishes only bounded route templates, methods, status
 classes, counts and summed duration. It never records a query, document,
 tenant or raw URL. Every handled HTTP response carries an `X-Request-ID` for
 correlation without copying request content into logs.
+
+### Organization hierarchy in OpenWebUI
+
+Tenant is the company boundary. Inside one tenant, visibility is a directed
+tree: the root/CEO can monitor every descendant; a manager can monitor only its
+own descendants; a leaf can monitor nobody. Peers and ancestors are never
+returned, so nobody below the CEO can see the CEO. A position may additionally
+be protected from monitoring. These decisions come from PostgreSQL closure
+rows, never from a client-supplied level number or OpenWebUI profile role.
+
+Architecture administration is a separate capability and gives no document
+read access by itself. Bootstrap the first system architect with their own
+OpenWebUI user id (shown at `/ragtest-org` after the Event Function is installed):
+
+```bash
+python -m scripts.bootstrap_org \
+  --tenant-id 11111111-1111-1111-1111-111111111111 \
+  --tenant-name "Example Company" \
+  --openwebui-subject "the-user-id-shown-by-openwebui"
+```
+
+In OpenWebUI Admin → Functions, import
+`openwebui/functions/ragtest_org_portal.py` and enable it as a global Event
+Function. Signed-in users then open `/ragtest-org`: everyone sees their own
+level and title, managers see only the descendant list they are authorized to
+monitor, and an architecture admin receives the versioned tree editor. A save
+replaces the topology atomically; a stale editor receives 409 instead of
+overwriting a newer design. The portal is a same-origin OpenWebUI route and
+keeps both bridge secrets on the server.
 
 ### Production operations
 

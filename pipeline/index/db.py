@@ -32,7 +32,7 @@ load_dotenv()
 # password intentionally fails auth so a missing .env surfaces loudly
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv("PG_DSN", "postgresql://rag:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -57,6 +57,14 @@ class IngestJobConflict(RuntimeError):
 
 class IngestJobOwnershipLost(RuntimeError):
     """A worker tried to update a job it no longer owns."""
+
+
+class OrgVersionConflict(RuntimeError):
+    """The organization topology changed since an architect loaded it."""
+
+
+class OrgIdentityConflict(RuntimeError):
+    """An external identity cannot be bound safely to the requested tenant."""
 
 
 def set_tenant_context(conn, tenant_id=DEFAULT_TENANT_ID, *, service=False):
@@ -186,6 +194,22 @@ def init_schema(conn) -> None:
             "schema_sha256 text NOT NULL CHECK (length(schema_sha256) = 64), "
             "applied_at timestamptz NOT NULL DEFAULT now())")
         cur.execute(
+            "CREATE TABLE IF NOT EXISTS rag_schema_history ("
+            "schema_version integer PRIMARY KEY CHECK (schema_version > 0), "
+            "schema_sha256 text NOT NULL CHECK (length(schema_sha256) = 64), "
+            "applied_at timestamptz NOT NULL DEFAULT now())")
+        cur.execute(
+            "SELECT schema_sha256 FROM rag_schema_history "
+            "WHERE schema_version = %s", (SCHEMA_VERSION,))
+        history = cur.fetchone()
+        if history is None:
+            cur.execute(
+                "INSERT INTO rag_schema_history "
+                "(schema_version, schema_sha256, applied_at) "
+                "VALUES (%s, %s, now())", (SCHEMA_VERSION, schema_sha256))
+        elif history[0] != schema_sha256:
+            raise RuntimeError("schema version digest ile daha once kullanildi")
+        cur.execute(
             "INSERT INTO rag_schema_state "
             "(singleton, schema_version, schema_sha256, applied_at) "
             "VALUES (true, %s, %s, now()) "
@@ -214,6 +238,284 @@ def schema_is_current(conn) -> bool:
         conn.rollback()
         return False
     return row is not None and tuple(row) == expected
+
+
+def resolve_org_identity(conn, issuer: str, subject: str):
+    """Resolve one verified external subject to one tenant context.
+
+    Display claims are intentionally absent.  Membership and architecture
+    capability are database facts; an OpenWebUI role/name/email cannot grant
+    either.  Multiple active tenant bindings are refused because silently
+    picking one would make routing order an authorization decision.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT id FROM org_identities "
+            "WHERE issuer = %s AND subject = %s AND state = 'active'",
+            (issuer, subject))
+        identity = cur.fetchone()
+        if identity is None:
+            return None
+        identity_id = identity["id"]
+        cur.execute(
+            "SELECT tenant_id, position_id, app_role, display_label "
+            "FROM org_memberships WHERE identity_id = %s AND state = 'active'",
+            (identity_id,))
+        memberships = list(cur.fetchall())
+        cur.execute(
+            "SELECT tenant_id FROM org_architects "
+            "WHERE identity_id = %s AND active = true",
+            (identity_id,))
+        architect_rows = list(cur.fetchall())
+    tenant_ids = {
+        row["tenant_id"] for row in (*memberships, *architect_rows)
+    }
+    if not tenant_ids:
+        return None
+    if len(tenant_ids) != 1:
+        raise ValueError("kimlik birden cok aktif tenant'a bagli")
+    tenant_id = next(iter(tenant_ids))
+    membership = next(
+        (row for row in memberships if row["tenant_id"] == tenant_id), None)
+    return {
+        "identity_id": identity_id,
+        "tenant_id": tenant_id,
+        "position_id": (None if membership is None
+                        else membership["position_id"]),
+        # Architecture authority alone must not accidentally become document
+        # read authority.  Org routes recognize this closed internal role;
+        # normal reader/editor/admin dependencies do not.
+        "role": ("org_architect" if membership is None
+                 else membership["app_role"]),
+        "display_label": (None if membership is None
+                          else membership["display_label"]),
+        "org_architect": any(
+            row["tenant_id"] == tenant_id for row in architect_rows),
+    }
+
+
+def org_context(conn, identity_id):
+    """The caller's own hierarchy facts; no ancestor identity is projected."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT m.identity_id, m.display_label, m.app_role, p.id position_id, "
+            "p.title, p.kind, p.can_monitor_descendants, "
+            "p.protected_from_monitoring, COALESCE(root.depth, 0) + 1 level, "
+            "t.architecture_version, t.policy_epoch "
+            "FROM org_memberships m "
+            "JOIN org_positions p ON p.tenant_id = m.tenant_id "
+            "AND p.id = m.position_id "
+            "JOIN org_tenants t ON t.id = m.tenant_id "
+            "LEFT JOIN LATERAL ("
+            " SELECT max(c.depth) depth FROM org_closure c "
+            " JOIN org_positions ancestor ON ancestor.tenant_id = c.tenant_id "
+            " AND ancestor.id = c.ancestor_id AND ancestor.kind = 'root' "
+            " WHERE c.tenant_id = m.tenant_id "
+            " AND c.descendant_id = m.position_id"
+            ") root ON true "
+            "WHERE m.identity_id = %s AND m.state = 'active'",
+            (identity_id,))
+        row = cur.fetchone()
+    return None if row is None else dict(row)
+
+
+def visible_org_members(conn, viewer_id):
+    """Strict descendants visible to a monitoring-capable business user."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT target.identity_id, target.display_label, target.app_role, "
+            "target.position_id, position.title, position.kind, "
+            "COALESCE(root.depth, 0) + 1 level "
+            "FROM org_memberships viewer "
+            "JOIN org_positions viewer_position "
+            " ON viewer_position.tenant_id = viewer.tenant_id "
+            "AND viewer_position.id = viewer.position_id "
+            "JOIN org_closure scope ON scope.tenant_id = viewer.tenant_id "
+            "AND scope.ancestor_id = viewer.position_id AND scope.depth > 0 "
+            "JOIN org_memberships target ON target.tenant_id = scope.tenant_id "
+            "AND target.position_id = scope.descendant_id "
+            "AND target.state = 'active' "
+            "JOIN org_positions position ON position.tenant_id = target.tenant_id "
+            "AND position.id = target.position_id "
+            "LEFT JOIN LATERAL ("
+            " SELECT max(c.depth) depth FROM org_closure c "
+            " JOIN org_positions ancestor ON ancestor.tenant_id = c.tenant_id "
+            " AND ancestor.id = c.ancestor_id AND ancestor.kind = 'root' "
+            " WHERE c.tenant_id = target.tenant_id "
+            " AND c.descendant_id = target.position_id"
+            ") root ON true "
+            "WHERE viewer.identity_id = %s AND viewer.state = 'active' "
+            "AND viewer_position.can_monitor_descendants = true "
+            "AND (viewer_position.kind = 'root' "
+            "OR position.protected_from_monitoring = false) "
+            "ORDER BY scope.depth, target.display_label, target.identity_id",
+            (viewer_id,))
+        return [dict(row) for row in cur.fetchall()]
+
+
+def org_topology(conn):
+    """Return one tenant's content-free organization architecture."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT id, name, architecture_version, policy_epoch "
+            "FROM org_tenants WHERE id = rag_effective_tenant()")
+        tenant = cur.fetchone()
+        if tenant is None:
+            return None
+        cur.execute(
+            "SELECT id, parent_id, title, kind, can_monitor_descendants, "
+            "protected_from_monitoring FROM org_positions "
+            "WHERE tenant_id = rag_effective_tenant() ORDER BY title, id")
+        positions = [dict(row) for row in cur.fetchall()]
+        cur.execute(
+            "SELECT i.issuer, i.subject, m.position_id, m.display_label, "
+            "m.app_role, m.state FROM org_memberships m "
+            "JOIN org_identities i ON i.id = m.identity_id "
+            "WHERE m.tenant_id = rag_effective_tenant() "
+            "ORDER BY m.display_label, i.subject")
+        members = [dict(row) for row in cur.fetchall()]
+    return {**dict(tenant), "positions": positions, "members": members}
+
+
+def bootstrap_org_tenant(conn, *, tenant_id, name, issuer, subject):
+    """Create the first content-blind architect binding idempotently."""
+    tenant_id = uuid.UUID(str(tenant_id))
+    identity_id = uuid.uuid4()
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "INSERT INTO org_tenants (id, name) VALUES (%s, %s) "
+            "ON CONFLICT (id) DO NOTHING", (tenant_id, name))
+        cur.execute(
+            "SELECT name FROM org_tenants WHERE id = %s", (tenant_id,))
+        tenant = cur.fetchone()
+        if tenant is None or tenant["name"] != name:
+            raise OrgIdentityConflict("tenant kimligi baska ada bagli")
+        cur.execute(
+            "INSERT INTO org_identities (id, issuer, subject) "
+            "VALUES (%s, %s, %s) ON CONFLICT (issuer, subject) DO NOTHING",
+            (identity_id, issuer, subject))
+        cur.execute(
+            "SELECT id, state FROM org_identities "
+            "WHERE issuer = %s AND subject = %s", (issuer, subject))
+        identity = cur.fetchone()
+        if identity is None or identity["state"] != "active":
+            raise OrgIdentityConflict("bootstrap kimligi aktif degil")
+        identity_id = identity["id"]
+        cur.execute(
+            "SELECT 1 FROM org_memberships WHERE identity_id = %s "
+            "AND state = 'active' AND tenant_id <> %s "
+            "UNION ALL SELECT 1 FROM org_architects WHERE identity_id = %s "
+            "AND active = true AND tenant_id <> %s LIMIT 1",
+            (identity_id, tenant_id, identity_id, tenant_id))
+        if cur.fetchone() is not None:
+            raise OrgIdentityConflict("bootstrap kimligi baska tenant'a bagli")
+        cur.execute(
+            "INSERT INTO org_architects (tenant_id, identity_id) "
+            "VALUES (%s, %s) ON CONFLICT (tenant_id, identity_id) "
+            "DO UPDATE SET active = true", (tenant_id, identity_id))
+    conn.commit()
+    return {"tenant_id": tenant_id, "identity_id": identity_id}
+
+
+def replace_org_topology(conn, *, expected_version, name, positions, members,
+                         actor_id, request_id):
+    """Replace a tenant tree atomically under optimistic concurrency.
+
+    ``positions`` is already topologically ordered by the API policy layer.
+    The transaction first locks the tenant version, then removes memberships
+    before positions so no foreign key is ever weakened.  External subjects
+    are never allowed to acquire an active binding in a second tenant.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT architecture_version FROM org_tenants "
+            "WHERE id = rag_effective_tenant() FOR UPDATE")
+        tenant = cur.fetchone()
+        if tenant is None:
+            raise OrgIdentityConflict("organizasyon tenant'i bulunamadi")
+        if tenant["architecture_version"] != expected_version:
+            raise OrgVersionConflict("organizasyon mimarisi degisti")
+
+        cur.execute(
+            "DELETE FROM org_memberships "
+            "WHERE tenant_id = rag_effective_tenant()")
+        cur.execute(
+            "DELETE FROM org_positions "
+            "WHERE tenant_id = rag_effective_tenant()")
+        for position in positions:
+            cur.execute(
+                "INSERT INTO org_positions "
+                "(id, tenant_id, parent_id, title, kind, "
+                "can_monitor_descendants, protected_from_monitoring) "
+                "VALUES (%(id)s, rag_effective_tenant(), %(parent_id)s, "
+                "%(title)s, %(kind)s, %(can_monitor_descendants)s, "
+                "%(protected_from_monitoring)s)", position)
+
+        for member in members:
+            cur.execute(
+                "INSERT INTO org_identities (id, issuer, subject) "
+                "VALUES (%s, %s, %s) ON CONFLICT (issuer, subject) DO NOTHING",
+                (uuid.uuid4(), member["issuer"], member["subject"]))
+            cur.execute(
+                "SELECT id, state FROM org_identities "
+                "WHERE issuer = %s AND subject = %s",
+                (member["issuer"], member["subject"]))
+            identity_row = cur.fetchone()
+            if identity_row is None or identity_row["state"] != "active":
+                raise OrgIdentityConflict("organizasyon kimligi aktif degil")
+            identity_id = identity_row["id"]
+            if member["state"] == "active":
+                cur.execute(
+                    "SELECT 1 FROM org_memberships "
+                    "WHERE identity_id = %s AND state = 'active' "
+                    "AND tenant_id <> rag_effective_tenant() "
+                    "UNION ALL SELECT 1 FROM org_architects "
+                    "WHERE identity_id = %s AND active = true "
+                    "AND tenant_id <> rag_effective_tenant() LIMIT 1",
+                    (identity_id, identity_id))
+                if cur.fetchone() is not None:
+                    raise OrgIdentityConflict(
+                        "kimlik baska tenant'a aktif bagli")
+            cur.execute(
+                "INSERT INTO org_memberships "
+                "(tenant_id, identity_id, position_id, display_label, "
+                "app_role, state) VALUES (rag_effective_tenant(), %s, %s, "
+                "%s, %s, %s)",
+                (identity_id, member["position_id"],
+                 member["display_label"], member["app_role"], member["state"]))
+
+        cur.execute(
+            "UPDATE org_tenants SET name = %s, "
+            "architecture_version = architecture_version + 1, "
+            "policy_epoch = policy_epoch + 1 "
+            "WHERE id = rag_effective_tenant() "
+            "RETURNING architecture_version, policy_epoch",
+            (name,))
+        updated = cur.fetchone()
+        cur.execute(
+            "INSERT INTO org_audit_events "
+            "(id, tenant_id, actor_id, action, reason_code, decision, "
+            "request_id) VALUES (%s, rag_effective_tenant(), %s, "
+            "'topology_change', 'system_operation', 'allowed', %s)",
+            (uuid.uuid4(), actor_id, request_id))
+    conn.commit()
+    return dict(updated)
+
+
+def record_org_decision(conn, *, actor_id, subject_id, action,
+                        reason_code, allowed, request_id):
+    """Append one content-free organization authorization decision."""
+    event_id = uuid.uuid4()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO org_audit_events "
+            "(id, tenant_id, actor_id, subject_id, action, reason_code, "
+            "decision, request_id) VALUES (%s, rag_effective_tenant(), %s, "
+            "%s, %s, %s, %s, %s)",
+            (event_id, actor_id, subject_id, action, reason_code,
+             "allowed" if allowed else "denied", request_id))
+    conn.commit()
+    return str(event_id)
 
 
 def upsert_document(conn, filename: str, file_type: str,
