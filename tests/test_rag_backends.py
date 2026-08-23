@@ -76,6 +76,151 @@ def test_a_legacy_two_callable_backend_keeps_its_plain_path(monkeypatch):
         rag_backends.answer_checked("soru", backend="eski")
 
 
+SCOPE = ("11111111-1111-1111-1111-111111111111",
+         "22222222-2222-2222-2222-222222222222")
+
+
+def _register(monkeypatch, name, checked):
+    monkeypatch.setitem(
+        rag_backends.BACKENDS,
+        name,
+        lambda: (lambda q, k=15: [{"text": "x"}], lambda q: "cevap", checked),
+    )
+
+
+def test_an_unscoped_checked_call_still_passes_exactly_one_argument(
+        monkeypatch):
+    """The seam widened without moving: an engine written before the scope
+    existed declares one parameter, and an unscoped question must still be
+    the call it declared. Anything else would break every backend -- and
+    every replaced seam in the tests that are not editable here -- on the
+    day a scope became merely POSSIBLE."""
+    result = GuardResult(ANSWERED, "kontrol edilmis cevap", ())
+    seen = []
+
+    def only_the_question(question):
+        seen.append(question)
+        return result
+
+    _register(monkeypatch, "dar", only_the_question)
+
+    assert rag_backends.answer_checked("soru", backend="dar") is result
+    assert seen == ["soru"]
+
+
+def test_a_scope_reaches_the_engine_as_a_keyword(monkeypatch):
+    result = GuardResult(ANSWERED, "kontrol edilmis cevap", ())
+    seen = []
+
+    def scoped(question, *, document_ids=None):
+        seen.append((question, document_ids))
+        return result
+
+    _register(monkeypatch, "kapsamli", scoped)
+
+    assert rag_backends.answer_checked(
+        "soru", backend="kapsamli", document_ids=SCOPE) is result
+    assert seen == [("soru", SCOPE)]
+
+
+def test_no_scope_means_no_keyword_at_all(monkeypatch):
+    """Absent is absent: the engine is not handed `document_ids=None`, it is
+    handed nothing, so "unscoped" is the same call it has always been rather
+    than a scope that happens to be empty."""
+    result = GuardResult(ANSWERED, "kontrol edilmis cevap", ())
+    seen = []
+
+    def scoped(question, **kwargs):
+        seen.append(kwargs)
+        return result
+
+    _register(monkeypatch, "anahtarsiz", scoped)
+
+    rag_backends.answer_checked("soru", backend="anahtarsiz")
+
+    assert seen == [{}]
+
+
+def test_the_arity_check_still_counts_callables_not_signatures(monkeypatch):
+    """Two or three, as before. The registry validates HOW MANY callables a
+    backend supplies -- it never inspects what they accept, which is what
+    lets a one-argument engine and a scope-aware one coexist."""
+    monkeypatch.setitem(
+        rag_backends.BACKENDS, "dortlu",
+        lambda: (lambda q: None, lambda q: None, lambda q: None,
+                 lambda q: None))
+    monkeypatch.setitem(
+        rag_backends.BACKENDS, "callable_degil",
+        lambda: (lambda q: None, "cagirilamaz"))
+
+    with pytest.raises(TypeError):
+        rag_backends.get("dortlu")
+    with pytest.raises(TypeError):
+        rag_backends.get("callable_degil")
+
+
+def test_a_legacy_two_callable_backend_is_untouched_by_a_scope(monkeypatch):
+    """A scope cannot smuggle a two-callable backend onto the checked path:
+    the refusal is the same RuntimeError it has always been."""
+    monkeypatch.setitem(
+        rag_backends.BACKENDS,
+        "eski_kapsam",
+        lambda: (lambda q, k=15: [{"text": "x"}], lambda q: "cevap"),
+    )
+
+    with pytest.raises(RuntimeError):
+        rag_backends.answer_checked("soru", backend="eski_kapsam",
+                                    document_ids=SCOPE)
+    assert rag_backends.answer("soru", backend="eski_kapsam") == "cevap"
+
+
+def test_every_widened_seam_takes_the_scope_keyword_only_with_a_default():
+    """One shape at every hop. Keyword-only with a default is what keeps
+    every existing POSITIONAL call site meaning what it meant -- the
+    evaluation harness passes `top_k` positionally to one of these."""
+    import inspect
+
+    from pipeline.index import db
+    from pipeline.retrieval import query, rag_llamaindex
+
+    seams = (
+        rag_backends.answer_checked,
+        query.ask_checked,
+        query.retrieve,
+        rag_llamaindex.answer_checked,
+        rag_llamaindex.retrieve,
+        db.hybrid_search,
+    )
+    for seam in seams:
+        parameter = inspect.signature(seam).parameters["document_ids"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, seam
+        assert parameter.default is None, seam
+
+
+def test_the_widened_seams_did_not_reorder_what_came_before():
+    """The new parameter was ADDED, not inserted: every parameter a caller
+    could already pass positionally is still in the position it was in."""
+    import inspect
+
+    from pipeline.index import db
+    from pipeline.retrieval import query, rag_llamaindex
+
+    def positional(fn):
+        return [
+            name for name, parameter in inspect.signature(fn).parameters.items()
+            if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ]
+
+    assert positional(db.hybrid_search) == [
+        "conn", "dense_vec", "sparse_indices", "sparse_values", "top_k",
+        "rrf_k"]
+    assert positional(query.retrieve) == ["query", "top_k"]
+    assert positional(query.ask_checked) == ["question"]
+    assert positional(rag_llamaindex.retrieve) == ["question", "top_k"]
+    assert positional(rag_llamaindex.answer_checked) == ["question"]
+    assert positional(rag_backends.answer_checked) == ["question", "backend"]
+
+
 def test_the_alternative_engine_reuses_this_project_s_prompt():
     """Both engines must answer through the same context builder and prompt.
     Otherwise a difference in answer quality could be a difference in prompting,

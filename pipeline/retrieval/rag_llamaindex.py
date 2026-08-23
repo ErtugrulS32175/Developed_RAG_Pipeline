@@ -57,6 +57,84 @@ def _require():
             OpenAILikeEmbedding, OpenAILike, PGVectorStore)
 
 
+# A scoped question this engine CANNOT scope is refused, never widened.
+_SCOPE_UNSUPPORTED = (
+    "LlamaIndex metadata filtresi bu kurulumda kullanilamiyor; belge "
+    "kapsamli sorgu reddedildi. Kapsamsiz bir sonuc kapsamliymis gibi "
+    "dondurulmez."
+)
+
+
+def _require_filters():
+    """The metadata-filter API, or a refusal -- never an unscoped fallback.
+
+    Imported at the same seam and for the same reason as `_require`: the
+    package is optional, so nothing here may be needed by someone using the
+    default engine. The difference is what a failure MEANS. A missing
+    package means "this engine is unavailable"; a missing FILTER API means
+    "this engine cannot answer the question that was asked", and the one
+    answer it must never give is the wider one.
+    """
+    try:
+        from llama_index.core.vector_stores.types import (
+            FilterOperator,
+            MetadataFilter,
+            MetadataFilters,
+        )
+    except ImportError as e:
+        raise RuntimeError(f"{_SCOPE_UNSUPPORTED}\n({e})") from e
+    return FilterOperator, MetadataFilter, MetadataFilters
+
+
+def _scope_filenames(document_ids):
+    """Resolve the requested identifiers to filenames through `documents`.
+
+    THE ROUTE IS FIXED BY WHAT THE INDEX CARRIES, not by preference: node
+    metadata here is `{page, type, filename}` and holds no document
+    identifier, so an index built before this change -- every index that
+    exists -- can only be scoped by a name it already stores. Resolution
+    goes through the `documents` table so the id stays the one authority
+    for what a document is; this engine learns no second one, and nothing
+    is rebuilt.
+    """
+    from pipeline.index import db
+
+    with db.get_pool().connection() as conn:
+        return db.filenames_for_documents(conn, document_ids)
+
+
+def _scope_filters(filenames):
+    """An EXACT-match metadata filter over the resolved names.
+
+    The names are filter VALUES and nothing else: never a pattern, never
+    text assembled into a statement. `documents.filename` is `text NOT NULL
+    UNIQUE`, so exact equality against the stored name is an exact document
+    match -- which is what makes an IN filter over names equivalent to the
+    set of ids it came from.
+    """
+    FilterOperator, MetadataFilter, MetadataFilters = _require_filters()
+    return MetadataFilters(filters=[
+        MetadataFilter(key="filename", value=list(filenames),
+                       operator=FilterOperator.IN),
+    ])
+
+
+def _scope_reached(retriever, filters):
+    """Did the constructed retriever actually TAKE the filter?
+
+    A kwarg a retriever silently ignores is the exact failure this engine
+    must not survive: the query would run unscoped and its result would be
+    published as though it had been scoped. Checked against the object that
+    was handed over, so "the filter reached construction" is evidence
+    rather than an assumption about a version of an optional package.
+    """
+    for attribute in ("filters", "_filters"):
+        carried = getattr(retriever, attribute, None)
+        if carried is filters or (carried is not None and carried == filters):
+            return True
+    return False
+
+
 def _dsn_parts():
     """Split PG_DSN, which the store wants as separate fields."""
     from urllib.parse import urlparse
@@ -225,12 +303,42 @@ def _as_chunks(nodes):
     return out
 
 
-def retrieve(question, top_k=TOP_K):
+def retrieve(question, top_k=TOP_K, *, document_ids=None):
+    """Retrieve with LlamaIndex, optionally scoped to a set of documents.
+
+    THE SCOPE IS PART OF THE QUERY. It is resolved to filenames, turned
+    into a metadata filter and handed to the retriever AT CONSTRUCTION, so
+    the store answers the scoped question itself. Nothing is filtered out
+    of the returned node list: that would answer a scoped question with
+    whatever survived an UNSCOPED top-k, and a document that really holds
+    the answer would come back empty whenever other documents filled the
+    pool first.
+
+    Three fail-closed refusals, all of them before a node is fetched:
+    the filter API is not available, the retriever did not take the filter,
+    or every identifier resolved to nothing. The last one returns an empty
+    result rather than querying unscoped -- an unknown identifier must
+    narrow the search to nothing, never widen it to everything.
+    """
+    scope = None
+    if document_ids is not None:
+        # asked FIRST: an engine that cannot express the filter must refuse
+        # the question before it does any work that looks like answering it
+        _require_filters()
+        filenames = _scope_filenames(document_ids)
+        if not filenames:
+            return []
+        scope = _scope_filters(filenames)
     index, VectorStoreQueryMode = _index()
     retriever = index.as_retriever(
         similarity_top_k=top_k,
         vector_store_query_mode=VectorStoreQueryMode.HYBRID,
+        # an unscoped call passes no filter argument at all, so it is the
+        # same construction it has always been
+        **({} if scope is None else {"filters": scope}),
     )
+    if scope is not None and not _scope_reached(retriever, scope):
+        raise RuntimeError(_SCOPE_UNSUPPORTED)
     return _as_chunks(retriever.retrieve(question))
 
 
@@ -248,13 +356,19 @@ def answer(question):
     return generate(question, build_context(retrieve(question)))
 
 
-def answer_checked(question):
-    """Structured, provenance-checked answer for the public API."""
+def answer_checked(question, *, document_ids=None):
+    """Structured, provenance-checked answer for the public API.
+
+    `document_ids` scopes the retrieval and therefore everything built from
+    it: the assembled context and every citation the answer may publish.
+    Forwarded only when supplied, so an unscoped question reaches
+    ``retrieve`` as the single-argument call it has always been."""
     from pipeline.generation.answer import generate_structured
     from pipeline.retrieval.query import build_rag_context
     from pipeline.validation.rag.answer_guard import validate_structured
 
-    context = build_rag_context(retrieve(question), numbered=True)
+    scope = {} if document_ids is None else {"document_ids": document_ids}
+    context = build_rag_context(retrieve(question, **scope), numbered=True)
     reply = generate_structured(question, context.model_text)
     return validate_structured(reply, context)
 

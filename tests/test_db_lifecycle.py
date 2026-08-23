@@ -1066,3 +1066,291 @@ def test_all_five_filters_combine_with_and_fully_parameterized():
         assert str(instant) not in sql
         assert instant.isoformat() not in sql
     assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT")
+
+
+# --- the retrieval scope's own contract ----------------------------------
+#
+# `hybrid_search` runs TWO statements over one code-owned WHERE clause and
+# fuses their rankings with RRF. Fusion cannot tell which ranking a row
+# arrived on, so a scope that reached only one statement would let the
+# other one carry an out-of-scope candidate into the fused result -- and
+# then into the reranker, the context and a citation. These tests are at
+# the cursor seam, where the statement and its parameters are still
+# separable, and the fake cursor APPLIES the scope the way the server would
+# so both directions can be proven: what the scope keeps out, and that it
+# really would have come in without it.
+
+IC_BELGE = "11111111-1111-1111-1111-111111111111"
+DIS_BELGE = "22222222-2222-2222-2222-222222222222"
+YOK_BELGE = "33333333-3333-3333-3333-333333333333"
+
+
+def _chunk_row(chunk_id, document_id, filename):
+    return {
+        "id": chunk_id,
+        "type": "text",
+        "text": f"{filename} icindeki kurgu pasaj.",
+        "source_tag": "kurgu",
+        "page": 7,
+        "headings": [],
+        "table_data": None,
+        "document_id": document_id,
+        "filename": filename,
+    }
+
+
+CORPUS = [
+    _chunk_row("ic-1", IC_BELGE, "kapsam-icinde.pdf"),
+    _chunk_row("dis-1", DIS_BELGE, "kapsam-disinda.pdf"),
+    # a legacy chunk with no document row at all: reachable as it has always
+    # been, but it belongs to no NAMED document, so a scope must exclude it
+    _chunk_row("eski-1", None, None),
+]
+
+
+class HybridCursor:
+    """Records both statements AND answers them from a tiny corpus.
+
+    Recording alone proves the clause was sent; answering proves what the
+    clause does. The scope is applied here exactly as the server would
+    apply it -- from the statement text and the parameter that came with
+    it -- so a test can assert the row that stayed out really would have
+    come back without the clause.
+    """
+
+    def __init__(self, rows, scope_clause):
+        self._rows = rows
+        self._scope_clause = scope_clause
+        self._result = []
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        rows = list(self._rows)
+        if self._scope_clause in sql:
+            scope = set(params[0])
+            rows = [row for row in rows if row["document_id"] in scope]
+        self._result = rows
+
+    def fetchall(self):
+        return [dict(row) for row in self._result]
+
+
+class HybridConn:
+    def __init__(self, rows, scope_clause):
+        self.cur = HybridCursor(rows, scope_clause)
+
+    def cursor(self, row_factory=None):
+        return self.cur
+
+
+def _hybrid(rows=CORPUS, **kwargs):
+    """Run one hybrid search over a fake corpus; return (rows, cursor)."""
+    from pipeline.index import db
+
+    conn = HybridConn(rows, db.DOCUMENT_SCOPE_CLAUSE)
+    found = db.hybrid_search(conn, [0.0], [1], [1.0], top_k=5, **kwargs)
+    return found, conn.cur
+
+
+def test_an_unscoped_hybrid_search_sends_no_clause_and_no_parameter():
+    """Today's behaviour, unchanged: absent means absent in BOTH the
+    statement and the parameter tuple, not a scope that happens to be
+    empty."""
+    from pipeline.index import db
+
+    _found, cur = _hybrid()
+
+    assert len(cur.executed) == 2
+    for sql, params in cur.executed:
+        assert db.DOCUMENT_SCOPE_CLAUSE not in sql
+        assert "document_id = ANY" not in sql
+        # only the ranking vector and the page size travel
+        assert len(params) == 2
+
+
+def test_both_hybrid_statements_carry_the_SAME_scope_clause():
+    """One clause, written once, sent twice. If the dense statement were
+    scoped and the sparse one were not, a candidate from outside the scope
+    would enter the fusion through the sparse ranking and nothing later
+    could tell it apart from a legitimate one."""
+    from pipeline.index import db
+
+    _found, cur = _hybrid(document_ids=(IC_BELGE,))
+
+    dense_sql, dense_params = cur.executed[0]
+    sparse_sql, sparse_params = cur.executed[1]
+    assert db.DOCUMENT_SCOPE_CLAUSE in dense_sql
+    assert db.DOCUMENT_SCOPE_CLAUSE in sparse_sql
+    assert dense_sql.count(db.DOCUMENT_SCOPE_CLAUSE) == 1
+    assert sparse_sql.count(db.DOCUMENT_SCOPE_CLAUSE) == 1
+    # the same scope, bound the same way, on both
+    assert dense_params[0] == [IC_BELGE]
+    assert sparse_params[0] == [IC_BELGE]
+    # and the two statements differ ONLY in how they rank
+    assert (dense_sql.split("ORDER BY")[0]
+            == sparse_sql.split("ORDER BY")[0])
+
+
+def test_the_scope_clause_is_static_text_and_the_identifiers_are_values():
+    """No identifier is ever interpolated. The proof is a value carrying
+    quote syntax: it travels as a parameter like any other value, so the
+    statement the server prepares is the same closed text every call
+    sends."""
+    from pipeline.index import db
+
+    hostile = "11111111-1111-1111-1111-111111111111' OR '1'='1"
+    _found, cur = _hybrid(document_ids=(hostile,))
+
+    for sql, params in cur.executed:
+        assert hostile not in sql
+        assert IC_BELGE not in sql
+        assert params[0] == [hostile]
+    # the clause the code owns, spelled out with a placeholder and nothing
+    # else -- pinned here rather than derived from the statement it is in
+    assert db.DOCUMENT_SCOPE_CLAUSE == "c.document_id = ANY(%s::uuid[])"
+
+
+def test_the_scope_narrows_the_query_not_the_candidates_it_returned():
+    """Inside the statement, ahead of the cut. A scope applied after LIMIT
+    would answer a scoped question with whatever survived an UNSCOPED
+    top-k, so a document that really holds the answer would come back
+    empty whenever other documents filled the pool first."""
+    _found, cur = _hybrid(document_ids=(IC_BELGE,))
+
+    for sql, _params in cur.executed:
+        assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT")
+
+
+def test_a_document_outside_the_scope_would_have_matched_without_it():
+    """The negative and the positive in one test. Without the scope the
+    other document's passage comes back; with it, it does not -- so the
+    scoped result is evidence about the clause rather than about a corpus
+    that happened to hold one document."""
+    unscoped, _ = _hybrid()
+    scoped, _ = _hybrid(document_ids=(IC_BELGE,))
+
+    assert {row["filename"] for row in unscoped} == {
+        "kapsam-icinde.pdf", "kapsam-disinda.pdf", None}
+    assert [row["filename"] for row in scoped] == ["kapsam-icinde.pdf"]
+
+
+def test_several_identifiers_return_exactly_that_set():
+    scoped, _ = _hybrid(document_ids=(IC_BELGE, DIS_BELGE))
+
+    assert {row["filename"] for row in scoped} == {
+        "kapsam-icinde.pdf", "kapsam-disinda.pdf"}
+    # the legacy row belongs to no named document and is therefore outside
+    # every scope, even one naming every document there is
+    assert None not in {row["filename"] for row in scoped}
+
+
+def test_an_unknown_identifier_yields_an_empty_scope_not_the_corpus():
+    from pipeline.index import db
+
+    scoped, cur = _hybrid(document_ids=(YOK_BELGE,))
+
+    assert scoped == []
+    # it did not fall back: both statements were still scoped
+    for sql, params in cur.executed:
+        assert db.DOCUMENT_SCOPE_CLAUSE in sql
+        assert params[0] == [YOK_BELGE]
+
+
+def test_a_mixed_scope_is_scoped_to_the_known_identifier_alone():
+    scoped, _ = _hybrid(document_ids=(IC_BELGE, YOK_BELGE))
+
+    assert [row["filename"] for row in scoped] == ["kapsam-icinde.pdf"]
+
+
+def test_the_generation_filter_is_parenthesised_so_the_scope_binds_to_all():
+    """The existing filter is an OR. ANDing the scope onto a bare `a OR b`
+    would bind to `b` alone and leave every legacy NULL-document row
+    reachable from outside the requested scope -- which is why the row is
+    in the corpus above and why it is asserted twice."""
+    unscoped, _ = _hybrid()
+    scoped, cur = _hybrid(document_ids=(IC_BELGE,))
+
+    assert any(row["document_id"] is None for row in unscoped)
+    assert all(row["document_id"] is not None for row in scoped)
+    for sql, _params in cur.executed:
+        assert "WHERE (c.document_id IS NULL OR d.id IS NOT NULL) AND " in sql
+
+
+# --- resolving identifiers to filenames ----------------------------------
+#
+# The LlamaIndex index carries `{page, type, filename}` and no identifier,
+# so a scope stated in ids can only reach it as names. Resolution is a
+# SELECT against the same `documents` table everything else keys on, which
+# is what keeps the id the one authority for what a document is.
+
+
+class NameCursor:
+    def __init__(self, rows):
+        self._rows = rows
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class NameConn:
+    def __init__(self, rows=()):
+        self.cur = NameCursor(rows)
+
+    def cursor(self, row_factory=None):
+        return self.cur
+
+
+def test_the_filename_resolution_is_a_parameterised_select_only_query():
+    from pipeline.index import db
+
+    conn = NameConn([("kapsam-icinde.pdf",)])
+    db.filenames_for_documents(conn, (IC_BELGE, DIS_BELGE))
+
+    sql, params = conn.cur.executed[0]
+    assert sql.startswith("SELECT filename FROM documents")
+    assert "= ANY(%s::uuid[])" in sql
+    # the whole set travels as ONE array parameter; neither identifier is
+    # anywhere in the statement
+    assert params == ([IC_BELGE, DIS_BELGE],)
+    assert IC_BELGE not in sql and DIS_BELGE not in sql
+    upper = sql.upper()
+    for verb in ("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP"):
+        assert verb not in upper
+
+
+def test_resolved_filenames_come_back_deduplicated_and_ordered():
+    """Two ids resolving to one name produce ONE filter value, so a
+    repetition cannot become a repeated filter further down."""
+    from pipeline.index import db
+
+    conn = NameConn([("b.pdf",), ("a.pdf",), ("b.pdf",)])
+
+    assert db.filenames_for_documents(conn, (IC_BELGE, DIS_BELGE)) == [
+        "a.pdf", "b.pdf"]
+
+
+def test_an_unresolvable_identifier_resolves_to_no_name_at_all():
+    """An empty list is an EMPTY SCOPE, never "no scope" -- the caller is
+    the one that must not widen, and it cannot widen what it never got."""
+    from pipeline.index import db
+
+    conn = NameConn([])
+
+    assert db.filenames_for_documents(conn, (YOK_BELGE,)) == []

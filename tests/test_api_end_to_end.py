@@ -23,7 +23,11 @@ def _fake_db_conn():
     monkeypatched, so the connection object itself is never touched."""
     yield object()
 
-from pipeline.validation.rag.answer_guard import ANSWERED, REVIEW_REQUIRED
+from pipeline.validation.rag.answer_guard import (
+    ABSTAINED,
+    ANSWERED,
+    REVIEW_REQUIRED,
+)
 
 
 CHUNKS = [
@@ -45,15 +49,24 @@ def _headers(api):
     )
 
 
-def _chat(api, model, stream=False):
+_ABSENT = object()
+
+
+def _chat(api, model, stream=False, document_ids=_ABSENT):
+    """One chat request. `document_ids` is OMITTED unless a test supplies
+    one, so an unscoped request is byte-for-byte the request it always
+    was -- an absent field and a null field are not the same evidence."""
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "zeta uretimi nedir?"}],
+        "stream": stream,
+    }
+    if document_ids is not _ABSENT:
+        body["document_ids"] = document_ids
     return TestClient(api.app).post(
         "/v1/chat/completions",
         headers=_headers(api),
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": "zeta uretimi nedir?"}],
-            "stream": stream,
-        },
+        json=body,
     )
 
 
@@ -2138,3 +2151,500 @@ def test_unhandled_dependency_error_never_copies_its_message_to_logs(
     assert "RuntimeError" in caplog.text
     assert '"iz":' in caplog.text
     assert '"fonksiyon": "fail"' in caplog.text
+
+
+# --- answering from a named subset of documents --------------------------
+#
+# `document_ids` narrows a RAG question. Absent, everything below behaves
+# exactly as the tests above it do. Supplied, it must scope the whole path:
+# both retrieval statements, the reranker's candidates, the assembled
+# context and every published citation. The tests come in pairs on purpose
+# -- each scoped assertion is paired with the UNSCOPED run that shows the
+# excluded document really would have matched, so a passing scope is
+# evidence about the filter rather than about a corpus with one document
+# in it.
+
+IC_BELGE = "11111111-1111-1111-1111-111111111111"
+DIS_BELGE = "22222222-2222-2222-2222-222222222222"
+YOK_BELGE = "33333333-3333-3333-3333-333333333333"
+
+KAPSAM_CORPUS = [
+    {
+        "id": "ic-1",
+        "document_id": IC_BELGE,
+        "filename": "kapsam-icinde.pdf",
+        "page": 7,
+        "type": "text",
+        "text": "Zeta uretimi 47 000 birimdir.",
+        "source_tag": "kurgu",
+        "headings": [],
+        "table_data": None,
+    },
+    {
+        "id": "dis-1",
+        "document_id": DIS_BELGE,
+        "filename": "kapsam-disinda.pdf",
+        "page": 9,
+        "type": "text",
+        "text": "Omega uretimi 88 000 birimdir.",
+        "source_tag": "kurgu",
+        "headings": [],
+        "table_data": None,
+    },
+]
+
+ICERIDEN = json.dumps({
+    "dayanak": [{"pasaj": 1, "alinti": "Zeta uretimi 47 000 birimdir."}],
+    "cevap": "Sayfa 7'ye gore 47 000 birim.",
+})
+CEKIMSER = json.dumps({
+    "dayanak": [],
+    "cevap": "Bu bilgi mevcut belgelerde bulunamadi.",
+})
+
+
+def _wire_scoped_corpus(monkeypatch):
+    """The NATIVE chain with only its database and network seams replaced.
+
+    The request model, the endpoint, `rag_backends`, `query.ask_checked`,
+    `query.retrieve`, the real `db.hybrid_search` and the real guard all
+    run. The fake cursor applies the scope clause the way the server would,
+    so what comes back is decided by the statement that was actually sent.
+    """
+    from pipeline.generation import answer as generation
+    from pipeline.index import db
+    from pipeline.retrieval import query
+
+    seen = {"statements": [], "checkouts": 0, "dense": 0, "sparse": 0,
+            "ranked": [], "prompts": []}
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, params=None):
+            seen["statements"].append((sql, params))
+            rows = list(KAPSAM_CORPUS)
+            if db.DOCUMENT_SCOPE_CLAUSE in sql:
+                scope = set(params[0])
+                rows = [row for row in rows if row["document_id"] in scope]
+            self._rows = rows
+
+        def fetchall(self):
+            return [dict(row) for row in self._rows]
+
+    class Conn:
+        def cursor(self, row_factory=None):
+            return Cursor()
+
+    class Pool:
+        @contextmanager
+        def connection(self):
+            seen["checkouts"] += 1
+            yield Conn()
+
+    def embed_dense(_question):
+        seen["dense"] += 1
+        return [0.0]
+
+    def embed_sparse(_question):
+        seen["sparse"] += 1
+        return ([1], [1.0])
+
+    def rerank(_question, chunks, *_args, **_kwargs):
+        seen["ranked"].append(list(chunks))
+        return chunks
+
+    def complete(policy, user_content):
+        seen["prompts"].append((policy, user_content))
+        return (ICERIDEN if "Zeta uretimi 47 000 birimdir." in user_content
+                else CEKIMSER)
+
+    monkeypatch.setattr(db, "get_pool", lambda: Pool())
+    monkeypatch.setattr(query, "embed_dense", embed_dense)
+    monkeypatch.setattr(query, "embed_sparse", embed_sparse)
+    monkeypatch.setattr(query, "rerank", rerank)
+    monkeypatch.setattr(generation, "complete", complete)
+    return seen
+
+
+def _citations(response, stream):
+    if not stream:
+        return response.json()["rag_citations"]
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    published = {json.dumps(payload["rag_citations"], sort_keys=True)
+                 for payload in payloads}
+    assert len(published) == 1
+    return json.loads(published.pop())
+
+
+def _filenames(chunks):
+    return [chunk["filename"] for chunk in chunks]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_scoped_request_answers_from_that_document_alone(
+        monkeypatch, stream):
+    """One identifier, and the scope holds all the way down."""
+    from pipeline.api import app as api
+    from pipeline.index import db
+
+    seen = _wire_scoped_corpus(monkeypatch)
+
+    response = _chat(api, "ragtest-rag", stream, document_ids=[IC_BELGE])
+
+    assert response.status_code == 200
+    status, text = _public_reply(response, stream)
+    assert status == ANSWERED
+    assert text == "Sayfa 7'ye gore 47 000 birim."
+    # BOTH retrieval statements were scoped, by the same clause, with the
+    # identifier travelling as a parameter and never as statement text
+    assert len(seen["statements"]) == 2
+    for sql, params in seen["statements"]:
+        assert db.DOCUMENT_SCOPE_CLAUSE in sql
+        assert params[0] == [IC_BELGE]
+        assert IC_BELGE not in sql
+    # the reranker never saw a candidate from outside the scope
+    assert _filenames(seen["ranked"][0]) == ["kapsam-icinde.pdf"]
+    # neither did the assembled context, so neither did any citation line
+    (_policy, user_content), = seen["prompts"]
+    assert "[kapsam-icinde.pdf | Sayfa 7]" in user_content
+    assert "kapsam-disinda.pdf" not in user_content
+    assert "Omega uretimi" not in user_content
+    # and the published citations name a page of the scoped document only
+    assert _citations(response, stream) == [{"page": 7, "source": "model"}]
+    assert "kapsam-disinda" not in response.text
+    assert "88 000" not in response.text
+
+
+def test_the_excluded_document_really_would_have_matched(monkeypatch):
+    """THE NEGATIVE HALF. Same corpus, same question, no scope: the other
+    document is retrieved, reranked and put in front of the model. Without
+    this, the test above would pass over a corpus that simply had nothing
+    else in it."""
+    from pipeline.api import app as api
+    from pipeline.index import db
+
+    seen = _wire_scoped_corpus(monkeypatch)
+
+    response = _chat(api, "ragtest-rag")
+
+    assert response.status_code == 200
+    assert _filenames(seen["ranked"][0]) == [
+        "kapsam-icinde.pdf", "kapsam-disinda.pdf"]
+    (_policy, user_content), = seen["prompts"]
+    assert "kapsam-disinda.pdf" in user_content
+    # ... and an unscoped request added NO clause and NO parameter
+    for sql, params in seen["statements"]:
+        assert db.DOCUMENT_SCOPE_CLAUSE not in sql
+        assert len(params) == 2
+
+
+def test_a_scope_of_several_documents_returns_only_that_set(monkeypatch):
+    from pipeline.api import app as api
+
+    seen = _wire_scoped_corpus(monkeypatch)
+
+    response = _chat(api, "ragtest-rag",
+                     document_ids=[IC_BELGE, DIS_BELGE])
+
+    assert response.status_code == 200
+    assert _filenames(seen["ranked"][0]) == [
+        "kapsam-icinde.pdf", "kapsam-disinda.pdf"]
+    for _sql, params in seen["statements"]:
+        assert sorted(params[0]) == sorted([IC_BELGE, DIS_BELGE])
+
+
+def test_an_unknown_identifier_scopes_to_nothing_not_to_everything(
+        monkeypatch):
+    """An identifier that names no document must NARROW the search to
+    nothing. Falling back to the corpus would answer a question the caller
+    never asked, and would look like a good answer while doing it."""
+    from pipeline.api import app as api
+    from pipeline.index import db
+
+    seen = _wire_scoped_corpus(monkeypatch)
+
+    response = _chat(api, "ragtest-rag", document_ids=[YOK_BELGE])
+
+    assert response.status_code == 200
+    status, _text = _public_reply(response, False)
+    assert status == ABSTAINED
+    assert seen["ranked"] == [[]]
+    for sql, params in seen["statements"]:
+        assert db.DOCUMENT_SCOPE_CLAUSE in sql
+        assert params[0] == [YOK_BELGE]
+    assert _citations(response, False) == []
+
+
+def test_a_mixed_scope_is_scoped_to_the_known_identifier_alone(monkeypatch):
+    from pipeline.api import app as api
+
+    seen = _wire_scoped_corpus(monkeypatch)
+
+    response = _chat(api, "ragtest-rag",
+                     document_ids=[IC_BELGE, YOK_BELGE])
+
+    assert response.status_code == 200
+    assert _filenames(seen["ranked"][0]) == ["kapsam-icinde.pdf"]
+    for _sql, params in seen["statements"]:
+        assert sorted(params[0]) == sorted([IC_BELGE, YOK_BELGE])
+
+
+def test_a_repeated_identifier_neither_widens_nor_repeats_the_filter(
+        monkeypatch):
+    """Set semantics, applied ONCE before the first backend call. The
+    repetition must not reach the database as a repeated filter value, and
+    the answer must be the one the single identifier produces."""
+    from pipeline.api import app as api
+
+    seen = _wire_scoped_corpus(monkeypatch)
+    repeated = _chat(api, "ragtest-rag",
+                     document_ids=[IC_BELGE, IC_BELGE, IC_BELGE])
+
+    for _sql, params in seen["statements"]:
+        assert params[0] == [IC_BELGE]
+    assert _filenames(seen["ranked"][0]) == ["kapsam-icinde.pdf"]
+
+    once = _wire_scoped_corpus(monkeypatch)
+    single = _chat(api, "ragtest-rag", document_ids=[IC_BELGE])
+
+    assert repeated.json()["rag_status"] == single.json()["rag_status"]
+    assert (repeated.json()["choices"][0]["message"]["content"]
+            == single.json()["choices"][0]["message"]["content"])
+    assert repeated.json()["rag_citations"] == single.json()["rag_citations"]
+    assert ([params for _sql, params in seen["statements"]]
+            == [params for _sql, params in once["statements"]])
+
+
+def test_the_collapse_happens_before_the_first_backend_call(monkeypatch):
+    """Pinned at the seam itself: the backend is handed ONE canonical
+    scope, not a list with a repetition for something further down to
+    deduplicate (or fail to)."""
+    from pipeline.api import app as api
+    from pipeline.validation.rag.answer_guard import ANSWERED, GuardResult
+
+    handed = []
+
+    def checked(question, backend=None, *, document_ids=None):
+        handed.append(document_ids)
+        return GuardResult(ANSWERED, "kurgu cevap", ())
+
+    monkeypatch.setattr(api.rag_backends, "answer_checked", checked)
+
+    _chat(api, "ragtest-rag",
+          document_ids=[DIS_BELGE, IC_BELGE, IC_BELGE])
+
+    assert handed == [(IC_BELGE, DIS_BELGE)]
+    assert len(handed[0]) == len(set(handed[0]))
+
+
+def test_an_unscoped_request_hands_the_backend_no_scope_at_all(monkeypatch):
+    """Absent stays absent: the backend is called exactly as it always
+    was, so every caller that passes no scope keeps working untouched."""
+    from pipeline.api import app as api
+    from pipeline.validation.rag.answer_guard import ANSWERED, GuardResult
+
+    handed = []
+
+    def checked(question, backend=None, **kwargs):
+        handed.append(kwargs)
+        return GuardResult(ANSWERED, "kurgu cevap", ())
+
+    monkeypatch.setattr(api.rag_backends, "answer_checked", checked)
+
+    _chat(api, "ragtest-rag")
+
+    assert handed == [{}]
+
+
+def test_streaming_and_non_streaming_agree_under_the_same_scope(monkeypatch):
+    """One closure serves both response shapes, so the two cannot be
+    scoped differently: same retrieval, same status, same citations."""
+    from pipeline.api import app as api
+
+    streamed_seen = _wire_scoped_corpus(monkeypatch)
+    streamed = _chat(api, "ragtest-rag", True, document_ids=[IC_BELGE])
+    plain_seen = _wire_scoped_corpus(monkeypatch)
+    plain = _chat(api, "ragtest-rag", False, document_ids=[IC_BELGE])
+
+    assert _public_reply(streamed, True) == _public_reply(plain, False)
+    assert _citations(streamed, True) == _citations(plain, False)
+    assert ([params for _sql, params in streamed_seen["statements"]]
+            == [params for _sql, params in plain_seen["statements"]])
+    assert (_filenames(streamed_seen["ranked"][0])
+            == _filenames(plain_seen["ranked"][0]))
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_llamaindex_model_is_given_the_same_scope(monkeypatch, stream):
+    """The other engine is scoped through the same field and the same
+    closure; its own route to the store is pinned in
+    tests/test_llamaindex_build.py."""
+    from pipeline.api import app as api
+    from pipeline.generation import answer as generation
+    from pipeline.retrieval import rag_llamaindex
+
+    handed = []
+
+    def retrieve(_question, **kwargs):
+        handed.append(kwargs)
+        return [KAPSAM_CORPUS[0]]
+
+    monkeypatch.setattr(rag_llamaindex, "retrieve", retrieve)
+    monkeypatch.setattr(generation, "complete",
+                        lambda _policy, _user_content: ICERIDEN)
+
+    response = _chat(api, "ragtest-rag-llamaindex", stream,
+                     document_ids=[IC_BELGE])
+
+    assert response.status_code == 200
+    assert _public_reply(response, stream)[0] == ANSWERED
+    assert handed == [{"document_ids": (IC_BELGE,)}]
+
+
+# --- refusing a scope that is not one ------------------------------------
+#
+# Every refusal below is proven to cost NOTHING: the request model refuses
+# the shape before the endpoint body runs, so no backend is called, no
+# pooled connection is borrowed and neither embedding is computed. Each
+# test also pins WHICH gate refused it -- a validation error located at
+# `body -> document_ids` -- so a refusal cannot quietly move to (or away
+# from) the declaration that is supposed to carry it.
+
+
+def _refusal_gates(monkeypatch):
+    """Counters on every seam a refused request must never reach."""
+    from pipeline.api import app as api
+    from pipeline.index import db
+    from pipeline.retrieval import query
+
+    counted = {"backend": 0, "checkouts": 0, "dense": 0, "sparse": 0}
+
+    class Pool:
+        @contextmanager
+        def connection(self):
+            counted["checkouts"] += 1
+            yield object()
+
+    def backend(*_args, **_kwargs):
+        counted["backend"] += 1
+        raise AssertionError("reddedilen istek backende ulasti")
+
+    def dense(_question):
+        counted["dense"] += 1
+        return [0.0]
+
+    def sparse(_question):
+        counted["sparse"] += 1
+        return ([1], [1.0])
+
+    monkeypatch.setattr(db, "get_pool", lambda: Pool())
+    monkeypatch.setattr(api.rag_backends, "answer_checked", backend)
+    monkeypatch.setattr(query, "embed_dense", dense)
+    monkeypatch.setattr(query, "embed_sparse", sparse)
+    return counted
+
+
+@pytest.mark.parametrize(
+    ("document_ids", "gerekce"),
+    [
+        ([], "bos liste"),
+        ([f"{n:08d}-0000-0000-0000-000000000000" for n in range(51)],
+         "elli birden fazla"),
+        ("kurgu", "liste degil"),
+        ({"belge": IC_BELGE}, "liste degil"),
+        (7, "liste degil"),
+        ([IC_BELGE, "belge-bir"], "gecersiz uuid"),
+        (["  "], "gecersiz uuid"),
+        ([IC_BELGE, 7], "uuid degil"),
+        ([[IC_BELGE]], "uuid degil"),
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_malformed_scope_is_refused_and_costs_nothing(
+        monkeypatch, document_ids, gerekce, stream):
+    from pipeline.api import app as api
+
+    counted = _refusal_gates(monkeypatch)
+
+    response = _chat(api, "ragtest-rag", stream, document_ids=document_ids)
+
+    assert response.status_code == 422, gerekce
+    # the gate that refused it: the request model's own declaration, which
+    # is why the error carries a body location instead of a text detail
+    locations = [tuple(error["loc"]) for error in response.json()["detail"]]
+    assert any(location[:2] == ("body", "document_ids")
+               for location in locations), locations
+    # ... and it was refused BEFORE any of this could happen
+    assert counted == {"backend": 0, "checkouts": 0, "dense": 0, "sparse": 0}
+
+
+def test_the_scope_bound_is_the_list_as_sent(monkeypatch):
+    """Fifty is the cap and fifty is accepted: the refusal above is about
+    the bound, not about long lists being unsupported."""
+    from pipeline.api import app as api
+    from pipeline.validation.rag.answer_guard import ANSWERED, GuardResult
+
+    handed = []
+
+    def checked(question, backend=None, *, document_ids=None):
+        handed.append(document_ids)
+        return GuardResult(ANSWERED, "kurgu cevap", ())
+
+    monkeypatch.setattr(api.rag_backends, "answer_checked", checked)
+
+    fifty = [f"{n:08d}-0000-0000-0000-000000000000" for n in range(50)]
+    response = _chat(api, "ragtest-rag", document_ids=fifty)
+
+    assert response.status_code == 200
+    assert api.DOCUMENT_SCOPE_MAX == 50
+    assert len(handed[0]) == 50
+
+
+def test_an_unknown_model_is_still_refused_before_any_scope_work(monkeypatch):
+    from pipeline.api import app as api
+
+    counted = _refusal_gates(monkeypatch)
+
+    response = _chat(api, "ragtest-bilinmeyen", document_ids=[IC_BELGE])
+
+    assert response.status_code == 404
+    assert counted["backend"] == 0
+
+
+def test_the_table_route_is_unaffected_by_the_new_field(monkeypatch):
+    """The table model keeps its separate service path. The field is not
+    its business, and it must not become a reason to touch RAG."""
+    from pipeline.api import app as api
+
+    counted = _refusal_gates(monkeypatch)
+    monkeypatch.setattr(api.owui_chat, "tables_reply",
+                        lambda _messages: "KURGU_TABLO_CEVABI")
+
+    response = _chat(api, "ragtest-table", document_ids=[IC_BELGE])
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == (
+        "KURGU_TABLO_CEVABI")
+    assert "rag_status" not in response.json()
+    assert counted["backend"] == 0
+
+
+def test_the_chat_route_keeps_the_same_auth_dependency_object():
+    """Widening the request model must not have rewired the route: the
+    dependency list is the SAME object every other protected route uses."""
+    from pipeline.api import app as api
+
+    route = next(route for route in api.app.routes
+                 if getattr(route, "path", None) == "/v1/chat/completions")
+    assert len(route.dependencies) == 1
+    assert route.dependencies[0] is api.AUTH[0]
+    assert api.AUTH[0].dependency is api.require_api_key

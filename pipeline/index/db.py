@@ -1206,7 +1206,66 @@ def _explain_failed_promotion(cur, conn, document_id, candidate_id,
         "es zamanli bir islem kazandi, bu kosu terfi ETMEDI")
 
 
-def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15, rrf_k=1) -> list[dict]:
+def filenames_for_documents(conn, document_ids) -> list[str]:
+    """The names a set of document identifiers resolves to. SELECT only.
+
+    `documents.filename` is `text NOT NULL UNIQUE`, so a name identifies a
+    document exactly as an id does -- which is what makes it usable as the
+    LlamaIndex engine's scope. That index carries `{page, type, filename}`
+    in its node metadata and NO identifier at all, so a scope expressed in
+    ids has to be resolved to names somewhere; resolving it HERE, against
+    the same `documents` table the rest of the system keys on, keeps ONE
+    authority for what a document identifier is instead of teaching the
+    other engine a second one.
+
+    The identifiers travel as a SINGLE array parameter and the statement is
+    closed text -- no identifier is ever assembled into it. An identifier
+    matching no row simply contributes no name, so an unknown one NARROWS
+    the answer rather than widening it: the caller receives an empty list
+    and must read it as an empty scope, never as "no scope".
+
+    The names come back deduplicated and ordered, so a scope that repeats a
+    document (or two ids that somehow resolve to one name) produces one
+    filter value rather than a repeated one.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT filename FROM documents WHERE id = ANY(%s::uuid[])",
+            (list(document_ids),))
+        return sorted({str(row[0]) for row in cur.fetchall()})
+
+
+# THE ONE SCOPE CLAUSE, written once as static text. `hybrid_search` runs
+# TWO statements over one code-owned WHERE clause and fuses their rankings
+# with RRF; fusion cannot tell which ranking a row arrived on, so scoping
+# one statement and not the other would let an out-of-scope candidate into
+# the fused result through the unscoped side. Naming the clause once is
+# what makes "the same clause on both" a property of the code rather than
+# of remembering. No identifier appears in it -- the whole set travels as a
+# single array parameter, which is also why a repeated identifier can
+# neither widen the scope nor add a second filter.
+DOCUMENT_SCOPE_CLAUSE = "c.document_id = ANY(%s::uuid[])"
+
+
+def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15,
+                  rrf_k=1, *, document_ids=None) -> list[dict]:
+    """Hybrid retrieval, optionally scoped to a named set of documents.
+
+    `document_ids` is keyword-only with a default, so every existing
+    positional call site keeps its meaning. Absent, the statements are the
+    ones this function has always sent: no scope clause and no scope
+    parameter. Supplied, the clause is ANDed onto BOTH statements, so the
+    dense and the sparse ranking are drawn from the same set and nothing
+    from outside it can reach the fusion.
+
+    THE SCOPE IS APPLIED IN THE QUERY, not to the candidates it returns. A
+    filter after `LIMIT` would answer a scoped question with whatever
+    survived an UNSCOPED top-k: a document that really does hold the answer
+    would come back empty whenever other documents filled the pool first.
+
+    An empty set is a legitimate scope and matches nothing -- an identifier
+    that names no document must never fall back to the whole corpus.
+    """
     sparse_lit = sparse_to_literal(sparse_indices, sparse_values)
     cols = (
         "c.id, c.type, c.text, c.source_tag, c.page, c.headings, c.table_data, "
@@ -1221,20 +1280,34 @@ def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15, rrf_
         "chunks c LEFT JOIN documents d ON c.document_id = d.id "
         "AND c.generation = d.active_generation"
     )
-    where_clause = "WHERE c.document_id IS NULL OR d.id IS NOT NULL"
+    # The generation test is parenthesised because it is an OR: ANDing the
+    # scope onto a bare `a OR b` would bind to `b` alone and leave every
+    # legacy NULL-document row reachable from OUTSIDE the requested scope.
+    where_clause = "WHERE (c.document_id IS NULL OR d.id IS NOT NULL)"
+    # A supplied scope adds its clause here and its value to the parameter
+    # tuple; an absent one adds NEITHER. The scope parameter comes first in
+    # both tuples because its placeholder sits in the WHERE clause, ahead of
+    # the ORDER BY and LIMIT placeholders -- these statements are positional
+    # `%s`, so the order of the tuple IS the binding.
+    scope_params = ()
+    if document_ids is not None:
+        where_clause += " AND " + DOCUMENT_SCOPE_CLAUSE
+        # a list, not a tuple: psycopg adapts a list to an ARRAY, which is
+        # what `= ANY(...)` reads, and a tuple to a record, which it does not
+        scope_params = (list(document_ids),)
 
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             f"SELECT {cols} FROM {from_clause} {where_clause} "
             f"ORDER BY c.dense <=> %s::vector LIMIT %s",
-            (dense_vec, top_k),
+            (*scope_params, dense_vec, top_k),
         )
         dense_ranked = cur.fetchall()
 
         cur.execute(
             f"SELECT {cols} FROM {from_clause} {where_clause} "
             f"ORDER BY c.sparse <#> %s::sparsevec LIMIT %s",
-            (sparse_lit, top_k),
+            (*scope_params, sparse_lit, top_k),
         )
         sparse_ranked = cur.fetchall()
 

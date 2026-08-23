@@ -7,13 +7,14 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Union
+from typing import Annotated, Union
+from uuid import UUID
 
 from fastapi import (
     Depends, FastAPI, Header, HTTPException, Query, Response, UploadFile, File,
 )
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import AwareDatetime, BaseModel
+from pydantic import AwareDatetime, BaseModel, Field
 from dotenv import load_dotenv
 
 from pipeline.index import db
@@ -195,12 +196,37 @@ class ChatMessage(BaseModel):
     content: Union[str, list]
 
 
+# How many documents one question may name. A scope is a NARROWING, so a
+# bound is what keeps it one: without a cap, a caller could hand over an
+# arbitrarily long array that every retrieval statement then carries. The
+# number is a product decision, declared here once and enforced by the
+# request model, so an oversized scope is refused before the endpoint body
+# runs -- and therefore before a connection, an embedding or a backend.
+DOCUMENT_SCOPE_MAX = 50
+
+# The scope's SHAPE lives on the field, not in the body, for exactly the
+# reason the inventory's page bounds do: a declaration is refused with 422
+# before anything is borrowed or computed. `UUID` is the type because
+# `documents.id` is `uuid` -- so "well-formed identifier" is answered by
+# the column's own type rather than by a second rule invented here. A
+# malformed element, a non-list value or a list outside 1..MAX is a
+# validation error with a `body -> document_ids` location; it is never
+# silently dropped, because a dropped scope is a question answered over the
+# whole corpus while the caller believes it was narrowed.
+DocumentScope = Annotated[
+    list[UUID],
+    Field(min_length=1, max_length=DOCUMENT_SCOPE_MAX),
+]
+
+
 class ChatRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     # OpenWebUI streams by default; without this the flag would be silently
     # dropped and every reply would arrive as one lump after minutes of silence.
     stream: bool = False
+    # Absent means what it has always meant: the whole corpus, unchanged.
+    document_ids: DocumentScope | None = None
 
 
 @app.get("/v1/models", dependencies=AUTH)
@@ -219,6 +245,26 @@ def list_models():
     }
 
 
+def _document_scope(document_ids):
+    """Collapse the requested identifiers into ONE canonical scope.
+
+    Absent stays absent: `None` here is the whole corpus, and it must not
+    acquire a scope by accident anywhere below.
+
+    Supplied, the identifiers are collapsed with SET SEMANTICS and ordered,
+    once, before the first backend call. A list naming one document three
+    times therefore produces exactly the scope -- and exactly the retrieval
+    filter -- that naming it once produces: a repetition can neither widen
+    the scope nor travel to the database as a repeated filter value. The
+    canonical spelling is `str(UUID)`, which the request model already
+    produced by parsing, so two spellings of one identifier are one element
+    here rather than two.
+    """
+    if document_ids is None:
+        return None
+    return tuple(sorted({str(document_id) for document_id in document_ids}))
+
+
 @app.post("/v1/chat/completions", dependencies=AUTH)
 def chat_completions(req: ChatRequest):
     """OpenAI-compatible wrapper with a checked publication boundary.
@@ -226,6 +272,12 @@ def chat_completions(req: ChatRequest):
     Table extraction keeps its separate service path. A RAG model may publish
     only the text carried by an answered/abstained ``GuardResult``; review
     results become a fixed notice and never expose the unchecked model reply.
+
+    ``document_ids`` narrows a RAG question to a named set of documents.
+    Its SHAPE is refused by the request model before this body runs; its
+    MEANING is settled here, once, and then handed to the one checked call
+    both response shapes go through -- which is why a streamed answer and a
+    non-streamed one cannot be scoped differently.
     """
     if req.model not in {*RAG_MODELS, TABLE_MODEL_ID}:
         raise HTTPException(status_code=404, detail="bilinmeyen model")
@@ -234,13 +286,21 @@ def chat_completions(req: ChatRequest):
 
     is_table = req.model == TABLE_MODEL_ID
     backend = RAG_MODELS.get(req.model)
+    # Settled BEFORE the first backend call, and outside the closure, so
+    # both branches ask the same question of the same set. The table route
+    # reads none of this: it keeps its separate service path unchanged.
+    document_ids = _document_scope(req.document_ids)
 
     def ask_checked():
         question = owui_chat.message_text(req.messages[-1].content)
         if not question.strip():
             raise HTTPException(status_code=400, detail="soru bos olamaz")
+        # Forwarded only when a scope was asked for: an unscoped request
+        # must reach the backend as the call it has always been.
+        scope = {} if document_ids is None else {"document_ids": document_ids}
         try:
-            result = rag_backends.answer_checked(question, backend=backend)
+            result = rag_backends.answer_checked(question, backend=backend,
+                                                 **scope)
         except RuntimeError as e:
             _log_rag_failure(e, backend)
             raise HTTPException(status_code=503, detail=RAG_UNAVAILABLE_MESSAGE)

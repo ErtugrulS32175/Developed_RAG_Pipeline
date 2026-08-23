@@ -22,6 +22,9 @@ def fake_llama(monkeypatch):
     class Document:
         def __init__(self, text=None, metadata=None):
             self.text = text
+            # kept so a test can read what the index would actually carry:
+            # the scope route depends on that metadata and on nothing else
+            self.metadata = metadata
 
     class StorageContext:
         @staticmethod
@@ -32,6 +35,8 @@ def fake_llama(monkeypatch):
         @staticmethod
         def from_documents(docs, storage_context=None, show_progress=None):
             events.append(("yaz", len(docs)))
+            for doc in docs:
+                events.append(("meta", doc.metadata))
 
     core.Document = Document
     core.StorageContext = StorageContext
@@ -151,6 +156,325 @@ def test_the_copy_reads_only_the_active_generation(monkeypatch, fake_llama):
                   if kind == "sql" and text.startswith("SELECT c.text"))
     assert "c.generation = d.active_generation" in select
     assert "c.document_id IS NULL OR d.id IS NOT NULL" in select
+
+
+def test_the_index_metadata_carries_no_document_identifier(
+        monkeypatch, fake_llama):
+    """THE MEASUREMENT THE ROUTE RESTS ON. A node here knows its page, its
+    type and its FILENAME -- and no document id. That is why a scope stated
+    in ids is resolved to names instead of matched against an id that is
+    not there, and why an index built BEFORE the scope existed can be
+    scoped without being rebuilt."""
+    events, _core = fake_llama
+    rag_llamaindex = _wire_db(monkeypatch, events)
+
+    rag_llamaindex.build_index()
+
+    metadata = [meta for kind, meta in events if kind == "meta"]
+    assert metadata == [{"page": 1, "type": "text",
+                         "filename": "kurgu.pdf"}]
+    for meta in metadata:
+        assert set(meta) == {"page", "type", "filename"}
+        assert not any("id" == key or key.endswith("_id") for key in meta)
+
+
+# --- scoping the alternative engine --------------------------------------
+#
+# The route is fixed by the measurement above: resolve the identifiers to
+# filenames through `documents`, then filter on filename metadata AT
+# CONSTRUCTION. These tests use the same fake-module strategy as the build
+# tests -- no optional package is installed, and nothing is skipped or
+# xfailed.
+
+IC_BELGE = "11111111-1111-1111-1111-111111111111"
+DIS_BELGE = "22222222-2222-2222-2222-222222222222"
+YOK_BELGE = "33333333-3333-3333-3333-333333333333"
+
+
+@pytest.fixture
+def fake_filters(monkeypatch):
+    """The metadata-filter API, faked at the seam the engine imports it."""
+    module = types.ModuleType("llama_index.core.vector_stores.types")
+
+    class FilterOperator:
+        IN = "in"
+
+    class MetadataFilter:
+        def __init__(self, key=None, value=None, operator=None):
+            self.key = key
+            self.value = value
+            self.operator = operator
+
+    class MetadataFilters:
+        def __init__(self, filters=None):
+            self.filters = list(filters or [])
+
+    module.FilterOperator = FilterOperator
+    module.MetadataFilter = MetadataFilter
+    module.MetadataFilters = MetadataFilters
+    package = types.ModuleType("llama_index.core.vector_stores")
+    package.types = module
+    monkeypatch.setitem(sys.modules, "llama_index",
+                        types.ModuleType("llama_index"))
+    monkeypatch.setitem(sys.modules, "llama_index.core",
+                        types.ModuleType("llama_index.core"))
+    monkeypatch.setitem(sys.modules, "llama_index.core.vector_stores", package)
+    monkeypatch.setitem(sys.modules, "llama_index.core.vector_stores.types",
+                        module)
+    return module
+
+
+class FakeNode:
+    def __init__(self, text, filename, page=1):
+        self.text = text
+        self.metadata = {"page": page, "type": "text", "filename": filename}
+
+    def get_content(self):
+        return self.text
+
+
+class FakeRetriever:
+    def __init__(self, nodes, filters=None):
+        self.nodes = nodes
+        self.filters = filters
+        self.asked = []
+
+    def retrieve(self, question):
+        self.asked.append(question)
+        return self.nodes
+
+
+class FakeIndex:
+    """Records how every retriever was CONSTRUCTED, which is the thing
+    under test: a filter that arrives here reached the query."""
+
+    def __init__(self, nodes, keep_filters=True):
+        self.nodes = nodes
+        self.keep_filters = keep_filters
+        self.constructed = []
+        self.retrievers = []
+
+    def as_retriever(self, **kwargs):
+        self.constructed.append(kwargs)
+        retriever = FakeRetriever(
+            self.nodes,
+            kwargs.get("filters") if self.keep_filters else None)
+        self.retrievers.append(retriever)
+        return retriever
+
+
+class Mode:
+    HYBRID = "hybrid"
+
+
+def _wire_scope(monkeypatch, index=None, names=(), nodes=None):
+    """The engine with its index and its database seam replaced.
+
+    The REAL `db.filenames_for_documents` runs against a recording cursor,
+    so the resolution statement in these tests is the production one.
+    """
+    from contextlib import contextmanager
+
+    from pipeline.index import db
+    from pipeline.retrieval import rag_llamaindex
+
+    statements = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, params=None):
+            statements.append((str(sql), params))
+
+        def fetchall(self):
+            return [(name,) for name in names]
+
+    class Conn:
+        def cursor(self, row_factory=None):
+            return Cursor()
+
+    class Pool:
+        @contextmanager
+        def connection(self):
+            yield Conn()
+
+    if index is None:
+        index = FakeIndex(nodes if nodes is not None else [])
+    monkeypatch.setattr(db, "get_pool", lambda: Pool())
+    monkeypatch.setattr(rag_llamaindex, "_index", lambda: (index, Mode))
+    return rag_llamaindex, index, statements
+
+
+def test_a_scoped_query_is_filtered_at_construction_not_afterwards(
+        monkeypatch, fake_filters):
+    """THE WHOLE ROUTE, in one test.
+
+    The identifiers are resolved to filenames through `documents`, and the
+    resulting metadata filter is handed to the retriever WHEN IT IS BUILT.
+    The fake store then answers with a node the filter would have excluded,
+    and that node comes back untouched -- which is the proof that nothing
+    here re-filters a returned node list. Scoping is the query's job; if it
+    were done in Python after top_k, a scoped document with matches could
+    come back empty merely because other documents filled the pool.
+    """
+    nodes = [FakeNode("kapsam icindeki pasaj", "kapsam-icinde.pdf"),
+             FakeNode("kapsam disindaki pasaj", "kapsam-disinda.pdf")]
+    rag_llamaindex, index, statements = _wire_scope(
+        monkeypatch, names=("kapsam-icinde.pdf",), nodes=nodes)
+
+    chunks = rag_llamaindex.retrieve("kurgu soru",
+                                     document_ids=(IC_BELGE,))
+
+    # the filter reached CONSTRUCTION
+    filters = index.constructed[0]["filters"]
+    assert [(f.key, f.value, f.operator) for f in filters.filters] == [
+        ("filename", ["kapsam-icinde.pdf"], fake_filters.FilterOperator.IN)]
+    # ... and the retriever kept the object it was handed
+    assert index.retrievers[0].filters is filters
+    assert index.retrievers[0].asked == ["kurgu soru"]
+    # ... and the RETURNED nodes were not second-guessed here
+    assert [chunk["filename"] for chunk in chunks] == [
+        "kapsam-icinde.pdf", "kapsam-disinda.pdf"]
+    # resolution went through `documents`, as a parameterised SELECT
+    assert len(statements) == 1
+    sql, params = statements[0]
+    assert sql.startswith("SELECT filename FROM documents")
+    assert params == ([IC_BELGE],)
+    assert IC_BELGE not in sql
+
+
+def test_the_resolved_names_are_exact_filter_values_only(
+        monkeypatch, fake_filters):
+    """A name is a VALUE: never a pattern, never text assembled into a
+    statement. `documents.filename` is unique, so exact membership over
+    names is exactly the set of ids it came from."""
+    rag_llamaindex, index, statements = _wire_scope(
+        monkeypatch, names=("kapsam-icinde.pdf", "ikinci-belge.pdf"))
+
+    rag_llamaindex.retrieve("kurgu soru",
+                            document_ids=(IC_BELGE, DIS_BELGE))
+
+    (metadata_filter,) = index.constructed[0]["filters"].filters
+    # The resolution seam returns names deduplicated AND sorted, which is
+    # what makes the dedup deterministic; the db battery pins the same
+    # contract directly. The order is stated here rather than assumed from
+    # the order the fixture happened to declare its names in.
+    assert metadata_filter.value == sorted(
+        ["kapsam-icinde.pdf", "ikinci-belge.pdf"])
+    assert metadata_filter.operator == fake_filters.FilterOperator.IN
+    for value in metadata_filter.value:
+        assert "%" not in value and "_" not in value
+    # and no resolved NAME was ever put into a statement either
+    for sql, _params in statements:
+        assert "kapsam-icinde.pdf" not in sql
+
+
+def test_an_unscoped_query_passes_no_filter_and_touches_no_database(
+        monkeypatch, fake_filters):
+    """Today's behaviour, unchanged: the same construction, no filter
+    argument at all, and no resolution query."""
+    rag_llamaindex, index, statements = _wire_scope(
+        monkeypatch, nodes=[FakeNode("pasaj", "kurgu.pdf")])
+
+    rag_llamaindex.retrieve("kurgu soru")
+
+    assert "filters" not in index.constructed[0]
+    assert index.constructed[0] == {"similarity_top_k": rag_llamaindex.TOP_K,
+                                    "vector_store_query_mode": Mode.HYBRID}
+    assert statements == []
+
+
+def test_an_unknown_identifier_never_widens_the_query(
+        monkeypatch, fake_filters):
+    """Nothing resolved, so the scope is EMPTY -- and an empty scope is
+    answered with nothing. Querying the index unfiltered here is the one
+    mistake that turns a narrowing request into the whole corpus."""
+    rag_llamaindex, index, _statements = _wire_scope(
+        monkeypatch, names=(), nodes=[FakeNode("pasaj", "kurgu.pdf")])
+
+    assert rag_llamaindex.retrieve("kurgu soru",
+                                   document_ids=(YOK_BELGE,)) == []
+    assert index.constructed == []
+
+
+def test_a_scope_fails_closed_when_the_filter_api_is_absent(monkeypatch):
+    """No `fake_filters` fixture here: the metadata-filter API cannot be
+    imported at all. The engine refuses; it does not answer the wider
+    question and label the answer scoped."""
+    rag_llamaindex, index, statements = _wire_scope(
+        monkeypatch, names=("kapsam-icinde.pdf",),
+        nodes=[FakeNode("pasaj", "kurgu.pdf")])
+    monkeypatch.setitem(sys.modules, "llama_index",
+                        types.ModuleType("llama_index"))
+    monkeypatch.setitem(sys.modules, "llama_index.core",
+                        types.ModuleType("llama_index.core"))
+    monkeypatch.delitem(sys.modules, "llama_index.core.vector_stores",
+                        raising=False)
+    monkeypatch.delitem(sys.modules, "llama_index.core.vector_stores.types",
+                        raising=False)
+
+    with pytest.raises(RuntimeError, match="kapsamli sorgu reddedildi"):
+        rag_llamaindex.retrieve("kurgu soru", document_ids=(IC_BELGE,))
+
+    # refused BEFORE anything that looks like answering
+    assert index.constructed == []
+    assert statements == []
+
+
+def test_a_retriever_that_drops_the_filter_fails_closed(
+        monkeypatch, fake_filters):
+    """A keyword a retriever silently ignores is the failure this engine
+    must not survive: the query would run unscoped and the result would be
+    published as though it had been scoped."""
+    index = FakeIndex([FakeNode("pasaj", "kurgu.pdf")], keep_filters=False)
+    rag_llamaindex, index, _statements = _wire_scope(
+        monkeypatch, index=index, names=("kapsam-icinde.pdf",))
+
+    with pytest.raises(RuntimeError, match="kapsamli sorgu reddedildi"):
+        rag_llamaindex.retrieve("kurgu soru", document_ids=(IC_BELGE,))
+
+    # the retriever was built, but it was never ASKED anything
+    assert index.retrievers[0].asked == []
+
+
+def test_the_checked_answer_forwards_the_scope_to_retrieval(
+        monkeypatch, fake_filters):
+    """The public path carries the scope; an unscoped one still calls
+    `retrieve` with the single argument it has always been given."""
+    from pipeline.retrieval import rag_llamaindex
+
+    seen = []
+    monkeypatch.setattr(rag_llamaindex, "retrieve",
+                        lambda question, **kwargs: seen.append(kwargs) or [])
+    monkeypatch.setattr(
+        "pipeline.generation.answer.generate_structured",
+        lambda _question, _context: '{"dayanak": [], "cevap": '
+                                    '"Bu bilgi mevcut belgelerde bulunamadi."}')
+
+    rag_llamaindex.answer_checked("kurgu soru")
+    rag_llamaindex.answer_checked("kurgu soru", document_ids=(IC_BELGE,))
+
+    assert seen == [{}, {"document_ids": (IC_BELGE,)}]
+
+
+def test_scoping_rebuilds_nothing(monkeypatch, fake_filters):
+    """No index is rebuilt and no schema is touched: the only statement a
+    scoped query runs is the SELECT that resolves the names."""
+    rag_llamaindex, _index, statements = _wire_scope(
+        monkeypatch, names=("kapsam-icinde.pdf",),
+        nodes=[FakeNode("pasaj", "kapsam-icinde.pdf")])
+
+    rag_llamaindex.retrieve("kurgu soru", document_ids=(IC_BELGE,))
+
+    assert len(statements) == 1
+    upper = statements[0][0].upper()
+    for verb in ("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP",
+                 "RENAME"):
+        assert verb not in upper
 
 
 def test_the_table_name_is_normalised_to_lower_case(monkeypatch):

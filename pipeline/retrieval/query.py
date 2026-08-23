@@ -25,7 +25,8 @@ TOP_K      = int(os.getenv("RAG_TOP_K", "15"))
 # shrink the context again.
 TOP_RERANK = int(os.getenv("RAG_TOP_RERANK", str(TOP_K)))
 
-def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
+def retrieve(query: str, top_k: int = TOP_K, *,
+             document_ids=None) -> list[dict]:
     """Hybrid search in Postgres (pgvector) combining dense and sparse vectors via RRF.
 
     Borrows a pooled connection per query instead of caching one at module
@@ -33,11 +34,20 @@ def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
     failed statement (or a server-side kill) took down every later chat request
     until the process restarted. The pool revalidates on checkout and nothing
     connects until the first query, so importing this module still needs no
-    database."""
+    database.
+
+    `document_ids` narrows the search to a named set of documents. It is
+    keyword-only with a default, so the existing positional call sites --
+    including the evaluation harness -- keep their exact meaning. The scope
+    is handed to the query seam rather than applied to its result: both
+    rankings are drawn from the scope, so the fusion never sees a candidate
+    from outside it."""
     dense_vector = embed_dense(query)
     sparse_indices, sparse_values = embed_sparse(query)
     with db.get_pool().connection() as conn:
-        return db.hybrid_search(conn, dense_vector, sparse_indices, sparse_values, top_k=top_k)
+        return db.hybrid_search(conn, dense_vector, sparse_indices,
+                                sparse_values, top_k=top_k,
+                                document_ids=document_ids)
 
 
 def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict]:
@@ -180,17 +190,28 @@ def ask(question: str, structured: bool = False) -> str:
     return generate(question, context.model_text)
 
 
-def ask_checked(question: str):
+def ask_checked(question: str, *, document_ids=None):
     """Generate a structured answer and return its publication decision.
 
     This is the product path. The plain ``ask`` function remains available for
     historical comparisons, but a public caller must not receive its unchecked
     string. Keeping the ``RagContext`` beside the exact model-visible text also
     prevents validation against different retrieval results.
+
+    `document_ids` scopes the retrieval this answer is built from, and it is
+    the ONLY thing it scopes: reranking, context assembly and provenance all
+    read the chunks retrieval returned, so a scope applied at the query is
+    already a scope on the reranker's candidates, on the assembled context
+    and on every citation the answer can carry.
     """
     from pipeline.validation.rag.answer_guard import validate_structured
 
-    chunks = retrieve(question)
+    # Forwarded ONLY when a scope was asked for. An absent scope must reach
+    # `retrieve` as the single-argument call it has always been -- callers
+    # that replace this seam (the evaluation harness, the structured-answer
+    # tests) declare the signature they have always been handed.
+    scope = {} if document_ids is None else {"document_ids": document_ids}
+    chunks = retrieve(question, **scope)
     chunks = rerank(question, chunks)
     context = build_rag_context(chunks, numbered=True)
     reply = gen.generate_structured(question, context.model_text)
