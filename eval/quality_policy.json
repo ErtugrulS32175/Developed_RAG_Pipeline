@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "sets": {
+    "human": {
+      "n": 38,
+      "retrieval_profile": "top_k=15 rrf_k=1",
+      "retrieval_minimum": {"ctx_recall": 1.0, "hit@5": 1.0, "mrr": 0.9693},
+      "answer_minimum": {"ctx_recall": 1.0, "cevap_dogrulugu": 1.0, "ust_sinir": 1.0, "sayfa_dogrulugu": 1.0},
+      "answer_maximum": {"incele_orani": 0.0}
+    },
+    "human2": {
+      "n": 21,
+      "retrieval_profile": "top_k=15 rrf_k=1",
+      "retrieval_minimum": {"ctx_recall": 1.0, "hit@5": 1.0, "mrr": 0.9286},
+      "answer_minimum": {"ctx_recall": 1.0, "cevap_dogrulugu": 1.0, "ust_sinir": 1.0, "sayfa_dogrulugu": 1.0},
+      "answer_maximum": {"incele_orani": 0.0}
+    },
+    "kanun": {
+      "n": 20,
+      "retrieval_profile": "[native] top_k=15 rrf_k=1",
+      "retrieval_minimum": {"ctx_recall": 1.0, "hit@5": 1.0, "mrr": 0.8875},
+      "answer_minimum": {"ctx_recall": 1.0, "cevap_dogrulugu": 0.95, "ust_sinir": 1.0, "sayfa_dogrulugu": 1.0},
+      "answer_maximum": {"incele_orani": 0.05}
+    },
+    "tables": {
+      "n": 17,
+      "retrieval_profile": "top_k=15 rrf_k=1",
+      "retrieval_minimum": {"ctx_recall": 1.0, "hit@5": 0.9412, "mrr": 0.8515},
+      "answer_minimum": {"ctx_recall": 1.0, "cevap_dogrulugu": 0.9412, "ust_sinir": 1.0, "sayfa_dogrulugu": 0.9412},
+      "answer_maximum": {"incele_orani": 0.0588}
+    }
+  }
+}

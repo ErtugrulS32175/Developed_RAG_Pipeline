@@ -123,6 +123,21 @@ right, and which stage is at fault when they are not. Reports show coverage and
 risk together, because suppressing every answer would otherwise look perfectly
 safe.
 
+Saved runs can be checked against the repository's closed quality policy
+without calling a model or embedding service:
+
+```bash
+python -m eval.quality_gate --run-dir output/eval
+```
+
+The gate re-scores raw saved answers with the current deterministic scorer,
+rather than trusting the old summary embedded in each file. Unsettled answers
+remain review cases, so they can raise the upper bound but never the confirmed
+lower bound. Missing sets, changed sample counts, ambiguous retrieval profiles,
+malformed policy fields and metric regressions all fail closed. Its output is
+aggregate-only: set names, counts, metric names and numbers, with no question,
+answer, context or missed-query text.
+
 Ragas adds two optional diagnostic signals, neither of them a release gate:
 faithfulness against the supplied context, and similarity to a hand-written
 reference. The judge is whatever `LLM_API_URL` points at, so nothing leaves your
