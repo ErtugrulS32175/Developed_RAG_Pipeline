@@ -28,7 +28,7 @@ services:
       - pgvector_data:/var/lib/postgresql/data
       # applied once, on an empty data directory -- it creates the vector
       # extension and every table, so no separate schema step is needed
-      - ./pipeline/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ./pipeline/index/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U rag -d ragdb"]
       interval: 5s

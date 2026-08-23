@@ -168,6 +168,15 @@ cannot install, fetch or commit anything, and the acceptance commands are run by
 the runner rather than by the model. That split is what makes the gates mean
 something.
 
+While `runner.run` or `runner.resume` is active, treat the main checkout as
+read-only evidence. Do not run pytest (including `--collect-only`), formatters,
+IDE tasks or any other command that can write a cache, bytecode or generated
+file there: even `.pytest_cache` is deliberately part of the before/after
+evidence, and a write makes the runner reject an otherwise valid candidate.
+Measure in a disposable clone pinned to the run's baseline instead, outside the
+candidate workspace and `.agent-loop/` holder. Reading the closed `RunResult`
+after the call returns is safe; inspecting or changing the live run is not.
+
 A run gets exactly one repair attempt. It can be spent either by the evaluator
 asking for changes, or by the first acceptance run failing on ordinary test
 failures the runner can identify. Anything it cannot identify, such as a

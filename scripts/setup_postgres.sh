@@ -38,7 +38,7 @@ done
 
 echo "Enabling pgvector extension and creating schema..."
 docker exec "${CONTAINER_NAME}" psql -U rag -d ragdb -c "CREATE EXTENSION IF NOT EXISTS vector;"
-docker exec -i "${CONTAINER_NAME}" psql -U rag -d ragdb < pipeline/schema.sql
+docker exec -i "${CONTAINER_NAME}" psql -U rag -d ragdb < pipeline/index/schema.sql
 
 echo "Done."
 echo "Connection string: postgresql://rag:<DB_PASSWORD>@localhost:${HOST_PORT}/ragdb"

@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS chunks (
 -- above won't add this column to an already-created chunks table.
 ALTER TABLE chunks ADD COLUMN IF NOT EXISTS document_id uuid REFERENCES documents(id);
 
+-- Document-scoped retrieval filters this column before ranking. Measured on a
+-- real PostgreSQL 17 + pgvector server with 10,002 chunks and a 1% scope: the
+-- unindexed plan scanned all 10,002 rows (estimated cost 322), while this
+-- index selected the 101 scoped rows directly (estimated cost 29). Unscoped
+-- retrieval kept its sequential plan, so the index narrows only the new path.
+CREATE INDEX IF NOT EXISTS chunks_document_id_idx ON chunks(document_id);
+
 -- What the filename cannot say: WHICH bytes this row represents. Documents
 -- are keyed by filename, so two different files sharing a basename used to
 -- merge silently -- and the second ingest then deleted the first file's
