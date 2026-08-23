@@ -619,8 +619,12 @@ def process_document(document_id: str):
     # connection parked here for that long would starve every other request.
     with db_conn() as conn:
         doc = db.get_document(conn, document_id)
+        queued_job = db.active_ingest_job(conn, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
+    if queued_job is not None:
+        raise HTTPException(status_code=409,
+                            detail="document already has an active ingest job")
     if doc.get("archived_at") is not None:
         raise HTTPException(status_code=409, detail="document is archived")
     # A row with no recorded candidate has nothing for an ingest to bind
@@ -679,6 +683,12 @@ def process_document(document_id: str):
                 status_code=409,
                 detail="bu belge icin calisan bir islem var; bitmesini "
                        "bekleyin")
+        except db.IngestJobConflict:
+            # The earlier read is only a fast refusal. begin_attempt repeats
+            # it while holding the document row lock, closing enqueue races.
+            raise HTTPException(
+                status_code=409,
+                detail="document already has an active ingest job")
         except db.DocumentLifecycleConflict:
             # Rechecked while taking the row lock: archive may have committed
             # after the read above and before begin_attempt started.
@@ -733,6 +743,48 @@ def process_document(document_id: str):
     if note:
         response["status_note"] = note
     return response
+
+
+@app.post("/documents/{document_id}/ingest-jobs", dependencies=AUTH,
+          status_code=202)
+def enqueue_ingest_job(
+        document_id: UUID,
+        idempotency_key: Annotated[
+            str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+):
+    try:
+        with db_conn() as conn:
+            job = db.enqueue_ingest_job(
+                conn, str(document_id), idempotency_key)
+    except (db.IngestJobConflict, db.DocumentLifecycleConflict,
+            CandidateNotPublished) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    if job is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    return job
+
+
+@app.get("/ingest-jobs/{job_id}", dependencies=AUTH)
+def read_ingest_job(job_id: UUID):
+    with db_conn() as conn:
+        job = db.get_ingest_job(conn, str(job_id))
+    if job is None:
+        raise HTTPException(status_code=404, detail="ingest job not found")
+    return job
+
+
+@app.delete("/ingest-jobs/{job_id}", dependencies=AUTH)
+def cancel_ingest_job(job_id: UUID):
+    try:
+        with db_conn() as conn:
+            job = db.cancel_ingest_job(conn, str(job_id))
+    except db.IngestJobConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    if job is None:
+        raise HTTPException(status_code=404, detail="ingest job not found")
+    return job
 
 
 # What an INVENTORY may say about a document. Deliberately not "the row

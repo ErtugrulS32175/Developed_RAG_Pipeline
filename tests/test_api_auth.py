@@ -57,6 +57,9 @@ def test_every_data_endpoint_is_covered(secured):
         ("post", "/v1/chat/completions"),
         ("post", "/documents/upload"),
         ("post", "/documents/abc/process"),
+        ("post", "/documents/11111111-1111-1111-1111-111111111111/ingest-jobs"),
+        ("get", "/ingest-jobs/22222222-2222-2222-2222-222222222222"),
+        ("delete", "/ingest-jobs/22222222-2222-2222-2222-222222222222"),
         ("get", "/documents/abc"),
     ]:
         r = getattr(secured, method)(path)

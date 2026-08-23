@@ -27,7 +27,6 @@ import pytest
 
 from pipeline.index import db, ingest
 from pipeline.index.attempt_contract import (
-    AttemptFenced,
     CandidateConflict,
     CandidateNotPublished,
     CandidateState,
@@ -631,6 +630,8 @@ def test_a_process_in_the_publish_gap_is_refused_without_touching_state(
             raise RuntimeError("disk icerigi kayitli adayla uyusmuyor")
 
     monkeypatch.setattr(api, "db_conn", fake_conn)
+    monkeypatch.setattr(api.db, "active_ingest_job",
+                        lambda _conn, _document_id: None)
     monkeypatch.setattr(api.db, "document_publish_lock", publish_lock)
     for name in ("upsert_document", "lookup_document", "get_document",
                  "set_document_status", "stage_candidate",
@@ -1245,7 +1246,9 @@ def test_the_frozen_seams_have_exact_signatures():
           "allow_replace")),
         (db, "finalize_candidate_publication",
          ("conn", "document_id", "candidate_id")),
-        (db, "begin_attempt", ("conn", "document_id", "owner")),
+        (db, "begin_attempt",
+         ("conn", "document_id", "owner", "ingest_job_id",
+          "ingest_job_worker")),
         (db, "heartbeat_attempt", ("conn", "attempt")),
         (db, "record_attempt_outcome",
          ("conn", "attempt", "status", "note")),

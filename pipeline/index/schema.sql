@@ -46,6 +46,41 @@ CREATE TABLE IF NOT EXISTS document_tags (
 
 CREATE INDEX IF NOT EXISTS document_tags_tag_idx ON document_tags(tag_id);
 
+-- Durable ingest requests are separate from attempt leases. A job survives an
+-- API or worker restart; an attempt remains the fenced authority for writes to
+-- one candidate. Only the digest of the caller's idempotency key is persisted.
+CREATE TABLE IF NOT EXISTS ingest_jobs (
+    id                     uuid PRIMARY KEY,
+    document_id            uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    candidate_id           uuid NOT NULL,
+    candidate_sha          text NOT NULL CHECK (length(candidate_sha) = 64),
+    idempotency_key_sha256 text NOT NULL
+                           CHECK (length(idempotency_key_sha256) = 64),
+    status                 text NOT NULL DEFAULT 'queued'
+                           CHECK (status IN ('queued', 'running', 'succeeded',
+                                             'partial', 'failed', 'cancelled')),
+    attempt_count          integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    worker_id              text,
+    lease_expires_at       timestamptz,
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    started_at             timestamptz,
+    finished_at            timestamptz,
+    outcome_note           text CHECK (outcome_note IS NULL OR
+                                       length(outcome_note) BETWEEN 1 AND 100),
+    CHECK ((status = 'running') =
+           (worker_id IS NOT NULL AND lease_expires_at IS NOT NULL)),
+    CHECK ((status IN ('succeeded', 'partial', 'failed', 'cancelled')) =
+           (finished_at IS NOT NULL)),
+    UNIQUE (document_id, idempotency_key_sha256)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ingest_jobs_one_active_document_idx
+    ON ingest_jobs(document_id)
+    WHERE status IN ('queued', 'running');
+
+CREATE INDEX IF NOT EXISTS ingest_jobs_claim_idx
+    ON ingest_jobs(status, created_at, id);
+
 -- fastembed's Qdrant/bm25 has no fixed vocabulary: it hashes tokens with
 -- MurmurHash3 (abs() of a signed 32-bit hash), giving raw indices up to
 -- ~2.15 billion -- past pgvector's sparsevec dimension cap (1e9). Every

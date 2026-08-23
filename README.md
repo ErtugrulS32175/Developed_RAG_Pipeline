@@ -170,6 +170,30 @@ are case-insensitive identities while preserving their first display spelling.
 Archived documents never resolve into a chat scope, and an empty resolved scope
 stays empty rather than widening to the whole corpus.
 
+### Durable ingest jobs
+
+For work that must survive an API or worker restart, enqueue the current
+published candidate with `POST /documents/{document_id}/ingest-jobs` and a
+bounded `Idempotency-Key` header. Repeating that key returns the same job rather
+than starting duplicate work. Read it with `GET /ingest-jobs/{job_id}` or cancel
+a still-queued job with `DELETE /ingest-jobs/{job_id}`. Responses expose closed
+job state and counters, never the idempotency key or candidate digest.
+
+Run workers separately from the API:
+
+```bash
+python -m pipeline.index.job_worker
+```
+
+Workers claim rows with a database lease, bind each job to the candidate that
+was current when it was queued, and use the existing fenced ingest-attempt
+authority for every chunk write and publication. Expired work is retried up to
+the configured attempt budget; an expired owner cannot finish or requeue it.
+Only one queued/running job or synchronous `/process` call may own a document at
+a time, and archive/restore refuses while that work is active. The synchronous
+`POST /documents/{document_id}/process` route remains available for callers that
+intentionally want request-bound processing.
+
 ## Controlled task runs (agent-loop)
 
 `tools/agent_loop` runs a coding task through an implementer model and an

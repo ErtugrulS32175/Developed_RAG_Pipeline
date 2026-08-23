@@ -366,6 +366,8 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
     monkeypatch.setattr(api.db, "begin_attempt", begin_attempt)
     monkeypatch.setattr(api.db, "lookup_document", lookup_document)
     monkeypatch.setattr(api.db, "get_document", get_document)
+    monkeypatch.setattr(api.db, "active_ingest_job",
+                        lambda _conn, _document_id: None)
     monkeypatch.setattr(api.db, "set_document_status", set_document_status)
     monkeypatch.setattr(api.db, "set_document_archived",
                         set_document_archived)

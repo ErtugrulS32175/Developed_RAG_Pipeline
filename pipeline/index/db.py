@@ -1,3 +1,4 @@
+import hashlib
 import os
 import uuid
 from contextlib import contextmanager
@@ -40,6 +41,14 @@ SPARSE_DIM = 999_999_937
 
 class DocumentLifecycleConflict(RuntimeError):
     """A document with an active ingest lease cannot change lifecycle."""
+
+
+class IngestJobConflict(RuntimeError):
+    """A document already has incompatible queued/running work."""
+
+
+class IngestJobOwnershipLost(RuntimeError):
+    """A worker tried to update a job it no longer owns."""
 
 
 def get_conn() -> psycopg.Connection:
@@ -347,7 +356,9 @@ def _default_owner() -> str:
     return f"{socket.gethostname()}/{os.getpid()}"
 
 
-def begin_attempt(conn, document_id: str, owner: str | None = None):
+def begin_attempt(conn, document_id: str, owner: str | None = None,
+                  ingest_job_id: str | None = None,
+                  ingest_job_worker: str | None = None):
     """Take the lease on a PUBLISHED candidate and mint the run's identity.
 
     One transaction does all three things the contract names: verify the
@@ -366,6 +377,8 @@ def begin_attempt(conn, document_id: str, owner: str | None = None):
     write nothing from this moment on and its record must not dangle.
     Expiry is judged by the DATABASE clock; a worker's own clock has no
     say in whether its lease is still good."""
+    if (ingest_job_id is None) != (ingest_job_worker is None):
+        raise ValueError("ingest job kimligi ve worker birlikte verilmeli")
     with conn.cursor() as cur:
         cur.execute(
             "SELECT candidate_state, candidate_id, content_sha256, "
@@ -387,6 +400,30 @@ def begin_attempt(conn, document_id: str, owner: str | None = None):
             conn.rollback()
             raise CandidateNotPublished(
                 "aday yayimlanmis degil; bu belge simdilik islenemez")
+        # The document lock closes the race between the synchronous endpoint
+        # and queue insertion. A worker may pass only the live job it already
+        # owns; every other caller must observe an entirely idle queue.
+        cur.execute(
+            "SELECT id, status, worker_id, "
+            "(lease_expires_at IS NOT NULL AND lease_expires_at > now()) "
+            "FROM ingest_jobs WHERE document_id = %s "
+            "AND status IN ('queued', 'running') "
+            "ORDER BY created_at, id LIMIT 1 FOR UPDATE",
+            (document_id,))
+        active_job = cur.fetchone()
+        if ingest_job_id is None:
+            if active_job is not None:
+                conn.rollback()
+                raise IngestJobConflict(
+                    "etkin ingest job varken dogrudan deneme baslatilamaz")
+        elif (active_job is None
+              or str(active_job[0]) != str(ingest_job_id)
+              or active_job[1] != "running"
+              or active_job[2] != ingest_job_worker
+              or not active_job[3]):
+            conn.rollback()
+            raise IngestJobOwnershipLost(
+                "ingest job bu worker icin canli ve bagli degil")
         if held_by is not None and lease_is_live:
             conn.rollback()
             raise AttemptAlreadyRunning(
@@ -836,6 +873,241 @@ def resolve_document_scope(conn, *, document_ids=None, collection_ids=None,
         return tuple(str(row[0]) for row in cur.fetchall())
 
 
+def _job_key_digest(value: str) -> str:
+    """Validate an HTTP idempotency token and retain only its digest."""
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or len(value) > 200
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise ValueError("idempotency key gecersiz")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _job_note(value) -> str | None:
+    if value is None:
+        return None
+    if (not isinstance(value, str) or not value or len(value) > 100
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise ValueError("job outcome note gecersiz")
+    return value
+
+
+def _public_job(row) -> dict:
+    return {
+        "job_id": str(row["id"]),
+        "document_id": str(row["document_id"]),
+        "candidate_id": str(row["candidate_id"]),
+        "status": row["status"],
+        "attempt_count": int(row["attempt_count"]),
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "outcome_note": row["outcome_note"],
+    }
+
+
+def enqueue_ingest_job(conn, document_id: str, idempotency_key: str) -> dict | None:
+    """Persist one candidate-bound job, idempotently and one-active-per-doc."""
+    key_digest = _job_key_digest(idempotency_key)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT id, candidate_id, content_sha256, candidate_state, "
+            "archived_at, attempt_id FROM documents WHERE id = %s FOR UPDATE",
+            (document_id,))
+        document = cur.fetchone()
+        if document is None:
+            conn.rollback()
+            return None
+        cur.execute(
+            "SELECT * FROM ingest_jobs WHERE document_id = %s "
+            "AND idempotency_key_sha256 = %s",
+            (document_id, key_digest))
+        existing = cur.fetchone()
+        if existing is not None:
+            conn.commit()
+            return _public_job(existing)
+        if document["archived_at"] is not None:
+            raise DocumentLifecycleConflict(
+                "arsivlenmis belge kuyruga alinamaz")
+        if (document["candidate_state"] != CandidateState.PUBLISHED
+                or document["candidate_id"] is None
+                or not document["content_sha256"]):
+            raise CandidateNotPublished("yayimlanmis aday olmadan job olusmaz")
+        if document["attempt_id"] is not None:
+            raise IngestJobConflict("belgenin canli ingest denemesi var")
+        cur.execute(
+            "SELECT id FROM ingest_jobs WHERE document_id = %s "
+            "AND status IN ('queued', 'running')",
+            (document_id,))
+        if cur.fetchone() is not None:
+            raise IngestJobConflict("belgenin etkin ingest job'i var")
+        job_id = str(uuid.uuid4())
+        cur.execute(
+            "INSERT INTO ingest_jobs "
+            "(id, document_id, candidate_id, candidate_sha, "
+            "idempotency_key_sha256) "
+            "VALUES (%(id)s, %(document)s, %(candidate)s, %(sha)s, %(key)s) "
+            "RETURNING *",
+            {"id": job_id, "document": document_id,
+             "candidate": str(document["candidate_id"]),
+             "sha": document["content_sha256"], "key": key_digest})
+        row = cur.fetchone()
+    conn.commit()
+    return _public_job(row)
+
+
+def get_ingest_job(conn, job_id: str) -> dict | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT * FROM ingest_jobs WHERE id = %s", (job_id,))
+        row = cur.fetchone()
+    return None if row is None else _public_job(row)
+
+
+def active_ingest_job(conn, document_id: str) -> dict | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT * FROM ingest_jobs WHERE document_id = %s "
+            "AND status IN ('queued', 'running') ORDER BY created_at, id LIMIT 1",
+            (document_id,))
+        row = cur.fetchone()
+    return None if row is None else _public_job(row)
+
+
+def claim_ingest_job(conn, worker_id: str, lease_seconds: int = 300,
+                     max_attempts: int = 3) -> dict | None:
+    """Claim one queued/expired job with SKIP LOCKED for concurrent workers."""
+    worker_id, _worker_key = _canonical_label(worker_id, "worker_id")
+    if (not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool)
+            or lease_seconds < 30 or lease_seconds > 7200):
+        raise ValueError("job lease 30..7200 saniye olmali")
+    if (not isinstance(max_attempts, int) or isinstance(max_attempts, bool)
+            or max_attempts < 1 or max_attempts > 20):
+        raise ValueError("max_attempts 1..20 olmali")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "UPDATE ingest_jobs SET status = 'failed', finished_at = now(), "
+            "worker_id = NULL, lease_expires_at = NULL, "
+            "outcome_note = 'attempts_exhausted' "
+            "WHERE status = 'running' AND lease_expires_at <= now() "
+            "AND attempt_count >= %s", (max_attempts,))
+        cur.execute(
+            "WITH next_job AS (SELECT id FROM ingest_jobs "
+            "WHERE (status = 'queued' OR (status = 'running' "
+            "AND lease_expires_at <= now())) "
+            "AND attempt_count < %(max_attempts)s "
+            "ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 1) "
+            "UPDATE ingest_jobs j SET status = 'running', "
+            "worker_id = %(worker)s, attempt_count = attempt_count + 1, "
+            "started_at = COALESCE(started_at, now()), finished_at = NULL, "
+            "outcome_note = NULL, "
+            "lease_expires_at = now() + make_interval(secs => %(lease)s) "
+            "FROM next_job WHERE j.id = next_job.id RETURNING j.*",
+            {"worker": worker_id, "lease": lease_seconds,
+             "max_attempts": max_attempts})
+        row = cur.fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        cur.execute(
+            "SELECT filename, archived_at, candidate_id, content_sha256 "
+            "FROM documents WHERE id = %s", (row["document_id"],))
+        document = cur.fetchone()
+    conn.commit()
+    claimed = _public_job(row)
+    claimed.update({
+        "filename": None if document is None else document["filename"],
+        "archived_at": None if document is None else document["archived_at"],
+        "bound_candidate_id": str(row["candidate_id"]),
+        "bound_candidate_sha": row["candidate_sha"],
+        "current_candidate_id": (None if document is None else
+                                 str(document["candidate_id"])),
+        "current_candidate_sha": (None if document is None else
+                                  document["content_sha256"]),
+    })
+    return claimed
+
+
+def heartbeat_ingest_job(conn, job_id: str, worker_id: str,
+                         lease_seconds: int = 300) -> bool:
+    if (not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool)
+            or not 30 <= lease_seconds <= 7200):
+        raise ValueError("job lease 30..7200 saniye olmali")
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE ingest_jobs SET lease_expires_at = "
+            "now() + make_interval(secs => %(lease)s) "
+            "WHERE id = %(id)s AND status = 'running' "
+            "AND worker_id = %(worker)s AND lease_expires_at > now()",
+            {"lease": lease_seconds, "id": job_id, "worker": worker_id})
+        moved = cur.rowcount == 1
+    conn.commit()
+    return moved
+
+
+def finish_ingest_job(conn, job_id: str, worker_id: str, status: str,
+                      note: str | None = None) -> bool:
+    if status not in {"succeeded", "partial", "failed"}:
+        raise ValueError("job terminal status gecersiz")
+    note = _job_note(note)
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE ingest_jobs SET status = %(status)s, finished_at = now(), "
+            "worker_id = NULL, lease_expires_at = NULL, outcome_note = %(note)s "
+            "WHERE id = %(id)s AND status = 'running' "
+            "AND worker_id = %(worker)s AND lease_expires_at > now()",
+            {"status": status, "note": note, "id": job_id,
+             "worker": worker_id})
+        changed = cur.rowcount == 1
+    conn.commit()
+    return changed
+
+
+def retry_ingest_job(conn, job_id: str, worker_id: str,
+                     note: str, max_attempts: int = 3) -> str:
+    """Requeue while budget remains; otherwise close failed."""
+    note = _job_note(note)
+    if (not isinstance(max_attempts, int) or isinstance(max_attempts, bool)
+            or max_attempts < 1 or max_attempts > 20):
+        raise ValueError("max_attempts 1..20 olmali")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "UPDATE ingest_jobs SET "
+            "status = CASE WHEN attempt_count < %(max)s THEN 'queued' "
+            "ELSE 'failed' END, "
+            "finished_at = CASE WHEN attempt_count < %(max)s THEN NULL "
+            "ELSE now() END, worker_id = NULL, lease_expires_at = NULL, "
+            "outcome_note = %(note)s "
+            "WHERE id = %(id)s AND status = 'running' "
+            "AND worker_id = %(worker)s AND lease_expires_at > now() "
+            "RETURNING status",
+            {"max": max_attempts, "note": note, "id": job_id,
+             "worker": worker_id})
+        row = cur.fetchone()
+    conn.commit()
+    if row is None:
+        raise IngestJobOwnershipLost("ingest job lease artik bu worker'in degil")
+    return row["status"]
+
+
+def cancel_ingest_job(conn, job_id: str) -> dict | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT * FROM ingest_jobs WHERE id = %s FOR UPDATE",
+                    (job_id,))
+        row = cur.fetchone()
+        if row is None:
+            conn.rollback()
+            return None
+        if row["status"] == "running":
+            raise IngestJobConflict("calisan job iptal edilemez")
+        if row["status"] == "queued":
+            cur.execute(
+                "UPDATE ingest_jobs SET status = 'cancelled', "
+                "finished_at = now(), outcome_note = 'cancelled_by_user' "
+                "WHERE id = %s RETURNING *", (job_id,))
+            row = cur.fetchone()
+    conn.commit()
+    return _public_job(row)
+
+
 # The ONE escape character every LIKE pattern in this module is built
 # with. It is a literal in the code and is NEVER taken from a caller: an
 # operator or an escape character chosen by input would be a fragment of
@@ -1102,6 +1374,14 @@ def set_document_archived(conn, document_id: str,
             return {"document_id": str(row["id"]),
                     "archived": already,
                     "archived_at": row["archived_at"]}
+        cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM ingest_jobs "
+            "WHERE document_id = %s AND status IN ('queued', 'running')) "
+            "AS has_active_job",
+            (document_id,))
+        if cur.fetchone()["has_active_job"]:
+            raise DocumentLifecycleConflict(
+                "etkin ingest job varken belge yasam dongusu degisemez")
         if row["attempt_id"] is not None:
             raise DocumentLifecycleConflict(
                 "aktif ingest denemesi varken belge yasam dongusu degisemez")

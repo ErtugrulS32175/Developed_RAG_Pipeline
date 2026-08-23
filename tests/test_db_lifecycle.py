@@ -319,10 +319,12 @@ def test_the_listing_refuses_a_non_boolean_lifecycle_before_sql(archived):
 
 
 class LifecycleCursor:
-    """A two-statement row-lock/update seam for lifecycle transitions."""
+    """A row-lock, active-job, and update seam for lifecycle transitions."""
 
     def __init__(self, row, changed=None):
         self._answers = [row]
+        if row is not None:
+            self._answers.append({"has_active_job": False})
         if changed is not None:
             self._answers.append(changed)
         self.executed = []
@@ -374,10 +376,13 @@ def test_archive_locks_the_row_and_changes_only_lifecycle_metadata():
     result = db.set_document_archived(conn, "kurgu-id", True)
 
     lock_sql, lock_params = conn.cur.executed[0]
-    update_sql, update_params = conn.cur.executed[1]
+    active_job_sql, active_job_params = conn.cur.executed[1]
+    update_sql, update_params = conn.cur.executed[2]
     assert "SELECT id, archived_at, attempt_id" in lock_sql
     assert lock_sql.endswith("WHERE id = %s FOR UPDATE")
     assert lock_params == ("kurgu-id",)
+    assert "FROM ingest_jobs" in active_job_sql
+    assert active_job_params == ("kurgu-id",)
     assert "SET archived_at" in update_sql
     assert "now()" in update_sql and "ELSE NULL" in update_sql
     assert update_params == {"archived": True, "id": "kurgu-id"}
@@ -401,7 +406,7 @@ def test_restore_sets_the_lifecycle_marker_to_null():
 
     result = db.set_document_archived(conn, "kurgu-id", False)
 
-    assert conn.cur.executed[1][1]["archived"] is False
+    assert conn.cur.executed[2][1]["archived"] is False
     assert result["archived"] is False
     assert result["archived_at"] is None
     assert conn.commits == 1
@@ -441,7 +446,20 @@ def test_an_active_ingest_attempt_blocks_a_lifecycle_transition():
 
     with pytest.raises(db.DocumentLifecycleConflict):
         db.set_document_archived(conn, "kurgu-id", True)
-    assert len(conn.cur.executed) == 1
+    assert len(conn.cur.executed) == 2
+    assert conn.commits == 0
+
+
+def test_an_active_ingest_job_blocks_a_lifecycle_transition():
+    from pipeline.index import db
+
+    conn = LifecycleConn(_lifecycle_row())
+    conn.cur._answers[1] = {"has_active_job": True}
+
+    with pytest.raises(db.DocumentLifecycleConflict):
+        db.set_document_archived(conn, "kurgu-id", True)
+    assert len(conn.cur.executed) == 2
+    assert "FROM ingest_jobs" in conn.cur.executed[1][0]
     assert conn.commits == 0
 
 
