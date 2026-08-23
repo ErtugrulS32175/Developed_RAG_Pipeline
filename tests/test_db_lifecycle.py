@@ -1401,6 +1401,7 @@ def test_an_unscoped_hybrid_search_sends_no_clause_and_no_parameter():
         assert "document_id = ANY" not in sql
         # only the ranking vector and the page size travel
         assert len(params) == 2
+        assert params[-1] == db.rrf_candidate_limit(5)
 
 
 def test_both_hybrid_statements_carry_the_SAME_scope_clause():
@@ -1421,9 +1422,20 @@ def test_both_hybrid_statements_carry_the_SAME_scope_clause():
     # the same scope, bound the same way, on both
     assert dense_params[0] == [IC_BELGE]
     assert sparse_params[0] == [IC_BELGE]
+    assert dense_params[-1] == db.rrf_candidate_limit(5)
+    assert sparse_params[-1] == db.rrf_candidate_limit(5)
     # and the two statements differ ONLY in how they rank
     assert (dense_sql.split("ORDER BY")[0]
             == sparse_sql.split("ORDER BY")[0])
+
+
+def test_each_modality_has_a_stable_identity_tie_break_before_its_cut():
+    _found, cur = _hybrid()
+
+    dense_sql, _ = cur.executed[0]
+    sparse_sql, _ = cur.executed[1]
+    assert "ORDER BY c.dense <=> %s::vector, c.id LIMIT %s" in dense_sql
+    assert "ORDER BY c.sparse <#> %s::sparsevec, c.id LIMIT %s" in sparse_sql
 
 
 def test_both_hybrid_rankings_exclude_archived_documents_before_the_cut():

@@ -1821,6 +1821,48 @@ def lock_retrieval_filenames(conn, document_ids=None) -> list[str]:
 # single array parameter, which is also why a repeated identifier can
 # neither widen the scope nor add a second filter.
 DOCUMENT_SCOPE_CLAUSE = "c.document_id = ANY(%s::uuid[])"
+RRF_CANDIDATE_MULTIPLIER = 4
+RRF_CANDIDATE_CEILING = 200
+
+
+def rrf_candidate_limit(top_k):
+    """Bounded breadth for each ranking before reciprocal-rank fusion.
+
+    Pulling only ``top_k`` from each modality makes fusion blind to a chunk
+    ranked just below both individual cuts even when the two rankings together
+    make it the strongest candidate.  Four times the requested result size is
+    enough room for agreement to surface, while the absolute ceiling keeps a
+    caller from turning one request into an unbounded materialisation.  A
+    request already above the ceiling is never silently shrunk.
+    """
+    if type(top_k) is not int or top_k < 1:
+        raise ValueError("top_k pozitif bir tamsayi olmali")
+    return min(top_k * RRF_CANDIDATE_MULTIPLIER,
+               max(top_k, RRF_CANDIDATE_CEILING))
+
+
+def reciprocal_rank_fusion(dense_ranked, sparse_ranked, top_k, rrf_k):
+    """Fuse two complete rankings with stable ties and closed identities."""
+    if type(top_k) is not int or top_k < 1:
+        raise ValueError("top_k pozitif bir tamsayi olmali")
+    if type(rrf_k) is not int or rrf_k < 0:
+        raise ValueError("rrf_k negatif olmayan bir tamsayi olmali")
+    scores, payloads = {}, {}
+    for ranked_list in (dense_ranked, sparse_ranked):
+        seen = set()
+        for rank, row in enumerate(ranked_list, start=1):
+            if type(row) is not dict or row.get("id") is None:
+                raise ValueError("siralanmis chunk kapali bir id tasimali")
+            rid = row["id"]
+            if rid in seen:
+                raise ValueError("bir ranking ayni chunk kimligini tekrarladi")
+            seen.add(rid)
+            if rid in payloads and dict(payloads[rid]) != dict(row):
+                raise ValueError("iki ranking ayni chunk icin farkli veri tasidi")
+            payloads.setdefault(rid, row)
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (rrf_k + rank)
+    fused = sorted(scores, key=lambda rid: (-scores[rid], str(rid)))[:top_k]
+    return [payloads[rid] for rid in fused]
 
 
 def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15,
@@ -1842,6 +1884,9 @@ def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15,
     An empty set is a legitimate scope and matches nothing -- an identifier
     that names no document must never fall back to the whole corpus.
     """
+    candidate_limit = rrf_candidate_limit(top_k)
+    if type(rrf_k) is not int or rrf_k < 0:
+        raise ValueError("rrf_k negatif olmayan bir tamsayi olmali")
     sparse_lit = sparse_to_literal(sparse_indices, sparse_values)
     cols = (
         "c.id, c.type, c.text, c.source_tag, c.page, c.headings, c.table_data, "
@@ -1876,26 +1921,16 @@ def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15,
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             f"SELECT {cols} FROM {from_clause} {where_clause} "
-            f"ORDER BY c.dense <=> %s::vector LIMIT %s",
-            (*scope_params, dense_vec, top_k),
+            f"ORDER BY c.dense <=> %s::vector, c.id LIMIT %s",
+            (*scope_params, dense_vec, candidate_limit),
         )
         dense_ranked = cur.fetchall()
 
         cur.execute(
             f"SELECT {cols} FROM {from_clause} {where_clause} "
-            f"ORDER BY c.sparse <#> %s::sparsevec LIMIT %s",
-            (*scope_params, sparse_lit, top_k),
+            f"ORDER BY c.sparse <#> %s::sparsevec, c.id LIMIT %s",
+            (*scope_params, sparse_lit, candidate_limit),
         )
         sparse_ranked = cur.fetchall()
 
-    # Reciprocal Rank Fusion: combine the two rankings into one score per chunk.
-    scores: dict = {}
-    payloads: dict = {}
-    for ranked_list in (dense_ranked, sparse_ranked):
-        for rank, row in enumerate(ranked_list, start=1):
-            rid = row["id"]
-            scores[rid] = scores.get(rid, 0.0) + 1.0 / (rrf_k + rank)
-            payloads[rid] = row
-
-    fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-    return [payloads[rid] for rid, _ in fused]
+    return reciprocal_rank_fusion(dense_ranked, sparse_ranked, top_k, rrf_k)

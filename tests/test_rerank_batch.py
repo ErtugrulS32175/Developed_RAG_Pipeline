@@ -91,3 +91,10 @@ def test_empty_candidates_never_touch_the_service(monkeypatch):
     calls = _capture(monkeypatch, [])
     assert query.rerank("kurgu soru", [], top_n=5) == []
     assert calls == []
+
+
+def test_one_candidate_is_already_ranked_and_never_touches_the_service(monkeypatch):
+    calls = _capture(monkeypatch, [0.5])
+    chunk = {"text": "tek pasaj"}
+    assert query.rerank("kurgu soru", [chunk], top_n=1) == [chunk]
+    assert calls == []

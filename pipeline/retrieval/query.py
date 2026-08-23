@@ -74,6 +74,11 @@ def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict
     equivalence of ranking, not of answers."""
     if not chunks:
         return []
+    # One item is already totally ordered. Avoid a network round-trip which
+    # cannot change either membership or order, and keep the original mapping
+    # object rather than manufacturing a second representation of the chunk.
+    if len(chunks) == 1:
+        return list(chunks[:top_n])
     response = requests.post(
         RERANK_API_URL,
         json={

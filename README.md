@@ -138,6 +138,14 @@ malformed policy fields and metric regressions all fail closed. Its output is
 aggregate-only: set names, counts, metric names and numbers, with no question,
 answer, context or missed-query text.
 
+Hybrid retrieval takes a bounded candidate pool from both dense and sparse
+rankings before reciprocal-rank fusion: four times the requested result count,
+up to 200 candidates per ranking. The final `top_k` is unchanged. This lets a
+passage supported by both rankings beat modality-specific leaders just outside
+the old cut, while keeping database work bounded. Distance ties and fused-score
+ties use chunk identity as a deterministic final key, so pagination-free
+retrieval does not depend on database return order.
+
 Ragas adds two optional diagnostic signals, neither of them a release gate:
 faithfulness against the supplied context, and similarity to a hand-written
 reference. The judge is whatever `LLM_API_URL` points at, so nothing leaves your
