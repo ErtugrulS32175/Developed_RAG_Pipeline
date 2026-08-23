@@ -44,9 +44,11 @@ docker compose up -d                # PostgreSQL + Open WebUI
 docker compose --profile gpu up -d  # plus embeddings (8011) and reranker (8002)
 ```
 
-The database builds its schema on first start. On a machine with no GPU, skip
-`--profile gpu` and point `EMBED_API_URL` and `RERANK_API_URL` at the host that
-has one.
+The container bootstraps an empty database. Every deploy must then run the
+versioned migration command below; it serialises concurrent deploys and records
+the exact `schema.sql` digest that `/ready` later checks. On a machine with no
+GPU, skip `--profile gpu` and point `EMBED_API_URL` and `RERANK_API_URL` at the
+host that has one.
 
 Each model service gets its own environment. Table extraction needs a GPU
 (CUDA 12.6) and a Linux host, because the CUDA stack these use does not work on
@@ -90,10 +92,62 @@ either retrieval backend runs, so an external index cannot widen PostgreSQL's
 tenant boundary.
 
 Leave it empty and the API runs open, warning you about it at startup. That is
-fine on localhost and never fine anywhere else. Two endpoints stay open on
-purpose so monitoring can reach them: `/health` says the process is alive,
-`/ready` says it can actually serve, checking the database and the embedding
-service and returning 503 when either is down.
+fine on localhost and never fine anywhere else. Three endpoints stay open on
+purpose so monitoring can reach them: `/health` says the process is alive;
+`/ready` checks the database, exact schema version/digest, and embedding
+service; `/metrics` publishes only bounded route templates, methods, status
+classes, counts and summed duration. It never records a query, document,
+tenant or raw URL. Every handled HTTP response carries an `X-Request-ID` for
+correlation without copying request content into logs.
+
+### Production operations
+
+Apply migrations before sending traffic to a new application version:
+
+```bash
+python -m scripts.migrate_db
+curl --fail http://127.0.0.1:8000/ready
+curl --fail http://127.0.0.1:8000/metrics
+```
+
+The migration takes a transaction-scoped PostgreSQL advisory lock, applies the
+DDL and its schema receipt in one transaction, and prints closed JSON.
+Readiness remains false if either the version or digest differs, so a process
+cannot silently serve against a partially or incorrectly migrated database.
+
+Backups use PostgreSQL custom format and a SHA-256 sidecar. Credentials reach
+`pg_dump` and `pg_restore` through the process environment, never argv or JSON
+output. Restore is limited to an empty target and needs explicit confirmation:
+
+```bash
+python -m scripts.db_snapshot backup --output backups/rag.dump
+python -m scripts.db_snapshot verify --archive backups/rag.dump
+
+# Point this at a newly created, empty database; never the live database.
+export PG_RESTORE_DSN=postgresql://...
+python -m scripts.db_snapshot restore \
+  --archive backups/rag.dump --confirm EMPTY_DATABASE
+```
+
+Rehearse restoration regularly: create an empty temporary database, restore,
+run the migration, check readiness, then destroy the temporary database. A
+backup that has never survived a restore rehearsal is only a hopeful file.
+
+The rollout gate joins offline quality with live readiness. Save the aggregate
+quality report and start the migrated candidate before switching traffic:
+
+```bash
+python -m eval.quality_gate \
+  --run-dir output/eval --out output/quality-gate.json
+python -m scripts.rollout_gate \
+  --quality-report output/quality-gate.json \
+  --ready-url http://127.0.0.1:8000/ready
+```
+
+When the gate fails, route traffic back to the previous application image. Do
+not replay old DDL against the live database: restore a verified snapshot into
+a new empty database, migrate it forward, validate both gates, and switch the
+DSN under a human change gate.
 
 ### Running across two machines
 

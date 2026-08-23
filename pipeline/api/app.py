@@ -28,6 +28,7 @@ from pipeline.index.attempt_contract import (
 )
 from pipeline.api import owui_chat
 from pipeline.api import auth
+from pipeline.api import metrics
 from pipeline.retrieval import rag_backends
 from pipeline.retrieval.trace import RetrievalTrace
 from pipeline.validation.rag.answer_guard import (
@@ -131,8 +132,18 @@ async def log_requests(request, call_next):
     """
     request_id = uuid.uuid4().hex[:8]
     started = time.perf_counter()
+    status = 500
+
+    def route_template():
+        route = request.scope.get("route")
+        value = getattr(route, "path", "unmatched")
+        return (value if isinstance(value, str) and value.startswith("/")
+                and "?" not in value and len(value) <= 200 else "unmatched")
+
     try:
         response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-ID"] = request_id
     except Exception as error:
         # An arbitrary exception message can contain a DSN, a local path or
         # document/model text. The shared helper keeps safe frame locations
@@ -141,15 +152,20 @@ async def log_requests(request, call_next):
             error,
             "api_istek_hatasi",
             istek=request_id,
-            yol=request.url.path,
+            yol=route_template(),
             yontem=request.method,
             durum="exception",
         )
         raise
+    finally:
+        route_path = route_template()
+        metrics.observe(
+            request.method, route_path, status,
+            (time.perf_counter() - started) * 1000)
     log.info(json.dumps({
         "istek": request_id,
         "yontem": request.method,
-        "yol": request.url.path,
+        "yol": route_path,
         "durum": response.status_code,
         "ms": round((time.perf_counter() - started) * 1000, 1),
     }))
@@ -410,8 +426,10 @@ def chat_completions(req: ChatRequest):
             answer = owui_chat.tables_reply(
                 req.messages,
                 namespace=auth.current_principal().tenant_id.hex)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"tablo cikarimi basarisiz: {e}")
+        except Exception as error:
+            _log_safe_failure(error, "tablo_cikarimi_hatasi")
+            raise HTTPException(
+                status_code=500, detail="tablo cikarimi basarisiz") from None
     else:
         status, answer, citations, trace = ask_checked()
 
@@ -1144,6 +1162,12 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+def prometheus_metrics():
+    """Public monitoring surface containing route templates and counts only."""
+    return Response(metrics.render(), media_type="text/plain; version=0.0.4")
+
+
 def _probe(name, fn):
     """Report whether a dependency answers -- and nothing more.
 
@@ -1177,11 +1201,20 @@ def ready(response: Response):
         with db_conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT 1")
 
+    def check_schema():
+        with db_conn() as conn:
+            if not db.schema_is_current(conn):
+                raise RuntimeError("schema drift")
+
     def check_embed():
         base = embeddings.EMBED_API_URL.rsplit("/v1/", 1)[0]
         requests.get(f"{base}/v1/models", timeout=3).raise_for_status()
 
-    checks = dict([_probe("veritabani", check_db), _probe("embedding", check_embed)])
+    checks = dict([
+        _probe("veritabani", check_db),
+        _probe("sema", check_schema),
+        _probe("embedding", check_embed),
+    ])
     healthy = all(checks.values())
     response.status_code = 200 if healthy else 503
     return {"status": "ready" if healthy else "degraded", "kontroller": checks}

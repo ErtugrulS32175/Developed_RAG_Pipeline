@@ -137,9 +137,10 @@ def extract_tables(data_url: str, namespace: str = ""):
         try:
             export_result_xlsx(r, str(EXPORT_DIR / name))
             files.append(name)
-        except Exception as e:
+        except Exception:
             # A failed export must not cost the user the extracted table itself.
-            print(f"[API] xlsx yazilamadi ({name}): {e}")
+            # Exception prose can contain a source path or cell content.
+            print("[API] xlsx yazilamadi")
             files.append(None)
 
     entry = {"results": results, "files": files}
@@ -231,8 +232,11 @@ def stream_tables(messages, model, namespace: str = ""):
                 text = (BAD_IMAGE_MSG if entry is None
                         else NO_TABLE_MSG if not entry["results"]
                         else render_tables(entry))
-            except Exception as e:
-                text = f"⚠️ Tablo çıkarımı başarısız: {e}"
+            except Exception:
+                # Headers are already sent, so a fixed content-safe message is
+                # the only honest failure channel. Exception prose can carry a
+                # local path, credential, or document fragment.
+                text = "⚠️ Tablo çıkarımı başarısız."
         yield sse_chunk(chat_id, model, delta="\n\n" + text)
     yield sse_chunk(chat_id, model, finish="stop")
     yield "data: [DONE]\n\n"

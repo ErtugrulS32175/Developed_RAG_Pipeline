@@ -95,7 +95,11 @@ def test_readiness_reports_status_without_leaking_connection_detail(monkeypatch)
     r = TestClient(api.app).get("/ready")
     assert r.status_code == 503
     body = r.json()
-    assert body["kontroller"] == {"veritabani": False, "embedding": False}
+    assert body["kontroller"] == {
+        "veritabani": False,
+        "sema": False,
+        "embedding": False,
+    }
     assert "gizli" not in r.text and "db-host" not in r.text
 
 

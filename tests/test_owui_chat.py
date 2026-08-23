@@ -299,5 +299,6 @@ def test_stream_tables_surfaces_failure_as_text_not_a_crash(monkeypatch):
     chunks = list(owui_chat.stream_tables(messages, "m"))
     text = "".join(p["choices"][0]["delta"].get("content", "") for p in _payloads(chunks))
 
-    assert "servis kapali" in text
+    assert "Tablo çıkarımı başarısız." in text
+    assert "servis kapali" not in text
     assert chunks[-1] == "data: [DONE]\n\n"

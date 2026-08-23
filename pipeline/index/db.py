@@ -32,6 +32,10 @@ load_dotenv()
 # password intentionally fails auth so a missing .env surfaces loudly
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv("PG_DSN", "postgresql://rag:CHANGE_ME@localhost:5433/ragdb")
+SCHEMA_VERSION = 1
+# Stable across schema versions: old and new application revisions must
+# serialize against each other during a rolling deploy.
+_SCHEMA_LOCK_NAME = "ragtest-schema-migration"
 
 # fastembed's Qdrant/bm25 hashes tokens (no fixed vocabulary) into a range that
 # exceeds pgvector's sparsevec dimension cap (1_000_000_000). Every sparse index
@@ -154,10 +158,51 @@ def close_pool() -> None:
 
 
 def init_schema(conn) -> None:
-    sql = Path(__file__).parent.joinpath("schema.sql").read_text()
+    schema_path = Path(__file__).parent.joinpath("schema.sql")
+    schema_bytes = schema_path.read_bytes()
+    schema_sql = schema_bytes.decode("utf-8")
+    schema_sha256 = hashlib.sha256(schema_bytes).hexdigest()
     with conn.cursor() as cur:
-        cur.execute(sql)
+        # One transaction owns both DDL and its receipt. The xact advisory lock
+        # is released by commit/rollback even if the process dies midway.
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (_SCHEMA_LOCK_NAME,))
+        cur.execute(schema_sql)
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS rag_schema_state ("
+            "singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), "
+            "schema_version integer NOT NULL, "
+            "schema_sha256 text NOT NULL CHECK (length(schema_sha256) = 64), "
+            "applied_at timestamptz NOT NULL DEFAULT now())")
+        cur.execute(
+            "INSERT INTO rag_schema_state "
+            "(singleton, schema_version, schema_sha256, applied_at) "
+            "VALUES (true, %s, %s, now()) "
+            "ON CONFLICT (singleton) DO UPDATE SET "
+            "schema_version = EXCLUDED.schema_version, "
+            "schema_sha256 = EXCLUDED.schema_sha256, applied_at = now()",
+            (SCHEMA_VERSION, schema_sha256))
     conn.commit()
+
+
+def expected_schema_state() -> tuple[int, str]:
+    raw = Path(__file__).parent.joinpath("schema.sql").read_bytes()
+    return SCHEMA_VERSION, hashlib.sha256(raw).hexdigest()
+
+
+def schema_is_current(conn) -> bool:
+    """Exact version+digest readiness check; absence and drift are false."""
+    expected = expected_schema_state()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT schema_version, schema_sha256 FROM rag_schema_state "
+                "WHERE singleton = true")
+            row = cur.fetchone()
+    except Exception:
+        conn.rollback()
+        return False
+    return row is not None and tuple(row) == expected
 
 
 def upsert_document(conn, filename: str, file_type: str,

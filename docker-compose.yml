@@ -26,8 +26,8 @@ services:
       - "127.0.0.1:5433:5432"
     volumes:
       - pgvector_data:/var/lib/postgresql/data
-      # applied once, on an empty data directory -- it creates the vector
-      # extension and every table, so no separate schema step is needed
+      # Bootstrap only: applied once on an empty data directory. Every deploy
+      # still runs `python -m scripts.migrate_db`; /ready checks its receipt.
       - ./pipeline/index/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U rag -d ragdb"]
