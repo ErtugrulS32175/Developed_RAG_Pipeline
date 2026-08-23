@@ -155,6 +155,8 @@ def test_the_copy_reads_only_the_active_generation(monkeypatch, fake_llama):
     select = next(text for kind, text in events
                   if kind == "sql" and text.startswith("SELECT c.text"))
     assert "c.generation = d.active_generation" in select
+    assert "d.archived_at IS NULL" in select
+    assert select.index("d.archived_at IS NULL") < select.index("WHERE")
     assert "c.document_id IS NULL OR d.id IS NOT NULL" in select
 
 
@@ -270,15 +272,18 @@ class Mode:
 def _wire_scope(monkeypatch, index=None, names=(), nodes=None):
     """The engine with its index and its database seam replaced.
 
-    The REAL `db.filenames_for_documents` runs against a recording cursor,
-    so the resolution statement in these tests is the production one.
+    The REAL `db.lock_retrieval_filenames` runs against a recording cursor,
+    so the resolution statement and its lifecycle lock are production code.
     """
     from contextlib import contextmanager
 
     from pipeline.index import db
     from pipeline.retrieval import rag_llamaindex
 
-    statements = []
+    class Statements(list):
+        authority_open = False
+
+    statements = Statements()
 
     class Cursor:
         def __enter__(self):
@@ -300,7 +305,11 @@ def _wire_scope(monkeypatch, index=None, names=(), nodes=None):
     class Pool:
         @contextmanager
         def connection(self):
-            yield Conn()
+            statements.authority_open = True
+            try:
+                yield Conn()
+            finally:
+                statements.authority_open = False
 
     if index is None:
         index = FakeIndex(nodes if nodes is not None else [])
@@ -373,19 +382,51 @@ def test_the_resolved_names_are_exact_filter_values_only(
         assert "kapsam-icinde.pdf" not in sql
 
 
-def test_an_unscoped_query_passes_no_filter_and_touches_no_database(
+def test_an_unscoped_query_uses_live_active_names_not_the_stale_snapshot(
         monkeypatch, fake_filters):
-    """Today's behaviour, unchanged: the same construction, no filter
-    argument at all, and no resolution query."""
+    """Archive can change after build, so every query carries live authority."""
     rag_llamaindex, index, statements = _wire_scope(
-        monkeypatch, nodes=[FakeNode("pasaj", "kurgu.pdf")])
+        monkeypatch, names=("kurgu.pdf",),
+        nodes=[FakeNode("pasaj", "kurgu.pdf")])
 
     rag_llamaindex.retrieve("kurgu soru")
 
-    assert "filters" not in index.constructed[0]
-    assert index.constructed[0] == {"similarity_top_k": rag_llamaindex.TOP_K,
-                                    "vector_store_query_mode": Mode.HYBRID}
-    assert statements == []
+    filters = index.constructed[0]["filters"]
+    assert filters.filters[0].value == ["kurgu.pdf"]
+    assert index.retrievers[0].filters is filters
+    assert statements == [(
+        "SELECT filename FROM documents "
+        "WHERE archived_at IS NULL ORDER BY filename FOR SHARE", None)]
+
+
+def test_no_active_document_means_no_snapshot_query(monkeypatch, fake_filters):
+    rag_llamaindex, index, statements = _wire_scope(
+        monkeypatch, names=(), nodes=[FakeNode("eski pasaj", "arsiv.pdf")])
+
+    assert rag_llamaindex.retrieve("kurgu soru") == []
+    assert index.constructed == []
+    assert statements[0][0].endswith(
+        "WHERE archived_at IS NULL ORDER BY filename FOR SHARE")
+
+
+def test_lifecycle_lock_is_held_until_snapshot_nodes_are_projected(
+        monkeypatch, fake_filters):
+    rag_llamaindex, _index, statements = _wire_scope(
+        monkeypatch, names=("kurgu.pdf",),
+        nodes=[FakeNode("pasaj", "kurgu.pdf")])
+    projected_while_locked = []
+    original = rag_llamaindex._as_chunks
+
+    def project(nodes):
+        projected_while_locked.append(statements.authority_open)
+        return original(nodes)
+
+    monkeypatch.setattr(rag_llamaindex, "_as_chunks", project)
+
+    rag_llamaindex.retrieve("kurgu soru")
+
+    assert projected_while_locked == [True]
+    assert statements.authority_open is False
 
 
 def test_an_unknown_identifier_never_widens_the_query(

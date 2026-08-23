@@ -92,6 +92,11 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS attempt_id uuid;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS attempt_owner text;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS attempt_expires_at timestamptz;
 
+-- Reversible document lifecycle. NULL is active; a timestamp is archived.
+-- Chunks stay intact so restore is metadata-only, but every retrieval path
+-- joins through this authority and excludes archived rows before ranking.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+
 -- One row per indexing RUN. The system had an identity for a document,
 -- for a name and for a content version, and none for "this attempt to
 -- index that content" -- so a losing run's verdict could land on a

@@ -136,6 +136,20 @@ python -m pipeline.retrieval.rag_llamaindex build
 python -m eval.retrieval.rag_eval --set human --backend llamaindex
 ```
 
+### Document lifecycle
+
+`POST /documents/{document_id}/archive` removes a document from the normal
+inventory and from both retrieval engines without deleting its chunks.
+`POST /documents/{document_id}/restore` makes the same stored generation
+retrievable again. Both operations are idempotent, require the same API key as
+the other document routes, and return 409 while an ingest lease is active.
+
+`GET /documents` lists active documents by default; use `archived=true` to list
+only archived ones. An archived document cannot start processing. Lifecycle
+authority is checked again while the ingest lease is taken and is held through
+snapshot-backed LlamaIndex retrieval, so a concurrent request cannot publish a
+document halfway through its archive transition.
+
 ## Controlled task runs (agent-loop)
 
 `tools/agent_loop` runs a coding task through an implementer model and an

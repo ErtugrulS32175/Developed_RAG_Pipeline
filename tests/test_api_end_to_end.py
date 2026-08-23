@@ -255,6 +255,8 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
             "candidate_id": cid,
             "candidate_state": "staged",
             "active_generation": (row or {}).get("active_generation", 0),
+            "archived_at": (row or {}).get("archived_at"),
+            "attempt_id": (row or {}).get("attempt_id"),
         }
         return document_id, cid, canonical
 
@@ -267,6 +269,8 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
 
     def begin_attempt(_conn, wanted, owner=None):
         row = state[wanted]
+        if row.get("archived_at") is not None:
+            raise api.db.DocumentLifecycleConflict("kurgu arsiv")
         if row.get("candidate_state") != PUBLISHED:
             raise CandidateNotPublished("aday yayimlanmis degil")
         attempt = IngestAttempt(
@@ -302,6 +306,27 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
             return False
         row["status"] = status
         return True
+
+    def set_document_archived(_conn, wanted, archived):
+        row = state.get(wanted)
+        if row is None:
+            return None
+        already = row.get("archived_at") is not None
+        if already == archived:
+            return {
+                "document_id": wanted,
+                "archived": already,
+                "archived_at": row.get("archived_at"),
+            }
+        if row.get("attempt_id") is not None:
+            raise api.db.DocumentLifecycleConflict("kurgu cakisma")
+        row["archived_at"] = (
+            f"{998:04d}-01-01T00:00:00+00:00" if archived else None)
+        return {
+            "document_id": wanted,
+            "archived": archived,
+            "archived_at": row["archived_at"],
+        }
 
     def run_ingest(path, expected_candidate=None, attempt=None):
         """The core as it REALLY behaves, which is the point of this fake.
@@ -342,6 +367,8 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
     monkeypatch.setattr(api.db, "lookup_document", lookup_document)
     monkeypatch.setattr(api.db, "get_document", get_document)
     monkeypatch.setattr(api.db, "set_document_status", set_document_status)
+    monkeypatch.setattr(api.db, "set_document_archived",
+                        set_document_archived)
     monkeypatch.setattr(api.db, "document_publish_lock", publish_lock)
     monkeypatch.setattr(api.ingest, "main", run_ingest)
     return api, TestClient(api.app), state, calls, upload_dir, closed
@@ -951,6 +978,112 @@ def test_unsafe_filename_is_rejected_before_path_construction(filename):
     assert error.value.status_code == 400
 
 
+# --- reversible document lifecycle -------------------------------------
+
+
+def _lifecycle_api_row(*, archived_at=None, attempt_id=None):
+    return {
+        "id": "kurgu-yasam-belgesi",
+        "filename": "kurgu-yasam.pdf",
+        "file_type": "pdf",
+        "status": "done",
+        "content_sha256": "kurgu-ozet",
+        "candidate_id": "kurgu-aday",
+        "candidate_state": PUBLISHED,
+        "active_generation": 4,
+        "archived_at": archived_at,
+        "attempt_id": attempt_id,
+    }
+
+
+def test_archive_and_restore_are_idempotent_metadata_transitions(
+        monkeypatch, tmp_path):
+    api, client, state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    document_id = "kurgu-yasam-belgesi"
+    state[document_id] = _lifecycle_api_row()
+
+    archived = client.post(
+        f"/documents/{document_id}/archive", headers=_headers(api))
+    repeated = client.post(
+        f"/documents/{document_id}/archive", headers=_headers(api))
+    restored = client.post(
+        f"/documents/{document_id}/restore", headers=_headers(api))
+    restored_again = client.post(
+        f"/documents/{document_id}/restore", headers=_headers(api))
+
+    assert archived.status_code == repeated.status_code == 200
+    assert archived.json() == repeated.json()
+    assert archived.json()["archived"] is True
+    assert archived.json()["archived_at"] is not None
+    assert restored.status_code == restored_again.status_code == 200
+    assert restored.json() == restored_again.json() == {
+        "document_id": document_id,
+        "archived": False,
+        "archived_at": None,
+    }
+    # The lifecycle is metadata-only: the publication identity remains.
+    assert state[document_id]["candidate_id"] == "kurgu-aday"
+    assert state[document_id]["active_generation"] == 4
+
+
+@pytest.mark.parametrize("operation", ["archive", "restore"])
+def test_a_missing_document_has_no_lifecycle_to_change(
+        monkeypatch, tmp_path, operation):
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+
+    response = client.post(
+        f"/documents/yok/{operation}", headers=_headers(api))
+
+    assert response.status_code == 404
+
+
+def test_an_active_ingest_attempt_blocks_archive(monkeypatch, tmp_path):
+    api, client, state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    document_id = "kurgu-yasam-belgesi"
+    state[document_id] = _lifecycle_api_row(attempt_id="aktif-deneme")
+
+    response = client.post(
+        f"/documents/{document_id}/archive", headers=_headers(api))
+
+    assert response.status_code == 409
+    assert state[document_id]["archived_at"] is None
+
+
+def test_an_archived_document_cannot_start_processing(monkeypatch, tmp_path):
+    api, client, state, calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    document_id = "kurgu-yasam-belgesi"
+    state[document_id] = _lifecycle_api_row(archived_at="once")
+
+    response = client.post(
+        f"/documents/{document_id}/process", headers=_headers(api))
+
+    assert response.status_code == 409
+    assert calls == []
+
+
+def test_lifecycle_routes_use_the_same_api_key_dependency(
+        monkeypatch, tmp_path):
+    api, _client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+
+    def dependencies(path, method):
+        for route in api.app.routes:
+            if (getattr(route, "path", None) == path
+                    and method in getattr(route, "methods", ())):
+                return [depends.dependency for depends in route.dependencies]
+        raise AssertionError(path)
+
+    detail = dependencies("/documents/{document_id}", "GET")
+    assert dependencies(
+        "/documents/{document_id}/archive", "POST") == detail
+    assert dependencies(
+        "/documents/{document_id}/restore", "POST") == detail
+
+
 # --- the document inventory --------------------------------------------
 
 
@@ -972,6 +1105,7 @@ def _inventory_row(document_id, uploaded_at, **overrides):
         "status": "done",
         "status_note": None,
         "active_generation": 2,
+        "archived_at": None,
         "content_sha256": "KURGU_SHA_" + document_id,
         "candidate_id": "KURGU_ADAY_" + document_id,
         "candidate_state": PUBLISHED,
@@ -1001,6 +1135,7 @@ class _InventoryCalls(list):
         super().__init__()
         self.dates = []
         self.searches = []
+        self.archives = []
 
 
 def _like_matches(value, pattern, escape="!"):
@@ -1065,10 +1200,12 @@ def _wire_inventory(monkeypatch, api, rows=INVENTORY):
     asked = _InventoryCalls()
 
     def list_documents(_conn, limit, offset, status=None, file_type=None,
-                       uploaded_after=None, uploaded_before=None, q=None):
+                       uploaded_after=None, uploaded_before=None, q=None,
+                       archived=False):
         asked.append((limit, offset, status, file_type))
         asked.dates.append((uploaded_after, uploaded_before))
         asked.searches.append(q)
+        asked.archives.append(archived)
         pattern = (None if q is None
                    else "%" + api.db.escape_like_pattern(q) + "%")
         matched = [
@@ -1079,6 +1216,7 @@ def _wire_inventory(monkeypatch, api, rows=INVENTORY):
                  or row["uploaded_at"] > uploaded_after)
             and (uploaded_before is None
                  or row["uploaded_at"] < uploaded_before)
+            and ((row.get("archived_at") is not None) == archived)
             and (pattern is None
                  or _like_matches(row["filename"], pattern))
         ]
@@ -1133,13 +1271,56 @@ def test_the_inventory_publishes_only_the_safe_document_fields(
     for document in documents:
         assert set(document) == {
             "document_id", "filename", "file_type", "uploaded_at",
-            "status", "status_note", "active_generation"}
+            "status", "status_note", "active_generation", "archived_at"}
     # not merely absent as keys: the VALUES never appear in the response
     assert "content_sha256" not in response.text
     assert "candidate_id" not in response.text
     assert "KURGU_SHA_" not in response.text
     assert "KURGU_ADAY_" not in response.text
     assert documents[1]["status_note"] == "sayfa 2 kayip"
+
+
+def test_the_inventory_separates_active_and_archived_documents(
+        monkeypatch, tmp_path):
+    archived_at = f"{996:04d}-01-01T00:00:00+00:00"
+    rows = [
+        _inventory_row("aktif", f"{997:04d}-01-01T00:00:00+00:00"),
+        _inventory_row("arsiv", f"{996:04d}-01-01T00:00:00+00:00",
+                       archived_at=archived_at),
+    ]
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    asked = _wire_inventory(monkeypatch, api, rows)
+
+    active = client.get("/documents", headers=_headers(api))
+    archived = client.get("/documents?archived=true", headers=_headers(api))
+
+    assert active.status_code == archived.status_code == 200
+    assert [row["document_id"] for row in active.json()["documents"]] == [
+        "aktif"]
+    assert [row["document_id"] for row in archived.json()["documents"]] == [
+        "arsiv"]
+    assert archived.json()["documents"][0]["archived_at"] == archived_at
+    assert asked.archives == [False, True]
+
+
+def test_an_invalid_archive_filter_is_refused_before_a_connection_is_borrowed(
+        monkeypatch, tmp_path):
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    borrowed = []
+
+    @contextmanager
+    def recording_connection():
+        borrowed.append(True)
+        yield object()
+
+    monkeypatch.setattr(api, "db_conn", recording_connection)
+
+    response = client.get("/documents?archived=perhaps", headers=_headers(api))
+
+    assert response.status_code == 422
+    assert borrowed == []
 
 
 def test_the_inventory_defaults_to_the_first_twenty(monkeypatch, tmp_path):
@@ -1207,7 +1388,7 @@ def test_the_inventory_filters_by_exact_equality(
     for document in body["documents"]:
         assert set(document) == {
             "document_id", "filename", "file_type", "uploaded_at",
-            "status", "status_note", "active_generation"}
+            "status", "status_note", "active_generation", "archived_at"}
 
 
 def test_filters_are_applied_before_pagination(monkeypatch, tmp_path):
@@ -1331,7 +1512,7 @@ def test_the_inventory_window_on_uploaded_at_excludes_both_bounds(
     for document in body["documents"]:
         assert set(document) == {
             "document_id", "filename", "file_type", "uploaded_at",
-            "status", "status_note", "active_generation"}
+            "status", "status_note", "active_generation", "archived_at"}
 
 
 @pytest.mark.parametrize(
@@ -1667,7 +1848,7 @@ def test_the_inventory_searches_filenames_by_literal_substring(
     for document in body["documents"]:
         assert set(document) == {
             "document_id", "filename", "file_type", "uploaded_at",
-            "status", "status_note", "active_generation"}
+            "status", "status_note", "active_generation", "archived_at"}
 
 
 @pytest.mark.parametrize(
@@ -1933,7 +2114,7 @@ def test_a_searched_listing_publishes_only_the_safe_document_fields(
     for document in documents:
         assert set(document) == {
             "document_id", "filename", "file_type", "uploaded_at",
-            "status", "status_note", "active_generation"}
+            "status", "status_note", "active_generation", "archived_at"}
     # not merely absent as keys: the VALUES never appear in the response
     assert "content_sha256" not in response.text
     assert "candidate_id" not in response.text

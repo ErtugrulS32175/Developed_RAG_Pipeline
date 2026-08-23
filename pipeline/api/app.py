@@ -591,6 +591,8 @@ def process_document(document_id: str):
         doc = db.get_document(conn, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
+    if doc.get("archived_at") is not None:
+        raise HTTPException(status_code=409, detail="document is archived")
     # A row with no recorded candidate has nothing for an ingest to bind
     # to: processing it would be exactly the unbound run the P0 exploited.
     if not doc.get("candidate_id") or not doc.get("content_sha256"):
@@ -647,6 +649,12 @@ def process_document(document_id: str):
                 status_code=409,
                 detail="bu belge icin calisan bir islem var; bitmesini "
                        "bekleyin")
+        except db.DocumentLifecycleConflict:
+            # Rechecked while taking the row lock: archive may have committed
+            # after the read above and before begin_attempt started.
+            raise HTTPException(
+                status_code=409,
+                detail="document is archived")
 
     # THE DOCUMENT ROW IS NOT THIS REQUEST'S SCRATCHPAD. It used to be
     # stamped `processing` here and `error` in the handler below, and the
@@ -712,6 +720,7 @@ DOCUMENT_LIST_FIELDS = (
     "status",
     "status_note",
     "active_generation",
+    "archived_at",
 )
 
 # A page nobody sized is a full table scan waiting for its first large
@@ -776,8 +785,14 @@ def list_documents(
     uploaded_after: AwareDatetime | None = Query(None),
     uploaded_before: AwareDatetime | None = Query(None),
     q: str | None = Query(None, min_length=1),
+    archived: bool = Query(False),
 ):
     """One page of the document inventory, newest first.
+
+    The default is the active inventory. `archived=true` switches to the
+    archived inventory; the two sets never mix in one page. Archive state is
+    applied with every other filter before pagination and is published as
+    `archived_at` so a lifecycle result remains observable.
 
     `status` and `file_type` narrow the inventory by exact equality --
     each may stand alone, together they AND -- and they narrow it BEFORE
@@ -844,13 +859,36 @@ def list_documents(
                                  status=status, file_type=file_type,
                                  uploaded_after=uploaded_after,
                                  uploaded_before=uploaded_before,
-                                 q=q)
+                                 q=q, archived=archived)
     return {
         "documents": [_document_summary(row) for row in rows[:limit]],
         "limit": limit,
         "offset": offset,
         "has_more": len(rows) > limit,
     }
+
+
+def _set_document_lifecycle(document_id: str, archived: bool):
+    try:
+        with db_conn() as conn:
+            result = db.set_document_archived(conn, document_id, archived)
+    except db.DocumentLifecycleConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="document has an active ingest attempt") from None
+    if result is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    return result
+
+
+@app.post("/documents/{document_id}/archive", dependencies=AUTH)
+def archive_document(document_id: str):
+    return _set_document_lifecycle(document_id, True)
+
+
+@app.post("/documents/{document_id}/restore", dependencies=AUTH)
+def restore_document(document_id: str):
+    return _set_document_lifecycle(document_id, False)
 
 
 @app.get("/documents/{document_id}", dependencies=AUTH)

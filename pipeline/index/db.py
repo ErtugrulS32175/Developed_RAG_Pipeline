@@ -38,6 +38,10 @@ PG_DSN = os.getenv("PG_DSN", "postgresql://rag:CHANGE_ME@localhost:5433/ragdb")
 SPARSE_DIM = 999_999_937
 
 
+class DocumentLifecycleConflict(RuntimeError):
+    """A document with an active ingest lease cannot change lifecycle."""
+
+
 def get_conn() -> psycopg.Connection:
     conn = psycopg.connect(PG_DSN)
     register_vector(conn)
@@ -365,7 +369,7 @@ def begin_attempt(conn, document_id: str, owner: str | None = None):
     with conn.cursor() as cur:
         cur.execute(
             "SELECT candidate_state, candidate_id, content_sha256, "
-            "active_generation, attempt_id, "
+            "active_generation, attempt_id, archived_at, "
             "(attempt_expires_at IS NOT NULL AND attempt_expires_at > now()) "
             "FROM documents WHERE id = %s FOR UPDATE",
             (document_id,))
@@ -374,7 +378,11 @@ def begin_attempt(conn, document_id: str, owner: str | None = None):
             conn.rollback()
             raise ValueError("belge kaydi yok; deneme baslatilamaz")
         (state, candidate_id, candidate_sha, active_generation,
-         held_by, lease_is_live) = row
+         held_by, archived_at, lease_is_live) = row
+        if archived_at is not None:
+            conn.rollback()
+            raise DocumentLifecycleConflict(
+                "arsivlenmis belge icin ingest denemesi baslatilamaz")
         if state != CandidateState.PUBLISHED or candidate_id is None:
             conn.rollback()
             raise CandidateNotPublished(
@@ -632,7 +640,8 @@ def get_document(conn, document_id: str) -> dict | None:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             "SELECT id, filename, file_type, uploaded_at, status, "
-            "status_note, active_generation, content_sha256, candidate_id "
+            "status_note, active_generation, content_sha256, candidate_id, "
+            "archived_at "
             "FROM documents WHERE id = %s", (document_id,))
         row = cur.fetchone()
     if row is None:
@@ -691,10 +700,15 @@ def list_documents(conn, limit: int, offset: int,
                    file_type: str | None = None,
                    uploaded_after: datetime | None = None,
                    uploaded_before: datetime | None = None,
-                   q: str | None = None) -> list[dict]:
+                   q: str | None = None,
+                   archived: bool = False) -> list[dict]:
     """One page of the document inventory, newest first.
 
-    FIVE OPTIONAL FILTERS. `status` and `file_type` are exact equality;
+    SIX FILTERS. `archived=False` is the fail-closed default: the normal
+    inventory contains only active rows, while `archived=True` contains only
+    archived rows. It is static SQL authority and never a bound value.
+
+    The other five are optional. `status` and `file_type` are exact equality;
     neither column has a closed vocabulary -- `status` is free text with
     no CHECK constraint and `file_type` is whatever suffix the upload
     carried -- so no value set is enforced here: an unknown value simply
@@ -709,7 +723,8 @@ def list_documents(conn, limit: int, offset: int,
     LIMIT/OFFSET, so the page, the offset and the `limit + 1` sentinel
     all describe the filtered sequence.
 
-    `q` IS THE FIFTH, AND THE ONLY ONE THAT IS NOT EQUALITY: it searches
+    `q` IS THE FIFTH OPTIONAL FILTER, AND THE ONLY ONE THAT IS NOT EQUALITY:
+    it searches
     `documents.filename` ALONE, case-insensitively, for a LITERAL
     substring -- `ILIKE` against the pattern wrapped in `%` on both
     sides. LITERAL is the part that takes work, because `%` and `_` are
@@ -767,6 +782,8 @@ def list_documents(conn, limit: int, offset: int,
         raise ValueError("limit 1 veya daha buyuk bir tamsayi olmali")
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise ValueError("offset 0 veya daha buyuk bir tamsayi olmali")
+    if not isinstance(archived, bool):
+        raise ValueError("archived bir boolean olmali")
     # The same courtesy for the filters: the API refuses a malformed one
     # in its own signature, this refuses it for every OTHER caller --
     # before any statement is built, so a refused call executes nothing.
@@ -802,7 +819,8 @@ def list_documents(conn, limit: int, offset: int,
     # Only these static pieces are ever assembled into the statement; the
     # VALUES never are -- each supplied filter adds its clause here and
     # its value to the params dict, and an unsupplied one adds neither.
-    clauses = []
+    clauses = ["archived_at IS NOT NULL" if archived
+               else "archived_at IS NULL"]
     params = {"limit": limit + 1, "offset": offset}
     if status is not None:
         clauses.append("status = %(status)s")
@@ -841,7 +859,7 @@ def list_documents(conn, limit: int, offset: int,
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             "SELECT id, filename, file_type, uploaded_at, status, "
-            "status_note, active_generation "
+            "status_note, active_generation, archived_at "
             "FROM documents "
             + where_sql +
             "ORDER BY uploaded_at DESC, id DESC "
@@ -855,6 +873,48 @@ def list_documents(conn, limit: int, offset: int,
         row["document_id"] = str(row.pop("id"))
         listed.append(row)
     return listed
+
+
+def set_document_archived(conn, document_id: str,
+                          archived: bool) -> dict | None:
+    """Idempotently archive or restore one document under a row lock.
+
+    An active ingest attempt owns the document's mutable publication state;
+    changing lifecycle beside it would let a run publish into an archive, or
+    restore a row while a displaced worker still writes. Refuse that race.
+    """
+    if not isinstance(archived, bool):
+        raise ValueError("archived bir boolean olmali")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT id, archived_at, attempt_id FROM documents "
+            "WHERE id = %s FOR UPDATE", (document_id,))
+        row = cur.fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        already = row["archived_at"] is not None
+        if already == archived:
+            # Release the FOR UPDATE transaction here as well.  Idempotent
+            # lifecycle calls are complete operations, not locks handed to
+            # the caller to remember to close later.
+            conn.commit()
+            return {"document_id": str(row["id"]),
+                    "archived": already,
+                    "archived_at": row["archived_at"]}
+        if row["attempt_id"] is not None:
+            raise DocumentLifecycleConflict(
+                "aktif ingest denemesi varken belge yasam dongusu degisemez")
+        cur.execute(
+            "UPDATE documents SET archived_at = "
+            "CASE WHEN %(archived)s THEN now() ELSE NULL END "
+            "WHERE id = %(id)s RETURNING id, archived_at",
+            {"archived": archived, "id": document_id})
+        changed = cur.fetchone()
+    conn.commit()
+    return {"document_id": str(changed["id"]),
+            "archived": changed["archived_at"] is not None,
+            "archived_at": changed["archived_at"]}
 
 
 def set_document_status(conn, document_id: str, status: str,
@@ -1230,8 +1290,44 @@ def filenames_for_documents(conn, document_ids) -> list[str]:
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT filename FROM documents WHERE id = ANY(%s::uuid[])",
+            "SELECT filename FROM documents WHERE id = ANY(%s::uuid[]) "
+            "AND archived_at IS NULL",
             (list(document_ids),))
+        return sorted({str(row[0]) for row in cur.fetchall()})
+
+
+def active_document_filenames(conn) -> list[str]:
+    """Names currently allowed into the snapshot-backed retrieval engine.
+
+    LlamaIndex stores filename metadata in a snapshot.  Lifecycle state can
+    change after that snapshot was built, so its query-time filter must come
+    from the live documents table rather than from stale node metadata.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT filename FROM documents "
+            "WHERE archived_at IS NULL ORDER BY filename")
+        return sorted({str(row[0]) for row in cur.fetchall()})
+
+
+def lock_retrieval_filenames(conn, document_ids=None) -> list[str]:
+    """Lock the active rows that a snapshot-backed retrieval may publish.
+
+    The caller keeps this transaction open through retrieval.  Archive and
+    restore use ``FOR UPDATE`` on the same rows, so a lifecycle transition
+    either completes before this read (and is excluded) or waits until the
+    in-flight answer has finished.  No stale snapshot node crosses the seam.
+    """
+    params = None
+    where = "archived_at IS NULL"
+    if document_ids is not None:
+        where += " AND id = ANY(%s::uuid[])"
+        params = (list(document_ids),)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT filename FROM documents WHERE " + where
+            + " ORDER BY filename FOR SHARE",
+            params)
         return sorted({str(row[0]) for row in cur.fetchall()})
 
 
@@ -1278,7 +1374,8 @@ def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15,
     # stay reachable, as before the generation column existed.
     from_clause = (
         "chunks c LEFT JOIN documents d ON c.document_id = d.id "
-        "AND c.generation = d.active_generation"
+        "AND c.generation = d.active_generation "
+        "AND d.archived_at IS NULL"
     )
     # The generation test is parenthesised because it is an OR: ANDing the
     # scope onto a bare `a OR b` would bind to `b` alone and leave every

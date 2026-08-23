@@ -144,3 +144,117 @@ def test_the_real_schema_contains_the_measured_scope_index(
         row = cursor.fetchone()
     assert row is not None
     assert "USING btree (document_id)" in row[0]
+
+
+def test_archive_hides_a_document_before_real_ranking_and_restore_returns_it(
+        real_scope_connection):
+    archived = db.set_document_archived(real_scope_connection, OUTSIDE, True)
+    try:
+        assert archived["archived"] is True
+        assert archived["archived_at"] is not None
+        assert [row["filename"] for row in _search(real_scope_connection)] == [
+            "inside.pdf"]
+        assert db.filenames_for_documents(
+            real_scope_connection, [OUTSIDE]) == []
+        assert db.active_document_filenames(real_scope_connection) == [
+            "inside.pdf"]
+        assert [row["filename"] for row in db.list_documents(
+            real_scope_connection, limit=10, offset=0)] == ["inside.pdf"]
+        archived_rows = db.list_documents(
+            real_scope_connection, limit=10, offset=0, archived=True)
+        assert [row["filename"] for row in archived_rows] == ["outside.pdf"]
+    finally:
+        restored = db.set_document_archived(
+            real_scope_connection, OUTSIDE, False)
+    assert restored["archived"] is False
+    assert restored["archived_at"] is None
+    assert [row["filename"] for row in _search(real_scope_connection)] == [
+        "outside.pdf"]
+
+
+def test_a_real_active_lease_blocks_archive_without_changing_the_row(
+        real_scope_connection):
+    attempt_id = uuid.UUID("44444444-4444-4444-4444-444444444444")
+    candidate_id = uuid.UUID("55555555-5555-5555-5555-555555555555")
+    with real_scope_connection.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO attempts "
+            "(attempt_id, document_id, candidate_id, candidate_sha, "
+            "observed_active) VALUES (%s, %s, %s, %s, 1)",
+            (attempt_id, INSIDE, candidate_id, "kurgu-ozet"),
+        )
+        cursor.execute(
+            "UPDATE documents SET attempt_id = %s WHERE id = %s",
+            (attempt_id, INSIDE),
+        )
+    real_scope_connection.commit()
+    try:
+        with pytest.raises(db.DocumentLifecycleConflict):
+            db.set_document_archived(real_scope_connection, INSIDE, True)
+        real_scope_connection.rollback()
+        with real_scope_connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT archived_at FROM documents WHERE id = %s", (INSIDE,))
+            assert cursor.fetchone()[0] is None
+    finally:
+        with real_scope_connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE documents SET attempt_id = NULL WHERE id = %s",
+                (INSIDE,),
+            )
+            cursor.execute(
+                "DELETE FROM attempts WHERE attempt_id = %s", (attempt_id,))
+        real_scope_connection.commit()
+
+
+def test_a_real_archived_row_cannot_mint_an_ingest_lease(
+        real_scope_connection):
+    db.set_document_archived(real_scope_connection, OUTSIDE, True)
+    try:
+        with pytest.raises(db.DocumentLifecycleConflict):
+            db.begin_attempt(
+                real_scope_connection, OUTSIDE, owner="kurgu-worker")
+        with real_scope_connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT attempt_id FROM documents WHERE id = %s", (OUTSIDE,))
+            assert cursor.fetchone()[0] is None
+    finally:
+        real_scope_connection.rollback()
+        db.set_document_archived(real_scope_connection, OUTSIDE, False)
+
+
+def test_snapshot_retrieval_lock_orders_a_concurrent_real_archive(
+        real_scope_connection):
+    import psycopg
+    from psycopg import sql
+
+    with real_scope_connection.cursor() as cursor:
+        cursor.execute("SELECT current_schema()")
+        schema_name = cursor.fetchone()[0]
+    real_scope_connection.commit()
+
+    other = psycopg.connect(DSN)
+    try:
+        with other.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("SET search_path TO {}, public").format(
+                    sql.Identifier(schema_name)))
+            cursor.execute("SET lock_timeout = '200ms'")
+        other.commit()
+
+        assert db.lock_retrieval_filenames(
+            real_scope_connection, [INSIDE]) == ["inside.pdf"]
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            db.set_document_archived(other, INSIDE, True)
+        other.rollback()
+
+        # Releasing the retrieval transaction makes the same transition
+        # succeed; there was contention, not a permanently invalid request.
+        real_scope_connection.rollback()
+        changed = db.set_document_archived(other, INSIDE, True)
+        assert changed["archived"] is True
+        restored = db.set_document_archived(other, INSIDE, False)
+        assert restored["archived"] is False
+    finally:
+        real_scope_connection.rollback()
+        other.close()

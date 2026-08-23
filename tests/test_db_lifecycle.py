@@ -278,9 +278,8 @@ def test_the_listing_query_is_parameterized_and_totally_ordered():
     # swap places between pages, showing one twice and never showing the
     # other. The id tie-break makes the sequence total.
     assert "ORDER BY uploaded_at DESC, id DESC" in sql
-    # no filter was supplied, so no filter appears ANYWHERE: not as a
-    # clause in the statement and not as a key in the params dict
-    assert "WHERE" not in sql
+    # Lifecycle is always fail-closed: the default inventory is active-only.
+    assert "WHERE archived_at IS NULL" in sql
     assert "status" not in params and "file_type" not in params
 
 
@@ -296,6 +295,213 @@ def test_the_listing_query_asks_for_one_row_beyond_the_page():
 
     _sql, params = conn.cur.executed[0]
     assert params["limit"] == 2
+
+
+def test_the_listing_can_select_only_archived_documents():
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    db.list_documents(conn, limit=5, offset=0, archived=True)
+
+    sql, params = conn.cur.executed[0]
+    assert "WHERE archived_at IS NOT NULL" in sql
+    assert "archived" not in params
+
+
+@pytest.mark.parametrize("archived", [None, 0, 1, "true", (), []])
+def test_the_listing_refuses_a_non_boolean_lifecycle_before_sql(archived):
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    with pytest.raises(ValueError):
+        db.list_documents(conn, limit=5, offset=0, archived=archived)
+    assert conn.cur.executed == []
+
+
+class LifecycleCursor:
+    """A two-statement row-lock/update seam for lifecycle transitions."""
+
+    def __init__(self, row, changed=None):
+        self._answers = [row]
+        if changed is not None:
+            self._answers.append(changed)
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchone(self):
+        return self._answers.pop(0)
+
+
+class LifecycleConn:
+    def __init__(self, row, changed=None):
+        self.cur = LifecycleCursor(row, changed)
+        self.commits = 0
+
+    def cursor(self, row_factory=None):
+        return self.cur
+
+    def commit(self):
+        self.commits += 1
+
+
+def _lifecycle_row(*, archived_at=None, attempt_id=None):
+    import uuid
+
+    return {
+        "id": uuid.UUID("00000000-0000-0000-0000-0000000000ab"),
+        "archived_at": archived_at,
+        "attempt_id": attempt_id,
+    }
+
+
+def test_archive_locks_the_row_and_changes_only_lifecycle_metadata():
+    from pipeline.index import db
+
+    timestamp = f"{997:04d}-01-01T00:00:00+00:00"
+    conn = LifecycleConn(
+        _lifecycle_row(),
+        _lifecycle_row(archived_at=timestamp),
+    )
+
+    result = db.set_document_archived(conn, "kurgu-id", True)
+
+    lock_sql, lock_params = conn.cur.executed[0]
+    update_sql, update_params = conn.cur.executed[1]
+    assert "SELECT id, archived_at, attempt_id" in lock_sql
+    assert lock_sql.endswith("WHERE id = %s FOR UPDATE")
+    assert lock_params == ("kurgu-id",)
+    assert "SET archived_at" in update_sql
+    assert "now()" in update_sql and "ELSE NULL" in update_sql
+    assert update_params == {"archived": True, "id": "kurgu-id"}
+    assert conn.commits == 1
+    assert result == {
+        "document_id": "00000000-0000-0000-0000-0000000000ab",
+        "archived": True,
+        "archived_at": timestamp,
+    }
+    forbidden = ("DELETE", "TRUNCATE", "DROP", "chunks")
+    assert not any(word in update_sql for word in forbidden)
+
+
+def test_restore_sets_the_lifecycle_marker_to_null():
+    from pipeline.index import db
+
+    conn = LifecycleConn(
+        _lifecycle_row(archived_at="once"),
+        _lifecycle_row(archived_at=None),
+    )
+
+    result = db.set_document_archived(conn, "kurgu-id", False)
+
+    assert conn.cur.executed[1][1]["archived"] is False
+    assert result["archived"] is False
+    assert result["archived_at"] is None
+    assert conn.commits == 1
+
+
+@pytest.mark.parametrize(
+    ("archived_at", "wanted"),
+    [(None, False), ("once", True)],
+)
+def test_a_repeated_lifecycle_request_is_idempotent_and_releases_its_lock(
+        archived_at, wanted):
+    from pipeline.index import db
+
+    conn = LifecycleConn(_lifecycle_row(archived_at=archived_at))
+
+    result = db.set_document_archived(conn, "kurgu-id", wanted)
+
+    assert len(conn.cur.executed) == 1
+    assert result["archived"] is wanted
+    assert conn.commits == 1
+
+
+def test_a_missing_document_is_closed_without_an_update():
+    from pipeline.index import db
+
+    conn = LifecycleConn(None)
+
+    assert db.set_document_archived(conn, "yok", True) is None
+    assert len(conn.cur.executed) == 1
+    assert conn.commits == 1
+
+
+def test_an_active_ingest_attempt_blocks_a_lifecycle_transition():
+    from pipeline.index import db
+
+    conn = LifecycleConn(_lifecycle_row(attempt_id="aktif-deneme"))
+
+    with pytest.raises(db.DocumentLifecycleConflict):
+        db.set_document_archived(conn, "kurgu-id", True)
+    assert len(conn.cur.executed) == 1
+    assert conn.commits == 0
+
+
+def test_an_archived_row_cannot_mint_an_ingest_lease():
+    from pipeline.index import db
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+
+        def fetchone(self):
+            return (
+                "published", "kurgu-aday", "kurgu-ozet", 4, None,
+                "once", False,
+            )
+
+    class Conn:
+        def __init__(self):
+            self.cur = Cursor()
+            self.rollbacks = 0
+            self.commits = 0
+
+        def cursor(self):
+            return self.cur
+
+        def rollback(self):
+            self.rollbacks += 1
+
+        def commit(self):
+            self.commits += 1
+
+    conn = Conn()
+
+    with pytest.raises(db.DocumentLifecycleConflict):
+        db.begin_attempt(conn, "kurgu-id", owner="kurgu-worker")
+
+    sql = conn.cur.executed[0][0]
+    assert "archived_at" in sql and sql.endswith("FOR UPDATE")
+    assert len(conn.cur.executed) == 1
+    assert conn.rollbacks == 1
+    assert conn.commits == 0
+
+
+@pytest.mark.parametrize("archived", [None, 0, 1, "true"])
+def test_the_lifecycle_writer_refuses_non_boolean_authority(archived):
+    from pipeline.index import db
+
+    conn = LifecycleConn(_lifecycle_row())
+    with pytest.raises(ValueError):
+        db.set_document_archived(conn, "kurgu-id", archived)
+    assert conn.cur.executed == []
 
 
 def test_the_listing_query_never_selects_the_candidate_columns():
@@ -376,7 +582,8 @@ def test_both_filters_combine_with_and_fully_parameterized():
                       status="kurgu-durum", file_type="kurgu-tur")
 
     sql, params = conn.cur.executed[0]
-    assert "WHERE status = %(status)s AND file_type = %(file_type)s" in sql
+    assert ("WHERE archived_at IS NULL AND status = %(status)s "
+            "AND file_type = %(file_type)s" in sql)
     assert params == {"limit": 6, "offset": 0,
                       "status": "kurgu-durum", "file_type": "kurgu-tur"}
     assert "kurgu-durum" not in sql and "kurgu-tur" not in sql
@@ -527,7 +734,8 @@ def test_all_four_filters_combine_with_and_fully_parameterized():
                       uploaded_before=INSTANT_SONRA)
 
     sql, params = conn.cur.executed[0]
-    assert ("WHERE status = %(status)s AND file_type = %(file_type)s "
+    assert ("WHERE archived_at IS NULL AND status = %(status)s "
+            "AND file_type = %(file_type)s "
             "AND uploaded_at > %(uploaded_after)s "
             "AND uploaded_at < %(uploaded_before)s " in sql)
     assert params == {"limit": 6, "offset": 0,
@@ -632,7 +840,8 @@ def test_a_window_whose_bounds_are_spelled_differently_is_still_one_window():
                       uploaded_after=after, uploaded_before=before)
 
     sql, params = conn.cur.executed[0]
-    assert ("WHERE uploaded_at > %(uploaded_after)s "
+    assert ("WHERE archived_at IS NULL "
+            "AND uploaded_at > %(uploaded_after)s "
             "AND uploaded_at < %(uploaded_before)s " in sql)
     assert params == {"limit": 6, "offset": 0,
                       "uploaded_after": after, "uploaded_before": before}
@@ -1051,7 +1260,8 @@ def test_all_five_filters_combine_with_and_fully_parameterized():
                       q="kurgu%rapor")
 
     sql, params = conn.cur.executed[0]
-    assert ("WHERE status = %(status)s AND file_type = %(file_type)s "
+    assert ("WHERE archived_at IS NULL AND status = %(status)s "
+            "AND file_type = %(file_type)s "
             "AND uploaded_at > %(uploaded_after)s "
             "AND uploaded_at < %(uploaded_before)s "
             "AND filename ILIKE %(filename_search)s ESCAPE '!' " in sql)
@@ -1198,6 +1408,15 @@ def test_both_hybrid_statements_carry_the_SAME_scope_clause():
             == sparse_sql.split("ORDER BY")[0])
 
 
+def test_both_hybrid_rankings_exclude_archived_documents_before_the_cut():
+    _found, cur = _hybrid()
+
+    assert len(cur.executed) == 2
+    for sql, _params in cur.executed:
+        assert "d.archived_at IS NULL" in sql
+        assert sql.index("d.archived_at IS NULL") < sql.index("ORDER BY")
+
+
 def test_the_scope_clause_is_static_text_and_the_identifiers_are_values():
     """No identifier is ever interpolated. The proof is a value carrying
     quote syntax: it travels as a parameter like any other value, so the
@@ -1330,6 +1549,7 @@ def test_the_filename_resolution_is_a_parameterised_select_only_query():
     # anywhere in the statement
     assert params == ([IC_BELGE, DIS_BELGE],)
     assert IC_BELGE not in sql and DIS_BELGE not in sql
+    assert "archived_at IS NULL" in sql
     upper = sql.upper()
     for verb in ("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP"):
         assert verb not in upper
@@ -1344,6 +1564,41 @@ def test_resolved_filenames_come_back_deduplicated_and_ordered():
 
     assert db.filenames_for_documents(conn, (IC_BELGE, DIS_BELGE)) == [
         "a.pdf", "b.pdf"]
+
+
+def test_active_filename_resolution_reads_live_lifecycle_authority():
+    from pipeline.index import db
+
+    conn = NameConn([("a.pdf",), ("b.pdf",)])
+
+    assert db.active_document_filenames(conn) == ["a.pdf", "b.pdf"]
+    sql, params = conn.cur.executed[0]
+    assert sql == (
+        "SELECT filename FROM documents "
+        "WHERE archived_at IS NULL ORDER BY filename")
+    assert params is None
+
+
+@pytest.mark.parametrize(
+    ("document_ids", "suffix", "params"),
+    [
+        (None, "archived_at IS NULL ORDER BY filename FOR SHARE", None),
+        ((IC_BELGE,),
+         "archived_at IS NULL AND id = ANY(%s::uuid[]) "
+         "ORDER BY filename FOR SHARE",
+         ([IC_BELGE],)),
+    ],
+)
+def test_snapshot_retrieval_locks_exactly_its_active_authority(
+        document_ids, suffix, params):
+    from pipeline.index import db
+
+    conn = NameConn([("a.pdf",)])
+
+    assert db.lock_retrieval_filenames(conn, document_ids) == ["a.pdf"]
+    sql, sent = conn.cur.executed[0]
+    assert sql.endswith(suffix)
+    assert sent == params
 
 
 def test_an_unresolvable_identifier_resolves_to_no_name_at_all():

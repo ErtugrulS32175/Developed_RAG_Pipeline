@@ -86,21 +86,18 @@ def _require_filters():
     return FilterOperator, MetadataFilter, MetadataFilters
 
 
-def _scope_filenames(document_ids):
-    """Resolve the requested identifiers to filenames through `documents`.
+def _lifecycle_filenames(document_ids):
+    """Hold lifecycle authority until the snapshot query has completed."""
+    from contextlib import contextmanager
 
-    THE ROUTE IS FIXED BY WHAT THE INDEX CARRIES, not by preference: node
-    metadata here is `{page, type, filename}` and holds no document
-    identifier, so an index built before this change -- every index that
-    exists -- can only be scoped by a name it already stores. Resolution
-    goes through the `documents` table so the id stays the one authority
-    for what a document is; this engine learns no second one, and nothing
-    is rebuilt.
-    """
     from pipeline.index import db
 
-    with db.get_pool().connection() as conn:
-        return db.filenames_for_documents(conn, document_ids)
+    @contextmanager
+    def locked():
+        with db.get_pool().connection() as conn:
+            yield db.lock_retrieval_filenames(conn, document_ids)
+
+    return locked()
 
 
 def _scope_filters(filenames):
@@ -248,6 +245,7 @@ def build_index():
                 "SELECT c.text, c.page, c.type, d.filename "
                 "FROM chunks c LEFT JOIN documents d ON c.document_id = d.id "
                 "AND c.generation = d.active_generation "
+                "AND d.archived_at IS NULL "
                 "WHERE c.document_id IS NULL OR d.id IS NOT NULL"
             )
             rows = cur.fetchall()
@@ -304,7 +302,7 @@ def _as_chunks(nodes):
 
 
 def retrieve(question, top_k=TOP_K, *, document_ids=None):
-    """Retrieve with LlamaIndex, optionally scoped to a set of documents.
+    """Retrieve active documents, optionally scoped to a requested set.
 
     THE SCOPE IS PART OF THE QUERY. It is resolved to filenames, turned
     into a metadata filter and handed to the retriever AT CONSTRUCTION, so
@@ -314,32 +312,35 @@ def retrieve(question, top_k=TOP_K, *, document_ids=None):
     the answer would come back empty whenever other documents filled the
     pool first.
 
-    Three fail-closed refusals, all of them before a node is fetched:
-    the filter API is not available, the retriever did not take the filter,
-    or every identifier resolved to nothing. The last one returns an empty
-    result rather than querying unscoped -- an unknown identifier must
-    narrow the search to nothing, never widen it to everything.
+    The vector table is a snapshot but archive/restore is live metadata, so
+    an otherwise unscoped query still resolves the current active filenames
+    and filters at construction. Legacy snapshot nodes without a document
+    authority are excluded fail-closed on this comparison engine.
+
+    Three fail-closed refusals, all before a node is fetched: the filter API
+    is unavailable, the retriever did not take the filter, or the authority
+    resolves to no active filename. The last returns an empty result rather
+    than querying the stale snapshot unscoped.
     """
-    scope = None
-    if document_ids is not None:
-        # asked FIRST: an engine that cannot express the filter must refuse
-        # the question before it does any work that looks like answering it
-        _require_filters()
-        filenames = _scope_filenames(document_ids)
+    index, VectorStoreQueryMode = _index()
+    # Asked before retrieval: an engine that cannot express lifecycle
+    # authority must refuse before it does work that looks like answering.
+    # The vector table is a snapshot, while archive/restore is live metadata;
+    # even an
+    # otherwise unscoped query therefore carries the current active names.
+    _require_filters()
+    with _lifecycle_filenames(document_ids) as filenames:
         if not filenames:
             return []
         scope = _scope_filters(filenames)
-    index, VectorStoreQueryMode = _index()
-    retriever = index.as_retriever(
-        similarity_top_k=top_k,
-        vector_store_query_mode=VectorStoreQueryMode.HYBRID,
-        # an unscoped call passes no filter argument at all, so it is the
-        # same construction it has always been
-        **({} if scope is None else {"filters": scope}),
-    )
-    if scope is not None and not _scope_reached(retriever, scope):
-        raise RuntimeError(_SCOPE_UNSUPPORTED)
-    return _as_chunks(retriever.retrieve(question))
+        retriever = index.as_retriever(
+            similarity_top_k=top_k,
+            vector_store_query_mode=VectorStoreQueryMode.HYBRID,
+            filters=scope,
+        )
+        if not _scope_reached(retriever, scope):
+            raise RuntimeError(_SCOPE_UNSUPPORTED)
+        return _as_chunks(retriever.retrieve(question))
 
 
 def answer(question):
