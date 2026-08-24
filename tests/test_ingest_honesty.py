@@ -310,8 +310,14 @@ class _GenCursor:
         self.conn.statements.append(sql)
         if sql.startswith("SELECT id FROM chunks"):
             self._rows = [(i,) for i in self.conn.staged]
+        elif sql.startswith("SELECT status FROM attempts"):
+            self._one = (None,)
+        elif sql.startswith("SELECT candidate_id, attempt_id"):
+            self._one = ("kurgu-aday", "kurgu-deneme")
         elif sql.startswith("UPDATE documents"):
             self._one = ("kurgu-id",) if self.conn.cas_ok else None
+        elif sql.startswith("UPDATE attempts"):
+            self._one = ("kurgu-deneme",)
         elif sql.startswith("DELETE FROM chunks"):
             self.rowcount = self.conn.stale
 
@@ -430,11 +436,12 @@ def test_an_exact_manifest_promotes_and_sweeps_in_order():
                                     attempt_id="kurgu-deneme")
     assert removed == 3
     kinds = [s.split()[0] for s in conn.statements]
-    # SELECT (manifest) - UPDATE documents (the three-part CAS plus the
-    # lease release) - UPDATE attempts (this run's terminal DONE) -
-    # DELETE (the sweep). Package 3B added the third: closing the
+    # SELECT (manifest) - SELECT attempt (the trigger's parent proof) -
+    # UPDATE documents (the three-part CAS plus the lease release) - UPDATE
+    # attempts (this run's terminal DONE) - DELETE (the sweep). Package 3B
+    # added the attempt closure: closing the
     # attempt is part of the same success, not a follow-up.
-    assert kinds == ["SELECT", "UPDATE", "UPDATE", "DELETE"]
+    assert kinds == ["SELECT", "SELECT", "UPDATE", "UPDATE", "DELETE"]
     assert conn.commits == 1
 
 

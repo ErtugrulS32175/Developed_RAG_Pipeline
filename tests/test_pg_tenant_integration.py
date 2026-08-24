@@ -102,12 +102,33 @@ def test_snapshot_scope_keys_do_not_collapse_same_named_tenant_documents(
         tenant_database):
     _tenant(tenant_database, TENANT_A)
     assert db.lock_retrieval_scope_keys(tenant_database) == [
-        f"{TENANT_A}:{DOCUMENT_A}"]
+        f"{TENANT_A}:{DOCUMENT_A}:legacy:0"]
     tenant_database.rollback()
 
     _tenant(tenant_database, TENANT_B)
     assert db.lock_retrieval_scope_keys(tenant_database) == [
-        f"{TENANT_B}:{DOCUMENT_B}"]
+        f"{TENANT_B}:{DOCUMENT_B}:legacy:0"]
+    tenant_database.rollback()
+
+
+def test_version_catalogue_and_activation_are_tenant_closed(tenant_database):
+    _tenant(tenant_database, TENANT_A)
+    document, version, _name = db.stage_candidate(
+        tenant_database, "shared.pdf", "pdf", content_sha256="a" * 64,
+        allow_replace=True)
+    assert document == str(DOCUMENT_A)
+    assert db.finalize_candidate_publication(
+        tenant_database, document, version)
+    assert [row["version_id"] for row in db.list_document_versions(
+        tenant_database, document)] == [version]
+
+    _tenant(tenant_database, TENANT_B)
+    assert db.list_document_versions(tenant_database, document) == []
+    assert db.document_version_source_digest(
+        tenant_database, document, version) is None
+    assert db.activate_document_version(
+        tenant_database, document, version, 0,
+        verified_source_sha256="a" * 64) is None
     tenant_database.rollback()
 
 

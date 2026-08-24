@@ -37,6 +37,7 @@ def _public(status="queued"):
 def _claimed(path, status="running"):
     return {**_public(status), "filename": path.name, "archived_at": None,
             "tenant_id": str(db.DEFAULT_TENANT_ID),
+            "version_id": CANDIDATE,
             "bound_candidate_id": CANDIDATE, "bound_candidate_sha": "a" * 64,
             "current_candidate_id": CANDIDATE,
             "current_candidate_sha": "a" * 64}
@@ -157,6 +158,9 @@ def _worker_world(monkeypatch, tmp_path, job=None):
         return IngestAttempt("attempt", DOCUMENT, CANDIDATE, "a" * 64, 0)
 
     monkeypatch.setattr(job_worker.db, "begin_attempt", begin)
+    monkeypatch.setattr(
+        job_worker.publication, "ensure_bound_version_source",
+        lambda *_args, **_kwargs: None)
     monkeypatch.setattr(job_worker.db, "finish_ingest_job",
                         lambda _conn, *args: calls.append(("finish", args)) or True)
     monkeypatch.setattr(job_worker.db, "retry_ingest_job",
@@ -170,13 +174,16 @@ def test_worker_success_uses_the_existing_attempt_authority(monkeypatch, tmp_pat
     source, calls = _worker_world(monkeypatch, tmp_path)
     ingested = []
     monkeypatch.setattr(
-        job_worker.ingest, "main",
-        lambda path, attempt=None: ingested.append((path, attempt)) or
+        job_worker.ingest, "ingest_version_source",
+        lambda *args, **kwargs: ingested.append((args, kwargs)) or
         (AttemptOutcome.DONE, None))
 
     assert job_worker.run_one(worker_id="worker-alpha", upload_dir=tmp_path)
-    assert ingested[0][0] == str(source)
-    assert isinstance(ingested[0][1], IngestAttempt)
+    args, kwargs = ingested[0]
+    assert args[:5] == (
+        tmp_path, str(db.DEFAULT_TENANT_ID), DOCUMENT, CANDIDATE, source.name)
+    assert isinstance(args[5], IngestAttempt)
+    assert kwargs == {"expected_sha256": "a" * 64}
     assert calls == [
         ("begin", (DOCUMENT,), {
             "owner": "job/worker-alpha", "ingest_job_id": JOB,
@@ -206,7 +213,7 @@ def test_transient_worker_failure_requeues_with_only_the_exception_type(
     def fail(*_args, **_kwargs):
         raise OSError("private path and vendor prose")
 
-    monkeypatch.setattr(job_worker.ingest, "main", fail)
+    monkeypatch.setattr(job_worker.ingest, "ingest_version_source", fail)
     assert job_worker.run_one(worker_id="worker-alpha", upload_dir=tmp_path)
     assert calls[0][0] == "begin"
     assert calls[1][0] == "abandon"
@@ -227,7 +234,7 @@ def test_lost_job_ownership_never_retries_or_rewrites_the_job(
         monkeypatch, tmp_path):
     _source, calls = _worker_world(monkeypatch, tmp_path)
     monkeypatch.setattr(
-        job_worker.ingest, "main",
+        job_worker.ingest, "ingest_version_source",
         lambda *_args, **_kwargs: (AttemptOutcome.DONE, None))
     monkeypatch.setattr(job_worker.db, "finish_ingest_job",
                         lambda *_args: False)

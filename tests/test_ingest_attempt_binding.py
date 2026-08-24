@@ -21,6 +21,7 @@ publishes and begins; ``ingest_attempt`` refuses to run unbound.
 import hashlib
 import inspect
 import threading
+import uuid
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,9 @@ A_BYTES = b"KURGU_SURUM_A"
 B_BYTES = b"KURGU_SURUM_B"
 SHA_A = hashlib.sha256(A_BYTES).hexdigest()
 SHA_B = hashlib.sha256(B_BYTES).hexdigest()
+DOCUMENT_ID = "10000000-0000-4000-8000-000000000001"
+VERSION_A = "20000000-0000-4000-8000-00000000000a"
+VERSION_B = "20000000-0000-4000-8000-00000000000b"
 
 
 class Violations:
@@ -87,7 +91,7 @@ class DocumentStore:
 
     def __init__(self, filename="kurgu.pdf"):
         self.row = {
-            "id": "kurgu-belge-id",
+            "id": DOCUMENT_ID,
             "filename": filename,
             "status": "pending",
             "content_sha256": None,
@@ -128,7 +132,7 @@ class DocumentStore:
             candidate_id = row["candidate_id"]
         else:
             self.minted += 1
-            candidate_id = f"kurgu-aday-{self.minted}"
+            candidate_id = str(uuid.UUID(int=self.minted))
             row["candidate_state"] = CandidateState.STAGED
         row["status"] = status
         row["candidate_id"] = candidate_id
@@ -148,7 +152,7 @@ class DocumentStore:
                 row["content_sha256"] != content_sha256
                 or row["candidate_id"] is None):
             self.minted += 1
-            row["candidate_id"] = f"kurgu-aday-{self.minted}"
+            row["candidate_id"] = str(uuid.UUID(int=self.minted))
             row["content_sha256"] = content_sha256
             row["candidate_state"] = CandidateState.STAGED
             row["attempt_id"] = None
@@ -373,7 +377,7 @@ def test_the_documented_cli_entry_point_cannot_promote_a_stale_snapshot(
     the assertion is a full snapshot, not a spot check."""
     store, source = store_and_source
     store.row.update({
-        "content_sha256": SHA_A, "candidate_id": "kurgu-aday-A",
+        "content_sha256": SHA_A, "candidate_id": VERSION_A,
         "candidate_state": CandidateState.PUBLISHED,
         "active_generation": 1, "active_content_sha": SHA_A,
         "status": "done",
@@ -383,7 +387,7 @@ def test_the_documented_cli_entry_point_cannot_promote_a_stale_snapshot(
 
     def authorised_upload_lands():
         store.row.update({"content_sha256": SHA_B,
-                          "candidate_id": "kurgu-aday-B",
+                          "candidate_id": VERSION_B,
                           "candidate_state": CandidateState.PUBLISHED,
                           "status": "pending"})
         source.write_bytes(B_BYTES)
@@ -615,7 +619,7 @@ def test_a_process_in_the_publish_gap_is_refused_without_touching_state(
         yield
 
     store = DocumentStore()
-    store.row.update({"content_sha256": SHA_A, "candidate_id": "kurgu-aday-1",
+    store.row.update({"content_sha256": SHA_A, "candidate_id": VERSION_A,
                       "candidate_state": CandidateState.PUBLISHED,
                       "status": "done", "active_generation": 1,
                       "active_content_sha": SHA_A})
@@ -641,14 +645,15 @@ def test_a_process_in_the_publish_gap_is_refused_without_touching_state(
     monkeypatch.setattr(api.ingest, "main", bound_ingest)
 
     in_the_gap, process_done = threading.Event(), threading.Event()
-    real_replace = api.os.replace
+    real_publish_source = publication.publish_version_source
 
-    def replace_after_the_process_ran(src, dst):
+    def publish_after_the_process_ran(*args, **kwargs):
         in_the_gap.set()                 # the row is committed, disk is not
         process_done.wait(timeout=5)
-        return real_replace(src, dst)
+        return real_publish_source(*args, **kwargs)
 
-    monkeypatch.setattr(api.os, "replace", replace_after_the_process_ran)
+    monkeypatch.setattr(publication, "publish_version_source",
+                        publish_after_the_process_ran)
 
     client = TestClient(api.app)
     headers = ({"Authorization": f"Bearer {api.API_KEY}"}
@@ -704,10 +709,15 @@ def test_a_process_in_the_publish_gap_is_refused_without_touching_state(
     v.require(store.row["candidate_state"] == CandidateState.PUBLISHED,
               f"upload bitti ama aday yayimlanmis degil: "
               f"{store.row['candidate_state']}")
-    disk_sha = hashlib.sha256(
-        (upload_dir / "kurgu.pdf").read_bytes()).hexdigest()
+    stored = publication.read_version_source(
+        upload_dir, db.DEFAULT_TENANT_ID, store.row["id"],
+        store.row["candidate_id"],
+        expected_sha256=store.row["content_sha256"])
+    disk_sha = hashlib.sha256(stored).hexdigest()
     v.require(disk_sha == store.row["content_sha256"],
-              "disk hash'i kayitli adayla eslesmiyor")
+              "immutable kaynak hash'i kayitli adayla eslesmiyor")
+    v.require((upload_dir / "kurgu.pdf").read_bytes() == A_BYTES,
+              "yeni yayin legacy flat kaynagi degistirdi")
     v.assert_none()
 
 
@@ -848,7 +858,7 @@ def test_the_cli_replace_flag_is_behavioural_and_answers_with_exit_codes(
     not grepped: a source comment mentioning --replace would satisfy a
     textual check while the CLI silently replaced everything."""
     store, source = store_and_source
-    store.row.update({"content_sha256": SHA_A, "candidate_id": "kurgu-aday-A",
+    store.row.update({"content_sha256": SHA_A, "candidate_id": VERSION_A,
                       "candidate_state": CandidateState.PUBLISHED,
                       "active_generation": 1, "active_content_sha": SHA_A,
                       "status": "done"})
@@ -886,7 +896,7 @@ def test_there_is_no_implicit_environment_replacement(store_and_source,
     ways: the name must be gone from the module, AND setting it must not
     change the CLI's answer."""
     store, source = store_and_source
-    store.row.update({"content_sha256": SHA_A, "candidate_id": "kurgu-aday-A",
+    store.row.update({"content_sha256": SHA_A, "candidate_id": VERSION_A,
                       "candidate_state": CandidateState.PUBLISHED,
                       "active_generation": 1, "active_content_sha": SHA_A,
                       "status": "done"})
@@ -910,11 +920,11 @@ def test_there_is_no_implicit_environment_replacement(store_and_source,
 
 def test_the_publisher_writes_where_the_database_says_not_where_asked(
         monkeypatch, tmp_path):
-    """Rule 13, BEHAVIOURALLY: the database canonicalises a re-cased name,
-    and the bytes must follow the ROW, not the request. A parameter
-    blacklist was the earlier check and it let ``disk_location`` through;
-    an exact signature plus a real call cannot be worked around by
-    naming."""
+    """The canonical ROW name survives as metadata, never as storage authority.
+
+    A re-cased request returns the database spelling, while bytes are addressed
+    only by tenant/document/version UUIDs.  A caller-provided disk target or a
+    lowercased filename therefore cannot redirect the immutable write."""
     publication = _import_publication()
     v = Violations()
     if not v.require(publication is not None,
@@ -990,13 +1000,19 @@ def test_the_publisher_writes_where_the_database_says_not_where_asked(
     v.require(error is None, f"yayin servisi hata verdi: {error!r}")
     v.require(counts == {"stage": 1, "finalize": 1, "lock": 1},
               f"dikisler tam birer kez cagrilmadi: {counts}")
-    written = sorted(p.name for p in upload_dir.iterdir())
-    v.require(written == [canonical],
-              f"baytlar kanonik hedefe yazilmadi (ya da gecici dosya "
-              f"kaldi): {written}")
-    if written == [canonical]:
-        v.require((upload_dir / canonical).read_bytes() == B_BYTES,
-                  "kanonik hedefe YANLIS baytlar yazildi")
+    if result is not None:
+        document_id, candidate_id, _returned = result
+        try:
+            stored = publication.read_version_source(
+                upload_dir, db.DEFAULT_TENANT_ID, document_id, candidate_id,
+                expected_sha256=SHA_B)
+        except Exception as refusal:
+            v.require(False, f"uuid kaynak nesnesi okunamadi: {refusal!r}")
+        else:
+            v.require(stored == B_BYTES,
+                      "uuid kaynak nesnesine YANLIS baytlar yazildi")
+    v.require(not (upload_dir / canonical).exists(),
+              "kanonik metadata yeniden flat-file hedefe donustu")
     v.require(store.row["candidate_state"] == CandidateState.PUBLISHED,
               f"aday yayimlanmis degil: {store.row['candidate_state']}")
     v.require(isinstance(result, tuple) and len(result) == 3

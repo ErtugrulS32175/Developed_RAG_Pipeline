@@ -37,8 +37,14 @@ def real_job_connection():
             cursor.execute(
                 "INSERT INTO documents "
                 "(id, filename, file_type, candidate_id, content_sha256, "
-                "candidate_state) VALUES (%s, 'alpha.pdf', 'pdf', %s, %s, %s)",
+                "candidate_state, last_version_number) "
+                "VALUES (%s, 'alpha.pdf', 'pdf', %s, %s, %s, 1)",
                 (DOCUMENT, CANDIDATE, "a" * 64, "published"))
+            cursor.execute(
+                "INSERT INTO document_versions "
+                "(id, tenant_id, document_id, version_number, content_sha256) "
+                "SELECT %s, tenant_id, id, 1, %s FROM documents WHERE id = %s",
+                (CANDIDATE, "a" * 64, DOCUMENT))
         connection.commit()
         yield connection
     finally:

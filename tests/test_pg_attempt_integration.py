@@ -204,15 +204,22 @@ def _has_column(conn, table, column):
         return cur.fetchone()[0] > 0
 
 
-def _insert_chunk(conn, document_id, generation, chunk_id=None):
+def _insert_chunk(conn, document_id, generation, chunk_id=None, *,
+                  bind_candidate=True):
     chunk_id = chunk_id or str(uuid.uuid4())
     with conn.cursor() as cur:
+        version_id = None
+        if bind_candidate:
+            cur.execute("SELECT candidate_id FROM documents WHERE id = %s",
+                        (document_id,))
+            version_id = cur.fetchone()[0]
         cur.execute(
-            "INSERT INTO chunks (id, document_id, type, text, source_tag, "
+            "INSERT INTO chunks (id, document_id, version_id, type, text, source_tag, "
             "page, dense, sparse, generation, content_key) VALUES "
-            "(%s, %s, 'text', 'kurgu parca', 'page1:native', 1, '', '', "
+            "(%s, %s, %s, 'text', 'kurgu parca', 'page1:native', 1, '', '', "
             "%s, %s)",
-            (chunk_id, document_id, generation, str(uuid.uuid4())))
+            (chunk_id, document_id, version_id, generation,
+             str(uuid.uuid4())))
     conn.commit()
     return chunk_id
 
@@ -226,14 +233,20 @@ def _served_row(conn, filename, served_sha, candidate_sha,
     column must not make every other test fail during setup instead of
     on its own claim."""
     document_id = str(uuid.uuid4())
+    candidate_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO documents (id, filename, file_type, status, "
             "content_sha256, candidate_id, active_generation, "
-            "last_generation, active_content_sha) VALUES "
-            "(%s, %s, 'pdf', 'done', %s, %s, 1, 1, %s)",
-            (document_id, filename, candidate_sha, str(uuid.uuid4()),
+            "last_generation, active_content_sha, last_version_number) VALUES "
+            "(%s, %s, 'pdf', 'done', %s, %s, 1, 1, %s, 1)",
+            (document_id, filename, candidate_sha, candidate_id,
              served_sha))
+        cur.execute(
+            "INSERT INTO document_versions "
+            "(id, tenant_id, document_id, version_number, content_sha256) "
+            "SELECT %s, tenant_id, id, 1, %s FROM documents WHERE id = %s",
+            (candidate_id, candidate_sha, document_id))
     conn.commit()
     if candidate_state is not None and _has_column(conn, "documents",
                                                    "candidate_state"):
@@ -241,7 +254,7 @@ def _served_row(conn, filename, served_sha, candidate_sha,
             cur.execute("UPDATE documents SET candidate_state = %s "
                         "WHERE id = %s", (candidate_state, document_id))
         conn.commit()
-    _insert_chunk(conn, document_id, 1)
+    _insert_chunk(conn, document_id, 1, bind_candidate=False)
     return document_id
 
 
@@ -1073,7 +1086,7 @@ def test_rule_4_a_successful_promotion_clears_the_lease_and_closes_the_attempt(
 # crash windows, legacy rows, and the fixture's own safety
 # =====================================================================
 
-@pytest.mark.parametrize("crash_point", ["stage_sonrasi", "replace_sonrasi"])
+@pytest.mark.parametrize("crash_point", ["stage_sonrasi", "source_sonrasi"])
 def test_rule_11_publication_crash_windows_recover_idempotently(
         conn, filename, crash_point, tmp_path):
     """The recovery RUNS publish_candidate -- an earlier draft only checked
@@ -1090,15 +1103,17 @@ def test_rule_11_publication_crash_windows_recover_idempotently(
     upload_dir.mkdir()
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(publication, "UPLOAD_DIR", upload_dir, raising=False)
-    disk = upload_dir / filename
-    disk.write_bytes(A_BYTES)
+    legacy_disk = upload_dir / filename
+    legacy_disk.write_bytes(A_BYTES)
 
     try:
         document_id, candidate_id, _canonical = stage(
             conn, filename, "pdf", content_sha256=SHA_B,
             allow_replace=True)
-        if crash_point == "replace_sonrasi":
-            disk.write_bytes(B_BYTES)
+        if crash_point == "source_sonrasi":
+            publication.publish_version_source(
+                upload_dir, db.DEFAULT_TENANT_ID, document_id, candidate_id,
+                B_BYTES, expected_sha256=SHA_B)
         assert _row(conn, document_id,
                     "candidate_state")["candidate_state"] == (
             CandidateState.STAGED)
@@ -1112,8 +1127,12 @@ def test_rule_11_publication_crash_windows_recover_idempotently(
     assert row["candidate_state"] == CandidateState.PUBLISHED
     assert str(row["candidate_id"]) == str(candidate_id), (
         "idempotent tekrar yeni bir aday kimligi uretti")
-    assert disk.read_bytes() == B_BYTES, (
-        "toparlanma diske dokunmadi: yayin servisi baytlari yaymadi")
+    assert publication.read_version_source(
+        upload_dir, db.DEFAULT_TENANT_ID, document_id, candidate_id,
+        expected_sha256=SHA_B) == B_BYTES, (
+        "toparlanma immutable surum kaynagini yayimlamadi")
+    assert legacy_disk.read_bytes() == A_BYTES, (
+        "yeni yayin legacy flat kaynagi degistirdi")
 
 
 def test_rule_8_a_legacy_row_is_not_processable(conn, filename):

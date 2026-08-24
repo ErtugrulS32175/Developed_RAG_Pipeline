@@ -10,6 +10,7 @@ import hashlib
 import json
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -194,6 +195,17 @@ PUBLISHED = "published"
 DONE_RUN = ("done", None)
 
 
+DOCUMENT_UUID = "11111111-1111-4111-8111-111111111111"
+VERSION_UUID = "22222222-2222-4222-8222-222222222222"
+
+
+def _version_source(api, root, document_id, version_id):
+    from pipeline.index import publication
+
+    return publication.version_source_path(
+        root, str(api.db.DEFAULT_TENANT_ID), document_id, version_id)
+
+
 def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
                   ingest_error=None):
     """The document routes with only their DATABASE seams replaced.
@@ -220,7 +232,7 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
     monkeypatch.setattr(publication, "UPLOAD_DIR", upload_dir)
     monkeypatch.setattr(api, "db_conn", _fake_db_conn)
 
-    document_id = "kurgu-belge-kimligi"
+    document_id = DOCUMENT_UUID
     state = {}
     calls = []
     minted = {"n": 0}
@@ -243,7 +255,7 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
             cid = row["candidate_id"]
         else:
             minted["n"] += 1
-            cid = f"kurgu-aday-{minted['n']}"
+            cid = str(uuid.UUID(int=minted["n"] + 32))
         state[document_id] = {
             "id": document_id,
             "filename": canonical,
@@ -328,7 +340,9 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
             "archived_at": row["archived_at"],
         }
 
-    def run_ingest(path, expected_candidate=None, attempt=None):
+    def run_ingest(object_root, tenant_id, wanted_document, version_id,
+                   canonical_filename, attempt, *, expected_sha256,
+                   max_bytes):
         """The core as it REALLY behaves, which is the point of this fake.
 
         The previous version wrote the document's status directly, and
@@ -338,14 +352,16 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
         called a truthful partial run a failure. Here only a PROMOTION
         moves the served status, in the same breath as the generation,
         and the run REPORTS its verdict to its caller."""
-        calls.append((path, expected_candidate, attempt))
+        calls.append((object_root, tenant_id, wanted_document, version_id,
+                      canonical_filename, attempt, expected_sha256,
+                      max_bytes))
         if ingest_error is not None:
             raise ingest_error
         if ingest_outcome is None:
             return None                 # a run that reported nothing
         status, note = ingest_outcome
         if status == "done":
-            row = state[document_id]
+            row = state[wanted_document]
             row["status"] = "done"
             row["active_generation"] = int(row.get("active_generation") or 0) + 1
         return status, note
@@ -372,7 +388,13 @@ def _document_api(monkeypatch, tmp_path, *, ingest_outcome=DONE_RUN,
     monkeypatch.setattr(api.db, "set_document_archived",
                         set_document_archived)
     monkeypatch.setattr(api.db, "document_publish_lock", publish_lock)
-    monkeypatch.setattr(api.ingest, "main", run_ingest)
+    # Immutable-source and legacy-migration behaviour has its own storage
+    # battery.  This fixture models the HTTP/attempt contract, so keep that
+    # storage prerequisite neutral unless a test replaces it deliberately.
+    monkeypatch.setattr(
+        api.publication, "ensure_bound_version_source",
+        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(api.ingest, "ingest_version_source", run_ingest)
     return api, TestClient(api.app), state, calls, upload_dir, closed
 
 
@@ -392,7 +414,8 @@ def test_document_upload_process_and_read_use_the_production_routes(
     document_id = uploaded.json()["document_id"]
     assert uploaded.json()["status"] == "pending"
     first_candidate = uploaded.json()["candidate_id"]
-    assert (upload_dir / "kurgu-belge.pdf").read_bytes() == b"KURGU_PDF"
+    assert _version_source(
+        api, upload_dir, document_id, first_candidate).read_bytes() == b"KURGU_PDF"
 
     # Round 14: same name + different bytes is a CONFLICT by default -- the
     # old contract announced the replacement only after doing it. The old
@@ -403,7 +426,8 @@ def test_document_upload_process_and_read_use_the_production_routes(
         files={"file": ("kurgu-belge.pdf", b"KURGU_PDF_V2", "application/pdf")},
     )
     assert conflict.status_code == 409
-    assert (upload_dir / "kurgu-belge.pdf").read_bytes() == b"KURGU_PDF"
+    assert _version_source(
+        api, upload_dir, document_id, first_candidate).read_bytes() == b"KURGU_PDF"
     # replacement happens only when the caller claims it out loud
     replaced = client.post(
         "/documents/upload?replace=true",
@@ -416,7 +440,9 @@ def test_document_upload_process_and_read_use_the_production_routes(
     # report back and which could only be re-derived OUTSIDE the publish
     # lock. The candidate id answers the same question truthfully.
     assert replaced.json()["candidate_id"] != first_candidate
-    assert (upload_dir / "kurgu-belge.pdf").read_bytes() == b"KURGU_PDF_V2"
+    assert _version_source(
+        api, upload_dir, document_id,
+        replaced.json()["candidate_id"]).read_bytes() == b"KURGU_PDF_V2"
     # same bytes again: the SAME candidate, so nothing was replaced
     again = client.post(
         "/documents/upload",
@@ -436,9 +462,14 @@ def test_document_upload_process_and_read_use_the_production_routes(
     # took before anything was parsed -- processing "whatever the disk
     # holds now" was the P0, and a tuple the endpoint read a moment
     # earlier was still not a run identity.
-    path_called, legacy_binding, attempt = calls[0]
-    assert path_called == str(upload_dir / "kurgu-belge.pdf")
-    assert legacy_binding is None
+    (root_called, tenant_called, document_called, version_called,
+     name_called, attempt, expected_sha, _max_bytes) = calls[0]
+    assert root_called == upload_dir
+    assert tenant_called == api.db.DEFAULT_TENANT_ID
+    assert document_called == document_id
+    assert version_called == state[document_id]["candidate_id"]
+    assert name_called == "kurgu-belge.pdf"
+    assert expected_sha == state[document_id]["content_sha256"]
     assert attempt.candidate_id == state[document_id]["candidate_id"]
     assert attempt.candidate_sha == state[document_id]["content_sha256"]
 
@@ -478,23 +509,25 @@ def test_upload_publishes_db_and_disk_inside_one_held_lock(
     def recording_stage(_conn, filename, file_type, content_sha256=None,
                         allow_replace=False):
         events.append("db-evrele")
-        return "kurgu-belge-kimligi", "kurgu-aday-1", filename
+        return DOCUMENT_UUID, VERSION_UUID, filename
 
     def recording_finalize(_conn, _document_id, _candidate_id):
         events.append("db-yayimla")
         return True
 
-    real_replace = api.os.replace
+    from pipeline.index import publication
+    real_publish = publication.publish_version_source
 
-    def recording_replace(src, dst):
-        events.append("disk")
-        return real_replace(src, dst)
+    def recording_publish(*args, **kwargs):
+        events.append("surum-kaynagi")
+        return real_publish(*args, **kwargs)
 
     monkeypatch.setattr(api.db, "document_publish_lock", recording_lock)
     monkeypatch.setattr(api.db, "stage_candidate", recording_stage)
     monkeypatch.setattr(api.db, "finalize_candidate_publication",
                         recording_finalize)
-    monkeypatch.setattr(api.os, "replace", recording_replace)
+    monkeypatch.setattr(publication, "publish_version_source",
+                        recording_publish)
 
     response = client.post(
         "/documents/upload",
@@ -502,7 +535,7 @@ def test_upload_publishes_db_and_disk_inside_one_held_lock(
         files={"file": ("kurgu.pdf", b"KURGU_PDF", "application/pdf")},
     )
     assert response.status_code == 200
-    assert events == ["kilit-al", "db-evrele", "disk", "db-yayimla",
+    assert events == ["kilit-al", "db-evrele", "surum-kaynagi", "db-yayimla",
                       "kilit-birak"]
 
 
@@ -527,18 +560,18 @@ def test_two_workers_cannot_split_the_database_from_the_disk(
 
     def slow_stage(_conn, filename, file_type, content_sha256=None,
                    allow_replace=False):
-        state["kurgu-belge-kimligi"] = {
-            "id": "kurgu-belge-kimligi",
+        candidate_id = str(uuid.UUID(content_sha256[:32]))
+        state[DOCUMENT_UUID] = {
+            "id": DOCUMENT_UUID,
             "filename": filename,
             "file_type": file_type,
             "status": "pending",
             "content_sha256": content_sha256,
-            "candidate_id": f"kurgu-aday-{content_sha256[:8]}",
+            "candidate_id": candidate_id,
             "candidate_state": "staged",
         }
         time.sleep(0.15)  # the historic gap between DB commit and os.replace
-        return ("kurgu-belge-kimligi",
-                state["kurgu-belge-kimligi"]["candidate_id"], filename)
+        return (DOCUMENT_UUID, candidate_id, filename)
 
     monkeypatch.setattr(api.db, "document_publish_lock", session_lock)
     monkeypatch.setattr(api.db, "stage_candidate", slow_stage)
@@ -562,9 +595,11 @@ def test_two_workers_cannot_split_the_database_from_the_disk(
     second.join()
 
     assert sorted(codes) == [200, 200]
-    disk_sha = hashlib.sha256(
-        (upload_dir / "kurgu.pdf").read_bytes()).hexdigest()
-    assert state["kurgu-belge-kimligi"]["content_sha256"] == disk_sha
+    winning = state[DOCUMENT_UUID]
+    source = _version_source(
+        api, upload_dir, DOCUMENT_UUID, winning["candidate_id"])
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == winning[
+        "content_sha256"]
 
 
 def test_a_recased_upload_targets_the_canonical_disk_file(
@@ -591,8 +626,10 @@ def test_a_recased_upload_targets_the_canonical_disk_file(
     assert recased.status_code == 200
     # the response and the disk both speak the CANONICAL spelling
     assert recased.json()["filename"] == "kurgu-belge.pdf"
-    assert (upload_dir / "kurgu-belge.pdf").read_bytes() == b"IKINCI_KURGU"
-    assert state["kurgu-belge-kimligi"]["filename"] == "kurgu-belge.pdf"
+    assert _version_source(
+        api, upload_dir, DOCUMENT_UUID,
+        recased.json()["candidate_id"]).read_bytes() == b"IKINCI_KURGU"
+    assert state[DOCUMENT_UUID]["filename"] == "kurgu-belge.pdf"
 
 
 def test_a_process_bound_to_a_stale_candidate_cannot_touch_the_index(
@@ -603,25 +640,23 @@ def test_a_process_bound_to_a_stale_candidate_cannot_touch_the_index(
     was read -- the refusal is the contract."""
     api, client, state, calls, upload_dir, _closed = _document_api(
         monkeypatch, tmp_path)
-    document_id = "kurgu-belge-kimligi"
+    document_id = DOCUMENT_UUID
     state[document_id] = {
         "id": document_id,
         "filename": "kurgu-belge.pdf",
         "file_type": "pdf",
         "status": "pending",
         "content_sha256": hashlib.sha256(b"ILK_KURGU").hexdigest(),
-        "candidate_id": "kurgu-aday-0",
+        "candidate_id": VERSION_UUID,
         "candidate_state": PUBLISHED,
     }
-    (upload_dir / "kurgu-belge.pdf").write_bytes(b"ILK_KURGU")
-
     response = client.post(
         f"/documents/{document_id}/process",
         headers=_headers(api),
     )
     assert response.status_code == 200
-    _path, _legacy, attempt = calls[0]
-    assert attempt.candidate_id == "kurgu-aday-0"
+    attempt = calls[0][5]
+    assert attempt.candidate_id == VERSION_UUID
     assert attempt.candidate_sha == hashlib.sha256(b"ILK_KURGU").hexdigest()
 
 
@@ -710,14 +745,15 @@ def test_a_lost_promotion_race_does_not_relabel_the_winners_done(
     }
     (upload_dir / "kurgu-belge.pdf").write_bytes(b"KURGU_PDF")
 
-    def losing_ingest(_path, expected_candidate=None, attempt=None):
+    def losing_ingest(_root, _tenant, _document, _version, _filename,
+                      _attempt, **_kwargs):
         # a concurrent run promotes first...
         state[document_id]["active_generation"] = 1
         state[document_id]["status"] = "done"
         # ...and THIS run's promotion fails its CAS loudly
         raise RuntimeError("es zamanli terfi kazandi")
 
-    monkeypatch.setattr(api.ingest, "main", losing_ingest)
+    monkeypatch.setattr(api.ingest, "ingest_version_source", losing_ingest)
 
     response = client.post(
         f"/documents/{document_id}/process",
@@ -829,13 +865,20 @@ def test_a_missing_source_file_is_generic_and_leaves_the_index_alone(
         "candidate_state": PUBLISHED,
     }
 
+    from pipeline.index.publication import VersionSourceMissing
+
+    def missing_source(*_args, **_kwargs):
+        raise VersionSourceMissing("invented private storage detail")
+
+    monkeypatch.setattr(api.ingest, "ingest_version_source", missing_source)
+
     response = client.post(
         f"/documents/{document_id}/process",
         headers=_headers(api),
     )
 
-    assert response.status_code == 404
-    assert response.json()["detail"] == "uploaded file missing"
+    assert response.status_code == 500
+    assert response.json()["detail"] == api.DOCUMENT_PROCESSING_FAILURE_MESSAGE
     # The SERVED version is untouched. Its chunks are in the index and
     # still answering questions -- the source file is only needed to
     # build the NEXT generation, so a missing one is a storage problem,
@@ -844,7 +887,7 @@ def test_a_missing_source_file_is_generic_and_leaves_the_index_alone(
     assert state[document_id]["status"] == "done"
     assert state[document_id]["active_generation"] == 4
     assert calls == []
-    assert closed == []          # no lease was ever taken
+    assert closed == [("kurgu-deneme-1", "VersionSourceMissing")]
     assert "kurgu-belge.pdf" not in response.text
 
 
@@ -943,7 +986,10 @@ def test_rejected_alias_cannot_overwrite_an_existing_upload(
 
     assert original.status_code == 200
     assert alias.status_code == 400
-    assert (upload_dir / "kurgu.pdf").read_bytes() == b"ILK_KURGU_PDF"
+    source = _version_source(
+        api, upload_dir, original.json()["document_id"],
+        original.json()["candidate_id"])
+    assert source.read_bytes() == b"ILK_KURGU_PDF"
     assert len(state) == 1
     assert calls == []
 
@@ -2488,8 +2534,11 @@ def test_a_scoped_request_answers_from_that_document_alone(
     assert text == "Sayfa 7'ye gore 47 000 birim."
     # BOTH retrieval statements were scoped, by the same clause, with the
     # identifier travelling as a parameter and never as statement text
-    assert len(seen["statements"]) == 2
-    for sql, params in seen["statements"]:
+    assert len(seen["statements"]) == 3
+    lock_sql, lock_params = seen["statements"][0]
+    assert "FOR SHARE" in lock_sql
+    assert lock_params[0] == [IC_BELGE]
+    for sql, params in seen["statements"][1:]:
         assert db.DOCUMENT_SCOPE_CLAUSE in sql
         assert params[0] == [IC_BELGE]
         assert IC_BELGE not in sql
@@ -2524,7 +2573,10 @@ def test_the_excluded_document_really_would_have_matched(monkeypatch):
     (_policy, user_content), = seen["prompts"]
     assert "kapsam-disinda.pdf" in user_content
     # ... and an unscoped request added NO clause and NO parameter
-    for sql, params in seen["statements"]:
+    lock_sql, lock_params = seen["statements"][0]
+    assert "FOR SHARE" in lock_sql
+    assert lock_params == ()
+    for sql, params in seen["statements"][1:]:
         assert db.DOCUMENT_SCOPE_CLAUSE not in sql
         assert len(params) == 2
 
@@ -2560,7 +2612,10 @@ def test_an_unknown_identifier_scopes_to_nothing_not_to_everything(
     status, _text = _public_reply(response, False)
     assert status == ABSTAINED
     assert seen["ranked"] == [[]]
-    for sql, params in seen["statements"]:
+    lock_sql, lock_params = seen["statements"][0]
+    assert "FOR SHARE" in lock_sql
+    assert lock_params[0] == [YOK_BELGE]
+    for sql, params in seen["statements"][1:]:
         assert db.DOCUMENT_SCOPE_CLAUSE in sql
         assert params[0] == [YOK_BELGE]
     assert _citations(response, False) == []

@@ -32,7 +32,7 @@ load_dotenv()
 # password intentionally fails auth so a missing .env surfaces loudly
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv("PG_DSN", "postgresql://rag:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -49,6 +49,10 @@ _EXECUTION_TENANT = contextvars.ContextVar(
 
 class DocumentLifecycleConflict(RuntimeError):
     """A document with an active ingest lease cannot change lifecycle."""
+
+
+class DocumentVersionConflict(RuntimeError):
+    """A document version write lost its optimistic concurrency fence."""
 
 
 class IngestJobConflict(RuntimeError):
@@ -726,6 +730,27 @@ def stage_candidate(conn, filename: str, file_type: str,
                 "yeniden adlandir ya da bilincli degistirme icin "
                 "replace yetkisi ver")
         document_id, candidate_id, stored_name = row[0], row[1], row[2]
+        # candidate_id IS version_id. Allocation and immutable catalogue
+        # insertion live in this SAME transaction as staging; a crash can
+        # leave neither side committed, never a candidate without its version.
+        # An idempotent re-knock finds the version and consumes no number.
+        cur.execute(
+            "WITH allocated AS ("
+            "UPDATE documents d SET last_version_number = "
+            "d.last_version_number + 1 "
+            "WHERE d.id = %(document)s AND %(sha)s::text IS NOT NULL "
+            "AND %(candidate)s::uuid IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM document_versions v "
+            "WHERE v.document_id = d.id AND v.id = %(candidate)s::uuid) "
+            "RETURNING d.tenant_id, d.id, d.last_version_number), "
+            "inserted AS (INSERT INTO document_versions "
+            "(id, tenant_id, document_id, version_number, content_sha256) "
+            "SELECT %(candidate)s::uuid, tenant_id, id, "
+            "last_version_number, %(sha)s FROM allocated "
+            "ON CONFLICT (id) DO NOTHING RETURNING id) "
+            "SELECT count(*) FROM inserted",
+            {"document": document_id, "candidate": candidate_id,
+             "sha": content_sha256})
         # A fenced attempt is not left dangling: the SYSTEM closes it
         # here, in the same transaction, because the displaced worker may
         # write nothing from the moment it was fenced.
@@ -848,8 +873,10 @@ def begin_attempt(conn, document_id: str, owner: str | None = None,
              "ttl": ATTEMPT_LEASE_SECONDS, "id": document_id})
         cur.execute(
             "INSERT INTO attempts (attempt_id, document_id, candidate_id, "
+            "version_id, "
             "candidate_sha, observed_active, owner) "
-            "VALUES (%(attempt)s, %(document)s, %(candidate)s, %(sha)s, "
+            "VALUES (%(attempt)s, %(document)s, %(candidate)s, "
+            "%(candidate)s, %(sha)s, "
             "%(active)s, %(owner)s)",
             {"attempt": attempt_id, "document": document_id,
              "candidate": str(candidate_id), "sha": candidate_sha,
@@ -1081,14 +1108,199 @@ def get_document(conn, document_id: str) -> dict | None:
         cur.execute(
             "SELECT id, filename, file_type, uploaded_at, status, "
             "status_note, active_generation, content_sha256, candidate_id, "
-            "archived_at "
+            "active_version_id, revision, archived_at "
             "FROM documents WHERE id = %s", (document_id,))
         row = cur.fetchone()
     if row is None:
         return None
     if row.get("candidate_id") is not None:
         row["candidate_id"] = str(row["candidate_id"])
+    if row.get("active_version_id") is not None:
+        row["active_version_id"] = str(row["active_version_id"])
     return row
+
+
+def _version_uuid(value, field: str) -> str:
+    try:
+        parsed = uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(field + " gecerli bir UUID olmali") from exc
+    return str(parsed)
+
+
+def _version_counter(value, field: str, *, minimum=0) -> int:
+    if (not isinstance(value, int) or isinstance(value, bool)
+            or value < minimum):
+        raise ValueError(field + " gecersiz")
+    return value
+
+
+def _version_hash(value) -> str:
+    if (not isinstance(value, str) or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)):
+        raise ValueError("surum ozeti 64 kucuk harf hex karakter olmali")
+    return value
+
+
+def document_version_source_digest(conn, document_id: str,
+                                   version_id: str) -> str | None:
+    """Return the immutable digest needed for a fresh source-store proof.
+
+    This is an internal coordination seam, not an API projection.  A caller
+    obtains the digest, proves the handle-bound retained source against it,
+    and passes the proof's digest into ``activate_document_version``.  The
+    version row is immutable, so the value cannot change between those steps.
+    """
+    document_id = _version_uuid(document_id, "document_id")
+    version_id = _version_uuid(version_id, "version_id")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT content_sha256 FROM document_versions "
+            "WHERE document_id = %s AND id = %s", (document_id, version_id))
+        row = cur.fetchone()
+    return None if row is None else str(row[0])
+
+
+def list_document_versions(conn, document_id: str, *, limit: int = 20,
+                           before_version_number: int | None = None
+                           ) -> list[dict]:
+    """Return a newest-first safe projection plus one pagination sentinel.
+
+    Content hashes and candidate ids are immutable internal identities and are
+    intentionally absent.  Tenant isolation is PostgreSQL RLS authority; the
+    statement never accepts a tenant value from its caller.
+    """
+    document_id = _version_uuid(document_id, "document_id")
+    _version_counter(limit, "limit", minimum=1)
+    if limit > 100:
+        raise ValueError("limit gecersiz")
+    if before_version_number is not None:
+        _version_counter(before_version_number, "before_version_number",
+                         minimum=1)
+    params = {"document": document_id, "limit": limit + 1}
+    before = ""
+    if before_version_number is not None:
+        before = "AND v.version_number < %(before)s "
+        params["before"] = before_version_number
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT v.id, v.version_number, v.created_at, "
+            "(d.active_version_id = v.id) AS is_active, d.revision "
+            ", EXISTS (SELECT 1 FROM document_version_builds b "
+            "WHERE b.document_id = v.document_id AND b.version_id = v.id "
+            "AND b.chunk_count = (SELECT count(*) FROM chunks c "
+            "WHERE c.document_id = v.document_id AND c.version_id = v.id "
+            "AND c.generation = b.generation)) "
+            "AS index_ready "
+            "FROM document_versions v "
+            "JOIN documents d ON d.id = v.document_id "
+            "WHERE v.document_id = %(document)s " + before +
+            "ORDER BY v.version_number DESC, v.id DESC LIMIT %(limit)s",
+            params)
+        rows = cur.fetchall()
+    return [{"version_id": str(row["id"]),
+             "version_number": int(row["version_number"]),
+             "created_at": row["created_at"],
+             "is_active": bool(row["is_active"]),
+             "index_ready": bool(row["index_ready"]),
+             "document_revision": int(row["revision"])}
+            for row in rows]
+
+
+def activate_document_version(conn, document_id: str, version_id: str,
+                              expected_revision: int, *,
+                              verified_source_sha256: str) -> dict | None:
+    """Atomically switch all retrieval authority with an optimistic CAS.
+
+    The caller must first freshly prove the retained source object and pass
+    that proof's digest. This transaction then requires an immutable ready
+    build whose retained chunk count still matches, refuses any active job,
+    attempt or archive, and moves version, generation, digest, status and
+    revision together. ``None`` means the tenant-visible version has no ready
+    retained build; a stale revision is a typed conflict, never overwrite.
+    """
+    document_id = _version_uuid(document_id, "document_id")
+    version_id = _version_uuid(version_id, "version_id")
+    expected_revision = _version_counter(
+        expected_revision, "expected_revision")
+    verified_source_sha256 = _version_hash(verified_source_sha256)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT tenant_id, active_version_id, active_generation, "
+            "revision, attempt_id, "
+            "archived_at FROM documents WHERE id = %s FOR UPDATE",
+            (document_id,))
+        document = cur.fetchone()
+        if document is None:
+            conn.rollback()
+            return None
+        if document["attempt_id"] is not None:
+            conn.rollback()
+            raise DocumentLifecycleConflict(
+                "aktif ingest surerken belge surumu etkinlestirilemez")
+        if document["archived_at"] is not None:
+            conn.rollback()
+            raise DocumentLifecycleConflict(
+                "arsivlenmis belgede surum etkinlestirilemez")
+        if int(document["revision"]) != expected_revision:
+            conn.rollback()
+            raise DocumentVersionConflict("belge surum revizyonu degisti")
+        cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM ingest_jobs "
+            "WHERE document_id = %s AND status IN ('queued', 'running')) "
+            "AS has_active_job", (document_id,))
+        if cur.fetchone()["has_active_job"]:
+            conn.rollback()
+            raise DocumentLifecycleConflict(
+                "etkin ingest job varken belge surumu etkinlestirilemez")
+        cur.execute(
+            "SELECT v.id, v.content_sha256, b.generation, b.chunk_count "
+            "FROM document_versions v "
+            "JOIN document_version_builds b ON b.document_id = v.document_id "
+            "AND b.version_id = v.id "
+            "WHERE v.document_id = %(document)s AND v.id = %(version)s "
+            "AND b.chunk_count = (SELECT count(*) FROM chunks c "
+            "WHERE c.document_id = v.document_id AND c.version_id = v.id "
+            "AND c.generation = b.generation) "
+            "ORDER BY b.generation DESC LIMIT 1",
+            {"document": document_id, "version": version_id})
+        target = cur.fetchone()
+        if target is None:
+            conn.rollback()
+            return None
+        if target["content_sha256"] != verified_source_sha256:
+            conn.rollback()
+            raise DocumentVersionConflict(
+                "saklanan kaynak kaniti surum ozetiyle eslesmiyor")
+        if (document["active_version_id"] is not None
+                and str(document["active_version_id"]) == version_id
+                and int(document["active_generation"])
+                == int(target["generation"])):
+            conn.rollback()
+            return {"document_id": document_id,
+                    "active_version_id": version_id,
+                    "active_generation": int(target["generation"]),
+                    "revision": expected_revision,
+                    "changed": False}
+        cur.execute(
+            "UPDATE documents SET active_version_id = %(version)s, "
+            "active_generation = %(generation)s, "
+            "active_content_sha = %(sha)s, status = 'done', "
+            "status_note = NULL, "
+            "revision = revision + 1 "
+            "WHERE id = %(document)s AND revision = %(expected)s "
+            "RETURNING revision",
+            {"version": version_id, "generation": target["generation"],
+             "sha": target["content_sha256"], "document": document_id,
+             "expected": expected_revision})
+        moved = cur.fetchone()
+        if moved is None:
+            conn.rollback()
+            raise DocumentVersionConflict("belge surum revizyonu degisti")
+    conn.commit()
+    return {"document_id": document_id, "active_version_id": version_id,
+            "active_generation": int(target["generation"]),
+            "revision": int(moved["revision"]), "changed": True}
 
 
 def _canonical_label(value: str, field: str = "name") -> tuple[str, str]:
@@ -1307,6 +1519,7 @@ def _public_job(row) -> dict:
         "job_id": str(row["id"]),
         "document_id": str(row["document_id"]),
         "candidate_id": str(row["candidate_id"]),
+        "version_id": str(row.get("version_id") or row["candidate_id"]),
         "status": row["status"],
         "attempt_count": int(row["attempt_count"]),
         "created_at": row["created_at"],
@@ -1354,9 +1567,10 @@ def enqueue_ingest_job(conn, document_id: str, idempotency_key: str) -> dict | N
         job_id = str(uuid.uuid4())
         cur.execute(
             "INSERT INTO ingest_jobs "
-            "(id, document_id, candidate_id, candidate_sha, "
+            "(id, document_id, candidate_id, version_id, candidate_sha, "
             "idempotency_key_sha256) "
-            "VALUES (%(id)s, %(document)s, %(candidate)s, %(sha)s, %(key)s) "
+            "VALUES (%(id)s, %(document)s, %(candidate)s, %(candidate)s, "
+            "%(sha)s, %(key)s) "
             "RETURNING *",
             {"id": job_id, "document": document_id,
              "candidate": str(document["candidate_id"]),
@@ -1871,7 +2085,9 @@ def upsert_chunks(conn, rows: list[dict], attempt) -> None:
     a second ago.
     """
     prepared = [
-        {**r, "headings": Json(r["headings"]), "table_data": Json(r["table_data"]) if r["table_data"] else None}
+        {**r, "version_id": str(attempt.candidate_id),
+         "headings": Json(r["headings"]),
+         "table_data": Json(r["table_data"]) if r["table_data"] else None}
         for r in rows
     ]
     try:
@@ -1886,8 +2102,9 @@ def upsert_chunks(conn, rows: list[dict], attempt) -> None:
 
 def _insert_chunk_rows(cur, prepared) -> None:
     cur.executemany(
-        "INSERT INTO chunks (id, document_id, type, text, source_tag, page, headings, table_data, dense, sparse, generation, content_key, embedding_fingerprint) "
-        "VALUES (%(id)s, %(document_id)s, %(type)s, %(text)s, %(source_tag)s, %(page)s, %(headings)s, "
+        "INSERT INTO chunks (id, document_id, version_id, type, text, source_tag, page, headings, table_data, dense, sparse, generation, content_key, embedding_fingerprint) "
+        "VALUES (%(id)s, %(document_id)s, %(version_id)s, %(type)s, "
+        "%(text)s, %(source_tag)s, %(page)s, %(headings)s, "
         "%(table_data)s, %(dense)s, %(sparse)s::sparsevec, %(generation)s, %(content_key)s, %(embedding_fingerprint)s) "
         "ON CONFLICT (id) DO NOTHING",
         prepared,
@@ -1950,7 +2167,8 @@ def copy_chunks_into_generation(conn, rows, attempt) -> int:
     moved: the active generation keeps every one of its own rows."""
     copied = 0
     prepared = [
-        {**r, "headings": Json(r["headings"]),
+        {**r, "version_id": str(attempt.candidate_id),
+         "headings": Json(r["headings"]),
          "table_data": Json(r["table_data"]) if r["table_data"] else None}
         for r in rows
     ]
@@ -1969,14 +2187,15 @@ def _copy_rows(cur, prepared) -> int:
     copied = 0
     for row in prepared:
         cur.execute(
-            "INSERT INTO chunks (id, document_id, type, text, source_tag, "
+            "INSERT INTO chunks (id, document_id, version_id, type, text, source_tag, "
             "page, headings, table_data, dense, sparse, generation, "
             "content_key, embedding_fingerprint) "
-            "SELECT %(id)s, %(document_id)s, %(type)s, %(text)s, "
+            "SELECT %(id)s, %(document_id)s, %(version_id)s, %(type)s, %(text)s, "
             "%(source_tag)s, %(page)s, %(headings)s, %(table_data)s, "
             "dense, sparse, %(generation)s, %(content_key)s, "
             "%(embedding_fingerprint)s "
             "FROM chunks WHERE document_id = %(document_id)s "
+            "AND (version_id = %(version_id)s OR version_id IS NULL) "
             "AND content_key = %(content_key)s "
             "AND embedding_fingerprint = %(embedding_fingerprint)s "
             "ORDER BY generation DESC LIMIT 1 "
@@ -2040,8 +2259,10 @@ def promote_generation(conn, document_id: str, generation: int,
         committed before releasing would leave a finished run holding a
         fence. Rule 4 is proven by fault injection at both of those
         writes, not by reading a successful end state.
-      * The stale sweep of other generations happens only after all of
-        the above.
+      * READY old builds are retained for rollback. The final sweep removes
+        only rows that are neither the winner nor covered by an immutable
+        build receipt; a failed/stale staging generation remains disposable,
+        but a previously served version does not vanish at the next promote.
 
     ``attempt_id`` is REQUIRED. It was briefly optional while the core
     ingest had not yet been bound to an attempt; that transitional gap is
@@ -2067,21 +2288,46 @@ def promote_generation(conn, document_id: str, generation: int,
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id FROM chunks WHERE document_id = %s "
-            "AND generation = %s",
-            (document_id, generation))
+            "AND generation = %s AND version_id = %s::uuid",
+            (document_id, generation, candidate_id))
         staged = {str(row[0]) for row in cur.fetchall()}
         if staged != ids:
             conn.rollback()
             raise ValueError(
                 f"manifest uyusmuyor: {len(ids - staged)} eksik, "
                 f"{len(staged - ids)} yabanci satir; terfi reddedildi")
+        # The activation trigger records an immutable build receipt bound to
+        # this attempt. Prove and lock that parent before the document UPDATE:
+        # otherwise a missing record fails inside the trigger as a raw FK
+        # violation, bypassing the contract's typed closed refusal.
+        cur.execute(
+            "SELECT status FROM attempts "
+            "WHERE attempt_id = %(attempt)s::uuid "
+            "AND document_id = %(document)s::uuid "
+            "AND candidate_id = %(candidate)s::uuid FOR UPDATE",
+            {"attempt": attempt_id, "document": document_id,
+             "candidate": candidate_id})
+        attempt_row = cur.fetchone()
+        if (attempt_row is not None
+                and attempt_row[0] == AttemptOutcome.SUPERSEDED):
+            conn.rollback()
+            raise AttemptLeaseLost(
+                "lease artik bu denemenin degil; bu kosu terfi ETMEDI")
+        if attempt_row is None or attempt_row[0] is not None:
+            conn.rollback()
+            raise AttemptRecordInconsistent(
+                "belge satiri lease'i bu denemede gosteriyor ama deneme "
+                "kaydi kapatilamadi (kayit yok ya da zaten terminal); "
+                "terfi geri alindi")
         lease_release = (", attempt_id = NULL, attempt_owner = NULL, "
                          "attempt_expires_at = NULL" if attempt_id else "")
         attempt_clause = ("AND attempt_id = %(attempt)s::uuid "
                           if attempt_id else "")
         cur.execute(
-            "UPDATE documents SET active_generation = %(gen)s, "
+            "UPDATE documents SET active_version_id = %(cid)s::uuid, "
+            "active_generation = %(gen)s, "
             "active_content_sha = %(sha)s, "
+            "revision = revision + 1, "
             f"status = 'done', status_note = NULL{lease_release} "
             "WHERE id = %(id)s AND active_generation = %(expected)s "
             "AND candidate_id = %(cid)s::uuid "
@@ -2118,8 +2364,13 @@ def promote_generation(conn, document_id: str, generation: int,
                     "kaydi kapatilamadi (kayit yok ya da zaten terminal); "
                     "terfi geri alindi")
         cur.execute(
-            "DELETE FROM chunks WHERE document_id = %s AND generation != %s",
-            (document_id, generation))
+            "DELETE FROM chunks c WHERE c.document_id = %s "
+            "AND (c.generation != %s OR c.version_id IS DISTINCT FROM %s::uuid) "
+            "AND NOT EXISTS (SELECT 1 FROM document_version_builds b "
+            "WHERE b.document_id = c.document_id "
+            "AND b.version_id = c.version_id "
+            "AND b.generation = c.generation)",
+            (document_id, generation, candidate_id))
         removed = cur.rowcount
     conn.commit()
     return removed
@@ -2229,7 +2480,11 @@ def lock_retrieval_scope_keys(conn, document_ids=None) -> list[str]:
     ``filename`` is unique only inside one tenant.  A global external vector
     snapshot therefore cannot use it as an authorization key: two tenants may
     legitimately upload the same name.  The key below is closed, deterministic
-    metadata derived from the row's two real authorities.  RLS still decides
+    metadata derived from the row's four real authorities.  Version AND
+    generation are both present: rebuilding one version under a later
+    generation must invalidate the earlier snapshot just as switching to a
+    different version does.  ``legacy`` is a closed migration state for rows
+    whose historic candidate cannot be proven from their chunks. RLS decides
     which rows this request may resolve, and the caller keeps the share locks
     until retrieval and its post-return verification are complete.
     """
@@ -2240,7 +2495,9 @@ def lock_retrieval_scope_keys(conn, document_ids=None) -> list[str]:
         params = (list(document_ids),)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT tenant_id::text || ':' || id::text AS scope_key "
+            "SELECT tenant_id::text || ':' || id::text || ':' || "
+            "COALESCE(active_version_id::text, 'legacy') || ':' || "
+            "active_generation::text AS scope_key "
             "FROM documents WHERE " + where
             + " ORDER BY tenant_id, id FOR SHARE",
             params)
@@ -2325,8 +2582,8 @@ def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15,
         raise ValueError("rrf_k negatif olmayan bir tamsayi olmali")
     sparse_lit = sparse_to_literal(sparse_indices, sparse_values)
     cols = (
-        "c.id, c.type, c.text, c.source_tag, c.page, c.headings, c.table_data, "
-        "d.filename"
+        "c.id, c.document_id, c.version_id, c.type, c.text, c.source_tag, "
+        "c.page, c.headings, c.table_data, d.filename"
     )
     # Only the ACTIVE generation is retrievable. Without this filter an
     # audit probe pulled a partial re-ingest's staged rows and an older
@@ -2336,6 +2593,8 @@ def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15,
     from_clause = (
         "chunks c LEFT JOIN documents d ON c.document_id = d.id "
         "AND c.generation = d.active_generation "
+        "AND ((d.active_version_id IS NULL AND c.version_id IS NULL) "
+        "OR c.version_id = d.active_version_id) "
         "AND d.archived_at IS NULL"
     )
     # The generation test is parenthesised because it is an OR: ANDing the
@@ -2355,6 +2614,20 @@ def hybrid_search(conn, dense_vec, sparse_indices, sparse_values, top_k=15,
         scope_params = (list(document_ids),)
 
     with conn.cursor(row_factory=dict_row) as cur:
+        # Dense and sparse are two statements under READ COMMITTED. Without a
+        # lock, a rollback can switch active_version_id between them and fuse
+        # chunks from two editions even though each statement is correct in
+        # isolation. Hold the exact visible document rows through both reads;
+        # activation's UPDATE then waits until this retrieval transaction ends.
+        lock_sql = (
+            "SELECT id FROM documents WHERE archived_at IS NULL")
+        lock_params = ()
+        if document_ids is not None:
+            lock_sql += " AND id = ANY(%s::uuid[])"
+            lock_params = (list(document_ids),)
+        cur.execute(lock_sql + " ORDER BY id FOR SHARE", lock_params)
+        cur.fetchall()
+
         cur.execute(
             f"SELECT {cols} FROM {from_clause} {where_clause} "
             f"ORDER BY c.dense <=> %s::vector, c.id LIMIT %s",

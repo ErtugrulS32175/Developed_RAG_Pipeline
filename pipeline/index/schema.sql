@@ -279,6 +279,310 @@ CREATE UNIQUE INDEX IF NOT EXISTS collections_tenant_id_key
 CREATE UNIQUE INDEX IF NOT EXISTS tags_tenant_id_key
     ON tags(tenant_id, id);
 
+-- Durable document-version catalogue. candidate_id IS the version id; two
+-- identities for the same source bytes would let attempts/jobs/chunks agree
+-- on one while the activation pointer names the other. A version is immutable
+-- source identity; a build below proves which retained chunk generation is
+-- ready to serve that identity.
+CREATE TABLE IF NOT EXISTS document_versions (
+    id              uuid PRIMARY KEY,
+    tenant_id       uuid NOT NULL,
+    document_id     uuid NOT NULL,
+    version_number  bigint NOT NULL CHECK (version_number > 0),
+    content_sha256  text NOT NULL
+                    CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, document_id, id),
+    UNIQUE (tenant_id, document_id, version_number),
+    FOREIGN KEY (tenant_id, document_id)
+        REFERENCES documents(tenant_id, id) ON DELETE RESTRICT
+);
+
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS active_version_id uuid;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS revision bigint NOT NULL
+    DEFAULT 0 CHECK (revision >= 0);
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS last_version_number bigint
+    NOT NULL DEFAULT 0 CHECK (last_version_number >= 0);
+
+-- Safe legacy state: every candidate identity whose bytes are known becomes
+-- an immutable version, including candidates retained only by an old job or
+-- attempt. We intentionally do NOT infer active_version_id: candidate_id may
+-- already name newer staged bytes while active_generation still serves the
+-- prior version. NULL active_version_id + NULL chunk.version_id is the closed
+-- legacy pair until a new promotion proves both together.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT tenant_id, document_id, version_id
+        FROM (
+            SELECT tenant_id, id AS document_id,
+                   candidate_id AS version_id, content_sha256 AS sha
+            FROM documents
+            WHERE candidate_id IS NOT NULL AND content_sha256 IS NOT NULL
+            UNION ALL
+            SELECT tenant_id, document_id, candidate_id, candidate_sha
+            FROM attempts
+            UNION ALL
+            SELECT tenant_id, document_id, candidate_id, candidate_sha
+            FROM ingest_jobs
+        ) candidates
+        GROUP BY tenant_id, document_id, version_id
+        HAVING count(DISTINCT sha) > 1
+    ) THEN
+        RAISE EXCEPTION 'one version id names different source digests'
+            USING ERRCODE = '55000';
+    END IF;
+END
+$$;
+
+WITH identities AS (
+    SELECT tenant_id, id AS document_id, candidate_id AS version_id,
+           content_sha256 AS content_sha256
+    FROM documents
+    WHERE candidate_id IS NOT NULL AND content_sha256 IS NOT NULL
+    UNION
+    SELECT tenant_id, document_id, candidate_id, candidate_sha
+    FROM attempts
+    UNION
+    SELECT tenant_id, document_id, candidate_id, candidate_sha
+    FROM ingest_jobs
+), numbered AS (
+    SELECT tenant_id, document_id, version_id, content_sha256,
+           row_number() OVER (
+               PARTITION BY tenant_id, document_id ORDER BY version_id
+           ) AS version_number
+    FROM identities
+)
+INSERT INTO document_versions
+    (id, tenant_id, document_id, version_number, content_sha256)
+SELECT version_id, tenant_id, document_id, version_number, content_sha256
+FROM numbered
+ON CONFLICT (id) DO NOTHING;
+
+UPDATE documents d SET last_version_number = GREATEST(
+    d.last_version_number,
+    COALESCE((SELECT max(v.version_number) FROM document_versions v
+              WHERE v.tenant_id = d.tenant_id AND v.document_id = d.id), 0));
+
+ALTER TABLE ingest_jobs ADD COLUMN IF NOT EXISTS version_id uuid;
+UPDATE ingest_jobs SET version_id = candidate_id WHERE version_id IS NULL;
+ALTER TABLE ingest_jobs ALTER COLUMN version_id SET NOT NULL;
+
+ALTER TABLE attempts ADD COLUMN IF NOT EXISTS version_id uuid;
+UPDATE attempts SET version_id = candidate_id WHERE version_id IS NULL;
+ALTER TABLE attempts ALTER COLUMN version_id SET NOT NULL;
+
+-- Legacy chunk rows remain NULL because no historical row can prove WHICH
+-- candidate produced them. New writes always carry the attempt's version id.
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS version_id uuid;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'documents'::regclass
+          AND conname = 'documents_active_version_fk'
+    ) THEN
+        ALTER TABLE documents ADD CONSTRAINT documents_active_version_fk
+            FOREIGN KEY (tenant_id, id, active_version_id)
+            REFERENCES document_versions(tenant_id, document_id, id)
+            ON DELETE RESTRICT;
+    END IF;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS document_versions_tenant_document_order_idx
+    ON document_versions(tenant_id, document_id, version_number DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ingest_jobs_version_fk') THEN
+        ALTER TABLE ingest_jobs ADD CONSTRAINT ingest_jobs_version_fk
+            FOREIGN KEY (tenant_id, document_id, version_id)
+            REFERENCES document_versions(tenant_id, document_id, id)
+            ON DELETE RESTRICT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'attempts_version_fk') THEN
+        ALTER TABLE attempts ADD CONSTRAINT attempts_version_fk
+            FOREIGN KEY (tenant_id, document_id, version_id)
+            REFERENCES document_versions(tenant_id, document_id, id)
+            ON DELETE RESTRICT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'chunks_version_fk') THEN
+        ALTER TABLE chunks ADD CONSTRAINT chunks_version_fk
+            FOREIGN KEY (tenant_id, document_id, version_id)
+            REFERENCES document_versions(tenant_id, document_id, id)
+            ON DELETE RESTRICT;
+    END IF;
+END
+$$;
+
+-- Version history is append-only.  UPDATE would rewrite what a version id
+-- meant after an audit/event had named it; DELETE would make an activation
+-- event point at evidence that no longer exists.  Reject both at the owner
+-- role too -- RLS alone cannot protect against the table owner.
+CREATE OR REPLACE FUNCTION reject_document_version_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $immutable_version$
+BEGIN
+    RAISE EXCEPTION 'document version history is immutable'
+        USING ERRCODE = '55000';
+END
+$immutable_version$;
+
+DROP TRIGGER IF EXISTS document_versions_immutable ON document_versions;
+CREATE TRIGGER document_versions_immutable
+BEFORE UPDATE OR DELETE ON document_versions
+FOR EACH ROW EXECUTE FUNCTION reject_document_version_mutation();
+
+CREATE TABLE IF NOT EXISTS document_version_events (
+    id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id          uuid NOT NULL,
+    document_id        uuid NOT NULL,
+    event_type         text NOT NULL
+                       CHECK (event_type IN ('registered', 'activated')),
+    from_version_id    uuid,
+    to_version_id      uuid NOT NULL,
+    expected_revision  bigint NOT NULL CHECK (expected_revision >= 0),
+    resulting_revision bigint NOT NULL CHECK (resulting_revision >= 0),
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CHECK ((event_type = 'registered' AND from_version_id IS NULL AND
+            resulting_revision = expected_revision) OR
+           (event_type = 'activated' AND
+            resulting_revision = expected_revision + 1)),
+    FOREIGN KEY (tenant_id, document_id)
+        REFERENCES documents(tenant_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, document_id, from_version_id)
+        REFERENCES document_versions(tenant_id, document_id, id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, document_id, to_version_id)
+        REFERENCES document_versions(tenant_id, document_id, id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS document_version_events_tenant_document_time_idx
+    ON document_version_events(tenant_id, document_id, created_at DESC, id);
+
+-- A build row exists only after a complete manifest is promoted. Retaining
+-- these rows and their chunks is what makes a later activation a rollback,
+-- not merely a pointer aimed at data the stale sweep already deleted.
+CREATE TABLE IF NOT EXISTS document_version_builds (
+    tenant_id       uuid NOT NULL,
+    document_id     uuid NOT NULL,
+    version_id      uuid NOT NULL,
+    generation      integer NOT NULL CHECK (generation > 0),
+    content_sha256  text NOT NULL CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+    attempt_id      uuid NOT NULL REFERENCES attempts(attempt_id)
+                    ON DELETE RESTRICT,
+    chunk_count     integer NOT NULL CHECK (chunk_count > 0),
+    ready_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, document_id, version_id, generation),
+    FOREIGN KEY (tenant_id, document_id, version_id)
+        REFERENCES document_versions(tenant_id, document_id, id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS document_version_builds_ready_order_idx
+    ON document_version_builds(
+        tenant_id, document_id, version_id, generation DESC);
+
+CREATE OR REPLACE FUNCTION record_document_version_registration()
+RETURNS trigger LANGUAGE plpgsql AS $registered_version$
+DECLARE current_revision bigint;
+BEGIN
+    SELECT revision INTO STRICT current_revision
+    FROM documents WHERE tenant_id = NEW.tenant_id AND id = NEW.document_id;
+    INSERT INTO document_version_events
+        (tenant_id, document_id, event_type, from_version_id, to_version_id,
+         expected_revision, resulting_revision)
+    VALUES (NEW.tenant_id, NEW.document_id, 'registered', NULL, NEW.id,
+            current_revision, current_revision);
+    RETURN NEW;
+END
+$registered_version$;
+
+DROP TRIGGER IF EXISTS document_versions_record_registration
+    ON document_versions;
+CREATE TRIGGER document_versions_record_registration
+AFTER INSERT ON document_versions
+FOR EACH ROW EXECUTE FUNCTION record_document_version_registration();
+
+CREATE OR REPLACE FUNCTION record_document_version_activation()
+RETURNS trigger LANGUAGE plpgsql AS $activated_version$
+DECLARE ready_count integer;
+DECLARE version_sha text;
+BEGIN
+    IF NEW.active_version_id IS NOT DISTINCT FROM OLD.active_version_id
+       AND NEW.active_generation IS NOT DISTINCT FROM OLD.active_generation
+    THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.active_version_id IS NULL THEN
+        RAISE EXCEPTION 'active version cannot be cleared'
+            USING ERRCODE = '55000';
+    END IF;
+    SELECT content_sha256 INTO STRICT version_sha
+    FROM document_versions
+    WHERE tenant_id = NEW.tenant_id AND document_id = NEW.id
+      AND id = NEW.active_version_id;
+    SELECT count(*) INTO ready_count FROM chunks
+    WHERE tenant_id = NEW.tenant_id AND document_id = NEW.id
+      AND version_id = NEW.active_version_id
+      AND generation = NEW.active_generation;
+    IF ready_count < 1 OR version_sha IS DISTINCT FROM NEW.active_content_sha
+    THEN
+        RAISE EXCEPTION 'active version build is not ready'
+            USING ERRCODE = '55000';
+    END IF;
+    IF OLD.attempt_id IS NOT NULL THEN
+        INSERT INTO document_version_builds
+            (tenant_id, document_id, version_id, generation, content_sha256,
+             attempt_id, chunk_count)
+        VALUES (NEW.tenant_id, NEW.id, NEW.active_version_id,
+                NEW.active_generation, NEW.active_content_sha,
+                OLD.attempt_id, ready_count)
+        ON CONFLICT DO NOTHING;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM document_version_builds b
+        WHERE b.tenant_id = NEW.tenant_id AND b.document_id = NEW.id
+          AND b.version_id = NEW.active_version_id
+          AND b.generation = NEW.active_generation
+          AND b.content_sha256 = NEW.active_content_sha
+          AND (OLD.attempt_id IS NULL OR b.attempt_id = OLD.attempt_id)
+          AND b.chunk_count = ready_count
+    ) THEN
+        RAISE EXCEPTION 'active version build receipt is missing'
+            USING ERRCODE = '55000';
+    END IF;
+    INSERT INTO document_version_events
+        (tenant_id, document_id, event_type, from_version_id, to_version_id,
+         expected_revision, resulting_revision)
+    VALUES (NEW.tenant_id, NEW.id, 'activated', OLD.active_version_id,
+            NEW.active_version_id, OLD.revision, NEW.revision);
+    RETURN NEW;
+END
+$activated_version$;
+
+DROP TRIGGER IF EXISTS documents_record_version_activation ON documents;
+CREATE TRIGGER documents_record_version_activation
+AFTER UPDATE OF active_version_id, active_generation ON documents
+FOR EACH ROW EXECUTE FUNCTION record_document_version_activation();
+
+DROP TRIGGER IF EXISTS document_version_events_immutable
+    ON document_version_events;
+CREATE TRIGGER document_version_events_immutable
+BEFORE UPDATE OR DELETE ON document_version_events
+FOR EACH ROW EXECUTE FUNCTION reject_document_version_mutation();
+
+DROP TRIGGER IF EXISTS document_version_builds_immutable
+    ON document_version_builds;
+CREATE TRIGGER document_version_builds_immutable
+BEFORE UPDATE OR DELETE ON document_version_builds
+FOR EACH ROW EXECUTE FUNCTION reject_document_version_mutation();
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
@@ -381,6 +685,27 @@ ALTER TABLE attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE attempts FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON attempts;
 CREATE POLICY tenant_isolation ON attempts
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE document_versions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_versions FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON document_versions;
+CREATE POLICY tenant_isolation ON document_versions
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE document_version_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_version_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON document_version_events;
+CREATE POLICY tenant_isolation ON document_version_events
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE document_version_builds ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_version_builds FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON document_version_builds;
+CREATE POLICY tenant_isolation ON document_version_builds
     USING (rag_service_access() OR tenant_id = rag_effective_tenant())
     WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
 

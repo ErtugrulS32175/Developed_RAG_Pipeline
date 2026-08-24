@@ -119,15 +119,31 @@ def run_one(*, worker_id=None, upload_dir=None, lease_seconds=300,
         if (job["current_candidate_id"] != job["bound_candidate_id"]
                 or job["current_candidate_sha"] != job["bound_candidate_sha"]):
             raise StaleIngestJob("candidate_changed")
-        path = _source_path(upload_dir, job["filename"], job["tenant_id"])
         conn = db.get_conn()
         try:
             attempt = db.begin_attempt(
                 conn, job["document_id"], owner="job/" + worker_id,
                 ingest_job_id=job_id, ingest_job_worker=worker_id)
+            publication.ensure_bound_version_source(
+                conn,
+                upload_dir,
+                job["tenant_id"],
+                job["document_id"],
+                job["version_id"],
+                job["filename"],
+                expected_sha256=job["bound_candidate_sha"],
+            )
         finally:
             conn.close()
-        verdict = ingest.main(str(path), attempt=attempt)
+        verdict = ingest.ingest_version_source(
+            upload_dir,
+            job["tenant_id"],
+            job["document_id"],
+            job["version_id"],
+            job["filename"],
+            attempt,
+            expected_sha256=job["bound_candidate_sha"],
+        )
         if lost.is_set():
             raise db.IngestJobOwnershipLost("job heartbeat sahipligi kaybetti")
         if (not isinstance(verdict, tuple) or len(verdict) != 2
@@ -139,11 +155,14 @@ def run_one(*, worker_id=None, upload_dir=None, lease_seconds=300,
         _finish(job_id, worker_id, status,
                 None if verdict[1] is None else "partial")
     except (StaleIngestJob, CandidateNotPublished,
+            publication.VersionSourceMissing,
+            publication.VersionSourceCorrupt,
             db.DocumentLifecycleConflict, AttemptFenced) as error:
         if attempt is not None:
             ingest.abandon_attempt(attempt, type(error).__name__)
         _finish(job_id, worker_id, "failed", type(error).__name__)
-    except (AttemptAlreadyRunning, AttemptLeaseLost, OSError) as error:
+    except (AttemptAlreadyRunning, AttemptLeaseLost, OSError,
+            publication.VersionSourceRefused) as error:
         if attempt is not None:
             ingest.abandon_attempt(attempt, type(error).__name__)
         _retry(job_id, worker_id, type(error).__name__, max_attempts)

@@ -153,8 +153,9 @@ def test_upload_under_the_cap_still_works(pooled, monkeypatch, tmp_path):
     monkeypatch.setattr(api.db, "lookup_document", lambda *a, **k: None)
     monkeypatch.setattr(
         api.db, "stage_candidate",
-        lambda _conn, filename, *a, **k: ("kurgu-id", "kurgu-aday",
-                                          filename))
+        lambda _conn, filename, *a, **k: (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222", filename))
     monkeypatch.setattr(api.db, "finalize_candidate_publication",
                         lambda *a, **k: True)
 
@@ -169,7 +170,11 @@ def test_upload_under_the_cap_still_works(pooled, monkeypatch, tmp_path):
         files={"file": ("kurgu.pdf", b"X" * 10, "application/pdf")})
 
     assert response.status_code == 200
-    assert (upload_dir / "kurgu.pdf").read_bytes() == b"X" * 10
+    source = publication.version_source_path(
+        upload_dir, str(api.db.DEFAULT_TENANT_ID),
+        response.json()["document_id"], response.json()["version_id"])
+    assert source.read_bytes() == b"X" * 10
+    assert response.json()["candidate_id"] == response.json()["version_id"]
     assert pooled.returned == 1
 
 
@@ -1401,8 +1406,11 @@ def test_an_unscoped_hybrid_search_sends_no_clause_and_no_parameter():
 
     _found, cur = _hybrid()
 
-    assert len(cur.executed) == 2
-    for sql, params in cur.executed:
+    assert len(cur.executed) == 3
+    lock_sql, lock_params = cur.executed[0]
+    assert lock_sql.endswith("ORDER BY id FOR SHARE")
+    assert lock_params == ()
+    for sql, params in cur.executed[-2:]:
         assert db.DOCUMENT_SCOPE_CLAUSE not in sql
         assert "document_id = ANY" not in sql
         # only the ranking vector and the page size travel
@@ -1419,8 +1427,11 @@ def test_both_hybrid_statements_carry_the_SAME_scope_clause():
 
     _found, cur = _hybrid(document_ids=(IC_BELGE,))
 
-    dense_sql, dense_params = cur.executed[0]
-    sparse_sql, sparse_params = cur.executed[1]
+    lock_sql, lock_params = cur.executed[0]
+    assert "id = ANY(%s::uuid[])" in lock_sql
+    assert lock_params == ([IC_BELGE],)
+    dense_sql, dense_params = cur.executed[-2]
+    sparse_sql, sparse_params = cur.executed[-1]
     assert db.DOCUMENT_SCOPE_CLAUSE in dense_sql
     assert db.DOCUMENT_SCOPE_CLAUSE in sparse_sql
     assert dense_sql.count(db.DOCUMENT_SCOPE_CLAUSE) == 1
@@ -1438,8 +1449,8 @@ def test_both_hybrid_statements_carry_the_SAME_scope_clause():
 def test_each_modality_has_a_stable_identity_tie_break_before_its_cut():
     _found, cur = _hybrid()
 
-    dense_sql, _ = cur.executed[0]
-    sparse_sql, _ = cur.executed[1]
+    dense_sql, _ = cur.executed[-2]
+    sparse_sql, _ = cur.executed[-1]
     assert "ORDER BY c.dense <=> %s::vector, c.id LIMIT %s" in dense_sql
     assert "ORDER BY c.sparse <#> %s::sparsevec, c.id LIMIT %s" in sparse_sql
 
@@ -1447,8 +1458,8 @@ def test_each_modality_has_a_stable_identity_tie_break_before_its_cut():
 def test_both_hybrid_rankings_exclude_archived_documents_before_the_cut():
     _found, cur = _hybrid()
 
-    assert len(cur.executed) == 2
-    for sql, _params in cur.executed:
+    assert len(cur.executed) == 3
+    for sql, _params in cur.executed[-2:]:
         assert "d.archived_at IS NULL" in sql
         assert sql.index("d.archived_at IS NULL") < sql.index("ORDER BY")
 
@@ -1479,7 +1490,7 @@ def test_the_scope_narrows_the_query_not_the_candidates_it_returned():
     empty whenever other documents filled the pool first."""
     _found, cur = _hybrid(document_ids=(IC_BELGE,))
 
-    for sql, _params in cur.executed:
+    for sql, _params in cur.executed[-2:]:
         assert sql.index("WHERE") < sql.index("ORDER BY") < sql.index("LIMIT")
 
 
@@ -1513,7 +1524,7 @@ def test_an_unknown_identifier_yields_an_empty_scope_not_the_corpus():
 
     assert scoped == []
     # it did not fall back: both statements were still scoped
-    for sql, params in cur.executed:
+    for sql, params in cur.executed[-2:]:
         assert db.DOCUMENT_SCOPE_CLAUSE in sql
         assert params[0] == [YOK_BELGE]
 
@@ -1534,7 +1545,7 @@ def test_the_generation_filter_is_parenthesised_so_the_scope_binds_to_all():
 
     assert any(row["document_id"] is None for row in unscoped)
     assert all(row["document_id"] is not None for row in scoped)
-    for sql, _params in cur.executed:
+    for sql, _params in cur.executed[-2:]:
         assert "WHERE (c.document_id IS NULL OR d.id IS NOT NULL) AND " in sql
 
 
@@ -1641,13 +1652,16 @@ def test_snapshot_scope_keys_bind_tenant_and_document_identity():
     from pipeline.index import db
 
     key = ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:"
-           "11111111-1111-1111-1111-111111111111")
+           "11111111-1111-1111-1111-111111111111:"
+           "22222222-2222-2222-2222-222222222222:7")
     conn = NameConn([(key,)])
 
     assert db.lock_retrieval_scope_keys(conn, (IC_BELGE,)) == [key]
     sql, params = conn.cur.executed[0]
     assert sql.startswith(
-        "SELECT tenant_id::text || ':' || id::text AS scope_key")
+        "SELECT tenant_id::text || ':' || id::text || ':' || "
+        "COALESCE(active_version_id::text, 'legacy') || ':' || "
+        "active_generation::text AS scope_key")
     assert "FROM documents" in sql
     assert "archived_at IS NULL" in sql
     assert params == ([IC_BELGE],)

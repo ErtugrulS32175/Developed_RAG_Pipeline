@@ -412,6 +412,12 @@ class DocumentTagsRequest(BaseModel):
     tags: list[TagName] = Field(max_length=DOCUMENT_SCOPE_MAX)
 
 
+class DocumentVersionActivationRequest(BaseModel):
+    """The one caller-owned value in an activation: its observed revision."""
+
+    expected_revision: int = Field(ge=0)
+
+
 class OrgPositionRequest(BaseModel):
     id: UUID
     parent_id: UUID | None = None
@@ -874,10 +880,20 @@ async def upload_document(file: UploadFile = File(...), replace: bool = False):
             raise HTTPException(
                 status_code=500,
                 detail="kanonik ad tutarsizligi; dosya yazilmadi")
+        except publication.VersionSourceRefused as error:
+            _log_safe_failure(error, "surum_kaynagi_yayimlanamadi")
+            raise HTTPException(
+                status_code=500,
+                detail="document version source could not be published") \
+                from None
     return {
         "document_id": document_id,
         "filename": canonical,
         "candidate_id": candidate_id,
+        # During the compatibility window candidate identity is the immutable
+        # source-version identity.  Publishing both names lets new clients move
+        # to the durable vocabulary without breaking existing callers.
+        "version_id": candidate_id,
         "status": "pending",
     }
 
@@ -965,11 +981,6 @@ def process_document(document_id: str):
             detail=DOCUMENT_PROCESSING_FAILURE_MESSAGE,
         )
 
-    path = publication.source_path(
-        UPLOAD_DIR, filename, auth.current_principal().tenant_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="uploaded file missing")
-
     # THE LEASE IS TAKEN HERE, before anything is parsed. Two refusals
     # have to be answers rather than failures halfway through an ingest:
     # a candidate that is still STAGED (the upload committed its row but
@@ -1015,10 +1026,30 @@ def process_document(document_id: str):
     # verdict, and nothing here writes the served status at all --
     # promotion is the only thing that moves it.
     try:
+        with db_conn() as conn:
+            publication.ensure_bound_version_source(
+                conn,
+                UPLOAD_DIR,
+                auth.current_principal().tenant_id,
+                document_id,
+                attempt.candidate_id,
+                filename,
+                expected_sha256=attempt.candidate_sha,
+                max_bytes=UPLOAD_MAX_BYTES,
+            )
         # bound to the attempt, not to a tuple the endpoint read: the
         # candidate id, its bytes and the observed generation all travel
         # inside the one object the lease was minted with
-        verdict = _reported_outcome(ingest.main(str(path), attempt=attempt))
+        verdict = _reported_outcome(ingest.ingest_version_source(
+            UPLOAD_DIR,
+            auth.current_principal().tenant_id,
+            document_id,
+            attempt.candidate_id,
+            filename,
+            attempt,
+            expected_sha256=attempt.candidate_sha,
+            max_bytes=UPLOAD_MAX_BYTES,
+        ))
     except Exception as e:
         _release_attempt(attempt, type(e).__name__)
         _log_safe_failure(e, "belge_isleme_hatasi")
@@ -1113,6 +1144,18 @@ DOCUMENT_LIST_FIELDS = (
     "archived_at",
 )
 
+# Version history is metadata, not an internal catalogue dump. Keep a second
+# explicit projection at the HTTP boundary even though the DB seam is already
+# narrow, so a future internal column cannot become public by accident.
+DOCUMENT_VERSION_LIST_FIELDS = (
+    "version_id",
+    "version_number",
+    "created_at",
+    "is_active",
+    "index_ready",
+    "document_revision",
+)
+
 # A page nobody sized is a full table scan waiting for its first large
 # corpus; a cap that only the database enforces is a scan that already
 # started. Both bounds are decided here, in the signature, so an
@@ -1164,6 +1207,10 @@ def _document_summary(row):
     because one legacy row lacks a note tells the caller nothing.
     """
     return {field: row.get(field) for field in DOCUMENT_LIST_FIELDS}
+
+
+def _document_version_summary(row):
+    return {field: row.get(field) for field in DOCUMENT_VERSION_LIST_FIELDS}
 
 
 @app.get("/documents", dependencies=AUTH)
@@ -1364,6 +1411,93 @@ def archive_document(document_id: str):
 @app.post("/documents/{document_id}/restore", dependencies=ADMIN_AUTH)
 def restore_document(document_id: str):
     return _set_document_lifecycle(document_id, False)
+
+
+@app.get("/documents/{document_id}/versions", dependencies=AUTH)
+def list_document_versions(
+    document_id: UUID,
+    limit: int = Query(DOCUMENT_PAGE_DEFAULT, ge=1, le=DOCUMENT_PAGE_MAX),
+    before_version_number: int | None = Query(None, ge=1),
+):
+    """List content-safe immutable version metadata, newest first."""
+    try:
+        with db_conn() as conn:
+            rows = db.list_document_versions(
+                conn, str(document_id), limit=limit,
+                before_version_number=before_version_number)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    has_more = len(rows) > limit
+    page = [_document_version_summary(row) for row in rows[:limit]]
+    return {
+        "versions": page,
+        "limit": limit,
+        "before_version_number": before_version_number,
+        "has_more": has_more,
+        "next_before_version_number": (
+            page[-1]["version_number"] if has_more and page else None),
+    }
+
+
+@app.post(
+    "/documents/{document_id}/versions/{version_id}/activate",
+    dependencies=ADMIN_AUTH,
+)
+def activate_document_version(
+    document_id: UUID,
+    version_id: UUID,
+    request: DocumentVersionActivationRequest,
+):
+    """Activate one retained ready version after a fresh source proof."""
+    document_text = str(document_id)
+    version_text = str(version_id)
+    with db_conn() as conn:
+        digest = db.document_version_source_digest(
+            conn, document_text, version_text)
+        if digest is None:
+            raise HTTPException(status_code=404,
+                                detail="document version not found")
+        try:
+            proof = publication.verify_version_source(
+                UPLOAD_DIR,
+                auth.current_principal().tenant_id,
+                document_text,
+                version_text,
+                expected_sha256=digest,
+                max_bytes=UPLOAD_MAX_BYTES,
+            )
+        except publication.VersionSourceMissing:
+            raise HTTPException(status_code=409,
+                                detail="document version source unavailable") \
+                from None
+        except publication.VersionSourceRefused:
+            raise HTTPException(status_code=409,
+                                detail="document version source invalid") \
+                from None
+        try:
+            activated = db.activate_document_version(
+                conn,
+                document_text,
+                version_text,
+                request.expected_revision,
+                verified_source_sha256=proof.sha256,
+            )
+        except db.DocumentVersionConflict:
+            raise HTTPException(
+                status_code=409,
+                detail="document version revision conflict") from None
+        except db.DocumentLifecycleConflict:
+            raise HTTPException(
+                status_code=409,
+                detail="document lifecycle conflict") from None
+        except db.IngestJobConflict:
+            raise HTTPException(
+                status_code=409,
+                detail="document ingest job conflict") from None
+    if activated is None:
+        raise HTTPException(status_code=409,
+                            detail="document version is not activation-ready")
+    return activated
 
 
 @app.get("/documents/{document_id}", dependencies=AUTH)

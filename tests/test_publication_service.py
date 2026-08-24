@@ -28,6 +28,8 @@ from pipeline.index.publication import UnsafeCanonicalName
 
 BODY = b"KURGU_YAYIN_GOVDESI"
 SHA = hashlib.sha256(BODY).hexdigest()
+DOCUMENT_ID = "10000000-0000-4000-8000-000000000001"
+VERSION_ID = "20000000-0000-4000-8000-000000000002"
 
 
 class _Row:
@@ -55,7 +57,7 @@ def wired(monkeypatch, tmp_path):
     def stage(_conn, filename, file_type, content_sha256=None,
               allow_replace=False):
         row.state = CandidateState.STAGED
-        return "kurgu-belge-id", "kurgu-aday-1", row.canonical
+        return DOCUMENT_ID, VERSION_ID, row.canonical
 
     monkeypatch.setattr(db, "document_publish_lock", lock)
     monkeypatch.setattr(db, "stage_candidate", stage)
@@ -98,10 +100,12 @@ def test_an_accepted_finalisation_still_publishes(wired, monkeypatch):
 
     result = publication.publish_candidate(object(), "kurgu.pdf", "pdf", BODY)
 
-    assert result == ("kurgu-belge-id", "kurgu-aday-1", "kurgu.pdf")
+    assert result == (DOCUMENT_ID, VERSION_ID, "kurgu.pdf")
     assert row.state == CandidateState.PUBLISHED
-    assert (upload_dir / "kurgu.pdf").read_bytes() == BODY
-    assert sorted(p.name for p in upload_dir.iterdir()) == ["kurgu.pdf"]
+    assert publication.read_version_source(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID, VERSION_ID,
+        expected_sha256=SHA) == BODY
+    assert not (upload_dir / "kurgu.pdf").exists()
 
 
 # --- the portable filename rules, at the CENTRAL door -------------------
@@ -154,7 +158,26 @@ def test_the_central_check_accepts_ordinary_names(wired, monkeypatch, benign):
 
     publication.publish_candidate(object(), "kurgu.pdf", "pdf", BODY)
 
-    assert (upload_dir / benign).read_bytes() == BODY
+    assert publication.read_version_source(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID, VERSION_ID,
+        expected_sha256=SHA) == BODY
+    assert not (upload_dir / benign).exists()
+
+
+def test_new_publications_never_call_the_legacy_flat_replace(wired,
+                                                             monkeypatch):
+    _row, upload_dir = wired
+    monkeypatch.setattr(db, "finalize_candidate_publication",
+                        lambda *args: True)
+    monkeypatch.setattr(
+        publication.os, "replace",
+        lambda *args: pytest.fail("legacy flat-file replace was called"))
+
+    publication.publish_candidate(object(), "kurgu.pdf", "pdf", BODY)
+
+    assert publication.verify_version_source(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID, VERSION_ID,
+        expected_sha256=SHA).size == len(BODY)
 
 
 # --- the lock release reads its own answer ------------------------------

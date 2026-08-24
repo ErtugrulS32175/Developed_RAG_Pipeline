@@ -14,6 +14,17 @@ import types
 import pytest
 
 
+TENANT = "00000000-0000-0000-0000-000000000001"
+IC_BELGE = "11111111-1111-1111-1111-111111111111"
+DIS_BELGE = "22222222-2222-2222-2222-222222222222"
+YOK_BELGE = "33333333-3333-3333-3333-333333333333"
+IC_SURUM = "44444444-4444-4444-4444-444444444444"
+DIS_SURUM = "55555555-5555-5555-5555-555555555555"
+IC_KEY = f"{TENANT}:{IC_BELGE}:{IC_SURUM}:7"
+DIS_KEY = f"{TENANT}:{DIS_BELGE}:{DIS_SURUM}:9"
+ESKI_KEY = f"{TENANT}:{IC_BELGE}:{DIS_SURUM}:7"
+
+
 @pytest.fixture
 def fake_llama(monkeypatch):
     events = []
@@ -63,12 +74,13 @@ def _wire_db(monkeypatch, events, shadow_count=1):
             events.append(("sql", self._last))
 
         def fetchall(self):
-            return [("kurgu metin", 1, "text", "kurgu.pdf",
-                     "00000000-0000-0000-0000-000000000001:"
-                     "11111111-1111-1111-1111-111111111111")]
+            return [("kurgu metin", 1, "text", "kurgu.pdf", IC_KEY)]
 
         def fetchone(self):
             return (shadow_count,)
+
+        def executemany(self, sql, params):
+            events.append(("many", str(sql) + " " + repr(tuple(params))))
 
     class Conn:
         def cursor(self):
@@ -151,9 +163,9 @@ def test_an_empty_shadow_refuses_the_swap(monkeypatch, fake_llama):
                    if kind == "sql")
 
 
-def test_the_copy_reads_only_the_active_generation(monkeypatch, fake_llama):
-    """The swap must not loosen the round-16 parity fix: the SELECT keeps
-    the same active-generation filter as the native engine."""
+def test_the_copy_reads_every_retained_ready_version_and_safe_legacy(
+        monkeypatch, fake_llama):
+    """Rollback needs old ready builds in the snapshot, never staged rows."""
     events, _core = fake_llama
     rag_llamaindex = _wire_db(monkeypatch, events)
 
@@ -161,11 +173,16 @@ def test_the_copy_reads_only_the_active_generation(monkeypatch, fake_llama):
 
     select = next(text for kind, text in events
                   if kind == "sql" and text.startswith("SELECT c.text"))
+    assert "FROM document_version_builds b" in select
+    assert "c.version_id = b.version_id" in select
+    assert "c.generation = b.generation" in select
+    assert "UNION ALL" in select
+    assert "c.version_id IS NULL" in select
+    assert "d.active_version_id IS NULL" in select
     assert "c.generation = d.active_generation" in select
-    assert "d.archived_at IS NULL" in select
-    assert select.index("d.archived_at IS NULL") < select.index("WHERE")
-    assert "JOIN documents d ON c.document_id = d.id" in select
-    assert "d.tenant_id::text || ':' || d.id::text AS scope_key" in select
+    assert "d.archived_at IS NULL" not in select
+    assert "c.version_id::text || ':' || c.generation::text" in select
+    assert "':legacy:'" in select
 
 
 def test_the_index_metadata_carries_tenant_qualified_scope_authority(
@@ -181,11 +198,40 @@ def test_the_index_metadata_carries_tenant_qualified_scope_authority(
         "page": 1,
         "type": "text",
         "filename": "kurgu.pdf",
-        "scope_key": ("00000000-0000-0000-0000-000000000001:"
-                      "11111111-1111-1111-1111-111111111111"),
+        "scope_key": IC_KEY,
     }]
     for meta in metadata:
         assert set(meta) == {"page", "type", "filename", "scope_key"}
+
+
+def test_vector_and_scope_manifest_swap_under_one_exclusive_lock(
+        monkeypatch, fake_llama):
+    events, _core = fake_llama
+    rag_llamaindex = _wire_db(monkeypatch, events)
+
+    rag_llamaindex.build_index()
+
+    scope_shadow = rag_llamaindex._scope_table(
+        rag_llamaindex.TABLE + "_kurulum")
+    scope_live = rag_llamaindex._scope_table()
+    insert = next(text for kind, text in events if kind == "many")
+    assert scope_shadow in insert and IC_KEY in insert
+    lock_at = next(
+        index for index, (kind, text) in enumerate(events)
+        if kind == "sql" and "pg_advisory_xact_lock(hashtext" in text)
+    first_live_drop = next(
+        index for index, (kind, text) in enumerate(events)
+        if kind == "sql" and "DROP TABLE" in text
+        and (f"data_{rag_llamaindex.TABLE}" in text or scope_live in text)
+        and "kurulum" not in text
+    )
+    renames = [
+        text for kind, text in events
+        if kind == "sql" and "RENAME TO" in text
+    ]
+    assert lock_at < first_live_drop
+    assert len(renames) == 2
+    assert any(scope_shadow in text and scope_live in text for text in renames)
 
 
 # --- scoping the alternative engine --------------------------------------
@@ -195,11 +241,6 @@ def test_the_index_metadata_carries_tenant_qualified_scope_authority(
 # CONSTRUCTION. These tests use the same fake-module strategy as the build
 # tests -- no optional package is installed, and nothing is skipped or
 # xfailed.
-
-IC_BELGE = "11111111-1111-1111-1111-111111111111"
-DIS_BELGE = "22222222-2222-2222-2222-222222222222"
-YOK_BELGE = "33333333-3333-3333-3333-333333333333"
-
 
 @pytest.fixture
 def fake_filters(monkeypatch):
@@ -282,7 +323,8 @@ class Mode:
     HYBRID = "hybrid"
 
 
-def _wire_scope(monkeypatch, index=None, names=(), nodes=None):
+def _wire_scope(monkeypatch, index=None, names=(), nodes=None,
+                covered_names=None):
     """The engine with its index and its database seam replaced.
 
     The REAL `db.lock_retrieval_scope_keys` runs against a recording cursor,
@@ -306,10 +348,14 @@ def _wire_scope(monkeypatch, index=None, names=(), nodes=None):
             return False
 
         def execute(self, sql, params=None):
-            statements.append((str(sql), params))
+            self._last = str(sql)
+            statements.append((self._last, params))
 
         def fetchall(self):
-            return [(name,) for name in names]
+            selected = (names if covered_names is None
+                        or "kapsam" not in self._last.lower()
+                        else covered_names)
+            return [(name,) for name in selected]
 
     class Conn:
         def cursor(self, row_factory=None):
@@ -317,6 +363,9 @@ def _wire_scope(monkeypatch, index=None, names=(), nodes=None):
 
         def commit(self):
             pass
+
+        def rollback(self):
+            statements.append(("ROLLBACK", None))
 
     class Pool:
         @contextmanager
@@ -344,9 +393,10 @@ def test_a_scoped_query_is_filtered_at_construction_not_afterwards(
     resulting metadata filter is handed to the retriever WHEN IT IS BUILT.
     The returned nodes are then checked against the same live authority.
     """
-    nodes = [FakeNode("kapsam icindeki pasaj", "kapsam-icinde.pdf")]
+    nodes = [FakeNode("kapsam icindeki pasaj", "kapsam-icinde.pdf",
+                      scope_key=IC_KEY)]
     rag_llamaindex, index, statements = _wire_scope(
-        monkeypatch, names=("kapsam-icinde.pdf",), nodes=nodes)
+        monkeypatch, names=(IC_KEY,), nodes=nodes)
 
     chunks = rag_llamaindex.retrieve("kurgu soru",
                                      document_ids=(IC_BELGE,))
@@ -354,24 +404,27 @@ def test_a_scoped_query_is_filtered_at_construction_not_afterwards(
     # the filter reached CONSTRUCTION
     filters = index.constructed[0]["filters"]
     assert [(f.key, f.value, f.operator) for f in filters.filters] == [
-        ("scope_key", ["kapsam-icinde.pdf"], fake_filters.FilterOperator.IN)]
+        ("scope_key", [IC_KEY], fake_filters.FilterOperator.IN)]
     # ... and the retriever kept the object it was handed
     assert index.retrievers[0].filters is filters
     assert index.retrievers[0].asked == ["kurgu soru"]
     assert [chunk["filename"] for chunk in chunks] == ["kapsam-icinde.pdf"]
     # resolution went through `documents`, as a parameterised SELECT
-    assert len(statements) == 1
-    sql, params = statements[0]
+    assert len(statements) == 3
+    assert "pg_advisory_xact_lock_shared" in statements[0][0]
+    sql, params = statements[1]
     assert sql.startswith("SELECT tenant_id::text || ':' || id::text")
     assert params == ([IC_BELGE],)
     assert IC_BELGE not in sql
+    assert "kapsam" in statements[2][0].lower()
+    assert statements[2][1] == ([IC_KEY],)
 
 
 def test_the_resolved_scope_keys_are_exact_filter_values_only(
         monkeypatch, fake_filters):
     """A scope key is a value, never text assembled into a statement."""
     rag_llamaindex, index, statements = _wire_scope(
-        monkeypatch, names=("kapsam-icinde.pdf", "ikinci-belge.pdf"))
+        monkeypatch, names=(IC_KEY, DIS_KEY))
 
     rag_llamaindex.retrieve("kurgu soru",
                             document_ids=(IC_BELGE, DIS_BELGE))
@@ -382,25 +435,25 @@ def test_the_resolved_scope_keys_are_exact_filter_values_only(
     # contract directly. The order is stated here rather than assumed from
     # the order the fixture happened to declare its names in.
     assert metadata_filter.value == sorted(
-        ["kapsam-icinde.pdf", "ikinci-belge.pdf"])
+        [IC_KEY, DIS_KEY])
     assert metadata_filter.operator == fake_filters.FilterOperator.IN
     for value in metadata_filter.value:
-        assert "%" not in value and "_" not in value
-    # and no resolved NAME was ever put into a statement either
+        assert value.count(":") == 3
+    # and no resolved key was ever put into statement text either
     for sql, _params in statements:
-        assert "kapsam-icinde.pdf" not in sql
+        assert IC_KEY not in sql and DIS_KEY not in sql
 
 
 def test_a_returned_node_outside_the_live_scope_fails_closed(
         monkeypatch, fake_filters):
-    """A buggy/hostile vector store cannot bypass the construction filter."""
+    """The same document's old version cannot bypass the live filter."""
     nodes = [FakeNode(
-        "baska tenant pasaji",
+        "ayni belgenin eski surum pasaji",
         "ayni-ad.pdf",
-        scope_key="baska-tenant:ayni-belge")]
+        scope_key=ESKI_KEY)]
     rag_llamaindex, index, _statements = _wire_scope(
         monkeypatch,
-        names=("bu-tenant:bu-belge",),
+        names=(IC_KEY,),
         nodes=nodes)
 
     with pytest.raises(RuntimeError, match="yetki kapsami disinda"):
@@ -412,18 +465,18 @@ def test_an_unscoped_query_uses_live_scope_keys_not_the_stale_snapshot(
         monkeypatch, fake_filters):
     """Archive can change after build, so every query carries live authority."""
     rag_llamaindex, index, statements = _wire_scope(
-        monkeypatch, names=("kurgu.pdf",),
-        nodes=[FakeNode("pasaj", "kurgu.pdf")])
+        monkeypatch, names=(IC_KEY,),
+        nodes=[FakeNode("pasaj", "kurgu.pdf", scope_key=IC_KEY)])
 
     rag_llamaindex.retrieve("kurgu soru")
 
     filters = index.constructed[0]["filters"]
-    assert filters.filters[0].value == ["kurgu.pdf"]
+    assert filters.filters[0].value == [IC_KEY]
     assert index.retrievers[0].filters is filters
-    assert statements == [(
-        "SELECT tenant_id::text || ':' || id::text AS scope_key "
-        "FROM documents WHERE archived_at IS NULL "
-        "ORDER BY tenant_id, id FOR SHARE", None)]
+    assert "pg_advisory_xact_lock_shared" in statements[0][0]
+    assert "COALESCE(active_version_id::text, 'legacy')" in statements[1][0]
+    assert statements[1][1] is None
+    assert "scope_key FROM" in statements[2][0]
 
 
 def test_no_active_document_means_no_snapshot_query(monkeypatch, fake_filters):
@@ -432,15 +485,15 @@ def test_no_active_document_means_no_snapshot_query(monkeypatch, fake_filters):
 
     assert rag_llamaindex.retrieve("kurgu soru") == []
     assert index.constructed == []
-    assert statements[0][0].endswith(
+    assert statements[1][0].endswith(
         "WHERE archived_at IS NULL ORDER BY tenant_id, id FOR SHARE")
 
 
 def test_lifecycle_lock_is_held_until_snapshot_nodes_are_projected(
         monkeypatch, fake_filters):
     rag_llamaindex, _index, statements = _wire_scope(
-        monkeypatch, names=("kurgu.pdf",),
-        nodes=[FakeNode("pasaj", "kurgu.pdf")])
+        monkeypatch, names=(IC_KEY,),
+        nodes=[FakeNode("pasaj", "kurgu.pdf", scope_key=IC_KEY)])
     projected_while_locked = []
     original = rag_llamaindex._as_chunks
 
@@ -474,8 +527,8 @@ def test_a_scope_fails_closed_when_the_filter_api_is_absent(monkeypatch):
     imported at all. The engine refuses; it does not answer the wider
     question and label the answer scoped."""
     rag_llamaindex, index, statements = _wire_scope(
-        monkeypatch, names=("kapsam-icinde.pdf",),
-        nodes=[FakeNode("pasaj", "kurgu.pdf")])
+        monkeypatch, names=(IC_KEY,),
+        nodes=[FakeNode("pasaj", "kurgu.pdf", scope_key=IC_KEY)])
     monkeypatch.setitem(sys.modules, "llama_index",
                         types.ModuleType("llama_index"))
     monkeypatch.setitem(sys.modules, "llama_index.core",
@@ -498,9 +551,11 @@ def test_a_retriever_that_drops_the_filter_fails_closed(
     """A keyword a retriever silently ignores is the failure this engine
     must not survive: the query would run unscoped and the result would be
     published as though it had been scoped."""
-    index = FakeIndex([FakeNode("pasaj", "kurgu.pdf")], keep_filters=False)
+    index = FakeIndex(
+        [FakeNode("pasaj", "kurgu.pdf", scope_key=IC_KEY)],
+        keep_filters=False)
     rag_llamaindex, index, _statements = _wire_scope(
-        monkeypatch, index=index, names=("kapsam-icinde.pdf",))
+        monkeypatch, index=index, names=(IC_KEY,))
 
     with pytest.raises(RuntimeError, match="kapsamli sorgu reddedildi"):
         rag_llamaindex.retrieve("kurgu soru", document_ids=(IC_BELGE,))
@@ -533,16 +588,32 @@ def test_scoping_rebuilds_nothing(monkeypatch, fake_filters):
     """No index is rebuilt and no schema is touched: the only statement a
     scoped query runs is the SELECT that resolves the names."""
     rag_llamaindex, _index, statements = _wire_scope(
-        monkeypatch, names=("kapsam-icinde.pdf",),
-        nodes=[FakeNode("pasaj", "kapsam-icinde.pdf")])
+        monkeypatch, names=(IC_KEY,),
+        nodes=[FakeNode("pasaj", "kapsam-icinde.pdf", scope_key=IC_KEY)])
 
     rag_llamaindex.retrieve("kurgu soru", document_ids=(IC_BELGE,))
 
-    assert len(statements) == 1
-    upper = statements[0][0].upper()
-    for verb in ("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP",
-                 "RENAME"):
-        assert verb not in upper
+    assert len(statements) == 3
+    for statement, _params in statements:
+        upper = statement.upper()
+        for verb in ("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE",
+                     "DROP", "RENAME"):
+            assert verb not in upper
+
+
+def test_an_active_version_missing_from_the_snapshot_refuses_before_query(
+        monkeypatch, fake_filters):
+    """A false empty result must not hide a stale snapshot."""
+    rag_llamaindex, index, statements = _wire_scope(
+        monkeypatch, names=(IC_KEY,), covered_names=(),
+        nodes=[FakeNode("eski pasaj", "kurgu.pdf", scope_key=IC_KEY)])
+
+    with pytest.raises(RuntimeError, match="anlik goruntusu"):
+        rag_llamaindex.retrieve("kurgu soru", document_ids=(IC_BELGE,))
+
+    assert index.constructed == []
+    assert "kapsam" in statements[2][0].lower()
+    assert statements[-1] == ("ROLLBACK", None)
 
 
 def test_the_table_name_is_normalised_to_lower_case(monkeypatch):

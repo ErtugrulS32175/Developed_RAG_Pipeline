@@ -35,6 +35,24 @@ load_dotenv()
 TABLE = os.getenv("LLAMAINDEX_TABLE", "llamaindex_chunks").strip().lower()
 TOP_K = int(os.getenv("LLAMAINDEX_TOP_K", "15"))
 
+# The vector table and its coverage manifest are one snapshot.  Retrieval
+# holds the shared half from the live-authority read through node projection;
+# the build takes the exclusive half only for the final two-table swap.  This
+# closes the otherwise possible split where coverage is proved against one
+# snapshot and PGVectorStore queries another.
+_SNAPSHOT_LOCK = "ragtest-llamaindex-snapshot"
+_SNAPSHOT_STALE = (
+    "LlamaIndex anlik goruntusu etkin belge surumunu kapsamiyor; sorgu "
+    "reddedildi. Eski surumden sonuc dondurulmez."
+)
+
+
+def _scope_table(table=None):
+    """Closed companion name for the snapshot's exact authority keys."""
+    chosen = TABLE if table is None else table
+    return f"data_{chosen}_kapsam"
+
+
 _MISSING = (
     "LlamaIndex kurulu degil. Bu motoru kullanmak icin:\n"
     "    pip install -r requirements-llamaindex.txt\n"
@@ -87,8 +105,17 @@ def _require_filters():
 
 
 def _lifecycle_scope_keys(document_ids):
-    """Hold lifecycle authority until the snapshot query has completed."""
+    """Hold lifecycle and snapshot authority through node projection.
+
+    A metadata filter cannot distinguish "no matching passage" from "this
+    active version was never copied into the snapshot".  The companion
+    manifest does: every live four-part key must be present before a retriever
+    is constructed.  Missing table, unreadable table and missing key are the
+    same closed outcome -- the snapshot cannot prove it covers the request.
+    """
     from contextlib import contextmanager
+
+    from psycopg import sql as _sql
 
     from pipeline.index import db
 
@@ -101,7 +128,28 @@ def _lifecycle_scope_keys(document_ids):
                     "servis baglami kullanici retrieval kapsami olamaz")
             db.set_tenant_context(conn, tenant_id, service=False)
             try:
-                yield db.lock_retrieval_scope_keys(conn, document_ids)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
+                        (_SNAPSHOT_LOCK,))
+                scope_keys = db.lock_retrieval_scope_keys(conn, document_ids)
+                if scope_keys:
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                _sql.SQL(
+                                    "SELECT scope_key FROM {} "
+                                    "WHERE scope_key = ANY(%s::text[])").format(
+                                        _sql.Identifier(_scope_table())),
+                                (list(scope_keys),))
+                            covered = {str(row[0]) for row in cur.fetchall()}
+                    except Exception:
+                        conn.rollback()
+                        raise RuntimeError(_SNAPSHOT_STALE) from None
+                    if covered != set(scope_keys):
+                        conn.rollback()
+                        raise RuntimeError(_SNAPSHOT_STALE)
+                yield scope_keys
             finally:
                 db.clear_tenant_context(conn)
 
@@ -211,9 +259,10 @@ def build_index():
     only after the write succeeds and the shadow verifies non-empty does
     one transaction drop the old table and rename the shadow into place.
     A failed build leaves the previous snapshot serving, untouched.
-    Queries issued DURING the swap transaction wait; a comparison run
-    still should not race a rebuild -- written down rather than
-    pretended away.
+    The vector table and its scope manifest swap under one exclusive advisory
+    lock.  Queries hold the shared half from live-scope resolution through
+    node projection, so a query cannot prove coverage against one snapshot and
+    then read another.
     """
     from llama_index.core import Document, StorageContext, VectorStoreIndex
 
@@ -227,6 +276,8 @@ def build_index():
     # data_<table>.
     shadow = f"{TABLE}_kurulum"
     store = _store(shadow)
+    shadow_scope = _scope_table(shadow)
+    live_scope = _scope_table()
 
     # A snapshot contains every tenant and is never itself an authorization
     # boundary.  Query-time RLS-derived scope keys are.  Only the internal
@@ -237,21 +288,38 @@ def build_index():
             # a dead previous attempt's shadow must not pollute this build
             cur.execute(_sql.SQL("DROP TABLE IF EXISTS {}").format(
                 _sql.Identifier(f"data_{shadow}")))
+            cur.execute(_sql.SQL("DROP TABLE IF EXISTS {}").format(
+                _sql.Identifier(shadow_scope)))
         conn.commit()
         with conn.cursor() as cur:
-            # The SAME active-generation filter as the native engine's
-            # hybrid_search, or the two engines stop answering from the
-            # same chunk set: without it this copy swept staging, partial
-            # and superseded rows into LlamaIndex while native retrieval
-            # saw only the served generation -- and the A/B comparison
-            # silently stopped measuring retrieval strategy.
+            # Every retained READY version is copied, not merely the version
+            # active at build time.  That is what lets a later rollback change
+            # only the live four-part filter instead of requiring an index
+            # rebuild.  The second arm preserves the one safe legacy shape:
+            # its active generation has no version identity because the old
+            # system never recorded one.  Staging/partial generations match
+            # neither arm.
             cur.execute(
                 "SELECT c.text, c.page, c.type, d.filename, "
-                "d.tenant_id::text || ':' || d.id::text AS scope_key "
-                "FROM chunks c JOIN documents d ON c.document_id = d.id "
-                "AND c.generation = d.active_generation "
-                "AND d.archived_at IS NULL "
-                "WHERE d.id IS NOT NULL"
+                "d.tenant_id::text || ':' || d.id::text || ':' || "
+                "c.version_id::text || ':' || c.generation::text "
+                "AS scope_key "
+                "FROM document_version_builds b "
+                "JOIN chunks c ON c.tenant_id = b.tenant_id "
+                "AND c.document_id = b.document_id "
+                "AND c.version_id = b.version_id "
+                "AND c.generation = b.generation "
+                "JOIN documents d ON d.tenant_id = b.tenant_id "
+                "AND d.id = b.document_id "
+                "UNION ALL "
+                "SELECT c.text, c.page, c.type, d.filename, "
+                "d.tenant_id::text || ':' || d.id::text || ':legacy:' || "
+                "c.generation::text AS scope_key "
+                "FROM chunks c JOIN documents d "
+                "ON c.tenant_id = d.tenant_id AND c.document_id = d.id "
+                "WHERE c.version_id IS NULL "
+                "AND d.active_version_id IS NULL "
+                "AND c.generation = d.active_generation"
             )
             rows = cur.fetchall()
 
@@ -278,12 +346,28 @@ def build_index():
             raise RuntimeError(
                 "golge tablo bos kaldi; takas yapilmadi, eski indeks "
                 "hizmette")
+        scope_keys = sorted({str(row[4]) for row in rows})
         with conn.cursor() as cur:
+            cur.execute(_sql.SQL(
+                "CREATE TABLE {} (scope_key text PRIMARY KEY)").format(
+                    _sql.Identifier(shadow_scope)))
+            cur.executemany(
+                _sql.SQL("INSERT INTO {} (scope_key) VALUES (%s)").format(
+                    _sql.Identifier(shadow_scope)),
+                [(scope_key,) for scope_key in scope_keys])
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (_SNAPSHOT_LOCK,))
             cur.execute(_sql.SQL("DROP TABLE IF EXISTS {}").format(
                 _sql.Identifier(f"data_{TABLE}")))
+            cur.execute(_sql.SQL("DROP TABLE IF EXISTS {}").format(
+                _sql.Identifier(live_scope)))
             cur.execute(_sql.SQL("ALTER TABLE {} RENAME TO {}").format(
                 _sql.Identifier(f"data_{shadow}"),
                 _sql.Identifier(f"data_{TABLE}")))
+            cur.execute(_sql.SQL("ALTER TABLE {} RENAME TO {}").format(
+                _sql.Identifier(shadow_scope),
+                _sql.Identifier(live_scope)))
         conn.commit()
         print("[LLAMAINDEX] tamam: golge tablo atomik takasla hizmete girdi")
     finally:
@@ -328,10 +412,11 @@ def retrieve(question, top_k=TOP_K, *, document_ids=None):
     and filters at construction. Legacy snapshot nodes without a document
     authority are excluded fail-closed on this comparison engine.
 
-    Three fail-closed refusals, all before a node is fetched: the filter API
-    is unavailable, the retriever did not take the filter, or the authority
-    resolves to no active document. The last returns an empty result rather
-    than querying the stale snapshot unscoped.
+    Four fail-closed outcomes, all before a node is fetched: the filter API
+    is unavailable, the active-version key is absent from the snapshot, the
+    retriever did not take the filter, or the authority resolves to no active
+    document. Only the last returns an empty result; an uncovered active key
+    is a stale snapshot and therefore a refusal, not a false empty answer.
     """
     index, VectorStoreQueryMode = _index()
     # Asked before retrieval: an engine that cannot express lifecycle

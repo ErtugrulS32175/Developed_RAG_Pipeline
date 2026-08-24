@@ -604,8 +604,8 @@ def ingest_attempt(snapshot, attempt):
             # what has been written stays STAGED: ids are content-derived,
             # so re-running picks up from here instead of starting over,
             # and the active generation was never touched
-            print(f"[INGEST] HATA -- yazilanlar evrede korundu, ayni komutu "
-                  f"tekrar calistirarak kaldigi yerden devam edebilirsin")
+            print("[INGEST] HATA -- yazilanlar evrede korundu, ayni komutu "
+                  "tekrar calistirarak kaldigi yerden devam edebilirsin")
             raise
 
         # Promotion is the ONLY place old rows die, and it exists only for
@@ -653,6 +653,90 @@ def ingest_attempt(snapshot, attempt):
         return verdict
     finally:
         conn.close()
+
+
+def _canonical_snapshot_name(canonical_filename):
+    """Validate the database-owned display name without opening a source.
+
+    The parser still needs the original suffix to choose PDF/image handling,
+    but a filename must never regain authority over where immutable bytes are
+    read.  ``source_path`` supplies the publication service's existing,
+    cross-platform basename rules; only its validated name is retained.
+    """
+    try:
+        name = publication.source_path(Path("."), canonical_filename).name
+    except (TypeError, ValueError):
+        raise RuntimeError("kanonik kaynak adi guvenli degil") from None
+    if not Path(name).suffix:
+        raise RuntimeError("kanonik kaynak adi bir dosya turu tasimiyor")
+    return name
+
+
+def ingest_verified_source(body, canonical_filename, attempt, *,
+                           expected_sha256):
+    """Ingest verified in-memory bytes under their original parser suffix.
+
+    This is the path-free boundary for immutable version storage.  The only
+    path the parser receives is a private snapshot created from bytes already
+    in memory; a mutable upload path is never reopened.  The existing attempt
+    remains the sole write/promotion authority.
+    """
+    try:
+        if type(body) is not bytes:
+            raise RuntimeError("dogrulanmis kaynak bayt olmali")
+        if (type(expected_sha256) is not str or len(expected_sha256) != 64
+                or expected_sha256 != expected_sha256.lower()
+                or any(char not in "0123456789abcdef"
+                       for char in expected_sha256)):
+            raise RuntimeError("dogrulanmis kaynak ozeti gecersiz")
+        actual = hashlib.sha256(body).hexdigest()
+        if actual != expected_sha256:
+            raise RuntimeError("dogrulanmis kaynak ozetiyle eslesmiyor")
+        if str(attempt.candidate_sha) != expected_sha256:
+            raise RuntimeError("surum kaynagi denemenin adayina bagli degil")
+
+        name = _canonical_snapshot_name(canonical_filename)
+        snapshot, snapshot_dir = _snapshot_bytes(body, name)
+    except BaseException as failure:
+        abandon_attempt(attempt, type(failure).__name__)
+        raise
+    try:
+        return ingest_attempt(snapshot, attempt)
+    finally:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+
+def ingest_version_source(object_root, tenant_id, document_id, version_id,
+                          canonical_filename, attempt, *, expected_sha256,
+                          max_bytes=publication.MAX_VERSION_SOURCE_BYTES):
+    """Read and ingest one immutable tenant/document/version source object."""
+    try:
+        try:
+            bound_document = str(uuid.UUID(str(document_id)))
+        except (AttributeError, TypeError, ValueError):
+            raise RuntimeError("surum belge kimligi gecersiz") from None
+        if str(document_id) != bound_document:
+            raise RuntimeError("surum belge kimligi kanonik degil")
+        if str(attempt.document_id) != bound_document:
+            raise RuntimeError("surum kaynagi baska bir belge denemesine ait")
+        try:
+            bound_version = str(uuid.UUID(str(version_id)))
+        except (AttributeError, TypeError, ValueError):
+            raise RuntimeError("surum kimligi gecersiz") from None
+        if str(version_id) != bound_version:
+            raise RuntimeError("surum kimligi kanonik degil")
+        if str(attempt.candidate_id) != bound_version:
+            raise RuntimeError("surum kaynagi baska bir aday denemesine ait")
+
+        body = publication.read_version_source(
+            object_root, tenant_id, document_id, version_id,
+            expected_sha256=expected_sha256, max_bytes=max_bytes)
+    except BaseException as failure:
+        abandon_attempt(attempt, type(failure).__name__)
+        raise
+    return ingest_verified_source(
+        body, canonical_filename, attempt,
+        expected_sha256=expected_sha256)
 
 
 def main(path, expected_candidate=None, attempt=None):
