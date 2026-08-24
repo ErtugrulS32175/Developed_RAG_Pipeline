@@ -1,5 +1,7 @@
 import os
 from dataclasses import replace
+import hashlib
+import json
 from uuid import UUID
 
 import requests
@@ -9,6 +11,7 @@ from pipeline.generation import answer as gen
 from pipeline.index import db
 from pipeline.index.embeddings import embed_dense, embed_sparse
 from pipeline.retrieval.context import Passage, RagContext
+from pipeline.retrieval import planner
 from pipeline.retrieval.trace import TraceStage, clock, elapsed_ms, new_trace
 
 load_dotenv()
@@ -28,8 +31,123 @@ TOP_K      = int(os.getenv("RAG_TOP_K", "15"))
 # shrink the context again.
 TOP_RERANK = int(os.getenv("RAG_TOP_RERANK", str(TOP_K)))
 
-def retrieve(query: str, top_k: int = TOP_K, *,
-             document_ids=None) -> list[dict]:
+
+class _PlannedChunks(list):
+    """List-compatible retrieval result with private settled-plan evidence."""
+
+    def __init__(self, chunks, evidence):
+        super().__init__(chunks)
+        self.evidence = evidence
+
+def _scope_kind(document_ids, collection_ids, tags, resolved):
+    if resolved == ():
+        return "empty"
+    dimensions = sum(value is not None for value in (
+        document_ids, collection_ids, tags))
+    if dimensions == 0:
+        return "all_visible"
+    if dimensions > 1:
+        return "intersection"
+    if document_ids is not None:
+        return "explicit_documents"
+    return "metadata_filters"
+
+
+def _scope_digest(document_ids):
+    raw = json.dumps(
+        (None if document_ids is None else list(document_ids)),
+        ensure_ascii=True, separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _candidate_utf8_bytes(chunks):
+    total = 0
+    try:
+        for chunk in chunks:
+            value = chunk.get("text")
+            text = "" if value is None else str(value)
+            total += len(text.encode("utf-8", errors="strict"))
+    except (AttributeError, UnicodeEncodeError):
+        raise planner.PlannerError("planner_candidate_invalid") from None
+    return total
+
+
+def _resolve_scope(conn, *, document_ids, collection_ids, tags):
+    """Resolve one immutable scope inside the retrieval transaction."""
+    dimensions = (document_ids, collection_ids, tags)
+    if any(value is not None and len(value) == 0 for value in dimensions):
+        resolved = ()
+    elif all(value is None for value in dimensions):
+        # Native PostgreSQL retrieval inherits tenant/actor RLS directly.
+        # Preserve its historical unscoped statement while still binding it
+        # to this request's repeatable-read authority window.
+        resolved = None
+    else:
+        try:
+            resolved = db.resolve_document_scope(
+                conn, document_ids=document_ids,
+                collection_ids=collection_ids, tags=tags)
+        except ValueError:
+            raise planner.PlannerError("planner_scope_invalid") from None
+    if resolved is not None:
+        resolved = tuple(sorted({str(value) for value in resolved}))
+    return resolved, _scope_kind(
+        document_ids, collection_ids, tags, resolved)
+
+
+def _authorized_retrieve(query, *, top_k, document_ids, collection_ids,
+                         tags, planned):
+    """Bind policy, scope and both rankings to one database snapshot."""
+    if planned:
+        # The caller-owned query is bounded before a connection, embedding or
+        # retrieval service can be touched.  The settled plan below rechecks
+        # and digest-binds the same bytes once policy/scope facts are known.
+        planner.query_class(query)
+    plan_started = clock()
+    with db.get_pool().connection() as conn:
+        tenant_id, service = db.current_execution_tenant()
+        if service:
+            raise RuntimeError(
+                "servis baglami kullanici retrieval kapsami olamaz")
+        actor_id = db.current_execution_actor()
+        identity = {} if actor_id is None else {"actor_id": actor_id}
+        db.set_tenant_context(conn, tenant_id, service=False, **identity)
+        try:
+            db.begin_retrieval_snapshot(conn)
+            policy_epoch = db.retrieval_policy_epoch(conn)
+            resolved, scope_kind = _resolve_scope(
+                conn, document_ids=document_ids,
+                collection_ids=collection_ids, tags=tags)
+            plan = None
+            if planned:
+                plan = planner.build_plan(
+                    query, backend="native", scope_kind=scope_kind,
+                    policy_epoch=policy_epoch,
+                    scope_digest=_scope_digest(resolved))
+                planner.verify_query(plan, query)
+                top_k = plan.budget.top_k
+            plan_ms = elapsed_ms(plan_started)
+            retrieve_started = clock()
+            if resolved == ():
+                chunks = []
+            else:
+                dense_vector = embed_dense(query)
+                sparse_indices, sparse_values = embed_sparse(query)
+                chunks = db.hybrid_search(
+                    conn, dense_vector, sparse_indices, sparse_values,
+                    top_k=top_k, document_ids=resolved)
+            retrieve_ms = elapsed_ms(retrieve_started)
+            scope_count = None if resolved is None else len(resolved)
+            return (chunks, plan, scope_count, scope_kind,
+                    policy_epoch, plan_ms, retrieve_ms)
+        finally:
+            conn.rollback()
+            db.clear_tenant_context(conn)
+
+
+def retrieve(query: str, top_k: int = TOP_K, *, document_ids=None,
+             collection_ids=None, tags=None) -> list[dict]:
     """Hybrid search in Postgres (pgvector) combining dense and sparse vectors via RRF.
 
     Borrows a pooled connection per query instead of caching one at module
@@ -45,25 +163,11 @@ def retrieve(query: str, top_k: int = TOP_K, *,
     is handed to the query seam rather than applied to its result: both
     rankings are drawn from the scope, so the fusion never sees a candidate
     from outside it."""
-    dense_vector = embed_dense(query)
-    sparse_indices, sparse_values = embed_sparse(query)
-    with db.get_pool().connection() as conn:
-        tenant_id, service = db.current_execution_tenant()
-        if service:
-            raise RuntimeError(
-                "servis baglami kullanici retrieval kapsami olamaz")
-        db.set_tenant_context(conn, tenant_id, service=False)
-        try:
-            return db.hybrid_search(conn, dense_vector, sparse_indices,
-                                    sparse_values, top_k=top_k,
-                                    document_ids=document_ids)
-        finally:
-            # A failed statement leaves psycopg's transaction aborted, where a
-            # RESET cannot run. Roll back the read transaction first, then
-            # clear the session-scoped tenant before this pooled connection can
-            # be handed to another request.
-            conn.rollback()
-            db.clear_tenant_context(conn)
+    evidence = _authorized_retrieve(
+        query, top_k=top_k, document_ids=document_ids,
+        collection_ids=collection_ids, tags=tags,
+        planned=(top_k == planner.TOP_K))
+    return _PlannedChunks(evidence[0], evidence)
 
 
 def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict]:
@@ -236,7 +340,8 @@ def ask(question: str, structured: bool = False) -> str:
     return generate(question, context.model_text)
 
 
-def ask_checked(question: str, *, document_ids=None):
+def ask_checked(question: str, *, document_ids=None, collection_ids=None,
+                tags=None):
     """Generate a structured answer and return its publication decision.
 
     This is the product path. The plain ``ask`` function remains available for
@@ -244,30 +349,74 @@ def ask_checked(question: str, *, document_ids=None):
     string. Keeping the ``RagContext`` beside the exact model-visible text also
     prevents validation against different retrieval results.
 
-    `document_ids` scopes the retrieval this answer is built from, and it is
-    the ONLY thing it scopes: reranking, context assembly and provenance all
-    read the chunks retrieval returned, so a scope applied at the query is
-    already a scope on the reranker's candidates, on the assembled context
-    and on every citation the answer can carry.
+    Direct document ids, collection ids and tags scope the retrieval this
+    answer is built from.  Reranking, context assembly and provenance all read
+    the chunks retrieval returned, so the resolved query scope also governs
+    the reranker's candidates, assembled context and every citation.
     """
     from pipeline.validation.rag.answer_guard import validate_structured
 
+    if (TOP_K != planner.TOP_K
+            or TOP_RERANK != planner.RERANK_LIMIT):
+        raise planner.PlannerError("planner_runtime_policy_mismatch")
     # Forwarded ONLY when a scope was asked for. An absent scope must reach
     # `retrieve` as the single-argument call it has always been -- callers
     # that replace this seam (the evaluation harness, the structured-answer
     # tests) declare the signature they have always been handed.
-    scope = {} if document_ids is None else {"document_ids": document_ids}
-    started = clock()
+    planner.query_class(question)
+    retrieve_started = clock()
+    scope = {
+        name: value for name, value in (
+            ("document_ids", document_ids),
+            ("collection_ids", collection_ids),
+            ("tags", tags),
+        ) if value is not None
+    }
     chunks = retrieve(question, **scope)
-    stages = [TraceStage("retrieve", elapsed_ms(started))]
+    if isinstance(chunks, _PlannedChunks) and chunks.evidence[1] is not None:
+        (_same_chunks, plan, scope_count, scope_kind, policy_epoch,
+         plan_ms, retrieve_ms) = chunks.evidence
+    else:
+        # Test/extension replacements of the historical `retrieve(question)`
+        # seam remain usable for an unscoped or direct-id call.  Metadata
+        # scopes cannot be reconstructed from returned chunks and therefore
+        # fail closed rather than receiving invented planner evidence.
+        if collection_ids is not None or tags is not None:
+            raise RuntimeError("planned retrieval evidence is missing")
+        if document_ids is None:
+            scope_kind, scope_count, digest = "all_visible", None, None
+        elif len(document_ids) == 0:
+            scope_kind, scope_count, digest = "empty", 0, _scope_digest(())
+        else:
+            scope_kind = "explicit_documents"
+            scope_count = len(set(document_ids))
+            digest = _scope_digest(sorted({str(v) for v in document_ids}))
+        policy_epoch = 1
+        plan = planner.build_plan(
+            question, backend="native", scope_kind=scope_kind,
+            policy_epoch=policy_epoch, scope_digest=digest)
+        plan_ms = 0
+        retrieve_ms = elapsed_ms(retrieve_started)
+    stages = [
+        TraceStage("plan", plan_ms),
+        TraceStage("retrieve", retrieve_ms),
+    ]
     retrieved_count = len(chunks)
+    if _candidate_utf8_bytes(chunks) > plan.budget.candidate_utf8_max:
+        raise planner.PlannerError("planner_candidate_limit")
     started = clock()
+    # V1 preserves the historical two-argument seam.  The code-owned default
+    # above is first proved equal to the settled plan, so omitting the keyword
+    # cannot hand control back to an environment knob.
     chunks = rerank(question, chunks)
     stages.append(TraceStage("rerank", elapsed_ms(started)))
     reranked_count = len(chunks)
     started = clock()
     context = build_rag_context(chunks, numbered=True)
     stages.append(TraceStage("context", elapsed_ms(started)))
+    context_utf8_bytes = len(context.model_text.encode("utf-8"))
+    if context_utf8_bytes > plan.budget.context_utf8_max:
+        raise planner.PlannerError("planner_context_limit")
     started = clock()
     reply = gen.generate_structured(question, context.model_text)
     stages.append(TraceStage("generate", elapsed_ms(started)))
@@ -276,11 +425,19 @@ def ask_checked(question: str, *, document_ids=None):
     stages.append(TraceStage("validate", elapsed_ms(started)))
     trace = new_trace(
         backend="native",
-        scope_document_count=(None if document_ids is None
-                              else len(document_ids)),
+        planner_policy_version=plan.policy_version,
+        query_class=plan.query_class,
+        retrieval_mode=plan.mode,
+        fallback=plan.fallback,
+        scope_kind=scope_kind,
+        policy_epoch=policy_epoch,
+        top_k=plan.budget.top_k,
+        candidate_limit=plan.budget.candidate_limit,
+        scope_document_count=scope_count,
         retrieved_count=retrieved_count,
         reranked_count=reranked_count,
         context_passage_count=len(context.passages),
+        context_utf8_bytes=context_utf8_bytes,
         stages=stages,
     )
     return replace(result, trace=trace)

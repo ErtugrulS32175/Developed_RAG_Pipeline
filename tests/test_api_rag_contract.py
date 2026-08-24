@@ -92,18 +92,51 @@ def _public_trace(response, stream):
 
 def _trace():
     return RetrievalTrace(
+        trace_version=2,
         trace_id="a" * 32,
         backend="native",
+        planner_policy_version=1,
+        query_class="factual",
+        retrieval_mode="hybrid_balanced",
+        fallback="none",
+        scope_kind="explicit_documents",
+        policy_epoch=7,
+        top_k=15,
+        candidate_limit=60,
         scope_document_count=2,
         retrieved_count=15,
         reranked_count=10,
         context_passage_count=10,
+        context_utf8_bytes=2048,
         stages=(
-            TraceStage("retrieve", 7), TraceStage("rerank", 3),
-            TraceStage("context", 1), TraceStage("generate", 9),
-            TraceStage("validate", 2),
+            TraceStage("plan", 1), TraceStage("retrieve", 7),
+            TraceStage("rerank", 3), TraceStage("context", 1),
+            TraceStage("generate", 9), TraceStage("validate", 2),
         ),
     )
+
+
+def test_planner_rejects_an_oversized_question_before_database_or_network(
+        monkeypatch):
+    from pipeline.api import app as api
+    from pipeline.retrieval import query
+
+    monkeypatch.setattr(
+        query.db, "get_pool",
+        lambda: pytest.fail("database was borrowed"))
+    monkeypatch.setattr(
+        query, "embed_dense",
+        lambda _value: pytest.fail("embedding service was called"))
+    response = TestClient(api.app).post(
+        "/v1/chat/completions",
+        headers=_headers(api),
+        json={
+            "model": api.RAG_MODEL_ID,
+            "messages": [{"role": "user", "content": "x" * 8001}],
+        },
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "gecersiz retrieval istegi"}
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -122,14 +155,22 @@ def test_trace_is_opt_in_closed_and_identical_across_response_shapes(
     assert _public_trace(absent, stream) is None
     assert _public_trace(present, stream) == trace.public()
     assert set(trace.public()) == {
-        "trace_id", "backend", "scope_document_count", "retrieved_count",
-        "reranked_count", "context_passage_count", "stages_ms",
+        "trace_version", "trace_id", "backend", "planner_policy_version",
+        "query_class", "retrieval_mode", "fallback", "scope_kind",
+        "policy_epoch", "top_k", "candidate_limit", "scope_document_count",
+        "retrieved_count", "reranked_count", "context_passage_count",
+        "context_utf8_bytes", "stages_ms",
     }
     forbidden = ("kurgu soru", "Kurgu cevap", "OZEL_DOSYA_ADI.pdf",
                  "11111111-1111-1111-1111-111111111111",
                  "HAM_PASAJ_METNI", "0.91357")
     encoded = json.dumps(trace.public())
     assert not any(value in encoded for value in forbidden)
+    assert trace.public()["query_class"] == "factual"
+    assert trace.public()["retrieval_mode"] == "hybrid_balanced"
+    assert trace.public()["fallback"] == "none"
+    assert set(trace.public()["stages_ms"]) == {
+        "plan", "retrieve", "rerank", "context", "generate", "validate"}
 
 
 @pytest.mark.parametrize("stream", [False, True])

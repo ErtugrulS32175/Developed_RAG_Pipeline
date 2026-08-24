@@ -122,17 +122,9 @@ def test_unknown_collection_or_document_is_a_closed_not_found(monkeypatch):
     assert response.status_code == 404
 
 
-def test_chat_intersects_collection_tag_and_direct_scopes_before_backend(
+def test_chat_hands_canonical_scope_dimensions_to_the_checked_backend(
         monkeypatch):
-    resolved = (DOCUMENT,)
     seen = []
-    monkeypatch.setattr(api, "db_conn", _conn)
-
-    def resolve(_conn, **scope):
-        seen.append(scope)
-        return resolved
-
-    monkeypatch.setattr(api.db, "resolve_document_scope", resolve)
     monkeypatch.setattr(
         api.rag_backends, "answer_checked",
         lambda _question, backend=None, **scope: seen.append(
@@ -149,17 +141,16 @@ def test_chat_intersects_collection_tag_and_direct_scopes_before_backend(
         })
 
     assert response.status_code == 200
-    assert seen[0] == {
-        "document_ids": (DOCUMENT,), "collection_ids": (COLLECTION,),
-        "tags": ["Finance", "URGENT"]}
-    assert seen[1] == {"backend": "native", "document_ids": resolved}
+    assert seen == [{
+        "backend": "native", "document_ids": (DOCUMENT,),
+        "collection_ids": (COLLECTION,),
+        "tags": ("Finance", "URGENT")},
+    ]
 
 
-def test_empty_resolved_scope_is_forwarded_and_never_widens(monkeypatch):
+def test_metadata_scope_is_never_dropped_before_the_checked_backend(
+        monkeypatch):
     scopes = []
-    monkeypatch.setattr(api, "db_conn", _conn)
-    monkeypatch.setattr(api.db, "resolve_document_scope",
-                        lambda *_args, **_kwargs: ())
     monkeypatch.setattr(
         api.rag_backends, "answer_checked",
         lambda _question, backend=None, **scope: scopes.append(scope) or
@@ -172,7 +163,7 @@ def test_empty_resolved_scope_is_forwarded_and_never_widens(monkeypatch):
             "collection_ids": [COLLECTION],
         })
     assert response.status_code == 200
-    assert scopes == [{"document_ids": ()}]
+    assert scopes == [{"collection_ids": (COLLECTION,)}]
 
 
 def test_inventory_forwards_organization_filters_without_widening_projection(

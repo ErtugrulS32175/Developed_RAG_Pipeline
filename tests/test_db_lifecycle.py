@@ -210,6 +210,9 @@ def test_retrieve_borrows_from_the_pool_per_query(monkeypatch):
     monkeypatch.setattr(
         db, "current_execution_tenant",
         lambda: (db.DEFAULT_TENANT_ID, False))
+    monkeypatch.setattr(db, "current_execution_actor", lambda: None)
+    monkeypatch.setattr(db, "begin_retrieval_snapshot", lambda _conn: None)
+    monkeypatch.setattr(db, "retrieval_policy_epoch", lambda _conn: 1)
     monkeypatch.setattr(
         db, "set_tenant_context",
         lambda conn, tenant_id, *, service=False:

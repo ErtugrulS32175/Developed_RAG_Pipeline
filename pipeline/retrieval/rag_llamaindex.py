@@ -23,6 +23,8 @@ the default engine should have to install it. Set it up with
     python -m pipeline.retrieval.rag_llamaindex build
 """
 import os
+import hashlib
+import json
 
 from dotenv import load_dotenv
 
@@ -34,6 +36,14 @@ load_dotenv()
 # maintenance statements manage another
 TABLE = os.getenv("LLAMAINDEX_TABLE", "llamaindex_chunks").strip().lower()
 TOP_K = int(os.getenv("LLAMAINDEX_TOP_K", "15"))
+
+
+class _PlannedChunks(list):
+    """List-compatible result carrying private planner evidence."""
+
+    def __init__(self, chunks, evidence):
+        super().__init__(chunks)
+        self.evidence = evidence
 
 # The vector table and its coverage manifest are one snapshot.  Retrieval
 # holds the shared half from the live-authority read through node projection;
@@ -104,7 +114,42 @@ def _require_filters():
     return FilterOperator, MetadataFilter, MetadataFilters
 
 
-def _lifecycle_scope_keys(document_ids):
+def _scope_kind(document_ids, collection_ids, tags, resolved):
+    if not resolved:
+        return "empty"
+    dimensions = sum(value is not None for value in (
+        document_ids, collection_ids, tags))
+    if dimensions == 0:
+        return "all_visible"
+    if dimensions > 1:
+        return "intersection"
+    if document_ids is not None:
+        return "explicit_documents"
+    return "metadata_filters"
+
+
+def _scope_digest(document_ids):
+    raw = json.dumps(
+        list(document_ids), ensure_ascii=True, separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _candidate_utf8_bytes(chunks):
+    from pipeline.retrieval.planner import PlannerError
+
+    total = 0
+    try:
+        for chunk in chunks:
+            value = chunk.get("text")
+            text = "" if value is None else str(value)
+            total += len(text.encode("utf-8", errors="strict"))
+    except (AttributeError, UnicodeEncodeError):
+        raise PlannerError("planner_candidate_invalid") from None
+    return total
+
+
+def _lifecycle_scope_keys(document_ids, collection_ids=None, tags=None):
     """Hold lifecycle and snapshot authority through node projection.
 
     A metadata filter cannot distinguish "no matching passage" from "this
@@ -126,13 +171,40 @@ def _lifecycle_scope_keys(document_ids):
             if service:
                 raise RuntimeError(
                     "servis baglami kullanici retrieval kapsami olamaz")
-            db.set_tenant_context(conn, tenant_id, service=False)
+            actor_id = db.current_execution_actor()
+            identity = {} if actor_id is None else {"actor_id": actor_id}
+            db.set_tenant_context(
+                conn, tenant_id, service=False, **identity)
             try:
+                db.begin_retrieval_snapshot(conn)
+                policy_epoch = db.retrieval_policy_epoch(conn)
+                dimensions = (document_ids, collection_ids, tags)
+                if any(value is not None and len(value) == 0
+                       for value in dimensions):
+                    resolved_ids = ()
+                elif all(value is None for value in dimensions):
+                    resolved_ids = db.active_document_ids(conn)
+                else:
+                    try:
+                        resolved_ids = db.resolve_document_scope(
+                            conn, document_ids=document_ids,
+                            collection_ids=collection_ids, tags=tags)
+                    except ValueError:
+                        from pipeline.retrieval.planner import PlannerError
+                        raise PlannerError(
+                            "planner_scope_invalid") from None
+                resolved_ids = tuple(sorted(
+                    {str(value) for value in resolved_ids}))
+                scope_kind = _scope_kind(
+                    document_ids, collection_ids, tags, resolved_ids)
+                if not resolved_ids:
+                    yield ([], resolved_ids, policy_epoch, scope_kind)
+                    return
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
                         (_SNAPSHOT_LOCK,))
-                scope_keys = db.lock_retrieval_scope_keys(conn, document_ids)
+                scope_keys = db.lock_retrieval_scope_keys(conn, resolved_ids)
                 if scope_keys:
                     try:
                         with conn.cursor() as cur:
@@ -149,8 +221,9 @@ def _lifecycle_scope_keys(document_ids):
                     if covered != set(scope_keys):
                         conn.rollback()
                         raise RuntimeError(_SNAPSHOT_STALE)
-                yield scope_keys
+                yield (scope_keys, resolved_ids, policy_epoch, scope_kind)
             finally:
+                conn.rollback()
                 db.clear_tenant_context(conn)
 
     return locked()
@@ -398,7 +471,48 @@ def _as_chunks(nodes, allowed_scope_keys):
     return out
 
 
-def retrieve(question, top_k=TOP_K, *, document_ids=None):
+def _authorized_retrieve(question, *, top_k, document_ids, collection_ids,
+                         tags, planned):
+    from pipeline.retrieval import planner
+    from pipeline.retrieval.trace import clock, elapsed_ms
+
+    if planned:
+        planner.query_class(question)
+    plan_started = clock()
+    with _lifecycle_scope_keys(
+            document_ids, collection_ids, tags) as authority:
+        scope_keys, resolved_ids, policy_epoch, scope_kind = authority
+        plan = None
+        if planned:
+            plan = planner.build_plan(
+                question, backend="llamaindex", scope_kind=scope_kind,
+                policy_epoch=policy_epoch,
+                scope_digest=_scope_digest(resolved_ids))
+            planner.verify_query(plan, question)
+            top_k = plan.budget.top_k
+        plan_ms = elapsed_ms(plan_started)
+        retrieve_started = clock()
+        if not scope_keys:
+            chunks = []
+        else:
+            index, VectorStoreQueryMode = _index()
+            _require_filters()
+            scope = _scope_filters(scope_keys)
+            retriever = index.as_retriever(
+                similarity_top_k=top_k,
+                vector_store_query_mode=VectorStoreQueryMode.HYBRID,
+                filters=scope,
+            )
+            if not _scope_reached(retriever, scope):
+                raise RuntimeError(_SCOPE_UNSUPPORTED)
+            chunks = _as_chunks(retriever.retrieve(question), scope_keys)
+        retrieve_ms = elapsed_ms(retrieve_started)
+        return (chunks, plan, len(resolved_ids), scope_kind,
+                policy_epoch, plan_ms, retrieve_ms)
+
+
+def retrieve(question, top_k=TOP_K, *, document_ids=None,
+             collection_ids=None, tags=None):
     """Retrieve active documents, optionally scoped to a requested set.
 
     THE SCOPE IS PART OF THE QUERY. It is resolved to tenant-qualified keys, turned
@@ -420,25 +534,13 @@ def retrieve(question, top_k=TOP_K, *, document_ids=None):
     document. Only the last returns an empty result; an uncovered active key
     is a stale snapshot and therefore a refusal, not a false empty answer.
     """
-    index, VectorStoreQueryMode = _index()
-    # Asked before retrieval: an engine that cannot express lifecycle
-    # authority must refuse before it does work that looks like answering.
-    # The vector table is a snapshot, while archive/restore is live metadata;
-    # even an
-    # otherwise unscoped query therefore carries the current active keys.
-    _require_filters()
-    with _lifecycle_scope_keys(document_ids) as scope_keys:
-        if not scope_keys:
-            return []
-        scope = _scope_filters(scope_keys)
-        retriever = index.as_retriever(
-            similarity_top_k=top_k,
-            vector_store_query_mode=VectorStoreQueryMode.HYBRID,
-            filters=scope,
-        )
-        if not _scope_reached(retriever, scope):
-            raise RuntimeError(_SCOPE_UNSUPPORTED)
-        return _as_chunks(retriever.retrieve(question), scope_keys)
+    from pipeline.retrieval import planner
+
+    evidence = _authorized_retrieve(
+        question, top_k=top_k, document_ids=document_ids,
+        collection_ids=collection_ids, tags=tags,
+        planned=(top_k == planner.TOP_K))
+    return _PlannedChunks(evidence[0], evidence)
 
 
 def answer(question):
@@ -455,13 +557,14 @@ def answer(question):
     return generate(question, build_context(retrieve(question)))
 
 
-def answer_checked(question, *, document_ids=None):
+def answer_checked(question, *, document_ids=None, collection_ids=None,
+                   tags=None):
     """Structured, provenance-checked answer for the public API.
 
-    `document_ids` scopes the retrieval and therefore everything built from
-    it: the assembled context and every citation the answer may publish.
-    Forwarded only when supplied, so an unscoped question reaches
-    ``retrieve`` as the single-argument call it has always been."""
+    Direct document ids, collection ids and tags scope retrieval and therefore
+    everything built from it: assembled context and every citation the answer
+    may publish.  Dimensions are forwarded only when supplied, so an unscoped
+    question reaches ``retrieve`` as its historical single-argument call."""
     from dataclasses import replace
 
     from pipeline.generation.answer import generate_structured
@@ -471,13 +574,52 @@ def answer_checked(question, *, document_ids=None):
     )
     from pipeline.validation.rag.answer_guard import validate_structured
 
-    scope = {} if document_ids is None else {"document_ids": document_ids}
-    started = clock()
+    from pipeline.retrieval import planner
+
+    if TOP_K != planner.TOP_K:
+        raise planner.PlannerError("planner_runtime_policy_mismatch")
+    planner.query_class(question)
+    retrieve_started = clock()
+    scope = {
+        name: value for name, value in (
+            ("document_ids", document_ids),
+            ("collection_ids", collection_ids),
+            ("tags", tags),
+        ) if value is not None
+    }
     chunks = retrieve(question, **scope)
-    stages = [TraceStage("retrieve", elapsed_ms(started))]
+    if isinstance(chunks, _PlannedChunks) and chunks.evidence[1] is not None:
+        (_same_chunks, plan, scope_count, scope_kind, policy_epoch,
+         plan_ms, retrieve_ms) = chunks.evidence
+    else:
+        if collection_ids is not None or tags is not None:
+            raise RuntimeError("planned retrieval evidence is missing")
+        if document_ids is None:
+            scope_kind, scope_count, digest = "all_visible", None, None
+        elif len(document_ids) == 0:
+            scope_kind, scope_count, digest = "empty", 0, _scope_digest(())
+        else:
+            scope_kind = "explicit_documents"
+            scope_count = len(set(document_ids))
+            digest = _scope_digest(sorted({str(v) for v in document_ids}))
+        policy_epoch = 1
+        plan = planner.build_plan(
+            question, backend="llamaindex", scope_kind=scope_kind,
+            policy_epoch=policy_epoch, scope_digest=digest)
+        plan_ms = 0
+        retrieve_ms = elapsed_ms(retrieve_started)
+    stages = [
+        TraceStage("plan", plan_ms),
+        TraceStage("retrieve", retrieve_ms),
+    ]
+    if _candidate_utf8_bytes(chunks) > plan.budget.candidate_utf8_max:
+        raise planner.PlannerError("planner_candidate_limit")
     started = clock()
     context = build_rag_context(chunks, numbered=True)
     stages.append(TraceStage("context", elapsed_ms(started)))
+    context_utf8_bytes = len(context.model_text.encode("utf-8"))
+    if context_utf8_bytes > plan.budget.context_utf8_max:
+        raise planner.PlannerError("planner_context_limit")
     started = clock()
     reply = generate_structured(question, context.model_text)
     stages.append(TraceStage("generate", elapsed_ms(started)))
@@ -486,11 +628,19 @@ def answer_checked(question, *, document_ids=None):
     stages.append(TraceStage("validate", elapsed_ms(started)))
     return replace(result, trace=new_trace(
         backend="llamaindex",
-        scope_document_count=(None if document_ids is None
-                              else len(document_ids)),
+        planner_policy_version=plan.policy_version,
+        query_class=plan.query_class,
+        retrieval_mode=plan.mode,
+        fallback=plan.fallback,
+        scope_kind=scope_kind,
+        policy_epoch=policy_epoch,
+        top_k=plan.budget.top_k,
+        candidate_limit=plan.budget.candidate_limit,
+        scope_document_count=scope_count,
         retrieved_count=len(chunks),
         reranked_count=None,
         context_passage_count=len(context.passages),
+        context_utf8_bytes=context_utf8_bytes,
         stages=stages,
     ))
 

@@ -145,19 +145,14 @@ def test_non_default_tenant_storage_is_namespaced(tmp_path):
     assert publication.source_path(tmp_path, "same.pdf", TENANT_B).parent == second
 
 
-def test_multitenant_unscoped_rag_is_projected_to_visible_ids(monkeypatch):
+def test_multitenant_unscoped_rag_is_resolved_by_the_checked_backend(
+        monkeypatch):
     monkeypatch.setattr(api, "AUTH_REGISTRY", _registry())
     captured = []
 
-    @contextmanager
-    def conn():
-        yield object()
-
-    monkeypatch.setattr(api, "db_conn", conn)
-    monkeypatch.setattr(api.db, "active_document_ids",
-                        lambda _conn: ("visible-a", "visible-b"))
     def answer(_question, **kwargs):
-        captured.append((kwargs, db._EXECUTION_TENANT.get()))
+        captured.append((kwargs, db._EXECUTION_TENANT.get(),
+                         db.current_execution_actor()))
         return SimpleNamespace(status="abstained", answer="bilmiyorum",
                                citations=(), trace=None)
 
@@ -170,9 +165,11 @@ def test_multitenant_unscoped_rag_is_projected_to_visible_ids(monkeypatch):
         json={"model": api.RAG_MODEL_ID,
               "messages": [{"role": "user", "content": "soru"}]})
     assert response.status_code == 200
-    assert captured[0][0]["document_ids"] == ("visible-a", "visible-b")
+    assert captured[0][0] == {"backend": "native"}
     assert captured[0][1] == (TENANT_A, False)
+    assert captured[0][2] is None
     assert db._EXECUTION_TENANT.get() == (db.DEFAULT_TENANT_ID, False)
+    assert db.current_execution_actor() is None
 
 
 def test_native_retrieval_binds_and_clears_the_execution_tenant(monkeypatch):
@@ -188,10 +185,16 @@ def test_native_retrieval_binds_and_clears_the_execution_tenant(monkeypatch):
         lambda: SimpleNamespace(connection=connection))
     monkeypatch.setattr(query, "embed_dense", lambda _value: [0.0])
     monkeypatch.setattr(query, "embed_sparse", lambda _value: ([1], [1.0]))
+    monkeypatch.setattr(query.db, "begin_retrieval_snapshot",
+                        lambda actual: seen.append(("snapshot", actual)))
+    monkeypatch.setattr(query.db, "retrieval_policy_epoch", lambda _conn: 1)
+    monkeypatch.setattr(query.db, "active_document_ids",
+                        lambda _conn: ("visible-document",))
+    monkeypatch.setattr(query.db, "current_execution_actor", lambda: None)
     monkeypatch.setattr(
         query.db, "set_tenant_context",
-        lambda actual, tenant, service=False:
-        seen.append((actual, tenant, service)))
+        lambda actual, tenant, service=False, actor_id=None:
+        seen.append((actual, tenant, service, actor_id)))
     monkeypatch.setattr(
         query.db, "clear_tenant_context",
         lambda actual: seen.append(("clear", actual)))
@@ -207,11 +210,58 @@ def test_native_retrieval_binds_and_clears_the_execution_tenant(monkeypatch):
         db.reset_execution_tenant(token)
 
     assert seen == [
-        (conn, TENANT_A, False),
+        (conn, TENANT_A, False, None),
+        ("snapshot", conn),
         ("search", conn),
         "rollback",
         ("clear", conn),
     ]
+
+
+def test_execution_actor_is_bound_and_reset_beside_the_legacy_tenant_seam():
+    actor = UUID("10000000-0000-0000-0000-000000000099")
+    token = db.bind_execution_tenant(TENANT_A, actor_id=actor)
+    try:
+        assert db.current_execution_tenant() == (TENANT_A, False)
+        assert db.current_execution_actor() == actor
+        # Existing callers that inspect the historical context retain its
+        # exact two-item shape; actor identity is a separate authority.
+        assert db._EXECUTION_TENANT.get() == (TENANT_A, False)
+    finally:
+        db.reset_execution_tenant(token)
+    assert db.current_execution_tenant() == (db.DEFAULT_TENANT_ID, False)
+    assert db.current_execution_actor() is None
+
+
+def test_checked_chat_binds_the_verified_openwebui_actor(monkeypatch):
+    actor = UUID("10000000-0000-0000-0000-000000000099")
+    principal = auth.Principal(
+        TENANT_A, "reader", subject_id=actor, source="openwebui")
+    seen = []
+    monkeypatch.setattr(
+        api.db, "bind_execution_tenant",
+        lambda tenant_id, *, service=False, actor_id=None:
+        seen.append((tenant_id, service, actor_id)) or "token")
+    monkeypatch.setattr(api.db, "reset_execution_tenant",
+                        lambda token: seen.append(("reset", token)))
+    monkeypatch.setattr(
+        api.rag_backends, "answer_checked",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="abstained", answer="bilmiyorum", citations=(),
+            trace=None))
+    monkeypatch.setattr(api, "_publish_checked",
+                        lambda _result: ("abstained", "bilmiyorum", (), None))
+    monkeypatch.setattr(api, "_persist_review_interaction",
+                        lambda _result: None)
+    token = auth.bind(principal)
+    try:
+        response = api.chat_completions(api.ChatRequest(
+            model=api.RAG_MODEL_ID,
+            messages=[api.ChatMessage(role="user", content="soru")]))
+    finally:
+        auth.reset(token)
+    assert response["choices"][0]["message"]["content"] == "bilmiyorum"
+    assert seen == [(TENANT_A, False, actor), ("reset", "token")]
 
 
 def test_schema_declares_forced_row_level_isolation_for_every_tenant_table():

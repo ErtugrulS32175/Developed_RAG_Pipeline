@@ -11,10 +11,10 @@ Built-in backends expose three callables internally:
     answer(question)          -> str             the full question-to-answer path
     answer_checked(question)  -> GuardResult     the public, publication-safe path
 
-The checked callable may additionally accept a keyword-only `document_ids`,
-which scopes the answer to a named set of documents. It is passed only when
-a caller asks for a scope, so an engine that never learned about it still
-answers every unscoped question exactly as before.
+The checked callable may additionally accept keyword-only document,
+collection and tag scope dimensions.  Each is passed only when a caller asks
+for it, so an engine that never learned about scoping still answers every
+unscoped question exactly as before.
 
 The historical two-callable shape remains valid for retrieval/evaluation
 extensions. Such a backend cannot serve the public API until it adds the third
@@ -84,20 +84,26 @@ def answer(question, backend=None):
     return fn(question)
 
 
-def answer_checked(question, backend=None, *, document_ids=None):
+def answer_checked(question, backend=None, *, document_ids=None,
+                   collection_ids=None, tags=None):
     """Return only the status-bearing answer suitable for publication.
 
-    `document_ids` narrows the question to a named set of documents. It is
-    keyword-only with a default, and it is FORWARDED ONLY WHEN SUPPLIED: an
-    unscoped question reaches the engine as the one-argument call every
-    backend has always been asked, so a two- or three-callable backend
-    written before this parameter existed keeps working untouched. The
-    arity check above is unchanged for the same reason -- it validates how
-    many callables a backend supplies, never their signatures.
+    Document ids, collection ids and tags narrow the question.  Each is
+    keyword-only and FORWARDED ONLY WHEN SUPPLIED: an unscoped question reaches
+    the engine as the one-argument call every backend has always been asked,
+    so a two- or three-callable backend written before these parameters existed
+    keeps working untouched.  The arity check validates how many callables a
+    backend supplies, never their signatures.
     """
     functions = _get_all(backend)
     if len(functions) != 3:
         raise RuntimeError("secilen RAG backend checked answer desteklemiyor")
     fn = functions[2]
-    scope = {} if document_ids is None else {"document_ids": document_ids}
+    scope = {
+        name: value for name, value in (
+            ("document_ids", document_ids),
+            ("collection_ids", collection_ids),
+            ("tags", tags),
+        ) if value is not None
+    }
     return fn(question, **scope)

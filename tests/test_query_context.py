@@ -106,6 +106,48 @@ def test_reranking_never_shrinks_the_context():
     assert query.TOP_RERANK >= query.TOP_K
 
 
+def test_candidate_byte_budget_refuses_before_rerank(monkeypatch):
+    from pipeline.retrieval import planner, query
+
+    chunks = [_chunk(text="x" * 20_000) for _ in range(15)]
+    monkeypatch.setattr(query, "retrieve", lambda _question: chunks)
+    monkeypatch.setattr(
+        query, "rerank",
+        lambda *_args, **_kwargs: pytest.fail("reranker was called"))
+    with pytest.raises(planner.PlannerError,
+                       match="^planner_candidate_limit$"):
+        query.ask_checked("bounded question")
+
+
+def test_context_byte_budget_refuses_before_generation(monkeypatch):
+    from pipeline.retrieval import planner, query
+
+    chunks = [_chunk(text="x" * planner.CONTEXT_UTF8_MAX)]
+    monkeypatch.setattr(query, "retrieve", lambda _question: chunks)
+    monkeypatch.setattr(
+        query.gen, "generate_structured",
+        lambda *_args, **_kwargs: pytest.fail("generator was called"))
+    with pytest.raises(planner.PlannerError,
+                       match="^planner_context_limit$"):
+        query.ask_checked("bounded question")
+
+
+@pytest.mark.parametrize("name", ["TOP_K", "TOP_RERANK"])
+def test_runtime_retrieval_knobs_cannot_disagree_with_the_plan(
+        monkeypatch, name):
+    from pipeline.retrieval import planner, query
+
+    current = getattr(query, name)
+    monkeypatch.setattr(query, name, current + 1)
+    monkeypatch.setattr(
+        query, "retrieve",
+        lambda *_args, **_kwargs: pytest.fail("retrieval was called"))
+
+    with pytest.raises(planner.PlannerError,
+                       match="^planner_runtime_policy_mismatch$"):
+        query.ask_checked("bounded question")
+
+
 # --- answering-endpoint auth (lives with generation, not retrieval) ---
 
 def test_no_header_when_no_key_is_set(monkeypatch):

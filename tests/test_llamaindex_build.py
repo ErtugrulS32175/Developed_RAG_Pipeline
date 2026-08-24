@@ -385,6 +385,16 @@ def _wire_scope(monkeypatch, index=None, names=(), nodes=None,
     monkeypatch.setattr(db, "get_pool", lambda: Pool())
     monkeypatch.setattr(db, "set_tenant_context", lambda *_a, **_k: None)
     monkeypatch.setattr(db, "clear_tenant_context", lambda *_a, **_k: None)
+    monkeypatch.setattr(db, "current_execution_actor", lambda: None)
+    monkeypatch.setattr(db, "begin_retrieval_snapshot", lambda _conn: None)
+    monkeypatch.setattr(db, "retrieval_policy_epoch", lambda _conn: 1)
+    monkeypatch.setattr(
+        db, "resolve_document_scope",
+        lambda _conn, *, document_ids=None, collection_ids=None, tags=None:
+        tuple(document_ids or ()))
+    monkeypatch.setattr(
+        db, "active_document_ids",
+        lambda _conn: (() if not names else (IC_BELGE,)))
     monkeypatch.setattr(rag_llamaindex, "_index", lambda: (index, Mode))
     return rag_llamaindex, index, statements
 
@@ -414,7 +424,7 @@ def test_a_scoped_query_is_filtered_at_construction_not_afterwards(
     assert index.retrievers[0].asked == ["kurgu soru"]
     assert [chunk["filename"] for chunk in chunks] == ["kapsam-icinde.pdf"]
     # resolution went through `documents`, as a parameterised SELECT
-    assert len(statements) == 3
+    assert len(statements) == 4
     assert "pg_advisory_xact_lock_shared" in statements[0][0]
     sql, params = statements[1]
     assert sql.startswith("SELECT tenant_id::text || ':' || id::text")
@@ -422,6 +432,7 @@ def test_a_scoped_query_is_filtered_at_construction_not_afterwards(
     assert IC_BELGE not in sql
     assert "kapsam" in statements[2][0].lower()
     assert statements[2][1] == ([IC_KEY],)
+    assert statements[3] == ("ROLLBACK", None)
 
 
 def test_the_resolved_scope_keys_are_exact_filter_values_only(
@@ -479,8 +490,9 @@ def test_an_unscoped_query_uses_live_scope_keys_not_the_stale_snapshot(
     assert index.retrievers[0].filters is filters
     assert "pg_advisory_xact_lock_shared" in statements[0][0]
     assert "COALESCE(active_version_id::text, 'legacy')" in statements[1][0]
-    assert statements[1][1] is None
+    assert statements[1][1] == ([IC_BELGE],)
     assert "scope_key FROM" in statements[2][0]
+    assert statements[3] == ("ROLLBACK", None)
 
 
 def test_no_active_document_means_no_snapshot_query(monkeypatch, fake_filters):
@@ -489,8 +501,7 @@ def test_no_active_document_means_no_snapshot_query(monkeypatch, fake_filters):
 
     assert rag_llamaindex.retrieve("kurgu soru") == []
     assert index.constructed == []
-    assert statements[1][0].endswith(
-        "WHERE archived_at IS NULL ORDER BY tenant_id, id FOR SHARE")
+    assert statements == [("ROLLBACK", None)]
 
 
 def test_lifecycle_lock_is_held_until_snapshot_nodes_are_projected(
@@ -547,7 +558,9 @@ def test_a_scope_fails_closed_when_the_filter_api_is_absent(monkeypatch):
 
     # refused BEFORE anything that looks like answering
     assert index.constructed == []
-    assert statements == []
+    assert statements[-1] == ("ROLLBACK", None)
+    assert all(not statement.startswith("SELECT c.")
+               for statement, _params in statements)
 
 
 def test_a_retriever_that_drops_the_filter_fails_closed(
@@ -588,6 +601,20 @@ def test_the_checked_answer_forwards_the_scope_to_retrieval(
     assert seen == [{}, {"document_ids": (IC_BELGE,)}]
 
 
+def test_checked_answer_refuses_a_runtime_top_k_that_disagrees_with_the_plan(
+        monkeypatch):
+    from pipeline.retrieval import planner, rag_llamaindex
+
+    monkeypatch.setattr(rag_llamaindex, "TOP_K", planner.TOP_K + 1)
+    monkeypatch.setattr(
+        rag_llamaindex, "retrieve",
+        lambda *_args, **_kwargs: pytest.fail("retrieval was called"))
+
+    with pytest.raises(planner.PlannerError,
+                       match="^planner_runtime_policy_mismatch$"):
+        rag_llamaindex.answer_checked("kurgu soru")
+
+
 def test_scoping_rebuilds_nothing(monkeypatch, fake_filters):
     """No index is rebuilt and no schema is touched: the only statement a
     scoped query runs is the SELECT that resolves the names."""
@@ -597,7 +624,7 @@ def test_scoping_rebuilds_nothing(monkeypatch, fake_filters):
 
     rag_llamaindex.retrieve("kurgu soru", document_ids=(IC_BELGE,))
 
-    assert len(statements) == 3
+    assert len(statements) == 4
     for statement, _params in statements:
         upper = statement.upper()
         for verb in ("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE",

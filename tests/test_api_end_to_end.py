@@ -2444,7 +2444,8 @@ def _wire_scoped_corpus(monkeypatch):
     from pipeline.retrieval import query
 
     seen = {"statements": [], "checkouts": 0, "dense": 0, "sparse": 0,
-            "ranked": [], "prompts": [], "tenant": [], "rollbacks": 0}
+            "ranked": [], "prompts": [], "tenant": [], "rollbacks": 0,
+            "scope_resolutions": []}
 
     class Cursor:
         def __enter__(self):
@@ -2498,6 +2499,23 @@ def _wire_scoped_corpus(monkeypatch):
     monkeypatch.setattr(
         db, "current_execution_tenant",
         lambda: (db.DEFAULT_TENANT_ID, False))
+    monkeypatch.setattr(db, "current_execution_actor", lambda: None)
+    monkeypatch.setattr(db, "begin_retrieval_snapshot", lambda _conn: None)
+    monkeypatch.setattr(db, "retrieval_policy_epoch", lambda _conn: 1)
+    def resolve_document_scope(
+            _conn, *, document_ids=None, collection_ids=None, tags=None):
+        resolved = tuple(sorted(
+            set(document_ids or ())
+            & {row["document_id"] for row in KAPSAM_CORPUS}))
+        seen["scope_resolutions"].append({
+            "document_ids": document_ids,
+            "collection_ids": collection_ids,
+            "tags": tags,
+            "resolved": resolved,
+        })
+        return resolved
+
+    monkeypatch.setattr(db, "resolve_document_scope", resolve_document_scope)
     monkeypatch.setattr(
         db, "set_tenant_context",
         lambda _conn, tenant_id, *, service=False:
@@ -2615,7 +2633,6 @@ def test_an_unknown_identifier_scopes_to_nothing_not_to_everything(
     nothing. Falling back to the corpus would answer a question the caller
     never asked, and would look like a good answer while doing it."""
     from pipeline.api import app as api
-    from pipeline.index import db
 
     seen = _wire_scoped_corpus(monkeypatch)
 
@@ -2625,12 +2642,18 @@ def test_an_unknown_identifier_scopes_to_nothing_not_to_everything(
     status, _text = _public_reply(response, False)
     assert status == ABSTAINED
     assert seen["ranked"] == [[]]
-    lock_sql, lock_params = seen["statements"][0]
-    assert "FOR SHARE" in lock_sql
-    assert lock_params[0] == [YOK_BELGE]
-    for sql, params in seen["statements"][1:]:
-        assert db.DOCUMENT_SCOPE_CLAUSE in sql
-        assert params[0] == [YOK_BELGE]
+    assert seen["scope_resolutions"] == [{
+        "document_ids": (YOK_BELGE,),
+        "collection_ids": None,
+        "tags": None,
+        "resolved": (),
+    }]
+    # The authority resolved the requested identifier to the empty set.  That
+    # result short-circuits before embedding or retrieval SQL; it must never
+    # be reinterpreted as an unscoped corpus search.
+    assert seen["dense"] == 0
+    assert seen["sparse"] == 0
+    assert seen["statements"] == []
     assert _citations(response, False) == []
 
 
@@ -2644,8 +2667,14 @@ def test_a_mixed_scope_is_scoped_to_the_known_identifier_alone(monkeypatch):
 
     assert response.status_code == 200
     assert _filenames(seen["ranked"][0]) == ["kapsam-icinde.pdf"]
+    assert seen["scope_resolutions"] == [{
+        "document_ids": (IC_BELGE, YOK_BELGE),
+        "collection_ids": None,
+        "tags": None,
+        "resolved": (IC_BELGE,),
+    }]
     for _sql, params in seen["statements"]:
-        assert sorted(params[0]) == sorted([IC_BELGE, YOK_BELGE])
+        assert params[0] == [IC_BELGE]
 
 
 def test_a_repeated_identifier_neither_widens_nor_repeats_the_filter(

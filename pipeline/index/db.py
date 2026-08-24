@@ -60,6 +60,8 @@ SPARSE_DIM = 999_999_937
 DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 _EXECUTION_TENANT = contextvars.ContextVar(
     "rag_db_execution_tenant", default=(DEFAULT_TENANT_ID, False))
+_EXECUTION_ACTOR = contextvars.ContextVar(
+    "rag_db_execution_actor", default=None)
 
 
 class DocumentLifecycleConflict(RuntimeError):
@@ -148,13 +150,19 @@ def clear_tenant_context(conn):
     conn.commit()
 
 
-def bind_execution_tenant(tenant_id, *, service=False):
+def bind_execution_tenant(tenant_id, *, service=False, actor_id=None):
     tenant = uuid.UUID(str(tenant_id))
-    return _EXECUTION_TENANT.set((tenant, bool(service)))
+    actor = None if actor_id is None else uuid.UUID(str(actor_id))
+    return (
+        _EXECUTION_TENANT.set((tenant, bool(service))),
+        _EXECUTION_ACTOR.set(actor),
+    )
 
 
 def reset_execution_tenant(token):
-    _EXECUTION_TENANT.reset(token)
+    tenant_token, actor_token = token
+    _EXECUTION_ACTOR.reset(actor_token)
+    _EXECUTION_TENANT.reset(tenant_token)
 
 
 def current_execution_tenant():
@@ -168,13 +176,26 @@ def current_execution_tenant():
     return _EXECUTION_TENANT.get()
 
 
+def current_execution_actor():
+    """Return the actor bound to the current checked product request.
+
+    The historical tenant seam deliberately remains a two-item tuple so
+    workers and retrieval adapters written before actor-bound authorization
+    keep their exact contract.  Actor identity is a separate authority: a
+    missing actor stays missing rather than being inferred from an app role.
+    """
+    return _EXECUTION_ACTOR.get()
+
+
 def get_conn(*, service=False) -> psycopg.Connection:
     conn = psycopg.connect(PG_DSN)
     register_vector(conn)
     tenant, inherited_service = _EXECUTION_TENANT.get()
+    actor = _EXECUTION_ACTOR.get()
     if service or inherited_service or tenant != DEFAULT_TENANT_ID:
         set_tenant_context(
-            conn, tenant, service=bool(service or inherited_service))
+            conn, tenant, service=bool(service or inherited_service),
+            actor_id=actor)
     return conn
 
 
@@ -2318,6 +2339,41 @@ def active_document_ids(conn) -> tuple[str, ...]:
         cur.execute(
             "SELECT id FROM documents WHERE archived_at IS NULL ORDER BY id")
         return tuple(str(row[0]) for row in cur.fetchall())
+
+
+def begin_retrieval_snapshot(conn) -> None:
+    """Start the one repeatable-read authority window for retrieval.
+
+    ``set_tenant_context`` uses session-scoped settings and therefore opens a
+    short transaction of its own.  Commit that setup first, then make the
+    isolation declaration the first statement of the retrieval transaction.
+    Scope resolution, policy binding and both hybrid rankings consequently see
+    one database snapshot even while embedding is performed between them.
+    """
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+
+
+def retrieval_policy_epoch(conn) -> int:
+    """Lock and return the current tenant's hierarchy policy epoch.
+
+    Legacy single-tenant installations may not have created an organization
+    topology yet.  Their closed epoch is one; once a topology row exists its
+    own positive counter is the authority.  No query or document identity is
+    recorded by this read seam.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT policy_epoch FROM org_tenants "
+            "WHERE id = rag_effective_tenant() FOR SHARE")
+        row = cur.fetchone()
+    if row is None:
+        return 1
+    epoch = row[0]
+    if type(epoch) is not int or epoch < 1:
+        raise RuntimeError("retrieval policy epoch gecersiz")
+    return epoch
 
 
 def _job_key_digest(value: str) -> str:

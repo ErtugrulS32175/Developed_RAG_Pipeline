@@ -4,6 +4,8 @@ Adding an alternative must not put the working one at risk: the default keeps
 behaving exactly as before, and an engine whose package is absent fails with a
 message instead of breaking anything that does not use it.
 """
+from contextlib import contextmanager
+
 import pytest
 
 from pipeline.retrieval import rag_backends
@@ -38,7 +40,12 @@ def test_a_missing_optional_engine_says_how_to_install_it(monkeypatch):
     def no_package():
         raise RuntimeError(rag_llamaindex._MISSING)
 
+    @contextmanager
+    def authority(*_args, **_kwargs):
+        yield (["scope-key"], ["document-id"], 1, "all_visible")
+
     monkeypatch.setattr(rag_llamaindex, "_require", no_package)
+    monkeypatch.setattr(rag_llamaindex, "_lifecycle_scope_keys", authority)
     with pytest.raises(RuntimeError) as e:
         rag_llamaindex.retrieve("soru")
     assert "requirements-llamaindex.txt" in str(e.value)

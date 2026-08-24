@@ -287,11 +287,25 @@ and both JSON and streaming replies carry `rag_status`.
 
 Set `include_trace: true` on a chat request when an operator needs to explain
 the retrieval path. Both JSON and streaming responses then carry the same
-`rag_trace`: a random trace id, backend name, requested-scope size, counts after
-retrieval/reranking/context assembly, and per-stage milliseconds. It is a
-closed, content-free record: no question, passage text, score, filename or
-document id is present. The field is omitted by default, so existing
-OpenAI-compatible clients keep their prior response shape.
+content-free Trace V2: a random trace id, backend, planner policy version,
+query class, retrieval mode, fallback policy, closed scope kind, tenant-policy
+epoch, bounded result limits, result/context counts, context byte count and
+per-stage milliseconds. It contains no question, query digest, passage text,
+score, filename, tenant, actor, document, chunk, version or citation identity.
+The field is omitted by default, so existing OpenAI-compatible clients keep
+their prior response shape.
+
+Checked retrieval first validates a deterministic V1 plan, then binds the
+verified tenant and actor, tenant-policy epoch, resolved document scope and
+retrieval itself to one repeatable-read database transaction. Unknown or
+cross-tenant explicit identifiers resolve to an empty scope and stop before
+embedding or search; they never widen to the corpus. V1 deliberately ships one
+measured mode (`hybrid_balanced`) with no automatic backend fallback, 15 final
+passages, 60 candidates, and closed candidate/context byte ceilings. Runtime
+`TOP_K` or rerank settings that disagree with that plan fail before retrieval
+instead of producing a misleading trace. Actor-level per-document visibility
+beyond the current tenant and explicit-scope authorities is not claimed here;
+that requires its own schema/RLS policy package.
 
 Quality is measured rather than assumed. `eval/retrieval/rag_eval.py` asks
 whether the answer even reached the context and at what rank;

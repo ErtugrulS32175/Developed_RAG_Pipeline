@@ -37,7 +37,7 @@ from pipeline.api import auth
 from pipeline.api import identity
 from pipeline.api import metrics
 from pipeline.api import org_policy
-from pipeline.retrieval import rag_backends
+from pipeline.retrieval import planner, rag_backends
 from pipeline.retrieval.trace import RetrievalTrace
 from pipeline.validation.rag.answer_guard import (
     ABSTAINED,
@@ -906,28 +906,24 @@ def _document_scope(document_ids):
     return tuple(sorted({str(document_id) for document_id in document_ids}))
 
 
-def _chat_document_scope(req: ChatRequest, is_table: bool):
-    """Resolve every RAG scope dimension through the document table once."""
+def _chat_retrieval_scope(req: ChatRequest):
+    """Return only canonical caller scope dimensions, never authority ids.
+
+    Meaning is resolved later by the checked backend on the same connection
+    and repeatable-read snapshot that performs retrieval.  Resolving here and
+    then opening another connection left a policy-change window in which a
+    collection/tag scope could be stale before either ranking began.
+    """
     direct = _document_scope(req.document_ids)
-    if is_table:
-        return direct
     collections = _document_scope(req.collection_ids)
-    has_metadata_scope = req.collection_ids is not None or req.tags is not None
-    # The legacy installation preserves its old unscoped fast path. Once more
-    # than one tenant is configured, even an apparently unscoped RAG request
-    # must become the complete *visible* id set: the LlamaIndex store is not a
-    # PostgreSQL table and therefore cannot inherit row-level security itself.
-    if not AUTH_REGISTRY.multi_tenant and not has_metadata_scope:
-        return direct
-    try:
-        with db_conn() as conn:
-            if direct is None and not has_metadata_scope:
-                return db.active_document_ids(conn)
-            return db.resolve_document_scope(
-                conn, document_ids=direct, collection_ids=collections,
-                tags=req.tags)
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from None
+    tags = None if req.tags is None else tuple(req.tags)
+    return {
+        name: value for name, value in (
+            ("document_ids", direct),
+            ("collection_ids", collections),
+            ("tags", tags),
+        ) if value is not None
+    }
 
 
 @app.post("/v1/chat/completions", dependencies=AUTH)
@@ -938,11 +934,11 @@ def chat_completions(req: ChatRequest):
     only the text carried by an answered/abstained ``GuardResult``; review
     results become a fixed notice and never expose the unchecked model reply.
 
-    ``document_ids`` narrows a RAG question to a named set of documents.
-    Its SHAPE is refused by the request model before this body runs; its
-    MEANING is settled here, once, and then handed to the one checked call
-    both response shapes go through -- which is why a streamed answer and a
-    non-streamed one cannot be scoped differently.
+    Retrieval scope SHAPE is refused by the request model before this body
+    runs.  Its canonical dimensions are handed to the one checked call both
+    response shapes use; the backend resolves their MEANING inside the same
+    authority snapshot as retrieval.  A streamed answer and a non-streamed
+    one therefore cannot be scoped differently.
     """
     if req.model not in {*RAG_MODELS, TABLE_MODEL_ID}:
         raise HTTPException(status_code=404, detail="bilinmeyen model")
@@ -951,10 +947,10 @@ def chat_completions(req: ChatRequest):
 
     is_table = req.model == TABLE_MODEL_ID
     backend = RAG_MODELS.get(req.model)
-    # Settled BEFORE the first backend call, and outside the closure, so
-    # both branches ask the same question of the same set. The table route
-    # reads none of this: it keeps its separate service path unchanged.
-    document_ids = _chat_document_scope(req, is_table)
+    # Canonicalised BEFORE the first backend call and outside the closure, so
+    # both branches offer the same dimensions.  Their meaning is settled in
+    # the backend transaction.  The table route reads none of this.
+    retrieval_scope = {} if is_table else _chat_retrieval_scope(req)
 
     def ask_checked():
         question = owui_chat.message_text(req.messages[-1].content)
@@ -962,12 +958,15 @@ def chat_completions(req: ChatRequest):
             raise HTTPException(status_code=400, detail="soru bos olamaz")
         # Forwarded only when a scope was asked for: an unscoped request
         # must reach the backend as the call it has always been.
-        scope = {} if document_ids is None else {"document_ids": document_ids}
+        principal = auth.current_principal()
         tenant_token = db.bind_execution_tenant(
-            auth.current_principal().tenant_id)
+            principal.tenant_id, actor_id=principal.subject_id)
         try:
             result = rag_backends.answer_checked(question, backend=backend,
-                                                 **scope)
+                                                 **retrieval_scope)
+        except planner.PlannerError:
+            raise HTTPException(
+                status_code=422, detail="gecersiz retrieval istegi") from None
         except RuntimeError as e:
             _log_rag_failure(e, backend)
             raise HTTPException(status_code=503, detail=RAG_UNAVAILABLE_MESSAGE)
