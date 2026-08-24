@@ -2666,14 +2666,16 @@ def list_documents(conn, limit: int, offset: int,
                    q: str | None = None,
                    archived: bool = False,
                    collection_id: str | None = None,
-                   tag: str | None = None) -> list[dict]:
+                   tag: str | None = None,
+                   before: tuple[datetime, str] | None = None,
+                   tenant_id: str | None = None) -> list[dict]:
     """One page of the document inventory, newest first.
 
-    SIX FILTERS. `archived=False` is the fail-closed default: the normal
+    FILTERS ARE CLOSED. `archived=False` is the fail-closed default: the normal
     inventory contains only active rows, while `archived=True` contains only
     archived rows. It is static SQL authority and never a bound value.
 
-    The other five are optional. `status` and `file_type` are exact equality;
+    The remaining filters are optional. `status` and `file_type` are exact equality;
     neither column has a closed vocabulary -- `status` is free text with
     no CHECK constraint and `file_type` is whatever suffix the upload
     carried -- so no value set is enforced here: an unknown value simply
@@ -2688,7 +2690,7 @@ def list_documents(conn, limit: int, offset: int,
     LIMIT/OFFSET, so the page, the offset and the `limit + 1` sentinel
     all describe the filtered sequence.
 
-    `q` IS THE FIFTH OPTIONAL FILTER, AND THE ONLY ONE THAT IS NOT EQUALITY:
+    `q` IS THE ONLY TEXT FILTER THAT IS NOT EQUALITY:
     it searches
     `documents.filename` ALONE, case-insensitively, for a LITERAL
     substring -- `ILIKE` against the pattern wrapped in `%` on both
@@ -2732,6 +2734,11 @@ def list_documents(conn, limit: int, offset: int,
     same row on two pages while another is never returned at all. The id
     tie-break makes the sequence the same on every page of one scan.
 
+    CURSOR PAGINATION reuses that exact order. ``before`` is the last
+    published ``(uploaded_at, id)`` pair and selects rows strictly below it.
+    It cannot be combined with a non-zero offset: offset remains the backward-
+    compatible path, while a cursor is the bounded path for deep inventories.
+
     ONE EXTRA ROW is fetched on purpose: ``limit + 1``. It answers "is
     there another page" from the same scan the page came from, without a
     second COUNT over the whole table and without the window between the
@@ -2747,8 +2754,28 @@ def list_documents(conn, limit: int, offset: int,
         raise ValueError("limit 1 veya daha buyuk bir tamsayi olmali")
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise ValueError("offset 0 veya daha buyuk bir tamsayi olmali")
+    before_time = before_id = None
+    if before is not None:
+        if type(before) is not tuple or len(before) != 2:
+            raise ValueError("inventory cursor gecersiz")
+        before_time, before_id = before
+        if (not isinstance(before_time, datetime)
+                or before_time.utcoffset() is None):
+            raise ValueError("inventory cursor zamani gecersiz")
+        try:
+            before_id = str(uuid.UUID(str(before_id)))
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("inventory cursor kimligi gecersiz") from None
+        if offset != 0:
+            raise ValueError("inventory cursor ve offset birlikte kullanilamaz")
     if not isinstance(archived, bool):
         raise ValueError("archived bir boolean olmali")
+    tenant = None
+    if tenant_id is not None:
+        try:
+            tenant = str(uuid.UUID(str(tenant_id)))
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("tenant_id gecerli bir UUID olmali") from None
     # The same courtesy for the filters: the API refuses a malformed one
     # in its own signature, this refuses it for every OTHER caller --
     # before any statement is built, so a refused call executes nothing.
@@ -2833,6 +2860,21 @@ def list_documents(conn, limit: int, offset: int,
             "EXISTS (SELECT 1 FROM document_tags dt JOIN tags t ON t.id = dt.tag_id "
             "WHERE dt.document_id = documents.id AND t.name_key = %(tag_key)s)")
         params["tag_key"] = tag_key
+    # RLS remains the security authority. The API also passes its authenticated
+    # tenant as a VALUE, giving PostgreSQL the same equality in a form its
+    # planner can use as the leading index key. Direct internal callers retain
+    # the database-owned effective-tenant expression as a compatibility path.
+    if tenant is None:
+        clauses.append("tenant_id = rag_effective_tenant()")
+    else:
+        clauses.append("tenant_id = %(inventory_tenant_id)s::uuid")
+        params["inventory_tenant_id"] = tenant
+    if before is not None:
+        clauses.append(
+            "(uploaded_at, id) < "
+            "(%(before_uploaded_at)s, %(before_id)s::uuid)")
+        params["before_uploaded_at"] = before_time
+        params["before_id"] = before_id
     where_sql = "WHERE " + " AND ".join(clauses) + " " if clauses else ""
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(

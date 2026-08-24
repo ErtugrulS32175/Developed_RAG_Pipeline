@@ -272,6 +272,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS tags_tenant_name_key
     ON tags(tenant_id, name_key);
 CREATE INDEX IF NOT EXISTS documents_tenant_inventory_idx
     ON documents(tenant_id, uploaded_at DESC, id DESC);
+-- Offset remains a compatibility path, but cursor pages and selective filters
+-- must be able to enter the total inventory order near their own boundary.
+-- The active/archived split is part of every inventory query; partial indexes
+-- avoid walking the half the caller explicitly excluded.
+CREATE INDEX IF NOT EXISTS documents_tenant_active_inventory_idx
+    ON documents(tenant_id, uploaded_at DESC, id DESC)
+    WHERE archived_at IS NULL;
+CREATE INDEX IF NOT EXISTS documents_tenant_archived_inventory_idx
+    ON documents(tenant_id, uploaded_at DESC, id DESC)
+    WHERE archived_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS documents_tenant_active_status_inventory_idx
+    ON documents(tenant_id, status, uploaded_at DESC, id DESC)
+    WHERE archived_at IS NULL;
+CREATE INDEX IF NOT EXISTS documents_tenant_active_type_inventory_idx
+    ON documents(tenant_id, file_type, uploaded_at DESC, id DESC)
+    WHERE archived_at IS NULL;
 
 -- The association rows carry tenant_id for RLS, and these composite keys make
 -- that value part of referential integrity too. Without them a service-role

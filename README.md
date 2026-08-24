@@ -372,6 +372,14 @@ authority is checked again while the ingest lease is taken and is held through
 snapshot-backed LlamaIndex retrieval, so a concurrent request cannot publish a
 document halfway through its archive transition.
 
+Inventory responses include `next_cursor` when another page exists. Pass its
+`before_uploaded_at` and `before_id` values together to walk deep inventories
+with keyset pagination; the pair cannot be mixed with a non-zero `offset`.
+Offset pagination remains available for existing clients. Active, archived,
+status and file-type inventory paths have tenant-leading PostgreSQL indexes;
+the total order remains `uploaded_at DESC, id DESC`, so cursor pages neither
+overlap nor leave gaps at equal timestamps.
+
 ### Collections and tags
 
 Collections and tags organise documents without copying or owning them. Create

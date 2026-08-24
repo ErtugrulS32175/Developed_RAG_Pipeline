@@ -1827,6 +1827,8 @@ def list_documents(
     archived: bool = Query(False),
     collection_id: UUID | None = Query(None),
     tag: str | None = Query(None, min_length=1),
+    before_uploaded_at: AwareDatetime | None = Query(None),
+    before_id: UUID | None = Query(None),
 ):
     """One page of the document inventory, newest first.
 
@@ -1884,6 +1886,10 @@ def list_documents(
     below the validation, so a limit of 0, 101, a negative offset, a
     malformed filter or a naive timestamp costs no pooled connection and
     no scan.
+
+    Deep pages may use the returned ``next_cursor`` as
+    ``before_uploaded_at`` plus ``before_id``. The pair is exact and cannot be
+    mixed with a non-zero offset; omitting both keeps the legacy offset path.
     """
     # The one rule no declaration can carry, checked where it still costs
     # nothing: an empty window (the bounds are exclusive, so equal bounds
@@ -1895,24 +1901,44 @@ def list_documents(
             status_code=422,
             detail="uploaded_after, uploaded_before'dan kesin olarak once "
                    "olmali")
+    if (before_uploaded_at is None) != (before_id is None):
+        raise HTTPException(
+            status_code=422,
+            detail="before_uploaded_at ve before_id birlikte verilmeli")
+    if before_uploaded_at is not None and offset != 0:
+        raise HTTPException(
+            status_code=422,
+            detail="cursor ve offset birlikte kullanilamaz")
     try:
         with db_conn() as conn:
             filters = {"status": status, "file_type": file_type,
                        "uploaded_after": uploaded_after,
                        "uploaded_before": uploaded_before,
-                       "q": q, "archived": archived}
+                       "q": q, "archived": archived,
+                       "tenant_id": str(
+                           auth.current_principal().tenant_id)}
             if collection_id is not None:
                 filters["collection_id"] = str(collection_id)
             if tag is not None:
                 filters["tag"] = tag
+            if before_uploaded_at is not None:
+                filters["before"] = (before_uploaded_at, str(before_id))
             rows = db.list_documents(conn, limit=limit, offset=offset, **filters)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page:
+        next_cursor = {
+            "before_uploaded_at": page[-1]["uploaded_at"],
+            "before_id": page[-1]["document_id"],
+        }
     return {
-        "documents": [_document_summary(row) for row in rows[:limit]],
+        "documents": [_document_summary(row) for row in page],
         "limit": limit,
         "offset": offset,
         "has_more": len(rows) > limit,
+        "next_cursor": next_cursor,
     }
 
 

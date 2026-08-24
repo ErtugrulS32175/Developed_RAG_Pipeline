@@ -1183,6 +1183,8 @@ class _InventoryCalls(list):
         self.dates = []
         self.searches = []
         self.archives = []
+        self.cursors = []
+        self.tenants = []
 
 
 def _like_matches(value, pattern, escape="!"):
@@ -1248,11 +1250,14 @@ def _wire_inventory(monkeypatch, api, rows=INVENTORY):
 
     def list_documents(_conn, limit, offset, status=None, file_type=None,
                        uploaded_after=None, uploaded_before=None, q=None,
-                       archived=False):
+                       archived=False, collection_id=None, tag=None,
+                       before=None, tenant_id=None):
         asked.append((limit, offset, status, file_type))
         asked.dates.append((uploaded_after, uploaded_before))
         asked.searches.append(q)
         asked.archives.append(archived)
+        asked.cursors.append(before)
+        asked.tenants.append(tenant_id)
         pattern = (None if q is None
                    else "%" + api.db.escape_like_pattern(q) + "%")
         matched = [
@@ -1266,6 +1271,8 @@ def _wire_inventory(monkeypatch, api, rows=INVENTORY):
             and ((row.get("archived_at") is not None) == archived)
             and (pattern is None
                  or _like_matches(row["filename"], pattern))
+            and (before is None
+                 or (row["uploaded_at"], str(row["document_id"])) < before)
         ]
         return matched[offset:offset + limit + 1]
 
@@ -1299,6 +1306,72 @@ def test_the_document_inventory_pages_with_a_limit_plus_one_probe(
     tail = last.json()
     assert [doc["document_id"] for doc in tail["documents"]] == ["kurgu-bir"]
     assert (tail["limit"], tail["offset"], tail["has_more"]) == (2, 2, False)
+
+
+def test_the_document_inventory_walks_deep_pages_with_an_exact_cursor(
+        monkeypatch, tmp_path):
+    """The published cursor is the last visible total-order key, not an
+    opaque offset. Feeding it back yields the next rows without overlap."""
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    rows = [
+        _inventory_row(
+            f"00000000-0000-0000-0000-00000000000{number}",
+            datetime(2026, 1, number, tzinfo=timezone.utc),
+        )
+        for number in (4, 3, 2, 1)
+    ]
+    asked = _wire_inventory(monkeypatch, api, rows)
+
+    first = client.get("/documents?limit=2", headers=_headers(api))
+
+    assert first.status_code == 200
+    first_body = first.json()
+    assert [item["document_id"] for item in first_body["documents"]] == [
+        rows[0]["document_id"], rows[1]["document_id"]]
+    assert first_body["next_cursor"] == {
+        "before_uploaded_at": "2026-01-03T00:00:00+00:00",
+        "before_id": rows[1]["document_id"],
+    }
+
+    second = client.get(
+        "/documents",
+        params={"limit": 2, **first_body["next_cursor"]},
+        headers=_headers(api),
+    )
+
+    assert second.status_code == 200
+    second_body = second.json()
+    assert [item["document_id"] for item in second_body["documents"]] == [
+        rows[2]["document_id"], rows[3]["document_id"]]
+    assert second_body["has_more"] is False
+    assert second_body["next_cursor"] is None
+    assert asked.cursors == [
+        None,
+        (datetime(2026, 1, 3, tzinfo=timezone.utc), rows[1]["document_id"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "before_uploaded_at=2026-01-03T00:00:00Z",
+        "before_id=00000000-0000-0000-0000-000000000003",
+        ("before_uploaded_at=2026-01-03T00:00:00Z&"
+         "before_id=00000000-0000-0000-0000-000000000003&offset=1"),
+    ],
+)
+def test_an_incomplete_or_mixed_inventory_cursor_costs_no_database_work(
+        monkeypatch, tmp_path, query):
+    api, client, _state, _calls, _upload_dir, _closed = _document_api(
+        monkeypatch, tmp_path)
+    borrowed, queried = _recording_gates(monkeypatch, api)
+
+    response = client.get("/documents?" + query, headers=_headers(api))
+
+    assert response.status_code == 422
+    assert borrowed == []
+    assert queried == []
 
 
 def test_the_inventory_publishes_only_the_safe_document_fields(
@@ -1555,7 +1628,7 @@ def test_the_inventory_window_on_uploaded_at_excludes_both_bounds(
                                  and bound.utcoffset() is not None)
     # the window changes WHICH rows are listed, never what a row shows
     assert set(response.json()) == {"documents", "limit", "offset",
-                                    "has_more"}
+                                    "has_more", "next_cursor"}
     for document in body["documents"]:
         assert set(document) == {
             "document_id", "filename", "file_type", "uploaded_at",
@@ -1891,7 +1964,8 @@ def test_the_inventory_searches_filenames_by_literal_substring(
     assert asked == [(20, 0, None, None)]
     assert asked.dates == [(None, None)]
     # the search changes WHICH rows are listed, never what a row shows
-    assert set(body) == {"documents", "limit", "offset", "has_more"}
+    assert set(body) == {
+        "documents", "limit", "offset", "has_more", "next_cursor"}
     for document in body["documents"]:
         assert set(document) == {
             "document_id", "filename", "file_type", "uploaded_at",
@@ -2140,7 +2214,7 @@ def test_a_search_is_not_validated_as_an_upload_filename(
     assert len(asked.searches[0]) == len(q)     # intact, never truncated
     assert response.json()["documents"] == []
     assert set(response.json()) == {"documents", "limit", "offset",
-                                    "has_more"}
+                                    "has_more", "next_cursor"}
 
 
 def test_a_searched_listing_publishes_only_the_safe_document_fields(
@@ -2298,7 +2372,7 @@ def test_a_long_filter_value_is_a_valid_filter(monkeypatch, tmp_path,
     assert queried[0][1][other] is None
     # the response shape is untouched by the length of a filter
     assert set(response.json()) == {"documents", "limit", "offset",
-                                    "has_more"}
+                                    "has_more", "next_cursor"}
 
 
 def test_the_inventory_sits_behind_the_same_key_as_the_other_document_routes(

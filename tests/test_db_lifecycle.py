@@ -315,6 +315,7 @@ def test_the_listing_query_is_parameterized_and_totally_ordered():
     assert "ORDER BY uploaded_at DESC, id DESC" in sql
     # Lifecycle is always fail-closed: the default inventory is active-only.
     assert "WHERE archived_at IS NULL" in sql
+    assert "tenant_id = rag_effective_tenant()" in sql
     assert "status" not in params and "file_type" not in params
 
 
@@ -330,6 +331,62 @@ def test_the_listing_query_asks_for_one_row_beyond_the_page():
 
     _sql, params = conn.cur.executed[0]
     assert params["limit"] == 2
+
+
+def test_the_listing_cursor_is_a_parameterized_total_order_boundary():
+    from pipeline.index import db
+
+    boundary_time = datetime(2026, 8, 24, 9, 30, tzinfo=timezone.utc)
+    boundary_id = "00000000-0000-0000-0000-0000000000AB"
+    conn = RecordingConn([_listing_row()])
+
+    db.list_documents(
+        conn, limit=5, offset=0, before=(boundary_time, boundary_id))
+
+    sql, params = conn.cur.executed[0]
+    clause = ("(uploaded_at, id) < "
+              "(%(before_uploaded_at)s, %(before_id)s::uuid)")
+    assert clause in sql
+    assert sql.index(clause) < sql.index("ORDER BY uploaded_at DESC, id DESC")
+    assert params["before_uploaded_at"] is boundary_time
+    assert params["before_id"] == "00000000-0000-0000-0000-0000000000ab"
+    assert boundary_id not in sql
+
+
+@pytest.mark.parametrize(
+    "before, offset",
+    [
+        ([], 0),
+        ((datetime.now(timezone.utc),), 0),
+        ((datetime(2026, 1, 1),
+          "00000000-0000-0000-0000-000000000001"), 0),
+        ((datetime.now(timezone.utc), "not-a-uuid"), 0),
+        ((datetime.now(timezone.utc),
+          "00000000-0000-0000-0000-000000000001"), 1),
+    ],
+)
+def test_the_listing_refuses_a_malformed_or_mixed_cursor_before_sql(
+        before, offset):
+    from pipeline.index import db
+
+    conn = RecordingConn([_listing_row()])
+    with pytest.raises(ValueError):
+        db.list_documents(conn, limit=5, offset=offset, before=before)
+    assert conn.cur.executed == []
+
+
+def test_inventory_scale_indexes_are_declared_once_and_match_query_shapes():
+    from pipeline.index import db
+
+    schema = db.Path(db.__file__).with_name("schema.sql").read_text("utf-8")
+    expected = (
+        "documents_tenant_active_inventory_idx",
+        "documents_tenant_archived_inventory_idx",
+        "documents_tenant_active_status_inventory_idx",
+        "documents_tenant_active_type_inventory_idx",
+    )
+    for declaration in expected:
+        assert schema.count(declaration) == 1
 
 
 def test_the_listing_can_select_only_archived_documents():
