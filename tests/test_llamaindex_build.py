@@ -20,6 +20,7 @@ DIS_BELGE = "22222222-2222-2222-2222-222222222222"
 YOK_BELGE = "33333333-3333-3333-3333-333333333333"
 IC_SURUM = "44444444-4444-4444-4444-444444444444"
 DIS_SURUM = "55555555-5555-5555-5555-555555555555"
+CHUNK = "66666666-6666-6666-6666-666666666666"
 IC_KEY = f"{TENANT}:{IC_BELGE}:{IC_SURUM}:7"
 DIS_KEY = f"{TENANT}:{DIS_BELGE}:{DIS_SURUM}:9"
 ESKI_KEY = f"{TENANT}:{IC_BELGE}:{DIS_SURUM}:7"
@@ -74,7 +75,8 @@ def _wire_db(monkeypatch, events, shadow_count=1):
             events.append(("sql", self._last))
 
         def fetchall(self):
-            return [("kurgu metin", 1, "text", "kurgu.pdf", IC_KEY)]
+            return [(
+                "kurgu metin", 1, "text", "kurgu.pdf", CHUNK, IC_KEY)]
 
         def fetchone(self):
             return (shadow_count,)
@@ -198,10 +200,12 @@ def test_the_index_metadata_carries_tenant_qualified_scope_authority(
         "page": 1,
         "type": "text",
         "filename": "kurgu.pdf",
+        "chunk_id": CHUNK,
         "scope_key": IC_KEY,
     }]
     for meta in metadata:
-        assert set(meta) == {"page", "type", "filename", "scope_key"}
+        assert set(meta) == {
+            "page", "type", "filename", "chunk_id", "scope_key"}
 
 
 def test_vector_and_scope_manifest_swap_under_one_exclusive_lock(

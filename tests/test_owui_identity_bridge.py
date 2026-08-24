@@ -13,6 +13,7 @@ from pipeline.api import identity
 
 SECRET = "identity-test-secret-with-more-than-32-bytes"
 GATEWAY_KEY = "gateway-only-test-key-with-more-than-32-bytes"
+EVIDENCE_SECRET = "evidence-only-test-key-with-more-than-32-bytes"
 
 
 def _part(value):
@@ -87,6 +88,7 @@ def gateway(monkeypatch):
     monkeypatch.setenv("API_KEYS_JSON", "")
     monkeypatch.setenv("OPENWEBUI_GATEWAY_KEY", GATEWAY_KEY)
     monkeypatch.setenv("OPENWEBUI_USER_JWT_SECRET", SECRET)
+    monkeypatch.setenv("EVIDENCE_HMAC_SECRET", EVIDENCE_SECRET)
     import pipeline.api.app as api
     importlib.reload(api)
     resolved = api.auth.Principal(
@@ -99,6 +101,7 @@ def gateway(monkeypatch):
     yield api
     monkeypatch.delenv("OPENWEBUI_GATEWAY_KEY", raising=False)
     monkeypatch.delenv("OPENWEBUI_USER_JWT_SECRET", raising=False)
+    monkeypatch.delenv("EVIDENCE_HMAC_SECRET", raising=False)
     importlib.reload(api)
 
 
@@ -151,11 +154,13 @@ def test_gateway_key_cannot_equal_a_legacy_api_key(monkeypatch):
     monkeypatch.setenv("API_KEY", GATEWAY_KEY)
     monkeypatch.setenv("OPENWEBUI_GATEWAY_KEY", GATEWAY_KEY)
     monkeypatch.setenv("OPENWEBUI_USER_JWT_SECRET", SECRET)
+    monkeypatch.setenv("EVIDENCE_HMAC_SECRET", EVIDENCE_SECRET)
     import pipeline.api.app as api
     with pytest.raises(identity.IdentityConfigurationError, match="ayni"):
         importlib.reload(api)
     monkeypatch.delenv("OPENWEBUI_GATEWAY_KEY", raising=False)
     monkeypatch.delenv("OPENWEBUI_USER_JWT_SECRET", raising=False)
+    monkeypatch.delenv("EVIDENCE_HMAC_SECRET", raising=False)
     monkeypatch.setenv("API_KEY", "")
     importlib.reload(api)
 
@@ -168,9 +173,43 @@ def test_local_open_mode_still_binds_its_explicit_default_principal(
     monkeypatch.setenv("API_KEYS_JSON", "")
     monkeypatch.delenv("OPENWEBUI_GATEWAY_KEY", raising=False)
     monkeypatch.delenv("OPENWEBUI_USER_JWT_SECRET", raising=False)
+    monkeypatch.delenv("EVIDENCE_HMAC_SECRET", raising=False)
     import pipeline.api.app as api
     importlib.reload(api)
     request = Request({"type": "http", "headers": []})
 
     assert api._request_principal(request) == api.AUTH_REGISTRY.open_principal
     assert api.AUTH_REGISTRY.open_principal is not None
+
+
+def test_authenticated_gateway_requires_an_independent_evidence_secret(
+        monkeypatch):
+    monkeypatch.setenv("API_KEY", "")
+    monkeypatch.setenv("API_KEYS_JSON", "")
+    monkeypatch.setenv("OPENWEBUI_GATEWAY_KEY", GATEWAY_KEY)
+    monkeypatch.setenv("OPENWEBUI_USER_JWT_SECRET", SECRET)
+    monkeypatch.delenv("EVIDENCE_HMAC_SECRET", raising=False)
+    import pipeline.api.app as api
+    with pytest.raises(identity.IdentityConfigurationError,
+                       match="evidence HMAC"):
+        importlib.reload(api)
+    monkeypatch.delenv("OPENWEBUI_GATEWAY_KEY", raising=False)
+    monkeypatch.delenv("OPENWEBUI_USER_JWT_SECRET", raising=False)
+    importlib.reload(api)
+
+
+def test_legacy_api_key_does_not_require_the_openwebui_evidence_secret(
+        monkeypatch):
+    monkeypatch.setenv("API_KEY", GATEWAY_KEY)
+    monkeypatch.setenv("API_KEYS_JSON", "")
+    monkeypatch.delenv("OPENWEBUI_GATEWAY_KEY", raising=False)
+    monkeypatch.delenv("OPENWEBUI_USER_JWT_SECRET", raising=False)
+    monkeypatch.delenv("EVIDENCE_HMAC_SECRET", raising=False)
+    import pipeline.api.app as api
+
+    importlib.reload(api)
+    assert api.AUTH_REGISTRY.configured is True
+    assert api.OPENWEBUI_IDENTITY is None
+
+    monkeypatch.setenv("API_KEY", "")
+    importlib.reload(api)

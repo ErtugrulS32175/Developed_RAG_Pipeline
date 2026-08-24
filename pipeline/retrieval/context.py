@@ -7,6 +7,7 @@ Validation must use the latter and must never reconstruct it by parsing the
 former.
 """
 from dataclasses import dataclass
+from uuid import UUID
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,24 @@ class Passage:
     page: int | None
     text: str
     citation: str
+    chunk_id: str | None = None
+    document_name: str | None = None
+
+    def __post_init__(self):
+        if self.chunk_id is not None:
+            if type(self.chunk_id) is not str:
+                raise TypeError("passage chunk id must be text or None")
+            try:
+                parsed = UUID(self.chunk_id)
+            except ValueError as exc:
+                raise ValueError("passage chunk id must be a UUID") from exc
+            if str(parsed) != self.chunk_id:
+                raise ValueError("passage chunk id must be canonical")
+        if (self.document_name is not None
+                and (type(self.document_name) is not str
+                     or not self.document_name
+                     or len(self.document_name) > 500)):
+            raise ValueError("passage document name is invalid")
 
 
 @dataclass(frozen=True)

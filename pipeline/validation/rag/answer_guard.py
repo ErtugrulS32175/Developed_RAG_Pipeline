@@ -44,12 +44,29 @@ class PageCitation:
 
     page: int
     source: str
+    chunk_id: str | None = None
+    document_name: str | None = None
 
     def __post_init__(self):
         if type(self.page) is not int or self.page < 1:
             raise ValueError("citation page must be a positive integer")
         if self.source not in {MODEL_CITATION, DERIVED_CITATION}:
             raise ValueError("unknown citation source")
+        if self.chunk_id is not None:
+            if type(self.chunk_id) is not str:
+                raise TypeError("citation chunk id must be text or None")
+            try:
+                from uuid import UUID
+                parsed = UUID(self.chunk_id)
+            except ValueError as exc:
+                raise ValueError("citation chunk id must be a UUID") from exc
+            if str(parsed) != self.chunk_id:
+                raise ValueError("citation chunk id must be canonical")
+        if (self.document_name is not None
+                and (type(self.document_name) is not str
+                     or not self.document_name
+                     or len(self.document_name) > 500)):
+            raise ValueError("citation document name is invalid")
 
 
 @dataclass(frozen=True)
@@ -300,18 +317,37 @@ def _page_citations(parsed, context):
     answer = parsed["cevap"]
     if is_abstention(answer):
         return ()
+    known = context.by_handle()
+    handles = list(dict.fromkeys(
+        item["pasaj"] for item in parsed["dayanak"]
+        if item["pasaj"] in known
+    ))
+    passages = [known[handle] for handle in handles]
+
+    def citations_for(page, source):
+        enriched = []
+        seen = set()
+        for passage in passages:
+            if passage.page != page or passage.chunk_id is None:
+                continue
+            if passage.chunk_id in seen:
+                continue
+            seen.add(passage.chunk_id)
+            enriched.append(PageCitation(
+                page, source, passage.chunk_id, passage.document_name))
+        # Legacy/evaluation contexts do not carry a database identity. Keep
+        # their established page-only contract instead of manufacturing one.
+        return tuple(enriched) or (PageCitation(page, source),)
+
     model_pages = cited_pages(answer)
     if model_pages:
         return tuple(
-            PageCitation(page, MODEL_CITATION)
+            citation
             for page in sorted(model_pages)
+            for citation in citations_for(page, MODEL_CITATION)
         )
-    page = _unambiguous_evidence_page(parsed, context.by_handle())
-    return (
-        (PageCitation(page, DERIVED_CITATION),)
-        if page is not None
-        else ()
-    )
+    page = _unambiguous_evidence_page(parsed, known)
+    return citations_for(page, DERIVED_CITATION) if page is not None else ()
 
 
 def check_structured(reply, context, minimum=0, derive=False):

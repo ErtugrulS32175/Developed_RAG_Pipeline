@@ -62,6 +62,22 @@ def test_model_text_and_provenance_are_built_from_the_same_chunks():
     ]
 
 
+def test_database_identity_stays_out_of_model_text_but_in_provenance():
+    chunk_id = "00000000-0000-0000-0000-000000000271"
+    context = build_rag_context(
+        [_chunk(id=chunk_id, filename="kurgu.pdf")], numbered=True)
+
+    passage = context.passages[0]
+    assert passage.chunk_id == chunk_id
+    assert passage.document_name == "kurgu.pdf"
+    assert chunk_id not in context.model_text
+
+
+def test_untrusted_chunk_identity_cannot_become_evidence_authority():
+    context = build_rag_context([_chunk(id="not-a-chunk")], numbered=True)
+    assert context.passages[0].chunk_id is None
+
+
 def test_numbered_text_cannot_discard_its_paired_provenance():
     with pytest.raises(ValueError, match="build_rag_context"):
         build_context([_chunk()], numbered=True)

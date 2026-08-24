@@ -80,6 +80,11 @@ and the second as OpenWebUI's 60-second signed user assertion. The API requires
 both; plain `X-OpenWebUI-User-*` headers, an unsigned user id, and OpenWebUI's
 own `admin` role grant no RAG permission. The deployment pins OpenWebUI v0.11.0
 by OCI digest so this identity contract cannot move under a mutable image tag.
+Set a third independent value, `EVIDENCE_HMAC_SECRET`, for stable opaque
+citation references. Keep it when applications restart or roll forward;
+after rotation, registering a new citation for a chunk replaces that chunk's
+old reference. References not registered again remain valid until their
+mapping is replaced, so rotation is not a global revocation operation.
 
 For more than one tenant, set `API_KEYS_JSON` to a JSON list whose entries are
 exactly `key`, `tenant_id` (UUID), and `role`. Roles are cumulative:
@@ -135,6 +140,28 @@ monitor, and an architecture admin receives the versioned tree editor. A save
 replaces the topology atomically; a stale editor receives 409 instead of
 overwriting a newer design. The portal is a same-origin OpenWebUI route and
 keeps both bridge secrets on the server.
+
+### Citation evidence in OpenWebUI
+
+Import `openwebui/functions/ragtest_citations.py` as a global Filter and
+`openwebui/functions/ragtest_evidence_action.py` as an Action. Checked RAG
+answers then publish OpenWebUI `source` events containing only a document
+label, page and opaque evidence reference. The initial answer never contains a
+passage, source path, ticket or raw chunk id.
+Keep streaming enabled on the OpenWebUI provider connection: the Filter emits
+the persisted `source` event while processing streamed chunks. Non-streaming
+direct API clients still receive the closed `rag_citations` response metadata,
+but do not run the OpenWebUI Filter.
+
+The **Kanıtı Göster** action exchanges the reference through two server-side
+JSON POSTs. The API first rechecks the signed OpenWebUI actor, active content
+membership, tenant, document lifecycle and exact active chunk, then issues a
+single-use 50-second ticket. Preview consumption repeats those checks and
+returns only the bounded passage. Tickets are actor/tenant/purpose bound,
+stored only as SHA-256 digests and never placed in a URL or browser storage.
+Organization-architecture authority alone grants no evidence access. The
+preview is shown transiently rather than saved into chat history, so revoking
+access is not defeated by a durable copy created by the plugin itself.
 
 ### Production operations
 

@@ -923,6 +923,58 @@ CREATE POLICY tenant_isolation ON org_audit_events
     USING (rag_service_access() OR tenant_id = rag_effective_tenant())
     WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
 
+-- Browser evidence tickets are deliberately NOT bearer authorization.  The
+-- opaque citation reference only identifies one trusted retrieval chunk; a
+-- short-lived ticket is minted after a fresh membership/document check and is
+-- bound to one OpenWebUI actor, one tenant and the single ``preview`` purpose.
+-- Only the SHA-256 digest of the random ticket is retained.  The source path,
+-- question, answer and passage never enter this table.
+CREATE UNIQUE INDEX IF NOT EXISTS chunks_tenant_id_key
+    ON chunks(tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS evidence_references (
+    ref_digest bytea PRIMARY KEY CHECK (octet_length(ref_digest) = 32),
+    tenant_id  uuid NOT NULL,
+    chunk_id   uuid NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, chunk_id),
+    FOREIGN KEY (tenant_id, chunk_id)
+        REFERENCES chunks(tenant_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS evidence_preview_tickets (
+    token_digest bytea PRIMARY KEY CHECK (octet_length(token_digest) = 32),
+    tenant_id    uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    actor_id     uuid NOT NULL REFERENCES org_identities(id) ON DELETE CASCADE,
+    chunk_id     uuid NOT NULL,
+    purpose      text NOT NULL CHECK (purpose = 'preview'),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    expires_at   timestamptz NOT NULL,
+    consumed_at  timestamptz,
+    UNIQUE (tenant_id, actor_id, purpose),
+    CHECK (expires_at > created_at),
+    FOREIGN KEY (tenant_id, chunk_id)
+        REFERENCES chunks(tenant_id, id) ON DELETE CASCADE,
+    CHECK (consumed_at IS NULL OR consumed_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS evidence_preview_tickets_expiry_idx
+    ON evidence_preview_tickets(expires_at);
+
+ALTER TABLE evidence_references ENABLE ROW LEVEL SECURITY;
+ALTER TABLE evidence_references FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON evidence_references;
+CREATE POLICY tenant_isolation ON evidence_references
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE evidence_preview_tickets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE evidence_preview_tickets FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON evidence_preview_tickets;
+CREATE POLICY tenant_isolation ON evidence_preview_tickets
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
 -- No ANN index yet: this is a small, single-document demo dataset, and a
 -- sequential scan over `dense <=> query` / `sparse <#> query` is effectively
 -- instant at this scale. Add an HNSW index (e.g. `USING hnsw (dense

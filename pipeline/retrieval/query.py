@@ -1,5 +1,6 @@
 import os
 from dataclasses import replace
+from uuid import UUID
 
 import requests
 from dotenv import load_dotenv
@@ -47,9 +48,22 @@ def retrieve(query: str, top_k: int = TOP_K, *,
     dense_vector = embed_dense(query)
     sparse_indices, sparse_values = embed_sparse(query)
     with db.get_pool().connection() as conn:
-        return db.hybrid_search(conn, dense_vector, sparse_indices,
-                                sparse_values, top_k=top_k,
-                                document_ids=document_ids)
+        tenant_id, service = db.current_execution_tenant()
+        if service:
+            raise RuntimeError(
+                "servis baglami kullanici retrieval kapsami olamaz")
+        db.set_tenant_context(conn, tenant_id, service=False)
+        try:
+            return db.hybrid_search(conn, dense_vector, sparse_indices,
+                                    sparse_values, top_k=top_k,
+                                    document_ids=document_ids)
+        finally:
+            # A failed statement leaves psycopg's transaction aborted, where a
+            # RESET cannot run. Roll back the read transaction first, then
+            # clear the session-scoped tenant before this pooled connection can
+            # be handed to another request.
+            conn.rollback()
+            db.clear_tenant_context(conn)
 
 
 def rerank(query: str, chunks: list[dict], top_n: int = TOP_RERANK) -> list[dict]:
@@ -158,11 +172,36 @@ def build_rag_context(chunks: list[dict], numbered: bool = False) -> RagContext:
     for i, chunk in enumerate(chunks, start=1):
         raw_text = chunk.get("text")
         text = "" if raw_text is None else str(raw_text)
+        raw_chunk_id = chunk.get("id")
+        if raw_chunk_id is None:
+            chunk_id = None
+        elif isinstance(raw_chunk_id, UUID):
+            chunk_id = str(raw_chunk_id)
+        elif type(raw_chunk_id) is str:
+            # Provenance is an internal database identity.  It is deliberately
+            # not rendered into model_text and is never itself authorization.
+            # Requiring the canonical UUID shape here prevents a vector-store
+            # metadata string from becoming a public evidence capability.
+            try:
+                parsed_chunk_id = str(UUID(raw_chunk_id))
+            except ValueError:
+                parsed_chunk_id = None
+            chunk_id = (
+                raw_chunk_id if parsed_chunk_id == raw_chunk_id else None
+            )
+        else:
+            chunk_id = None
+        raw_document_name = chunk.get("filename")
+        if raw_document_name is not None and type(raw_document_name) is not str:
+            raise TypeError("document name must be text or None")
+        document_name = raw_document_name
         passages.append(Passage(
             handle=i,
             page=_trusted_page(chunk),
             text=text,
             citation=citation(chunk),
+            chunk_id=chunk_id,
+            document_name=document_name,
         ))
     return RagContext(
         passages=tuple(passages),

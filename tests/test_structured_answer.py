@@ -296,6 +296,55 @@ def test_an_explicit_valid_page_is_marked_as_model_supplied():
     )
 
 
+def test_checked_citation_carries_only_internal_database_provenance():
+    chunk_id = "00000000-0000-0000-0000-000000000372"
+    ctx = build_rag_context([{
+        "id": chunk_id,
+        "filename": "kurgu.pdf",
+        "page": 953761,
+        "text": "KURGU_OMEGA_NESNESI 842753 birimdir.",
+    }], numbered=True)
+    reply = _reply(
+        1,
+        "KURGU_OMEGA_NESNESI 842753 birimdir.",
+        "Sayfa 953761: KURGU_OMEGA_NESNESI 842753 birimdir.",
+    )
+
+    result = validate_structured(reply, ctx)
+
+    assert result.status == ANSWERED
+    assert result.citations == (
+        PageCitation(953761, MODEL_CITATION, chunk_id, "kurgu.pdf"),
+    )
+    assert chunk_id not in ctx.model_text
+
+
+def test_two_claimed_chunks_on_one_page_remain_two_evidence_targets():
+    first = "00000000-0000-0000-0000-000000000471"
+    second = "00000000-0000-0000-0000-000000000472"
+    ctx = build_rag_context([
+        {"id": first, "filename": "kurgu.pdf", "page": 953762,
+         "text": "KURGU_ALPHA ilk satirdadir."},
+        {"id": second, "filename": "kurgu.pdf", "page": 953762,
+         "text": "KURGU_BETA ikinci satirdadir."},
+    ], numbered=True)
+    reply = {
+        "dayanak": [
+            {"pasaj": 1, "alinti": "KURGU_ALPHA ilk satirdadir."},
+            {"pasaj": 2, "alinti": "KURGU_BETA ikinci satirdadir."},
+        ],
+        "cevap": "KURGU_ALPHA ve KURGU_BETA desteklenir.",
+    }
+
+    result = validate_structured(reply, ctx)
+
+    assert result.status == ANSWERED
+    assert result.citations == (
+        PageCitation(953762, DERIVED_CITATION, first, "kurgu.pdf"),
+        PageCitation(953762, DERIVED_CITATION, second, "kurgu.pdf"),
+    )
+
+
 def test_an_abstention_with_no_evidence_raises_nothing():
     reply = {"dayanak": [], "cevap": "Bu bilgi mevcut belgelerde bulunamadı."}
     assert check_structured(reply, CONTEXT) == []

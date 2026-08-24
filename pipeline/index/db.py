@@ -32,7 +32,7 @@ load_dotenv()
 # password intentionally fails auth so a missing .env surfaces loudly
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv("PG_DSN", "postgresql://rag:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -69,6 +69,10 @@ class OrgVersionConflict(RuntimeError):
 
 class OrgIdentityConflict(RuntimeError):
     """An external identity cannot be bound safely to the requested tenant."""
+
+
+class EvidenceAccessRefused(RuntimeError):
+    """A citation ticket cannot be minted or consumed under fresh policy."""
 
 
 def set_tenant_context(conn, tenant_id=DEFAULT_TENANT_ID, *, service=False):
@@ -355,6 +359,138 @@ def visible_org_members(conn, viewer_id):
             "ORDER BY scope.depth, target.display_label, target.identity_id",
             (viewer_id,))
         return [dict(row) for row in cur.fetchall()]
+
+
+def register_evidence_references(conn, references):
+    """Persist opaque-HMAC-to-chunk mappings for trusted RAG citations."""
+    if type(references) is not tuple or not references:
+        raise EvidenceAccessRefused("kanit referanslari gecersiz")
+    normalized = []
+    for reference in references:
+        if (type(reference) is not tuple or len(reference) != 2
+                or type(reference[0]) is not bytes
+                or len(reference[0]) != 32):
+            raise EvidenceAccessRefused("kanit referanslari gecersiz")
+        try:
+            chunk_id = uuid.UUID(str(reference[1]))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise EvidenceAccessRefused("kanit kimligi gecersiz") from exc
+        normalized.append((reference[0], chunk_id))
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            for ref_digest, chunk_id in normalized:
+                cur.execute(
+                    "INSERT INTO evidence_references "
+                    "(ref_digest, tenant_id, chunk_id) "
+                    "SELECT %s, c.tenant_id, c.id FROM chunks c "
+                    "JOIN documents d ON d.tenant_id = c.tenant_id "
+                    "AND d.id = c.document_id "
+                    "WHERE c.id = %s AND d.archived_at IS NULL "
+                    "AND c.generation = d.active_generation "
+                    "AND ((d.active_version_id IS NULL AND c.version_id IS NULL) "
+                    "OR c.version_id = d.active_version_id) "
+                    "ON CONFLICT (tenant_id, chunk_id) DO UPDATE SET "
+                    "ref_digest = EXCLUDED.ref_digest, created_at = now() "
+                    "RETURNING ref_digest",
+                    (ref_digest, chunk_id))
+                if cur.fetchone() is None:
+                    raise EvidenceAccessRefused("kanit eslemesi reddedildi")
+    except psycopg.errors.UniqueViolation as exc:
+        conn.rollback()
+        raise EvidenceAccessRefused("kanit eslemesi cakisti") from exc
+    conn.commit()
+
+
+def mint_evidence_preview_ticket(conn, *, actor_id, ref_digest, token_digest,
+                                 ttl_seconds=50):
+    """Persist one actor-bound preview ticket after fresh content checks.
+
+    The citation reference is only an integrity-protected locator.  This
+    statement is the authorization decision: RLS binds the tenant, the
+    external identity must still have an active content membership, and the
+    chunk must still belong to the document's active version/generation.
+    Architecture authority is intentionally absent from the predicate.
+    """
+    try:
+        actor_id = uuid.UUID(str(actor_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise EvidenceAccessRefused("kanit kimligi gecersiz") from exc
+    if (type(ref_digest) is not bytes or len(ref_digest) != 32
+            or type(token_digest) is not bytes or len(token_digest) != 32
+            or type(ttl_seconds) is not int
+            or not 45 <= ttl_seconds <= 60):
+        raise EvidenceAccessRefused("kanit bileti sinirlari gecersiz")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "INSERT INTO evidence_preview_tickets "
+            "(token_digest, tenant_id, actor_id, chunk_id, purpose, expires_at) "
+            "SELECT %s, c.tenant_id, %s, c.id, 'preview', "
+            "now() + (%s * interval '1 second') "
+            "FROM evidence_references e "
+            "JOIN chunks c ON c.tenant_id = e.tenant_id "
+            "AND c.id = e.chunk_id "
+            "JOIN documents d ON d.tenant_id = c.tenant_id "
+            "AND d.id = c.document_id "
+            "JOIN org_memberships m ON m.tenant_id = c.tenant_id "
+            "AND m.identity_id = %s AND m.state = 'active' "
+            "AND m.app_role IN ('reader', 'editor', 'admin') "
+            "WHERE e.ref_digest = %s AND d.archived_at IS NULL "
+            "AND c.generation = d.active_generation "
+            "AND ((d.active_version_id IS NULL AND c.version_id IS NULL) "
+            "OR c.version_id = d.active_version_id) "
+            "ON CONFLICT (tenant_id, actor_id, purpose) DO UPDATE SET "
+            "token_digest = EXCLUDED.token_digest, "
+            "chunk_id = EXCLUDED.chunk_id, created_at = now(), "
+            "expires_at = EXCLUDED.expires_at, consumed_at = NULL "
+            "RETURNING expires_at",
+            (token_digest, actor_id, ttl_seconds, actor_id, ref_digest))
+        row = cur.fetchone()
+    if row is None:
+        raise EvidenceAccessRefused("kanit goruntuleme yetkisi yok")
+    conn.commit()
+    return row["expires_at"]
+
+
+def consume_evidence_preview_ticket(conn, *, actor_id, token_digest,
+                                    passage_max_chars=4000):
+    """Consume one ticket and return a bounded passage in one DB statement.
+
+    Keeping consumption and the fresh resource check in one statement avoids
+    a time-of-check/time-of-use window.  No source path or complete document is
+    selected, and a replay has no matching unconsumed row.
+    """
+    try:
+        actor_id = uuid.UUID(str(actor_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise EvidenceAccessRefused("kanit kimligi gecersiz") from exc
+    if (type(token_digest) is not bytes or len(token_digest) != 32
+            or type(passage_max_chars) is not int
+            or not 1 <= passage_max_chars <= 8000):
+        raise EvidenceAccessRefused("kanit bileti sinirlari gecersiz")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "UPDATE evidence_preview_tickets t SET consumed_at = now() "
+            "FROM chunks c "
+            "JOIN documents d ON d.tenant_id = c.tenant_id "
+            "AND d.id = c.document_id "
+            "JOIN org_memberships m ON m.tenant_id = c.tenant_id "
+            "AND m.identity_id = %s AND m.state = 'active' "
+            "AND m.app_role IN ('reader', 'editor', 'admin') "
+            "WHERE t.token_digest = %s AND t.actor_id = %s "
+            "AND t.tenant_id = c.tenant_id AND t.chunk_id = c.id "
+            "AND t.purpose = 'preview' AND t.consumed_at IS NULL "
+            "AND t.expires_at > now() AND d.archived_at IS NULL "
+            "AND c.generation = d.active_generation "
+            "AND ((d.active_version_id IS NULL AND c.version_id IS NULL) "
+            "OR c.version_id = d.active_version_id) "
+            "RETURNING d.filename AS document_name, c.page, "
+            "left(c.text, %s) AS passage",
+            (actor_id, token_digest, actor_id, passage_max_chars))
+        row = cur.fetchone()
+    if row is None:
+        raise EvidenceAccessRefused("kanit bileti gecersiz")
+    conn.commit()
+    return dict(row)
 
 
 def org_topology(conn):

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from pipeline.api import auth
 from pipeline.api import app as api
 from pipeline.index import db, publication
+from pipeline.retrieval import query
 
 
 TENANT_A = UUID("10000000-0000-0000-0000-000000000001")
@@ -171,6 +172,45 @@ def test_multitenant_unscoped_rag_is_projected_to_visible_ids(monkeypatch):
     assert captured[0][0]["document_ids"] == ("visible-a", "visible-b")
     assert captured[0][1] == (TENANT_A, False)
     assert db._EXECUTION_TENANT.get() == (db.DEFAULT_TENANT_ID, False)
+
+
+def test_native_retrieval_binds_and_clears_the_execution_tenant(monkeypatch):
+    seen = []
+    conn = SimpleNamespace(rollback=lambda: seen.append("rollback"))
+
+    @contextmanager
+    def connection():
+        yield conn
+
+    monkeypatch.setattr(
+        query.db, "get_pool",
+        lambda: SimpleNamespace(connection=connection))
+    monkeypatch.setattr(query, "embed_dense", lambda _value: [0.0])
+    monkeypatch.setattr(query, "embed_sparse", lambda _value: ([1], [1.0]))
+    monkeypatch.setattr(
+        query.db, "set_tenant_context",
+        lambda actual, tenant, service=False:
+        seen.append((actual, tenant, service)))
+    monkeypatch.setattr(
+        query.db, "clear_tenant_context",
+        lambda actual: seen.append(("clear", actual)))
+    monkeypatch.setattr(
+        query.db, "hybrid_search",
+        lambda actual, *_args, **_kwargs:
+        seen.append(("search", actual)) or [{"id": "visible"}])
+
+    token = db.bind_execution_tenant(TENANT_A)
+    try:
+        assert query.retrieve("kurgu") == [{"id": "visible"}]
+    finally:
+        db.reset_execution_tenant(token)
+
+    assert seen == [
+        (conn, TENANT_A, False),
+        ("search", conn),
+        "rollback",
+        ("clear", conn),
+    ]
 
 
 def test_schema_declares_forced_row_level_isolation_for_every_tenant_table():

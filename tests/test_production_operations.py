@@ -224,7 +224,7 @@ def test_migration_cli_never_reflects_connection_exception_prose(
     assert migrate_db.main() == 1
     output = capsys.readouterr().out
     assert json.loads(output) == {
-        "migration_version": 3, "status": "failed"}
+        "migration_version": 4, "status": "failed"}
     assert "OZEL" not in output
 
 

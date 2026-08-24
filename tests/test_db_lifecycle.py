@@ -24,12 +24,15 @@ class FakePool:
     def __init__(self):
         self.handed_out = []
         self.returned = 0
+        self.rolled_back = []
 
     @contextmanager
     def connection(self):
+        pool = self
+
         class Conn:
             def rollback(self):
-                pass
+                pool.rolled_back.append(self)
 
         conn = Conn()
         self.handed_out.append(conn)
@@ -202,7 +205,18 @@ def test_retrieve_borrows_from_the_pool_per_query(monkeypatch):
 
     pool = FakePool()
     seen = []
+    tenant_events = []
     monkeypatch.setattr(db, "get_pool", lambda: pool)
+    monkeypatch.setattr(
+        db, "current_execution_tenant",
+        lambda: (db.DEFAULT_TENANT_ID, False))
+    monkeypatch.setattr(
+        db, "set_tenant_context",
+        lambda conn, tenant_id, *, service=False:
+        tenant_events.append(("set", conn, tenant_id, service)))
+    monkeypatch.setattr(
+        db, "clear_tenant_context",
+        lambda conn: tenant_events.append(("clear", conn)))
     monkeypatch.setattr(query, "embed_dense", lambda q: [0.0])
     monkeypatch.setattr(query, "embed_sparse", lambda q: ([1], [1.0]))
     monkeypatch.setattr(
@@ -214,6 +228,13 @@ def test_retrieve_borrows_from_the_pool_per_query(monkeypatch):
 
     assert seen == pool.handed_out
     assert len(set(map(id, seen))) == 2
+    assert pool.rolled_back == seen
+    assert tenant_events == [
+        ("set", seen[0], db.DEFAULT_TENANT_ID, False),
+        ("clear", seen[0]),
+        ("set", seen[1], db.DEFAULT_TENANT_ID, False),
+        ("clear", seen[1]),
+    ]
     assert pooled_returns_match(pool)
 
 

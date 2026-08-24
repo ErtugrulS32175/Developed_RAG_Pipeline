@@ -300,7 +300,7 @@ def build_index():
             # system never recorded one.  Staging/partial generations match
             # neither arm.
             cur.execute(
-                "SELECT c.text, c.page, c.type, d.filename, "
+                "SELECT c.text, c.page, c.type, d.filename, c.id::text, "
                 "d.tenant_id::text || ':' || d.id::text || ':' || "
                 "c.version_id::text || ':' || c.generation::text "
                 "AS scope_key "
@@ -312,7 +312,7 @@ def build_index():
                 "JOIN documents d ON d.tenant_id = b.tenant_id "
                 "AND d.id = b.document_id "
                 "UNION ALL "
-                "SELECT c.text, c.page, c.type, d.filename, "
+                "SELECT c.text, c.page, c.type, d.filename, c.id::text, "
                 "d.tenant_id::text || ':' || d.id::text || ':legacy:' || "
                 "c.generation::text AS scope_key "
                 "FROM chunks c JOIN documents d "
@@ -327,8 +327,9 @@ def build_index():
             Document(text=text,
                      metadata={"page": page, "type": ctype,
                                "filename": filename,
+                               "chunk_id": chunk_id,
                                "scope_key": scope_key})
-            for text, page, ctype, filename, scope_key in rows
+            for text, page, ctype, filename, chunk_id, scope_key in rows
         ]
         print(f"[LLAMAINDEX] {len(docs)} chunk golge tabloya aktariliyor "
               f"({len(rows)} satir); eski indeks takasa kadar hizmette")
@@ -346,7 +347,7 @@ def build_index():
             raise RuntimeError(
                 "golge tablo bos kaldi; takas yapilmadi, eski indeks "
                 "hizmette")
-        scope_keys = sorted({str(row[4]) for row in rows})
+        scope_keys = sorted({str(row[5]) for row in rows})
         with conn.cursor() as cur:
             cur.execute(_sql.SQL(
                 "CREATE TABLE {} (scope_key text PRIMARY KEY)").format(
@@ -386,6 +387,7 @@ def _as_chunks(nodes, allowed_scope_keys):
             raise RuntimeError(
                 "LlamaIndex yetki kapsami disinda dugum dondurdu")
         out.append({
+            "id": meta.get("chunk_id"),
             "text": n.get_content(),
             "page": meta.get("page", 0),
             "type": meta.get("type", "text"),

@@ -1,8 +1,10 @@
+import base64
 import json
 import hashlib
 import hmac
 import logging
 import os
+import secrets
 import time
 import traceback
 import uuid
@@ -98,6 +100,14 @@ AUTH_REGISTRY = auth.load_registry(API_KEY, API_KEYS_JSON)
 OPENWEBUI_GATEWAY_KEY = os.getenv("OPENWEBUI_GATEWAY_KEY", "").strip()
 OPENWEBUI_USER_JWT_SECRET = os.getenv(
     "OPENWEBUI_USER_JWT_SECRET", "").strip()
+EVIDENCE_HMAC_SECRET = os.getenv("EVIDENCE_HMAC_SECRET", "").strip()
+if (EVIDENCE_HMAC_SECRET
+        and len(EVIDENCE_HMAC_SECRET.encode("utf-8")) < 32):
+    raise identity.IdentityConfigurationError(
+        "evidence HMAC anahtari en az 32 bayt olmali")
+if OPENWEBUI_GATEWAY_KEY and not EVIDENCE_HMAC_SECRET:
+    raise identity.IdentityConfigurationError(
+        "kimlik dogrulamali kurulumda evidence HMAC anahtari gerekli")
 if bool(OPENWEBUI_GATEWAY_KEY) != bool(OPENWEBUI_USER_JWT_SECRET):
     raise identity.IdentityConfigurationError(
         "OpenWebUI gateway key ve JWT anahtari birlikte tanimlanmali")
@@ -117,6 +127,18 @@ _GATEWAY_DIGEST = (
     hashlib.sha256(OPENWEBUI_GATEWAY_KEY.encode("utf-8")).digest()
     if OPENWEBUI_GATEWAY_KEY else None
 )
+# A configured deployment derives this domain-specific MAC key from stable
+# secret material.  The fixed fallback exists only in the deliberately open
+# local-development mode, where there is no remote actor or authorization
+# boundary.  It keeps local fixtures deterministic without pretending to be a
+# production secret.
+_EVIDENCE_KEY_MATERIAL = (
+    EVIDENCE_HMAC_SECRET or "ragtest-open-local-development-only"
+).encode("utf-8")
+_EVIDENCE_HMAC_KEY = hashlib.sha256(
+    b"ragtest-evidence-reference-v1\x00" + _EVIDENCE_KEY_MATERIAL).digest()
+EVIDENCE_TICKET_SECONDS = 50
+EVIDENCE_PASSAGE_MAX_CHARS = 4000
 if _GATEWAY_DIGEST is not None:
     if any(hmac.compare_digest(_GATEWAY_DIGEST, item.digest)
            for item in AUTH_REGISTRY.credentials):
@@ -355,6 +377,21 @@ def require_org_architect(
     return principal
 
 
+def require_evidence_actor(
+        principal=Depends(require_org_identity)):
+    """Require a real content role in addition to OpenWebUI identity.
+
+    An organization architect can design the hierarchy without acquiring any
+    document visibility.  A person who separately holds an active reader,
+    editor or admin membership is rechecked by the database at ticket mint and
+    consumption; this dependency only closes the route shape early.
+    """
+    if not auth.permits(principal, "reader"):
+        raise HTTPException(status_code=403,
+                            detail="kanit goruntuleme rolu gerekli")
+    return principal
+
+
 class ChatMessage(BaseModel):
     role: str
     # OpenWebUI sends a plain string for text turns, but an OpenAI-vision-style
@@ -416,6 +453,16 @@ class DocumentVersionActivationRequest(BaseModel):
     """The one caller-owned value in an activation: its observed revision."""
 
     expected_revision: int = Field(ge=0)
+
+
+class EvidenceTicketRequest(BaseModel):
+    evidence_ref: str = Field(min_length=43, max_length=43,
+                              pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class EvidencePreviewRequest(BaseModel):
+    ticket: str = Field(min_length=43, max_length=43,
+                        pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class OrgPositionRequest(BaseModel):
@@ -637,7 +684,8 @@ def chat_completions(req: ChatRequest):
                 answer,
                 req.model,
                 rag_status=status,
-                rag_citations=_citation_payload(citations),
+                rag_citations=_citation_payload(
+                    citations, persist=_browser_evidence_enabled()),
                 rag_trace=(_trace_payload(trace)
                            if req.include_trace else None),
             )
@@ -666,17 +714,132 @@ def chat_completions(req: ChatRequest):
     }
     if not is_table:
         response["rag_status"] = status
-        response["rag_citations"] = _citation_payload(citations)
+        response["rag_citations"] = _citation_payload(
+            citations, persist=_browser_evidence_enabled())
         if req.include_trace:
             response["rag_trace"] = _trace_payload(trace)
     return response
 
 
-def _citation_payload(citations):
-    return [
-        {"page": citation.page, "source": citation.source}
-        for citation in citations
-    ]
+def _browser_evidence_enabled():
+    principal = auth.bound_principal()
+    return (principal is not None and principal.source == "openwebui"
+            and principal.subject_id is not None
+            and auth.permits(principal, "reader"))
+
+
+def _citation_payload(citations, *, persist=False):
+    payload = []
+    references = {}
+    for citation in citations:
+        item = {"page": citation.page, "source": citation.source}
+        # Legacy backends may not yet carry trusted chunk identity.  Never
+        # synthesize a reference from filename/page -- neither is unique.  A
+        # fully bound citation gets the closed browser contract; the internal
+        # chunk UUID itself is never published.
+        if (persist and citation.chunk_id is not None
+                and citation.document_name is not None):
+            digest = _evidence_digest_for_chunk(citation.chunk_id)
+            item.update({
+                "evidence_ref": _b64url(digest),
+                "document_name": citation.document_name,
+            })
+            references[digest] = citation.chunk_id
+        payload.append(item)
+    if persist and references:
+        try:
+            with db_conn() as conn:
+                db.register_evidence_references(
+                    conn, tuple(sorted(references.items())))
+        except db.EvidenceAccessRefused:
+            raise HTTPException(status_code=500,
+                                detail="kanit referansi kaydedilemedi") from None
+    return payload
+
+
+def _b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _evidence_reference(chunk_id):
+    """Return a persistent opaque locator; it grants no read authority."""
+    return _b64url(_evidence_digest_for_chunk(chunk_id))
+
+
+def _evidence_digest_for_chunk(chunk_id):
+    try:
+        raw = UUID(str(chunk_id)).bytes
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=500,
+                            detail="gecersiz RAG kanit sozlesmesi") from exc
+    return hmac.new(
+        _EVIDENCE_HMAC_KEY, b"chunk\x00" + raw,
+        hashlib.sha256).digest()
+
+
+def _evidence_digest(reference):
+    """Decode one opaque digest; only a DB mapping can resolve its target."""
+    if type(reference) is not str or len(reference) != 43:
+        return None
+    try:
+        raw = base64.b64decode(
+            reference + "=", altchars=b"-_", validate=True)
+    except (ValueError, TypeError):
+        return None
+    if len(raw) != 32 or _b64url(raw) != reference:
+        return None
+    return raw
+
+
+@app.post("/v1/evidence/tickets")
+def create_evidence_ticket(
+        body: EvidenceTicketRequest, response: Response,
+        principal=Depends(require_evidence_actor)):
+    """Exchange an opaque citation locator for one 50-second preview ticket."""
+    ref_digest = _evidence_digest(body.evidence_ref)
+    if ref_digest is None:
+        raise HTTPException(status_code=404, detail="kanit bulunamadi")
+    ticket = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(ticket.encode("ascii")).digest()
+    try:
+        with db_conn() as conn:
+            db.mint_evidence_preview_ticket(
+                conn, actor_id=principal.subject_id, ref_digest=ref_digest,
+                token_digest=digest, ttl_seconds=EVIDENCE_TICKET_SECONDS)
+    except db.EvidenceAccessRefused:
+        raise HTTPException(status_code=404,
+                            detail="kanit bulunamadi") from None
+    response.headers["Cache-Control"] = "no-store"
+    return {"ticket": ticket, "expires_in": EVIDENCE_TICKET_SECONDS}
+
+
+@app.post("/v1/evidence/preview")
+def preview_evidence(
+        body: EvidencePreviewRequest, response: Response,
+        principal=Depends(require_evidence_actor)):
+    """Consume one actor-bound ticket and return one bounded passage only."""
+    digest = hashlib.sha256(body.ticket.encode("ascii")).digest()
+    try:
+        with db_conn() as conn:
+            preview = db.consume_evidence_preview_ticket(
+                conn, actor_id=principal.subject_id, token_digest=digest,
+                passage_max_chars=EVIDENCE_PASSAGE_MAX_CHARS)
+    except db.EvidenceAccessRefused:
+        raise HTTPException(status_code=404,
+                            detail="kanit bileti gecersiz") from None
+    if (set(preview) != {"document_name", "page", "passage"}
+            or type(preview["document_name"]) is not str
+            or type(preview["page"]) is not int
+            or type(preview["passage"]) is not str):
+        raise HTTPException(status_code=500,
+                            detail="gecersiz kanit onizleme sozlesmesi")
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "document_name": preview["document_name"],
+        "page": preview["page"],
+        "content_type": "passage",
+        "passage": preview["passage"],
+    }
 
 
 def _trace_payload(trace):

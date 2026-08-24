@@ -38,6 +38,16 @@ def test_openwebui_is_immutable_and_forwards_only_a_signed_user_assertion():
     assert "OPENAI_API_KEY: ${OPENWEBUI_GATEWAY_KEY:?" in compose
 
 
+def test_evidence_ui_keeps_its_mac_key_and_server_plugins_explicit():
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "EVIDENCE_HMAC_SECRET=" in example
+    assert "openwebui/functions/ragtest_citations.py" in readme
+    assert "openwebui/functions/ragtest_evidence_action.py" in readme
+    assert "single-use 50-second ticket" in readme
+    assert "never placed in a URL or browser storage" in readme
+
+
 def test_the_operator_rule_names_the_cache_that_invalidated_a_real_run():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "treat the main checkout as\nread-only evidence" in readme

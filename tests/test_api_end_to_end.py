@@ -2444,7 +2444,7 @@ def _wire_scoped_corpus(monkeypatch):
     from pipeline.retrieval import query
 
     seen = {"statements": [], "checkouts": 0, "dense": 0, "sparse": 0,
-            "ranked": [], "prompts": []}
+            "ranked": [], "prompts": [], "tenant": [], "rollbacks": 0}
 
     class Cursor:
         def __enter__(self):
@@ -2467,6 +2467,9 @@ def _wire_scoped_corpus(monkeypatch):
     class Conn:
         def cursor(self, row_factory=None):
             return Cursor()
+
+        def rollback(self):
+            seen["rollbacks"] += 1
 
     class Pool:
         @contextmanager
@@ -2492,6 +2495,16 @@ def _wire_scoped_corpus(monkeypatch):
                 else CEKIMSER)
 
     monkeypatch.setattr(db, "get_pool", lambda: Pool())
+    monkeypatch.setattr(
+        db, "current_execution_tenant",
+        lambda: (db.DEFAULT_TENANT_ID, False))
+    monkeypatch.setattr(
+        db, "set_tenant_context",
+        lambda _conn, tenant_id, *, service=False:
+        seen["tenant"].append(("set", tenant_id, service)))
+    monkeypatch.setattr(
+        db, "clear_tenant_context",
+        lambda _conn: seen["tenant"].append(("clear",)))
     monkeypatch.setattr(query, "embed_dense", embed_dense)
     monkeypatch.setattr(query, "embed_sparse", embed_sparse)
     monkeypatch.setattr(query, "rerank", rerank)
