@@ -36,10 +36,13 @@ The Python pipeline is not containerised. It runs on the host and talks to every
 model over HTTP, which is deliberate: the models can sit on another machine, so a
 laptop without a GPU can still run the whole thing.
 
-Set the database password in your shell first. It is never stored in the repo.
+Set separate migration/runtime passwords and a random context-signing key in
+your shell first. They are never stored in the repo.
 
 ```bash
-export DB_PASSWORD=...              # PowerShell: $env:DB_PASSWORD = "..."
+export DB_MIGRATION_PASSWORD=...
+export DB_RUNTIME_PASSWORD=...
+export RAG_DB_CONTEXT_SECRET=...    # at least 32 random bytes
 docker compose up -d                # PostgreSQL + Open WebUI
 docker compose --profile gpu up -d  # plus embeddings (8011) and reranker (8002)
 ```
@@ -71,7 +74,11 @@ TABLE_XLSX=out.xlsx python -m pipeline.extraction.table_pipeline path/to/image.p
 ### Authentication
 
 For scripts and direct API clients, set `API_KEY` in `.env`. Every endpoint that
-reads or adds documents then wants `Authorization: Bearer <key>`.
+reads or adds documents then wants `Authorization: Bearer <key>`. Missing API
+and OpenWebUI credentials fail startup closed. The sole exception is an
+explicit development opt-in with `ALLOW_INSECURE_LOCAL=1` and an
+`API_BIND_HOST` that is literally a loopback IP; a hostname or wildcard bind is
+refused.
 
 OpenWebUI uses a different, two-part boundary. Generate two different random
 values of at least 32 bytes for `OPENWEBUI_GATEWAY_KEY` and
@@ -103,9 +110,16 @@ request is converted to the active document ids visible to that tenant before
 either retrieval backend runs, so an external index cannot widen PostgreSQL's
 tenant boundary.
 
-Leave it empty and the API runs open, warning you about it at startup. That is
-fine on localhost and never fine anywhere else. Three endpoints stay open on
-purpose so monitoring can reach them: `/health` says the process is alive;
+The connection context is HMAC-signed with `RAG_DB_CONTEXT_SECRET`; PostgreSQL
+custom settings by themselves are not authority. Use a runtime `PG_DSN` role
+that is neither superuser nor `BYPASSRLS`, cannot create in the product schema,
+and cannot read `rag_context_secrets`. Give `scripts.migrate_db` a separate
+schema-owner `PG_MIGRATION_DSN`. The API checks both the exact schema receipt
+and the restricted runtime role before its first product query, and never runs
+DDL on a request path.
+
+Three endpoints stay open on purpose so monitoring can reach them: `/health`
+says the process is alive;
 `/ready` checks the database, exact schema version/digest, and embedding
 service; `/metrics` publishes only bounded route templates, methods, status
 classes, counts and summed duration. It never records a query, document,
@@ -208,6 +222,7 @@ non-persisted publications deliberately expose no feedback target.
 Apply migrations before sending traffic to a new application version:
 
 ```bash
+# PG_MIGRATION_DSN is the schema owner; PG_DSN remains the restricted runtime.
 python -m scripts.migrate_db
 curl --fail http://127.0.0.1:8000/ready
 curl --fail http://127.0.0.1:8000/metrics

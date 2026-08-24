@@ -77,6 +77,16 @@ for _name, _path in _DOCUMENT_ROOTS.items():
     _path.mkdir(parents=True, exist_ok=True)
     os.environ[_name] = str(_path)
 
+# Production fails closed without authentication. Tests that intentionally
+# exercise the historical local mode opt into it explicitly and pin the same
+# literal loopback address an operator must pass to the server.
+os.environ.setdefault("ALLOW_INSECURE_LOCAL", "1")
+os.environ.setdefault("API_BIND_HOST", "127.0.0.1")
+os.environ.setdefault(
+    "RAG_DB_CONTEXT_SECRET",
+    "test-only-database-context-key-with-more-than-32-bytes",
+)
+
 # Defence in depth, for the case this module was NOT first: if something
 # (a plugin, another conftest) already imported a pipeline module, its
 # root is already bound to the production value and no environment

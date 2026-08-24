@@ -36,6 +36,7 @@ def review_database():
     try:
         with admin.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public")
             cur.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(password)))
             cur.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(

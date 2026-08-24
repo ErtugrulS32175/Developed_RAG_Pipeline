@@ -1,6 +1,9 @@
 import hashlib
 import contextvars
+import hmac
 import os
+import secrets
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
@@ -31,8 +34,9 @@ load_dotenv()
 # No real credential in the default: set PG_DSN in .env. The placeholder
 # password intentionally fails auth so a missing .env surfaces loudly
 # instead of silently connecting with a committed secret.
-PG_DSN = os.getenv("PG_DSN", "postgresql://rag:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 6
+PG_DSN = os.getenv(
+    "PG_DSN", "postgresql://rag_runtime:CHANGE_ME@localhost:5433/ragdb")
+SCHEMA_VERSION = 7
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -62,6 +66,7 @@ _EXECUTION_TENANT = contextvars.ContextVar(
     "rag_db_execution_tenant", default=(DEFAULT_TENANT_ID, False))
 _EXECUTION_ACTOR = contextvars.ContextVar(
     "rag_db_execution_actor", default=None)
+_CONTEXT_MAX_SKEW_SECONDS = 120
 
 
 class DocumentLifecycleConflict(RuntimeError):
@@ -112,6 +117,21 @@ class EvalDatasetStateRefused(RuntimeError):
     """An evaluation lifecycle transition is not currently valid."""
 
 
+def _context_secret() -> bytes:
+    value = os.getenv("RAG_DB_CONTEXT_SECRET", "").strip()
+    encoded = value.encode("utf-8")
+    if len(encoded) < 32:
+        raise RuntimeError("RAG_DB_CONTEXT_SECRET en az 32 bayt olmali")
+    return encoded
+
+
+def _context_signature(tenant, actor, service, issued_at, nonce):
+    actor_text = "" if actor is None else str(actor)
+    material = (f"{tenant}|{actor_text}|{1 if service else 0}|"
+                f"{issued_at}|{nonce}").encode("ascii")
+    return hmac.new(_context_secret(), material, hashlib.sha256).hexdigest()
+
+
 def set_tenant_context(conn, tenant_id=DEFAULT_TENANT_ID, *, service=False,
                        actor_id=None):
     """Bind a connection session to one tenant or to the internal worker.
@@ -132,13 +152,22 @@ def set_tenant_context(conn, tenant_id=DEFAULT_TENANT_ID, *, service=False,
             actor = uuid.UUID(str(actor_id))
         except (AttributeError, TypeError, ValueError) as exc:
             raise ValueError("actor_id gecerli bir UUID olmali") from exc
+    issued_at = int(time.time())
+    nonce = secrets.token_hex(16)
+    service_text = "1" if service else "0"
+    actor_text = "" if actor is None else str(actor)
+    signature = _context_signature(
+        tenant, actor, bool(service), issued_at, nonce)
     with conn.cursor() as cur:
-        cur.execute("SELECT set_config('rag.tenant_id', %s, false)",
-                    (str(tenant),))
-        cur.execute("SELECT set_config('rag.service', %s, false)",
-                    ("1" if service else "0",))
-        cur.execute("SELECT set_config('rag.actor_id', %s, false)",
-                    ("" if actor is None else str(actor),))
+        cur.execute(
+            "SELECT set_config('rag.tenant_id', %s, false), "
+            "set_config('rag.service', %s, false), "
+            "set_config('rag.actor_id', %s, false), "
+            "set_config('rag.context_issued_at', %s, false), "
+            "set_config('rag.context_nonce', %s, false), "
+            "set_config('rag.context_signature', %s, false)",
+            (str(tenant), service_text, actor_text, str(issued_at), nonce,
+             signature))
 
 
 def clear_tenant_context(conn):
@@ -147,6 +176,9 @@ def clear_tenant_context(conn):
         cur.execute("RESET rag.tenant_id")
         cur.execute("RESET rag.service")
         cur.execute("RESET rag.actor_id")
+        cur.execute("RESET rag.context_issued_at")
+        cur.execute("RESET rag.context_nonce")
+        cur.execute("RESET rag.context_signature")
     conn.commit()
 
 
@@ -197,6 +229,22 @@ def get_conn(*, service=False) -> psycopg.Connection:
             conn, tenant, service=bool(service or inherited_service),
             actor_id=actor)
     return conn
+
+
+def get_migration_conn() -> psycopg.Connection:
+    """Open the explicit DDL connection; runtime credentials never substitute.
+
+    A missing migration DSN is a deployment error. Falling back to ``PG_DSN``
+    would quietly teach operators to give the web/worker role schema-owner
+    authority, defeating forced RLS and the private context-signing key.
+    """
+    dsn = os.getenv("PG_MIGRATION_DSN", "").strip()
+    if not dsn:
+        raise RuntimeError("PG_MIGRATION_DSN tanimli degil")
+    # A brand-new database does not have the vector type until schema.sql
+    # creates the extension.  Registering its codec here made the very first
+    # migration impossible; migration SQL itself never sends vector values.
+    return psycopg.connect(dsn)
 
 
 _pool = None
@@ -251,6 +299,7 @@ def close_pool() -> None:
 
 
 def init_schema(conn) -> None:
+    context_secret = _context_secret()
     schema_path = Path(__file__).parent.joinpath("schema.sql")
     schema_bytes = schema_path.read_bytes()
     schema_sql = schema_bytes.decode("utf-8")
@@ -297,6 +346,11 @@ def init_schema(conn) -> None:
         if history is not None and history[0] != schema_sha256:
             raise RuntimeError("schema version digest ile daha once kullanildi")
         cur.execute(schema_sql)
+        cur.execute(
+            "INSERT INTO rag_context_secrets (singleton, secret) "
+            "VALUES (true, %s) ON CONFLICT (singleton) DO UPDATE SET "
+            "secret = EXCLUDED.secret",
+            (context_secret,))
         if history is None:
             cur.execute(
                 "INSERT INTO rag_schema_history "
@@ -331,6 +385,49 @@ def schema_is_current(conn) -> bool:
         conn.rollback()
         return False
     return row is not None and tuple(row) == expected
+
+
+def runtime_role_is_safe(conn) -> bool:
+    """Return whether this session is a non-owner, RLS-bound runtime role."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT NOT role.rolsuper AND NOT role.rolbypassrls "
+                "AND NOT has_schema_privilege(current_user, "
+                "current_schema(), 'CREATE') "
+                "AND NOT has_table_privilege(current_user, "
+                "format('%I.rag_context_secrets', current_schema()), "
+                "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
+                "AND NOT has_table_privilege(current_user, "
+                "format('%I.org_identity_tenant_bindings', current_schema()), "
+                "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
+                "AND NOT has_table_privilege(current_user, "
+                "format('%I.rag_schema_state', current_schema()), "
+                "'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
+                "AND NOT has_table_privilege(current_user, "
+                "format('%I.rag_schema_history', current_schema()), "
+                "'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
+                "FROM pg_roles role WHERE role.rolname = current_user")
+            row = cur.fetchone()
+    except Exception:
+        conn.rollback()
+        return False
+    return row == (True,)
+
+
+def require_runtime_ready(conn) -> None:
+    """Refuse product work unless migration and runtime-role gates both hold.
+
+    Runtime callers never receive DDL authority.  Migration is an explicit
+    deployment step through ``scripts/migrate_db.py`` and ``PG_MIGRATION_DSN``;
+    an API process, worker, CLI ingest or bootstrap command may only prove that
+    the exact schema receipt is present and that its current database role is
+    RLS-bound and unable to read the signing secret.
+    """
+    if not schema_is_current(conn):
+        raise RuntimeError("veritabani semasi guncel degil; migrate_db calistir")
+    if not runtime_role_is_safe(conn):
+        raise RuntimeError("veritabani rolu runtime sinirini asmamali")
 
 
 def resolve_org_identity(conn, issuer: str, subject: str):

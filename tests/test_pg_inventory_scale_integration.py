@@ -53,6 +53,8 @@ def inventory_database():
     try:
         with admin.cursor() as cursor:
             cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cursor.execute(
+                "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public")
             cursor.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(password)))
             cursor.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
@@ -63,6 +65,9 @@ def inventory_database():
                 sql.Identifier(schema)))
             cursor.execute(Path(db.__file__).with_name("schema.sql").read_text(
                 encoding="utf-8"))
+            cursor.execute(
+                "INSERT INTO rag_context_secrets (singleton, secret) "
+                "VALUES (true, %s)", (db._context_secret(),))
         connection.commit()
         db.set_tenant_context(connection, TENANT)
         with connection.cursor() as cursor:

@@ -97,10 +97,18 @@ log = logging.getLogger("ragtest.api")
 # a caller who cannot use any of it.
 API_KEY = os.getenv("API_KEY", "").strip()
 API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
-AUTH_REGISTRY = auth.load_registry(API_KEY, API_KEYS_JSON)
 OPENWEBUI_GATEWAY_KEY = os.getenv("OPENWEBUI_GATEWAY_KEY", "").strip()
 OPENWEBUI_USER_JWT_SECRET = os.getenv(
     "OPENWEBUI_USER_JWT_SECRET", "").strip()
+ALLOW_INSECURE_LOCAL = os.getenv("ALLOW_INSECURE_LOCAL", "").strip() == "1"
+API_BIND_HOST = os.getenv("API_BIND_HOST", "").strip()
+AUTH_REGISTRY = auth.load_registry(
+    API_KEY,
+    API_KEYS_JSON,
+    external_auth=bool(OPENWEBUI_GATEWAY_KEY),
+    allow_insecure_local=ALLOW_INSECURE_LOCAL,
+    bind_host=API_BIND_HOST,
+)
 EVIDENCE_HMAC_SECRET = os.getenv("EVIDENCE_HMAC_SECRET", "").strip()
 if (EVIDENCE_HMAC_SECRET
         and len(EVIDENCE_HMAC_SECRET.encode("utf-8")) < 32):
@@ -182,12 +190,9 @@ def _gateway_offered(authorization):
 
 def _resolve_forwarded_principal(assertion):
     """Resolve a verified subject; display claims never reach this seam."""
-    global _schema_ready
     conn = db.get_conn(service=True)
     try:
-        if not _schema_ready:
-            db.init_schema(conn)
-            _schema_ready = True
+        _require_current_schema(conn)
         resolved = db.resolve_org_identity(
             conn, assertion.issuer, assertion.subject)
     finally:
@@ -300,6 +305,15 @@ async def log_requests(request, call_next):
 _schema_ready = False
 
 
+def _require_current_schema(conn):
+    """Prove readiness once; request traffic never receives DDL authority."""
+    global _schema_ready
+    if _schema_ready:
+        return
+    db.require_runtime_ready(conn)
+    _schema_ready = True
+
+
 @contextmanager
 def db_conn():
     """One pooled connection per request, connected on first use rather than at
@@ -309,11 +323,8 @@ def db_conn():
     exception, and checkout revalidates the connection -- so one failed
     statement can no longer poison every request that follows, which is
     exactly what the previous single cached module-level connection did."""
-    global _schema_ready
     with db.get_pool().connection() as conn:
-        if not _schema_ready:
-            db.init_schema(conn)
-            _schema_ready = True
+        _require_current_schema(conn)
         principal = auth.current_principal()
         db.set_tenant_context(
             conn, principal.tenant_id, actor_id=principal.subject_id)
@@ -324,13 +335,10 @@ def db_conn():
             db.clear_tenant_context(conn)
 
 
-# Shared-secret auth. Enforced when API_KEY is set; when it is not, the API is
-# open and says so loudly at startup rather than pretending to be protected.
-# That mirrors how vLLM and the rest of this stack behave, and keeps a local
-# run friction-free -- but anything reachable beyond localhost must set it.
+# Shared-secret or forwarded identity auth.  The only unauthenticated mode is
+# an explicit local-development opt-in bound to a literal loopback address.
 if not (AUTH_REGISTRY.configured or OPENWEBUI_IDENTITY is not None):
-    log.warning("API_KEY tanimli degil: ucnoktalar kimlik dogrulamasiz. "
-                "Yerel disinda calistiriyorsan API_KEY ayarla.")
+    log.warning("Kimliksiz yerel gelistirme modu acik; dis aga baglanamaz.")
 
 
 def _require_role(minimum_role, authorization):
@@ -374,9 +382,22 @@ def require_org_identity():
 
 
 def require_org_architect(
+        request: Request,
         principal=Depends(require_org_identity)):
     """Topology authority grants no document role by itself."""
     if not principal.org_architect:
+        action = ("topology_change" if request.method == "PUT"
+                  else "topology_read")
+        with db_conn() as conn:
+            db.record_org_decision(
+                conn,
+                actor_id=principal.subject_id,
+                subject_id=None,
+                action=action,
+                reason_code="system_operation",
+                allowed=False,
+                request_id=request.state.request_id,
+            )
         raise HTTPException(status_code=403,
                             detail="organizasyon mimari yetkisi gerekli")
     return principal

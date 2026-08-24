@@ -67,7 +67,7 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(ingest, "embed_dense", lambda text: [0.0])
     monkeypatch.setattr(ingest.db, "get_conn",
                         lambda: conn.opened())
-    monkeypatch.setattr(ingest.db, "init_schema", lambda c: None)
+    monkeypatch.setattr(ingest.db, "require_runtime_ready", lambda c: None)
     monkeypatch.setattr(
         ingest.db, "upsert_document",
         lambda *a, **k: ("kurgu-id", "kurgu-aday-kimligi", "kurgu.pdf"))
@@ -108,7 +108,7 @@ def wired(monkeypatch, tmp_path):
 
 def test_schema_init_failure_still_closes_the_connection(wired, monkeypatch):
     conn, source = wired
-    monkeypatch.setattr(ingest.db, "init_schema",
+    monkeypatch.setattr(ingest.db, "require_runtime_ready",
                         lambda c: (_ for _ in ()).throw(RuntimeError("KURGU")))
     with pytest.raises(RuntimeError):
         ingest.main(str(source))

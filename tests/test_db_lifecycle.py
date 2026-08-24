@@ -54,7 +54,8 @@ def pooled(monkeypatch):
         yield
 
     monkeypatch.setattr(api.db, "get_pool", lambda: pool)
-    monkeypatch.setattr(api.db, "init_schema", lambda conn: None)
+    monkeypatch.setattr(api.db, "schema_is_current", lambda conn: True)
+    monkeypatch.setattr(api.db, "runtime_role_is_safe", lambda conn: True)
     monkeypatch.setattr(api.db, "set_tenant_context", lambda *a, **k: None)
     monkeypatch.setattr(api.db, "clear_tenant_context", lambda *a, **k: None)
     monkeypatch.setattr(api.db, "document_publish_lock", publish_lock)
@@ -107,9 +108,14 @@ def test_every_request_borrows_and_returns_its_own_connection(pooled, monkeypatc
     assert pooled.returned == 3
 
 
-def test_schema_init_runs_once_not_per_request(pooled, monkeypatch):
+def test_schema_readiness_is_checked_once_and_requests_never_run_migrations(
+        pooled, monkeypatch):
     ran = []
-    monkeypatch.setattr(api.db, "init_schema", lambda conn: ran.append(1))
+    migrations = []
+    monkeypatch.setattr(
+        api.db, "schema_is_current", lambda conn: ran.append(1) or True)
+    monkeypatch.setattr(
+        api.db, "init_schema", lambda conn: migrations.append(1))
     monkeypatch.setattr(
         api.db, "get_document",
         lambda _conn, document_id: {"id": document_id, "filename": "kurgu.pdf",
@@ -120,6 +126,36 @@ def test_schema_init_runs_once_not_per_request(pooled, monkeypatch):
     client.get("/documents/kurgu-id", headers=_headers())
 
     assert ran == [1]
+    assert migrations == []
+
+
+def test_a_stale_schema_is_refused_without_running_ddl(pooled, monkeypatch):
+    migrations = []
+    monkeypatch.setattr(api.db, "schema_is_current", lambda _conn: False)
+    monkeypatch.setattr(
+        api.db, "init_schema", lambda _conn: migrations.append(1))
+    monkeypatch.setattr(
+        api.db, "get_document",
+        lambda *_args: pytest.fail("stale semada urun sorgusu calisti"))
+
+    response = TestClient(api.app, raise_server_exceptions=False).get(
+        "/documents/kurgu-id", headers=_headers())
+
+    assert response.status_code == 500
+    assert migrations == []
+
+
+def test_an_owner_or_bypass_role_is_refused_before_product_sql(
+        pooled, monkeypatch):
+    monkeypatch.setattr(api.db, "runtime_role_is_safe", lambda _conn: False)
+    monkeypatch.setattr(
+        api.db, "get_document",
+        lambda *_args: pytest.fail("guvensiz rolle urun sorgusu calisti"))
+
+    response = TestClient(api.app, raise_server_exceptions=False).get(
+        "/documents/kurgu-id", headers=_headers())
+
+    assert response.status_code == 500
 
 
 def test_oversized_upload_is_refused_before_disk_and_database(

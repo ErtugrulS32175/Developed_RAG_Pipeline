@@ -7,9 +7,8 @@
 #   docker compose up -d                  # postgres + open-webui   (no GPU)
 #   docker compose --profile gpu up -d    # ...plus embed + reranker (needs GPU)
 #
-# The password is never stored here. Set it in the shell first:
-#   PowerShell:  $env:DB_PASSWORD = "..."
-#   bash:        export DB_PASSWORD=...
+# Database passwords and the context-signing key are never stored here. Set
+# DB_MIGRATION_PASSWORD, DB_RUNTIME_PASSWORD and RAG_DB_CONTEXT_SECRET first.
 
 services:
   postgres:
@@ -17,9 +16,11 @@ services:
     container_name: ragtest-pgvector
     restart: unless-stopped
     environment:
-      POSTGRES_USER: rag
+      POSTGRES_USER: rag_migrator
       POSTGRES_DB: ragdb
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in your shell before running compose}
+      POSTGRES_PASSWORD: ${DB_MIGRATION_PASSWORD:?set DB_MIGRATION_PASSWORD}
+      DB_RUNTIME_PASSWORD: ${DB_RUNTIME_PASSWORD:?set DB_RUNTIME_PASSWORD}
+      RAG_DB_CONTEXT_SECRET: ${RAG_DB_CONTEXT_SECRET:?set RAG_DB_CONTEXT_SECRET}
     ports:
       # bound to loopback on purpose: the database must not be reachable from
       # the network just because the container is running
@@ -29,8 +30,9 @@ services:
       # Bootstrap only: applied once on an empty data directory. Every deploy
       # still runs `python -m scripts.migrate_db`; /ready checks its receipt.
       - ./pipeline/index/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ./scripts/init_runtime_role.sh:/docker-entrypoint-initdb.d/20-runtime-role.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rag -d ragdb"]
+      test: ["CMD-SHELL", "pg_isready -U rag_migrator -d ragdb"]
       interval: 5s
       timeout: 3s
       retries: 20

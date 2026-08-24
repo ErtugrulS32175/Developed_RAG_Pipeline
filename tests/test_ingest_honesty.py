@@ -529,7 +529,7 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(ingest, "embed_sparse", lambda text: ([1], [0.5]))
     monkeypatch.setattr(ingest, "embed_dense", lambda text: [0.0])
     monkeypatch.setattr(ingest.db, "get_conn", lambda: conn)
-    monkeypatch.setattr(ingest.db, "init_schema", lambda c: None)
+    monkeypatch.setattr(ingest.db, "require_runtime_ready", lambda c: None)
     monkeypatch.setattr(
         ingest.db, "upsert_document",
         lambda *a, **k: ("kurgu-id", "kurgu-aday-kimligi", "kurgu.pdf"))
@@ -1023,7 +1023,8 @@ def test_the_cli_answers_a_refused_lease_with_its_own_frozen_code(
             pass
 
     monkeypatch.setattr(ingest.db, "get_conn", lambda: FakeConn())
-    monkeypatch.setattr(ingest.db, "init_schema", lambda _conn: None)
+    monkeypatch.setattr(
+        ingest.db, "require_runtime_ready", lambda _conn: None)
     monkeypatch.setattr(
         ingest.publication, "publish_candidate",
         lambda *a, **k: ("kurgu-id", "kurgu-aday-1", "kurgu.pdf"))

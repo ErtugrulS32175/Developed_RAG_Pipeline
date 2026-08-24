@@ -1,4 +1,5 @@
-CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
 
 -- One row per ingested source file. Looked up by filename so re-ingesting
 -- the same file reuses its id instead of creating a duplicate document.
@@ -418,21 +419,24 @@ CREATE INDEX IF NOT EXISTS document_versions_tenant_document_order_idx
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'ingest_jobs_version_fk') THEN
+                   WHERE conname = 'ingest_jobs_version_fk'
+                     AND conrelid = 'ingest_jobs'::regclass) THEN
         ALTER TABLE ingest_jobs ADD CONSTRAINT ingest_jobs_version_fk
             FOREIGN KEY (tenant_id, document_id, version_id)
             REFERENCES document_versions(tenant_id, document_id, id)
             ON DELETE RESTRICT;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'attempts_version_fk') THEN
+                   WHERE conname = 'attempts_version_fk'
+                     AND conrelid = 'attempts'::regclass) THEN
         ALTER TABLE attempts ADD CONSTRAINT attempts_version_fk
             FOREIGN KEY (tenant_id, document_id, version_id)
             REFERENCES document_versions(tenant_id, document_id, id)
             ON DELETE RESTRICT;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'chunks_version_fk') THEN
+                   WHERE conname = 'chunks_version_fk'
+                     AND conrelid = 'chunks'::regclass) THEN
         ALTER TABLE chunks ADD CONSTRAINT chunks_version_fk
             FOREIGN KEY (tenant_id, document_id, version_id)
             REFERENCES document_versions(tenant_id, document_id, id)
@@ -607,45 +611,52 @@ FOR EACH ROW EXECUTE FUNCTION reject_document_version_mutation();
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'collection_documents_tenant_collection_fk') THEN
+                   WHERE conname = 'collection_documents_tenant_collection_fk'
+                     AND conrelid = 'collection_documents'::regclass) THEN
         ALTER TABLE collection_documents ADD CONSTRAINT
             collection_documents_tenant_collection_fk
             FOREIGN KEY (tenant_id, collection_id)
             REFERENCES collections(tenant_id, id) ON DELETE CASCADE;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'collection_documents_tenant_document_fk') THEN
+                   WHERE conname = 'collection_documents_tenant_document_fk'
+                     AND conrelid = 'collection_documents'::regclass) THEN
         ALTER TABLE collection_documents ADD CONSTRAINT
             collection_documents_tenant_document_fk
             FOREIGN KEY (tenant_id, document_id)
             REFERENCES documents(tenant_id, id) ON DELETE CASCADE;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'document_tags_tenant_document_fk') THEN
+                   WHERE conname = 'document_tags_tenant_document_fk'
+                     AND conrelid = 'document_tags'::regclass) THEN
         ALTER TABLE document_tags ADD CONSTRAINT document_tags_tenant_document_fk
             FOREIGN KEY (tenant_id, document_id)
             REFERENCES documents(tenant_id, id) ON DELETE CASCADE;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'document_tags_tenant_tag_fk') THEN
+                   WHERE conname = 'document_tags_tenant_tag_fk'
+                     AND conrelid = 'document_tags'::regclass) THEN
         ALTER TABLE document_tags ADD CONSTRAINT document_tags_tenant_tag_fk
             FOREIGN KEY (tenant_id, tag_id)
             REFERENCES tags(tenant_id, id) ON DELETE CASCADE;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'ingest_jobs_tenant_document_fk') THEN
+                   WHERE conname = 'ingest_jobs_tenant_document_fk'
+                     AND conrelid = 'ingest_jobs'::regclass) THEN
         ALTER TABLE ingest_jobs ADD CONSTRAINT ingest_jobs_tenant_document_fk
             FOREIGN KEY (tenant_id, document_id)
             REFERENCES documents(tenant_id, id) ON DELETE CASCADE;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'chunks_tenant_document_fk') THEN
+                   WHERE conname = 'chunks_tenant_document_fk'
+                     AND conrelid = 'chunks'::regclass) THEN
         ALTER TABLE chunks ADD CONSTRAINT chunks_tenant_document_fk
             FOREIGN KEY (tenant_id, document_id)
             REFERENCES documents(tenant_id, id);
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'attempts_tenant_document_fk') THEN
+                   WHERE conname = 'attempts_tenant_document_fk'
+                     AND conrelid = 'attempts'::regclass) THEN
         ALTER TABLE attempts ADD CONSTRAINT attempts_tenant_document_fk
             FOREIGN KEY (tenant_id, document_id)
             REFERENCES documents(tenant_id, id);
@@ -777,7 +788,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS org_positions_one_root_idx
     ON org_positions(tenant_id) WHERE parent_id IS NULL;
 CREATE INDEX IF NOT EXISTS org_positions_parent_idx
     ON org_positions(tenant_id, parent_id);
-
 CREATE TABLE IF NOT EXISTS org_closure (
     tenant_id    uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
     ancestor_id  uuid NOT NULL,
@@ -823,9 +833,136 @@ CREATE TABLE IF NOT EXISTS org_architects (
     PRIMARY KEY (tenant_id, identity_id)
 );
 
+-- One external identity may be active in exactly one tenant, whether its
+-- authority arrives through business membership, architecture capability or
+-- both.  The old SELECT-then-INSERT check was raceable across transactions;
+-- this global key is the database serialization point.  It is control-plane
+-- metadata, not a product-readable table.
+CREATE TABLE IF NOT EXISTS org_identity_tenant_bindings (
+    identity_id uuid PRIMARY KEY REFERENCES org_identities(id)
+                ON DELETE CASCADE,
+    tenant_id   uuid NOT NULL REFERENCES org_tenants(id) ON DELETE RESTRICT
+);
+REVOKE ALL ON org_identity_tenant_bindings FROM PUBLIC;
+
+DO $identity_binding_backfill$
+BEGIN
+    IF EXISTS (
+        SELECT identity_id FROM (
+            SELECT identity_id, tenant_id FROM org_memberships
+            WHERE state = 'active'
+            UNION ALL
+            SELECT identity_id, tenant_id FROM org_architects
+            WHERE active = true
+        ) active_bindings
+        GROUP BY identity_id HAVING count(DISTINCT tenant_id) > 1
+    ) THEN
+        RAISE EXCEPTION 'identity is active in multiple tenants'
+            USING ERRCODE = '23505';
+    END IF;
+    INSERT INTO org_identity_tenant_bindings (identity_id, tenant_id)
+    SELECT identity_id, min(tenant_id::text)::uuid
+    FROM (
+        SELECT identity_id, tenant_id FROM org_memberships
+        WHERE state = 'active'
+        UNION ALL
+        SELECT identity_id, tenant_id FROM org_architects
+        WHERE active = true
+    ) active_bindings
+    GROUP BY identity_id
+    ON CONFLICT (identity_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id
+    WHERE org_identity_tenant_bindings.tenant_id = EXCLUDED.tenant_id;
+END
+$identity_binding_backfill$;
+
+CREATE OR REPLACE FUNCTION rag_claim_identity_tenant()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+SET search_path FROM CURRENT AS $identity_claim$
+BEGIN
+    IF TG_TABLE_NAME = 'org_memberships' THEN
+        IF NEW.state = 'active' THEN
+            INSERT INTO org_identity_tenant_bindings (identity_id, tenant_id)
+            VALUES (NEW.identity_id, NEW.tenant_id)
+            ON CONFLICT (identity_id) DO UPDATE
+            SET tenant_id = org_identity_tenant_bindings.tenant_id
+            WHERE org_identity_tenant_bindings.tenant_id = EXCLUDED.tenant_id;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'identity is active in another tenant'
+                    USING ERRCODE = '23505';
+            END IF;
+        END IF;
+    ELSIF TG_TABLE_NAME = 'org_architects' THEN
+        IF NEW.active = true THEN
+            INSERT INTO org_identity_tenant_bindings (identity_id, tenant_id)
+            VALUES (NEW.identity_id, NEW.tenant_id)
+            ON CONFLICT (identity_id) DO UPDATE
+            SET tenant_id = org_identity_tenant_bindings.tenant_id
+            WHERE org_identity_tenant_bindings.tenant_id = EXCLUDED.tenant_id;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'identity is active in another tenant'
+                    USING ERRCODE = '23505';
+            END IF;
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$identity_claim$;
+
+CREATE OR REPLACE FUNCTION rag_release_identity_tenant()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+SET search_path FROM CURRENT AS $identity_release$
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') AND NOT EXISTS (
+        SELECT 1 FROM org_memberships
+        WHERE identity_id = OLD.identity_id AND tenant_id = OLD.tenant_id
+          AND state = 'active'
+        UNION ALL
+        SELECT 1 FROM org_architects
+        WHERE identity_id = OLD.identity_id AND tenant_id = OLD.tenant_id
+          AND active = true
+    ) THEN
+        DELETE FROM org_identity_tenant_bindings
+        WHERE identity_id = OLD.identity_id AND tenant_id = OLD.tenant_id;
+    END IF;
+    IF TG_OP = 'UPDATE'
+       AND (NEW.identity_id, NEW.tenant_id) IS DISTINCT FROM
+           (OLD.identity_id, OLD.tenant_id)
+       AND NOT EXISTS (
+        SELECT 1 FROM org_memberships
+        WHERE identity_id = NEW.identity_id AND tenant_id = NEW.tenant_id
+          AND state = 'active'
+        UNION ALL
+        SELECT 1 FROM org_architects
+        WHERE identity_id = NEW.identity_id AND tenant_id = NEW.tenant_id
+          AND active = true
+    ) THEN
+        DELETE FROM org_identity_tenant_bindings
+        WHERE identity_id = NEW.identity_id AND tenant_id = NEW.tenant_id;
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END
+$identity_release$;
+
+DROP TRIGGER IF EXISTS org_memberships_claim_tenant ON org_memberships;
+CREATE TRIGGER org_memberships_claim_tenant
+BEFORE INSERT OR UPDATE OF identity_id, tenant_id, state ON org_memberships
+FOR EACH ROW EXECUTE FUNCTION rag_claim_identity_tenant();
+DROP TRIGGER IF EXISTS org_memberships_release_tenant ON org_memberships;
+CREATE TRIGGER org_memberships_release_tenant
+AFTER UPDATE OF identity_id, tenant_id, state OR DELETE ON org_memberships
+FOR EACH ROW EXECUTE FUNCTION rag_release_identity_tenant();
+DROP TRIGGER IF EXISTS org_architects_claim_tenant ON org_architects;
+CREATE TRIGGER org_architects_claim_tenant
+BEFORE INSERT OR UPDATE OF identity_id, tenant_id, active ON org_architects
+FOR EACH ROW EXECUTE FUNCTION rag_claim_identity_tenant();
+DROP TRIGGER IF EXISTS org_architects_release_tenant ON org_architects;
+CREATE TRIGGER org_architects_release_tenant
+AFTER UPDATE OF identity_id, tenant_id, active OR DELETE ON org_architects
+FOR EACH ROW EXECUTE FUNCTION rag_release_identity_tenant();
+
 CREATE TABLE IF NOT EXISTS org_audit_events (
     id           uuid PRIMARY KEY,
-    tenant_id    uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    tenant_id    uuid NOT NULL REFERENCES org_tenants(id) ON DELETE RESTRICT,
     actor_id     uuid NOT NULL REFERENCES org_identities(id),
     subject_id   uuid REFERENCES org_identities(id),
     action       text NOT NULL CHECK (action IN (
@@ -845,6 +982,48 @@ ALTER TABLE org_audit_events
     ADD CONSTRAINT org_audit_events_action_check CHECK (action IN (
         'monitor_view', 'topology_read', 'topology_change', 'access_preview',
         'review_queue_view', 'review_decision'));
+
+ALTER TABLE org_audit_events
+    DROP CONSTRAINT IF EXISTS org_audit_events_tenant_id_fkey;
+ALTER TABLE org_audit_events
+    ADD CONSTRAINT org_audit_events_tenant_id_fkey
+    FOREIGN KEY (tenant_id) REFERENCES org_tenants(id) ON DELETE RESTRICT;
+
+CREATE OR REPLACE FUNCTION rag_guard_org_audit_identity()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+SET search_path FROM CURRENT AS $audit_identity$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM org_identity_tenant_bindings
+        WHERE identity_id = NEW.actor_id AND tenant_id = NEW.tenant_id
+    ) OR (NEW.subject_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM org_identity_tenant_bindings
+        WHERE identity_id = NEW.subject_id AND tenant_id = NEW.tenant_id
+    )) THEN
+        RAISE EXCEPTION 'audit identity is outside tenant'
+            USING ERRCODE = '23503';
+    END IF;
+    RETURN NEW;
+END
+$audit_identity$;
+
+DROP TRIGGER IF EXISTS org_audit_events_identity_guard ON org_audit_events;
+CREATE TRIGGER org_audit_events_identity_guard
+BEFORE INSERT ON org_audit_events
+FOR EACH ROW EXECUTE FUNCTION rag_guard_org_audit_identity();
+
+CREATE OR REPLACE FUNCTION rag_reject_security_event_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $security_event_immutable$
+BEGIN
+    RAISE EXCEPTION 'security event history is immutable'
+        USING ERRCODE = '55000';
+END
+$security_event_immutable$;
+
+DROP TRIGGER IF EXISTS org_audit_events_immutable ON org_audit_events;
+CREATE TRIGGER org_audit_events_immutable
+BEFORE UPDATE OR DELETE ON org_audit_events
+FOR EACH ROW EXECUTE FUNCTION rag_reject_security_event_mutation();
 CREATE INDEX IF NOT EXISTS org_audit_events_tenant_time_idx
     ON org_audit_events(tenant_id, created_at DESC, id);
 
@@ -1093,6 +1272,11 @@ CREATE TABLE IF NOT EXISTS review_case_events (
         REFERENCES review_cases(tenant_id, id) ON DELETE RESTRICT
 );
 
+DROP TRIGGER IF EXISTS review_case_events_immutable ON review_case_events;
+CREATE TRIGGER review_case_events_immutable
+BEFORE UPDATE OR DELETE ON review_case_events
+FOR EACH ROW EXECUTE FUNCTION rag_reject_security_event_mutation();
+
 CREATE OR REPLACE FUNCTION rag_can_monitor_identity(target_identity uuid)
 RETURNS boolean LANGUAGE sql STABLE AS $review_scope$
     SELECT EXISTS (
@@ -1179,6 +1363,12 @@ CREATE POLICY review_case_events_insert ON review_case_events FOR INSERT
                 (tenant_id = rag_effective_tenant() AND
                  reviewer_id = rag_effective_actor() AND
                  rag_can_monitor_identity(subject_actor_id)));
+DROP POLICY IF EXISTS review_case_events_update ON review_case_events;
+CREATE POLICY review_case_events_update ON review_case_events FOR UPDATE
+    USING (rag_service_access());
+DROP POLICY IF EXISTS review_case_events_delete ON review_case_events;
+CREATE POLICY review_case_events_delete ON review_case_events FOR DELETE
+    USING (rag_service_access());
 
 -- Evaluation datasets are tenant-owned product content.  Lists and lifecycle
 -- events carry metadata/digests only; the question, key and expected answer
@@ -1523,3 +1713,103 @@ CREATE POLICY eval_events_insert ON eval_dataset_events FOR INSERT
 -- sequential scan over `dense <=> query` / `sparse <#> query` is effectively
 -- instant at this scale. Add an HNSW index (e.g. `USING hnsw (dense
 -- vector_cosine_ops)`) once the corpus grows large enough for that to matter.
+
+-- Request/worker RLS context is authenticated, not merely named. PostgreSQL
+-- custom settings are writable by ordinary sessions, so tenant/service GUCs
+-- alone are not an authorization boundary. The process signs the complete
+-- tuple with a deployment secret; this owner-defined function verifies it on
+-- every policy decision. Replaying a current signature can reproduce only the
+-- same tenant, actor and service bit -- it cannot widen any of them.
+CREATE TABLE IF NOT EXISTS rag_context_secrets (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    secret bytea NOT NULL CHECK (octet_length(secret) >= 32)
+);
+REVOKE ALL ON rag_context_secrets FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION rag_context_valid()
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path FROM CURRENT
+AS $context_valid$
+    WITH settings AS (
+        SELECT
+            COALESCE(current_setting('rag.tenant_id', true), '') tenant_id,
+            COALESCE(current_setting('rag.actor_id', true), '') actor_id,
+            COALESCE(current_setting('rag.service', true), '') service,
+            COALESCE(current_setting('rag.context_issued_at', true), '') issued,
+            COALESCE(current_setting('rag.context_nonce', true), '') nonce,
+            COALESCE(current_setting('rag.context_signature', true), '') sig
+    ), closed AS (
+        SELECT * FROM settings
+        WHERE tenant_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          AND (actor_id = '' OR actor_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          AND service IN ('0', '1')
+          AND issued ~ '^[0-9]{1,12}$'
+          AND nonce ~ '^[0-9a-f]{32}$'
+          AND sig ~ '^[0-9a-f]{64}$'
+    )
+    SELECT COALESCE(bool_or(
+        abs(extract(epoch FROM now())::bigint - issued::bigint) <= 120
+        AND public.hmac(
+            convert_to(tenant_id || '|' || actor_id || '|' || service ||
+                       '|' || issued || '|' || nonce, 'UTF8'),
+            key.secret,
+            'sha256') = decode(sig, 'hex')
+    ), false)
+    FROM closed CROSS JOIN rag_context_secrets key
+    WHERE key.singleton = true
+$context_valid$;
+
+CREATE OR REPLACE FUNCTION rag_effective_tenant() RETURNS uuid
+LANGUAGE sql STABLE AS $tenant$
+    SELECT CASE WHEN rag_context_valid()
+        THEN current_setting('rag.tenant_id', true)::uuid
+        ELSE '00000000-0000-0000-0000-000000000000'::uuid END
+$tenant$;
+
+CREATE OR REPLACE FUNCTION rag_service_access() RETURNS boolean
+LANGUAGE sql STABLE AS $service$
+    SELECT rag_context_valid()
+       AND current_setting('rag.service', true) = '1'
+$service$;
+
+CREATE OR REPLACE FUNCTION rag_effective_actor() RETURNS uuid
+LANGUAGE sql STABLE AS $actor$
+    SELECT CASE WHEN rag_context_valid()
+        THEN NULLIF(current_setting('rag.actor_id', true), '')::uuid
+        ELSE NULL::uuid END
+$actor$;
+
+-- The runtime role receives broad product-table DML and relies on forced RLS,
+-- but these four tables are control-plane authority rather than product data.
+-- Default privileges may grant newly-created migration metadata before this
+-- migration reaches its end, so re-assert the exact revocations every time.
+DO $runtime_private_tables$
+DECLARE
+    product_schema text := current_schema();
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rag_runtime') THEN
+        EXECUTE format(
+            'REVOKE ALL ON TABLE %I.rag_context_secrets, '
+            '%I.org_identity_tenant_bindings FROM rag_runtime',
+            product_schema, product_schema);
+        IF to_regclass(format('%I.rag_schema_state', product_schema))
+                IS NOT NULL THEN
+            EXECUTE format(
+                'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
+                'ON TABLE %I.rag_schema_state FROM rag_runtime',
+                product_schema);
+            EXECUTE format(
+                'GRANT SELECT ON TABLE %I.rag_schema_state TO rag_runtime',
+                product_schema);
+        END IF;
+        IF to_regclass(format('%I.rag_schema_history', product_schema))
+                IS NOT NULL THEN
+            EXECUTE format(
+                'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
+                'ON TABLE %I.rag_schema_history FROM rag_runtime',
+                product_schema);
+        END IF;
+    END IF;
+END
+$runtime_private_tables$;

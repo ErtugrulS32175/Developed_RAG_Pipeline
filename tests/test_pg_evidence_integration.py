@@ -37,6 +37,7 @@ def evidence_database():
     try:
         with admin.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public")
             cur.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(password)))
             cur.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
@@ -47,6 +48,9 @@ def evidence_database():
                 sql.Identifier(schema)))
             cur.execute(Path(db.__file__).with_name("schema.sql").read_text(
                 encoding="utf-8"))
+            cur.execute(
+                "INSERT INTO rag_context_secrets (singleton, secret) "
+                "VALUES (true, %s)", (db._context_secret(),))
         conn.commit()
         db.set_tenant_context(conn, TENANT, service=True)
         with conn.cursor() as cur:

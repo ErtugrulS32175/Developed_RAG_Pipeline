@@ -1,6 +1,5 @@
 """Real PostgreSQL proof for directional organization visibility."""
 import os
-from pathlib import Path
 import uuid
 
 import pytest
@@ -33,6 +32,8 @@ def org_database():
     try:
         with admin.cursor() as cursor:
             cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cursor.execute(
+                "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public")
             cursor.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(password)))
             cursor.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
@@ -41,9 +42,8 @@ def org_database():
         with connection.cursor() as cursor:
             cursor.execute(sql.SQL("SET search_path TO {}, public").format(
                 sql.Identifier(schema)))
-            cursor.execute(Path(db.__file__).with_name("schema.sql").read_text(
-                encoding="utf-8"))
         connection.commit()
+        db.init_schema(connection)
         db.set_tenant_context(connection, TENANT, service=True)
         with connection.cursor() as cursor:
             cursor.execute("INSERT INTO org_tenants (id, name) VALUES (%s, 'T')",
@@ -108,6 +108,45 @@ def test_manager_sees_only_own_branch_and_leaf_sees_nobody(org_database):
             db.visible_org_members(connection, identities["manager-a"])] == [
                 "leaf-a"]
     assert db.visible_org_members(connection, identities["leaf-a"]) == []
+
+
+def test_a_denied_monitor_attempt_is_one_content_free_audit_event(org_database):
+    """Persist a real, authenticated refusal without private request data."""
+    connection, identities = org_database
+    actor = identities["leaf-a"]
+    subject = identities["ceo"]
+    request_id = "denied-" + uuid.uuid4().hex[:24]
+    db.set_tenant_context(connection, TENANT, actor_id=actor)
+
+    event_id = db.record_org_decision(
+        connection, actor_id=actor, subject_id=subject,
+        action="monitor_view", reason_code="management_duty",
+        allowed=False, request_id=request_id)
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT id, tenant_id, actor_id, subject_id, action, reason_code, "
+            "decision, request_id FROM org_audit_events WHERE id = %s",
+            (event_id,))
+        row = cursor.fetchone()
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() "
+            "AND table_name = 'org_audit_events' ORDER BY column_name")
+        columns = {item[0] for item in cursor.fetchall()}
+
+    assert row == (
+        uuid.UUID(event_id), TENANT, actor, subject, "monitor_view",
+        "management_duty", "denied", request_id,
+    )
+    assert columns == {
+        "action", "actor_id", "created_at", "decision", "id", "reason_code",
+        "request_id", "subject_id", "tenant_id",
+    }
+    for forbidden in (
+            "question", "answer", "passage", "source_path", "token",
+            "credential", "topology"):
+        assert forbidden not in columns
 
 
 def test_levels_are_derived_from_the_tree_not_client_claims(org_database):

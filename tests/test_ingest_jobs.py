@@ -149,7 +149,8 @@ def _worker_world(monkeypatch, tmp_path, job=None):
     calls = []
     monkeypatch.setattr(job_worker.db, "get_conn",
                         lambda **_kwargs: _Connection())
-    monkeypatch.setattr(job_worker.db, "init_schema", lambda _conn: None)
+    monkeypatch.setattr(
+        job_worker.db, "require_runtime_ready", lambda _conn: None)
     monkeypatch.setattr(job_worker.db, "claim_ingest_job",
                         lambda *_args, **_kwargs: claimed)
     monkeypatch.setattr(job_worker, "_heartbeat", lambda *_args: None)
@@ -224,7 +225,8 @@ def test_transient_worker_failure_requeues_with_only_the_exception_type(
 def test_empty_queue_does_no_ingest_work(monkeypatch, tmp_path):
     monkeypatch.setattr(job_worker.db, "get_conn",
                         lambda **_kwargs: _Connection())
-    monkeypatch.setattr(job_worker.db, "init_schema", lambda _conn: None)
+    monkeypatch.setattr(
+        job_worker.db, "require_runtime_ready", lambda _conn: None)
     monkeypatch.setattr(job_worker.db, "claim_ingest_job",
                         lambda *_args, **_kwargs: None)
     assert job_worker.run_one(worker_id="worker-alpha", upload_dir=tmp_path) is False

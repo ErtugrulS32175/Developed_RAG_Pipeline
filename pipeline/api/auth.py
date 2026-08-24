@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import ipaddress
 import json
 import secrets
 from dataclasses import dataclass
@@ -64,8 +65,17 @@ def _token(value, label):
     return value
 
 
-def load_registry(api_key, keys_json):
-    """Build one immutable registry from legacy and multi-key settings."""
+def load_registry(api_key, keys_json, *, external_auth=False,
+                  allow_insecure_local=False, bind_host=""):
+    """Build one immutable registry and make unauthenticated mode explicit.
+
+    Missing credentials used to silently mint a default-tenant administrator.
+    That is convenient on a laptop and catastrophic after one missing
+    deployment variable.  The compatibility mode therefore needs two closed
+    facts: an explicit opt-in and a literal loopback bind address.  A trusted
+    external identity bridge counts as authentication but never creates the
+    historical open principal.
+    """
     credentials = []
     if api_key:
         token = _token(api_key, "API_KEY")
@@ -97,7 +107,20 @@ def load_registry(api_key, keys_json):
     digests = [item.digest for item in credentials]
     if len(set(digests)) != len(digests):
         raise AuthConfigurationError("ayni API anahtari birden cok kez tanimli")
-    open_principal = None if credentials else Principal(DEFAULT_TENANT_ID, "admin")
+    if type(external_auth) is not bool or type(allow_insecure_local) is not bool:
+        raise AuthConfigurationError("kimlik modu gecersiz")
+    if credentials or external_auth:
+        open_principal = None
+    else:
+        try:
+            address = ipaddress.ip_address(bind_host)
+        except ValueError as exc:
+            raise AuthConfigurationError(
+                "kimliksiz yerel bind adresi gecersiz") from exc
+        if not allow_insecure_local or not address.is_loopback:
+            raise AuthConfigurationError(
+                "kimliksiz API yalniz acik yerel izinle calisabilir")
+        open_principal = Principal(DEFAULT_TENANT_ID, "admin")
     return Registry(tuple(credentials), open_principal)
 
 

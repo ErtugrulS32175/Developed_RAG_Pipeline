@@ -500,7 +500,7 @@ def ingest_attempt(snapshot, attempt):
     # finalisation used to leak it just as surely as one in the embed loop.
     conn = db.get_conn()
     try:
-        db.init_schema(conn)
+        db.require_runtime_ready(conn)
         print(f"[INGEST] Belge: {document_id} · deneme "
               f"{attempt.attempt_id}")
 
@@ -793,7 +793,7 @@ def main(path, expected_candidate=None, attempt=None):
                         "degismis olabilir")
             conn = db.get_conn()
             try:
-                db.init_schema(conn)
+                db.require_runtime_ready(conn)
                 row = db.lookup_document(conn, filename)
                 if row is None:
                     raise RuntimeError(
@@ -889,7 +889,7 @@ def cli_main(argv):
     try:
         conn = db.get_conn()
         try:
-            db.init_schema(conn)
+            db.require_runtime_ready(conn)
             document_id, _candidate_id, canonical = (
                 publication.publish_candidate(
                     conn, source.name, file_type, body,

@@ -26,7 +26,7 @@ def main(argv=None):
         raise SystemExit("openwebui-subject gecersiz")
     conn = db.get_conn(service=True)
     try:
-        db.init_schema(conn)
+        db.require_runtime_ready(conn)
         result = db.bootstrap_org_tenant(
             conn, tenant_id=args.tenant_id, name=args.tenant_name,
             issuer="open-webui", subject=args.openwebui_subject)

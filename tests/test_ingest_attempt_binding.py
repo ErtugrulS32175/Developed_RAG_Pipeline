@@ -333,7 +333,7 @@ def store_and_source(monkeypatch, tmp_path):
     monkeypatch.setattr(ingest, "embed_sparse", lambda text: ([1], [0.5]))
     monkeypatch.setattr(ingest, "embed_dense", lambda text: [0.0])
     monkeypatch.setattr(ingest.db, "get_conn", lambda: FakeConn())
-    monkeypatch.setattr(ingest.db, "init_schema", lambda c: None)
+    monkeypatch.setattr(ingest.db, "require_runtime_ready", lambda c: None)
     monkeypatch.setattr(ingest.db, "existing_content_keys",
                         lambda *a, **k: set())
     monkeypatch.setattr(

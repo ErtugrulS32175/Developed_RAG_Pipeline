@@ -88,7 +88,7 @@ def run_one(*, worker_id=None, upload_dir=None, lease_seconds=300,
     upload_dir = Path(upload_dir or os.getenv("UPLOAD_DIR", "./data/uploads"))
     conn = db.get_conn(service=True)
     try:
-        db.init_schema(conn)
+        db.require_runtime_ready(conn)
         job = db.claim_ingest_job(
             conn, worker_id, lease_seconds=lease_seconds,
             max_attempts=max_attempts)

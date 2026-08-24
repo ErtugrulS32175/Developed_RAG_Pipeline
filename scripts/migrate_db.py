@@ -9,7 +9,7 @@ from pipeline.index import db
 def main() -> int:
     conn = None
     try:
-        conn = db.get_conn(service=True)
+        conn = db.get_migration_conn()
         db.init_schema(conn)
         if not db.schema_is_current(conn):
             print(json.dumps({"migration_version": db.SCHEMA_VERSION,

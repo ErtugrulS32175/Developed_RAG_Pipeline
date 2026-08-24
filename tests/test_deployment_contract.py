@@ -19,6 +19,30 @@ def test_every_postgres_bootstrap_names_the_real_schema_file():
     assert "pipeline/schema.sql" not in setup
 
 
+def test_postgres_bootstrap_separates_migration_and_runtime_authority():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    provision = (ROOT / "scripts" / "init_runtime_role.sh").read_text(
+        encoding="utf-8")
+
+    assert "POSTGRES_USER: rag_migrator" in compose
+    assert "DB_RUNTIME_PASSWORD:" in compose
+    assert "RAG_DB_CONTEXT_SECRET:" in compose
+    assert "rag_runtime NOSUPERUSER NOBYPASSRLS" in provision
+    assert "REVOKE ALL ON rag_context_secrets FROM rag_runtime" in provision
+    assert (
+        "REVOKE ALL ON org_identity_tenant_bindings FROM rag_runtime"
+        in provision)
+    assert "ON rag_schema_state FROM rag_runtime" in provision
+    assert "ON rag_schema_history FROM rag_runtime" in provision
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES" in provision
+
+    schema = SCHEMA.read_text(encoding="utf-8")
+    assert schema.count(
+        "SECURITY DEFINER\nSET search_path FROM CURRENT") >= 4
+    assert "REVOKE ALL ON TABLE %I.rag_context_secrets" in schema
+    assert "%I.org_identity_tenant_bindings FROM rag_runtime" in schema
+
+
 def test_the_scope_index_is_an_idempotent_part_of_the_schema():
     text = SCHEMA.read_text(encoding="utf-8")
     statement = (

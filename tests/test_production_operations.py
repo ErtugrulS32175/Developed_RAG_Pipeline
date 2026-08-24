@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import subprocess
 
@@ -7,7 +8,8 @@ from fastapi.testclient import TestClient
 
 from pipeline.api import metrics
 from pipeline.index import db
-from scripts import db_snapshot, migrate_db, rollout_gate
+from pipeline.index import ingest, job_worker
+from scripts import bootstrap_org, db_snapshot, migrate_db, rollout_gate
 
 
 class _Cursor:
@@ -58,12 +60,14 @@ def test_schema_migration_serializes_ddl_and_records_the_exact_source_digest():
     assert "SELECT schema_version, schema_sha256" in calls[4][0]
     assert "SELECT schema_sha256 FROM rag_schema_history" in calls[5][0]
     assert "CREATE EXTENSION" in calls[6][0]
-    assert "INSERT INTO rag_schema_history" in calls[7][0]
-    assert "INSERT INTO rag_schema_state" in calls[8][0]
+    assert "INSERT INTO rag_context_secrets" in calls[7][0]
+    assert len(calls[7][1][0]) >= 32
+    assert "INSERT INTO rag_schema_history" in calls[8][0]
+    assert "INSERT INTO rag_schema_state" in calls[9][0]
     version, digest = db.expected_schema_state()
     assert calls[5][1] == (version,)
-    assert calls[7][1] == (version, digest)
     assert calls[8][1] == (version, digest)
+    assert calls[9][1] == (version, digest)
     assert digest == hashlib.sha256(
         db.Path(db.__file__).with_name("schema.sql").read_bytes()).hexdigest()
     assert conn.commits == 1
@@ -83,6 +87,36 @@ def test_schema_version_cannot_be_reused_for_different_bytes():
 ])
 def test_readiness_requires_the_exact_schema_version_and_digest(row, expected):
     assert db.schema_is_current(_Connection(row)) is expected
+
+
+def test_runtime_readiness_requires_both_the_receipt_and_restricted_role(
+        monkeypatch):
+    conn = object()
+    role_checks = []
+    monkeypatch.setattr(db, "schema_is_current", lambda _conn: False)
+    monkeypatch.setattr(
+        db, "runtime_role_is_safe",
+        lambda _conn: role_checks.append(True) or True)
+    with pytest.raises(RuntimeError, match="migrate_db"):
+        db.require_runtime_ready(conn)
+    assert role_checks == []
+
+    monkeypatch.setattr(db, "schema_is_current", lambda _conn: True)
+    monkeypatch.setattr(db, "runtime_role_is_safe", lambda _conn: False)
+    with pytest.raises(RuntimeError, match="runtime"):
+        db.require_runtime_ready(conn)
+
+    monkeypatch.setattr(db, "runtime_role_is_safe", lambda _conn: True)
+    assert db.require_runtime_ready(conn) is None
+
+
+def test_only_the_migration_entrypoint_invokes_schema_ddl():
+    runtime_modules = (ingest, job_worker, bootstrap_org)
+    for module in runtime_modules:
+        source = inspect.getsource(module)
+        assert "db.init_schema(" not in source
+        assert "db.require_runtime_ready(" in source
+    assert "db.init_schema(" in inspect.getsource(migrate_db)
 
 
 def test_metrics_keep_only_bounded_code_owned_labels():
@@ -221,13 +255,38 @@ def test_migration_cli_never_reflects_connection_exception_prose(
     def fail(**_kwargs):
         raise RuntimeError("OZEL_DSN_KULLANICI_PAROLA")
 
-    monkeypatch.setattr(migrate_db.db, "get_conn", fail)
+    monkeypatch.setattr(migrate_db.db, "get_migration_conn", fail)
 
     assert migrate_db.main() == 1
     output = capsys.readouterr().out
     assert json.loads(output) == {
         "migration_version": db.SCHEMA_VERSION, "status": "failed"}
     assert "OZEL" not in output
+
+
+def test_migration_connection_never_falls_back_to_the_runtime_dsn(monkeypatch):
+    opened = []
+    monkeypatch.setenv("PG_DSN", "runtime-role-must-not-open")
+    monkeypatch.delenv("PG_MIGRATION_DSN", raising=False)
+    monkeypatch.setattr(db.psycopg, "connect", lambda dsn: opened.append(dsn))
+
+    with pytest.raises(RuntimeError, match="PG_MIGRATION_DSN"):
+        db.get_migration_conn()
+
+    assert opened == []
+
+
+def test_migration_connection_does_not_require_vector_before_bootstrap(
+        monkeypatch):
+    connection = object()
+    registered = []
+    monkeypatch.setenv("PG_MIGRATION_DSN", "migration-owner-dsn")
+    monkeypatch.setattr(db.psycopg, "connect", lambda dsn: connection)
+    monkeypatch.setattr(
+        db, "register_vector", lambda conn: registered.append(conn))
+
+    assert db.get_migration_conn() is connection
+    assert registered == []
 
 
 class _ReadyResponse:

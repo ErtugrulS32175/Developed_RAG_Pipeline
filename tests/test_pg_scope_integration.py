@@ -58,8 +58,12 @@ def real_scope_connection():
                     sql.Identifier(schema_name)))
             schema_path = Path(db.__file__).with_name("schema.sql")
             cursor.execute(schema_path.read_text(encoding="utf-8"))
+            cursor.execute(
+                "INSERT INTO rag_context_secrets (singleton, secret) "
+                "VALUES (true, %s)", (db._context_secret(),))
         connection.commit()
         register_vector(connection)
+        db.set_tenant_context(connection, service=True)
 
         dense_inside = Vector([0.0, 1.0] + [0.0] * 1022)
         dense_outside = Vector([1.0] + [0.0] * 1023)

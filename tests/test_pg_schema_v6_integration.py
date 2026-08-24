@@ -1,4 +1,4 @@
-"""Real PostgreSQL proof for monotonic v5-to-v6 schema migration."""
+"""Real PostgreSQL proof for monotonic v5-to-current schema migration."""
 import os
 import uuid
 
@@ -26,6 +26,7 @@ def migration_database():
     try:
         with admin.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public")
             cur.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(password)))
             cur.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
@@ -69,21 +70,21 @@ def _legacy_receipt(conn, *, version=5, digest=V5_DIGEST):
     conn.commit()
 
 
-def test_v5_receipt_advances_to_v6_with_forced_rls_and_is_idempotent(
+def test_v5_receipt_advances_to_current_with_forced_rls_and_is_idempotent(
         migration_database):
     conn = migration_database
     _legacy_receipt(conn)
     db.init_schema(conn)
 
     version, digest = db.expected_schema_state()
-    assert version == db.SCHEMA_VERSION == 6
+    assert version == db.SCHEMA_VERSION == 7
     assert digest != V5_DIGEST
     assert db.schema_is_current(conn)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT schema_version, schema_sha256 FROM rag_schema_history "
             "ORDER BY schema_version")
-        assert cur.fetchall() == [(5, V5_DIGEST), (6, digest)]
+        assert cur.fetchall() == [(5, V5_DIGEST), (7, digest)]
         for table in ("eval_datasets", "eval_dataset_versions", "eval_cases",
                       "eval_dataset_events"):
             cur.execute("SELECT to_regclass(%s)", (table,))
@@ -147,12 +148,13 @@ def test_database_trigger_rolls_back_a_v5_binary_downgrade_transaction(
 def test_same_version_wrong_digest_is_refused_before_eval_product_ddl(
         migration_database):
     conn = migration_database
-    _legacy_receipt(conn, version=6, digest="0" * 64)
+    _legacy_receipt(conn, version=7, digest="0" * 64)
     with pytest.raises(RuntimeError, match="digest"):
         db.init_schema(conn)
     conn.rollback()
     with conn.cursor() as cur:
         for table in ("eval_datasets", "eval_dataset_versions", "eval_cases",
                       "eval_dataset_events"):
-            cur.execute("SELECT to_regclass(%s)", (table,))
+            cur.execute("SELECT to_regclass(current_schema() || '.' || %s)",
+                        (table,))
             assert cur.fetchone()[0] is None

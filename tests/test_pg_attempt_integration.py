@@ -95,7 +95,7 @@ def _probe_schema() -> str:
         encoding="utf-8")
     body = raw
     for pattern, replacement in (
-        (r"CREATE EXTENSION IF NOT EXISTS vector;",
+        (r"CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;",
          "-- [P0 KAPISI] vektor tipleri text'e ikame edildi"),
         (r"dense\s+vector\(1024\) NOT NULL", "dense       text NOT NULL"),
         (r"sparse\s+sparsevec\(999999937\) NOT NULL",
@@ -128,6 +128,9 @@ def isolated_schema():
         with setup.cursor() as cur:
             cur.execute(f'SET search_path TO "{name}"')
             cur.execute(_probe_schema())
+            cur.execute(
+                "INSERT INTO rag_context_secrets (singleton, secret) "
+                "VALUES (true, %s)", (db._context_secret(),))
         setup.commit()
         with setup.cursor() as cur:
             cur.execute("SELECT count(*) FROM information_schema.tables "
@@ -158,6 +161,7 @@ def _connect(schema):
     connection = _raw_connect()
     with connection.cursor() as cur:
         cur.execute(f'SET search_path TO "{schema}"')
+    db.set_tenant_context(connection, service=True)
     connection.commit()
     return connection
 

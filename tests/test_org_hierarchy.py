@@ -137,6 +137,41 @@ def test_only_architect_can_read_or_replace_the_topology(org_api, monkeypatch):
     assert client.get("/v1/org/admin/topology").status_code == 403
 
 
+def test_an_authenticated_topology_denial_writes_one_closed_audit_event(
+        org_api, monkeypatch):
+    """An authenticated actor's refusal is evidence, without request content.
+
+    The actor is a valid active OpenWebUI principal, but organization-admin
+    presentation or document-admin capability must not impersonate the
+    separately assigned architecture capability.  The refusal therefore has
+    a stable actor and request id worth auditing; no topology body, position
+    title, external subject or credential belongs in that event.
+    """
+    client, current = org_api
+    current["principal"] = auth.Principal(
+        TENANT, "admin", ARCHITECT, "openwebui", ROOT, False)
+    recorded = []
+    monkeypatch.setattr(api.db, "record_org_decision",
+                        lambda _conn, **fields: recorded.append(fields))
+
+    response = client.get("/v1/org/admin/topology")
+
+    assert response.status_code == 403
+    assert len(recorded) == 1
+    assert set(recorded[0]) == {
+        "actor_id", "subject_id", "action", "reason_code", "allowed",
+        "request_id",
+    }
+    assert recorded[0] == {
+        "actor_id": ARCHITECT,
+        "subject_id": None,
+        "action": "topology_read",
+        "reason_code": "system_operation",
+        "allowed": False,
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
 def test_topology_replace_is_closed_and_optimistically_versioned(org_api,
                                                                   monkeypatch):
     client, _current = org_api
@@ -170,7 +205,8 @@ def test_topology_replace_is_closed_and_optimistically_versioned(org_api,
 def test_bootstrap_cli_prints_only_closed_ids(monkeypatch, capsys):
     closed = SimpleConnection()
     monkeypatch.setattr(bootstrap_org.db, "get_conn", lambda **_kw: closed)
-    monkeypatch.setattr(bootstrap_org.db, "init_schema", lambda _conn: None)
+    monkeypatch.setattr(
+        bootstrap_org.db, "require_runtime_ready", lambda _conn: None)
     captured = []
     monkeypatch.setattr(
         bootstrap_org.db, "bootstrap_org_tenant",

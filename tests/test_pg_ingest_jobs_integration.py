@@ -35,6 +35,10 @@ def real_job_connection():
                 sql.Identifier(schema_name)))
             cursor.execute(Path(db.__file__).with_name("schema.sql").read_text())
             cursor.execute(
+                "INSERT INTO rag_context_secrets (singleton, secret) "
+                "VALUES (true, %s)", (db._context_secret(),))
+            db.set_tenant_context(connection, service=True)
+            cursor.execute(
                 "INSERT INTO documents "
                 "(id, filename, file_type, candidate_id, content_sha256, "
                 "candidate_state, last_version_number) "

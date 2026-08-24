@@ -1,6 +1,5 @@
 """Real PostgreSQL proof for RLS tenant separation and service claiming."""
 import os
-from pathlib import Path
 import uuid
 
 import pytest
@@ -31,6 +30,8 @@ def tenant_database():
     try:
         with admin.cursor() as cursor:
             cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cursor.execute(
+                "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public")
             cursor.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(password)))
             cursor.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
@@ -40,9 +41,8 @@ def tenant_database():
         with connection.cursor() as cursor:
             cursor.execute(sql.SQL("SET search_path TO {}, public").format(
                 sql.Identifier(schema)))
-            cursor.execute(Path(db.__file__).with_name("schema.sql").read_text(
-                encoding="utf-8"))
         connection.commit()
+        db.init_schema(connection)
         yield connection
     finally:
         if connection is not None:

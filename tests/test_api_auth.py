@@ -4,6 +4,10 @@ The API used to have no authentication at all, so anything that could reach the
 port could ask questions of the indexed documents and upload new ones.
 """
 import importlib
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -112,14 +116,56 @@ def test_the_download_link_is_not_a_public_filename_capability(secured):
     ).status_code in (400, 404)
 
 
-# --- with no key configured ---
+# --- deliberately insecure local startup ---
 
-def test_without_a_key_the_api_is_open(monkeypatch):
-    """Documented behaviour, not an oversight: a local run stays friction-free
-    and startup prints a warning. Anything exposed beyond localhost must set it."""
-    client, api = _client(monkeypatch, "")
-    try:
-        assert client.get("/v1/models").status_code == 200
-    finally:
-        monkeypatch.delenv("API_KEY", raising=False)
-        importlib.reload(api)
+def _startup(tmp_path, *, allow=None, bind=None):
+    """Import the application in an isolated process with no auth source.
+
+    Import is the startup configuration boundary.  A subprocess keeps a
+    deliberately failed import from leaving this test process with a partly
+    initialised module, and disabling dotenv prevents a developer's private
+    file from silently supplying a credential to the test.
+    """
+    environment = os.environ.copy()
+    for name in (
+            "API_KEY", "API_KEYS_JSON", "OPENWEBUI_GATEWAY_KEY",
+            "OPENWEBUI_USER_JWT_SECRET", "EVIDENCE_HMAC_SECRET",
+            "ALLOW_INSECURE_LOCAL", "API_BIND_HOST"):
+        environment.pop(name, None)
+    environment["PYTHON_DOTENV_DISABLED"] = "1"
+    environment["UPLOAD_DIR"] = str(tmp_path / "uploads")
+    if allow is not None:
+        environment["ALLOW_INSECURE_LOCAL"] = allow
+    if bind is not None:
+        environment["API_BIND_HOST"] = bind
+    return subprocess.run(
+        [sys.executable, "-c", "import pipeline.api.app"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(("allow", "bind"), [
+    (None, None),
+    (None, "127.0.0.1"),
+    ("1", None),
+    ("1", "0.0.0.0"),
+    ("1", "localhost"),
+    ("true", "127.0.0.1"),
+])
+def test_no_auth_configuration_fails_startup_closed(
+        tmp_path, allow, bind):
+    result = _startup(tmp_path, allow=allow, bind=bind)
+    assert result.returncode != 0
+    assert "AuthConfigurationError" in result.stderr
+
+
+def test_explicit_insecure_mode_requires_the_documented_loopback_binding(
+        tmp_path):
+    result = _startup(
+        tmp_path, allow="1", bind="127.0.0.1")
+    assert result.returncode == 0, result.stderr
