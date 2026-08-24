@@ -1,11 +1,23 @@
-# Runs the test suite on every push. No GPU, no database and no model services
-# are needed: the suite covers the logic that decides things -- scoring,
-# chunking, merging, table parsing, auth -- and the pieces that talk to a
-# service are exercised through fakes.
+# Runs the test suite on every push.  A disposable PostgreSQL service is
+# mandatory because tenant RLS, immutable eval releases and schema migration
+# fences cannot be proven by a fake connection.
 stages: [test]
 
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: CHANGE_ME
+  POSTGRES_DB: ragtest_ci
+  RAGTEST_OPERATIONS_PG_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
+  RAGTEST_TENANT_PG_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
+  RAGTEST_EVIDENCE_PG_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
+  RAGTEST_REVIEW_PG_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
+  RAGTEST_EVAL_PG_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
+  RAGTEST_JOB_PG_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
+  RAGTEST_PG_TEST_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
+  RAGTEST_P0_GATE: "1"
+  RAGTEST_SCOPE_PG_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
+  RAGTEST_SCOPE_GATE: "1"
 
 cache:
   key: "$CI_COMMIT_REF_SLUG"
@@ -14,6 +26,9 @@ cache:
 test:
   stage: test
   image: python:3.12
+  services:
+    - name: pgvector/pgvector:pg17
+      alias: postgres
   before_script:
     # OpenCV arrives through docling -> rapidocr and loads libGL at import time,
     # so without these the suite dies during collection -- not in the tests that

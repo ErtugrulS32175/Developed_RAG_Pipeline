@@ -145,6 +145,34 @@ replaces the topology atomically; a stale editor receives 409 instead of
 overwriting a newer design. The portal is a same-origin OpenWebUI route and
 keeps both bridge secrets on the server.
 
+### Governed evaluation datasets in OpenWebUI
+
+Import `openwebui/functions/ragtest_eval_portal.py` as a global Event Function
+and open `/ragtest-eval`. The portal creates tenant-bound evaluation sets,
+opens one draft at a time, imports a closed list of 1–500 cases and publishes
+an immutable version. The list exposes content-free version history, can fill
+the lifecycle forms without hand-copying hidden identifiers, and retires a set
+only when no draft remains. It reuses the signed OpenWebUI identity bridge; an
+OpenWebUI admin flag or organization-architect capability is not an eval-data
+bypass. Owners can work on their own sets, and an active editor above an owner
+may curate a visible descendant's set. Peers, descendants, unrelated branches,
+suspended identities and protected targets remain hidden.
+
+Lists and ordinary mutation responses contain metadata only. Case text is
+available solely from the explicit version-cases endpoint, which rechecks the
+current hierarchy and returns `Cache-Control: no-store`. Import is bounded
+before JSON parsing, requires exact case fields and canonical ordering, and
+rejects duplicate keys. Publication locks the tenant policy before the set,
+then checks the version revision, current policy epoch and the SHA-256 of the
+exact draft the browser observed. Published versions, their cases and their
+content-free event trail cannot be updated or deleted; later work starts a new
+server-numbered draft.
+
+The digest proves the exact evaluation-case document, not the provenance of
+the source corpus. A `pages` list by itself does not bind document versions or
+a retrieval snapshot, so this lifecycle must not be described as source-level
+reproducibility until that separate binding is added.
+
 ### Citation evidence in OpenWebUI
 
 Import `openwebui/functions/ragtest_citations.py` as a global Filter and

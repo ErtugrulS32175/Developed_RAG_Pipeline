@@ -1164,6 +1164,345 @@ CREATE POLICY review_case_events_insert ON review_case_events FOR INSERT
                  reviewer_id = rag_effective_actor() AND
                  rag_can_monitor_identity(subject_actor_id)));
 
+-- Evaluation datasets are tenant-owned product content.  Lists and lifecycle
+-- events carry metadata/digests only; the question, key and expected answer
+-- live exclusively in a version's case rows.  Published versions are sealed:
+-- later work always starts a new draft rather than rewriting old evidence.
+CREATE TABLE IF NOT EXISTS eval_datasets (
+    id                 uuid PRIMARY KEY,
+    tenant_id          uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    owner_identity_id  uuid NOT NULL REFERENCES org_identities(id)
+                       ON DELETE RESTRICT,
+    slug               text NOT NULL CHECK (
+                         length(slug) BETWEEN 1 AND 80 AND
+                         slug ~ '^[a-z0-9]+(?:-[a-z0-9]+)*$'),
+    label              text NOT NULL CHECK (length(label) BETWEEN 1 AND 160),
+    state              text NOT NULL DEFAULT 'active'
+                       CHECK (state IN ('active', 'retired')),
+    current_version_id uuid,
+    revision           bigint NOT NULL DEFAULT 1 CHECK (revision > 0),
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, id),
+    UNIQUE (tenant_id, slug),
+    FOREIGN KEY (tenant_id, owner_identity_id)
+        REFERENCES org_memberships(tenant_id, identity_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS eval_dataset_versions (
+    id                  uuid PRIMARY KEY,
+    tenant_id           uuid NOT NULL,
+    dataset_id          uuid NOT NULL,
+    version_number      integer NOT NULL CHECK (version_number > 0),
+    state               text NOT NULL DEFAULT 'draft'
+                        CHECK (state IN ('draft', 'published')),
+    schema_version      integer NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    parent_version_id   uuid,
+    created_by          uuid NOT NULL REFERENCES org_identities(id)
+                        ON DELETE RESTRICT,
+    published_by        uuid REFERENCES org_identities(id) ON DELETE RESTRICT,
+    revision            bigint NOT NULL DEFAULT 1 CHECK (revision > 0),
+    case_count          integer NOT NULL DEFAULT 0 CHECK (
+                          case_count BETWEEN 0 AND 500),
+    content_sha256      bytea,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    sealed_at           timestamptz,
+    UNIQUE (tenant_id, id),
+    UNIQUE (tenant_id, dataset_id, version_number),
+    FOREIGN KEY (tenant_id, dataset_id)
+        REFERENCES eval_datasets(tenant_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, parent_version_id)
+        REFERENCES eval_dataset_versions(tenant_id, id) ON DELETE RESTRICT,
+    CHECK (content_sha256 IS NULL OR octet_length(content_sha256) = 32),
+    CHECK ((state = 'draft' AND published_by IS NULL AND sealed_at IS NULL AND
+            content_sha256 IS NULL) OR
+           (state = 'published' AND published_by IS NOT NULL AND
+            sealed_at IS NOT NULL AND content_sha256 IS NOT NULL AND
+            case_count > 0))
+);
+
+DO $eval_current_version_fk$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'eval_datasets_current_version_fk'
+          AND conrelid = 'eval_datasets'::regclass
+    ) THEN
+        ALTER TABLE eval_datasets
+            ADD CONSTRAINT eval_datasets_current_version_fk
+            FOREIGN KEY (tenant_id, current_version_id)
+            REFERENCES eval_dataset_versions(tenant_id, id)
+            ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+END
+$eval_current_version_fk$;
+
+CREATE OR REPLACE FUNCTION rag_eval_pages_valid(offered_pages integer[])
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $eval_pages$
+    SELECT offered_pages IS NOT NULL
+       AND cardinality(offered_pages) BETWEEN 1 AND 100
+       AND array_position(offered_pages, NULL) IS NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM unnest(offered_pages)
+                         WITH ORDINALITY AS page(value, ordinal)
+           WHERE value <= 0 OR (
+               ordinal > 1 AND value <= offered_pages[ordinal - 1]
+           )
+       )
+$eval_pages$;
+
+CREATE TABLE IF NOT EXISTS eval_cases (
+    tenant_id      uuid NOT NULL,
+    version_id     uuid NOT NULL,
+    case_key       uuid NOT NULL,
+    ordinal        integer NOT NULL CHECK (ordinal BETWEEN 1 AND 500),
+    question       text NOT NULL CHECK (
+                     octet_length(question) BETWEEN 1 AND 4096),
+    document_key   text NOT NULL CHECK (
+                     octet_length(document_key) BETWEEN 1 AND 16384),
+    expected_answer text NOT NULL CHECK (
+                      octet_length(expected_answer) BETWEEN 1 AND 16384),
+    pages          integer[] NOT NULL CHECK (rag_eval_pages_valid(pages)),
+    question_type  text NOT NULL CHECK (
+                     question_type IN ('metin', 'sayisal', 'tablo')),
+    content_sha256 bytea NOT NULL CHECK (octet_length(content_sha256) = 32),
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, version_id, case_key),
+    UNIQUE (tenant_id, version_id, ordinal),
+    FOREIGN KEY (tenant_id, version_id)
+        REFERENCES eval_dataset_versions(tenant_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS eval_dataset_events (
+    id                 uuid PRIMARY KEY,
+    tenant_id          uuid NOT NULL,
+    dataset_id         uuid NOT NULL,
+    version_id         uuid,
+    actor_id           uuid NOT NULL REFERENCES org_identities(id)
+                       ON DELETE RESTRICT,
+    event_type         text NOT NULL CHECK (event_type IN (
+                         'dataset_created', 'version_created',
+                         'version_cases_replaced', 'version_published',
+                         'dataset_retired')),
+    base_revision      bigint,
+    resulting_revision bigint NOT NULL CHECK (resulting_revision > 0),
+    case_count         integer CHECK (case_count BETWEEN 0 AND 500),
+    content_sha256     bytea,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (tenant_id, dataset_id)
+        REFERENCES eval_datasets(tenant_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, version_id)
+        REFERENCES eval_dataset_versions(tenant_id, id) ON DELETE RESTRICT,
+    CHECK (base_revision IS NULL OR base_revision > 0),
+    CHECK (content_sha256 IS NULL OR octet_length(content_sha256) = 32)
+);
+
+CREATE INDEX IF NOT EXISTS eval_datasets_owner_order_idx
+    ON eval_datasets(tenant_id, owner_identity_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS eval_versions_dataset_order_idx
+    ON eval_dataset_versions(tenant_id, dataset_id, version_number DESC);
+
+CREATE OR REPLACE FUNCTION rag_eval_owner_can_write(owner_identity uuid)
+RETURNS boolean LANGUAGE sql STABLE AS $eval_write$
+    SELECT EXISTS (
+        SELECT 1 FROM org_memberships viewer
+        JOIN org_identities identity ON identity.id = viewer.identity_id
+        WHERE viewer.tenant_id = rag_effective_tenant()
+          AND viewer.identity_id = rag_effective_actor()
+          AND viewer.state = 'active'
+          AND viewer.app_role IN ('editor', 'admin')
+          AND identity.state = 'active'
+          AND (viewer.identity_id = owner_identity OR
+               rag_can_monitor_identity(owner_identity))
+    )
+$eval_write$;
+
+CREATE OR REPLACE FUNCTION rag_eval_owner_can_read(owner_identity uuid)
+RETURNS boolean LANGUAGE sql STABLE AS $eval_read$
+    SELECT EXISTS (
+        SELECT 1 FROM org_memberships viewer
+        JOIN org_identities identity ON identity.id = viewer.identity_id
+        WHERE viewer.tenant_id = rag_effective_tenant()
+          AND viewer.identity_id = rag_effective_actor()
+          AND viewer.state = 'active'
+          AND identity.state = 'active'
+          AND (viewer.identity_id = owner_identity OR
+               rag_can_monitor_identity(owner_identity))
+    )
+$eval_read$;
+
+CREATE OR REPLACE FUNCTION rag_guard_eval_version_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $eval_version_guard$
+BEGIN
+    IF OLD.state = 'published' THEN
+        RAISE EXCEPTION 'published eval version is immutable';
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END
+$eval_version_guard$;
+
+DROP TRIGGER IF EXISTS eval_versions_immutable ON eval_dataset_versions;
+CREATE TRIGGER eval_versions_immutable
+BEFORE UPDATE OR DELETE ON eval_dataset_versions
+FOR EACH ROW EXECUTE FUNCTION rag_guard_eval_version_immutable();
+
+CREATE OR REPLACE FUNCTION rag_guard_eval_cases_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $eval_case_guard$
+DECLARE
+    old_version uuid;
+    new_version uuid;
+BEGIN
+    old_version := CASE WHEN TG_OP IN ('UPDATE', 'DELETE')
+                        THEN OLD.version_id END;
+    new_version := CASE WHEN TG_OP IN ('INSERT', 'UPDATE')
+                        THEN NEW.version_id END;
+    IF EXISTS (
+        SELECT 1 FROM eval_dataset_versions version
+        WHERE version.tenant_id = rag_effective_tenant()
+          AND version.id IN (old_version, new_version)
+          AND version.state = 'published'
+    ) THEN
+        RAISE EXCEPTION 'published eval cases are immutable';
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END
+$eval_case_guard$;
+
+DROP TRIGGER IF EXISTS eval_cases_immutable ON eval_cases;
+CREATE TRIGGER eval_cases_immutable
+BEFORE INSERT OR UPDATE OR DELETE ON eval_cases
+FOR EACH ROW EXECUTE FUNCTION rag_guard_eval_cases_immutable();
+
+CREATE OR REPLACE FUNCTION rag_reject_eval_event_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $eval_event_guard$
+BEGIN
+    RAISE EXCEPTION 'eval dataset events are immutable';
+END
+$eval_event_guard$;
+
+DROP TRIGGER IF EXISTS eval_events_immutable ON eval_dataset_events;
+CREATE TRIGGER eval_events_immutable
+BEFORE UPDATE OR DELETE ON eval_dataset_events
+FOR EACH ROW EXECUTE FUNCTION rag_reject_eval_event_mutation();
+
+ALTER TABLE eval_datasets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE eval_datasets FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS eval_datasets_read ON eval_datasets;
+CREATE POLICY eval_datasets_read ON eval_datasets FOR SELECT
+    USING (rag_service_access() OR
+           (tenant_id = rag_effective_tenant() AND
+            rag_eval_owner_can_read(owner_identity_id)));
+DROP POLICY IF EXISTS eval_datasets_insert ON eval_datasets;
+CREATE POLICY eval_datasets_insert ON eval_datasets FOR INSERT
+    WITH CHECK (rag_service_access() OR
+                (tenant_id = rag_effective_tenant() AND
+                 rag_eval_owner_can_write(owner_identity_id)));
+DROP POLICY IF EXISTS eval_datasets_update ON eval_datasets;
+CREATE POLICY eval_datasets_update ON eval_datasets FOR UPDATE
+    USING (rag_service_access() OR rag_eval_owner_can_write(owner_identity_id))
+    WITH CHECK (rag_service_access() OR
+                (tenant_id = rag_effective_tenant() AND
+                 rag_eval_owner_can_write(owner_identity_id)));
+
+ALTER TABLE eval_dataset_versions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE eval_dataset_versions FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS eval_versions_read ON eval_dataset_versions;
+CREATE POLICY eval_versions_read ON eval_dataset_versions FOR SELECT
+    USING (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_datasets dataset
+        WHERE dataset.tenant_id = eval_dataset_versions.tenant_id
+          AND dataset.id = eval_dataset_versions.dataset_id));
+DROP POLICY IF EXISTS eval_versions_insert ON eval_dataset_versions;
+CREATE POLICY eval_versions_insert ON eval_dataset_versions FOR INSERT
+    WITH CHECK (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_datasets dataset
+        WHERE dataset.tenant_id = eval_dataset_versions.tenant_id
+          AND dataset.id = eval_dataset_versions.dataset_id
+          AND rag_eval_owner_can_write(dataset.owner_identity_id)));
+DROP POLICY IF EXISTS eval_versions_update ON eval_dataset_versions;
+CREATE POLICY eval_versions_update ON eval_dataset_versions FOR UPDATE
+    USING (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_datasets dataset
+        WHERE dataset.tenant_id = eval_dataset_versions.tenant_id
+          AND dataset.id = eval_dataset_versions.dataset_id
+          AND rag_eval_owner_can_write(dataset.owner_identity_id)))
+    WITH CHECK (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_datasets dataset
+        WHERE dataset.tenant_id = eval_dataset_versions.tenant_id
+          AND dataset.id = eval_dataset_versions.dataset_id
+          AND rag_eval_owner_can_write(dataset.owner_identity_id)));
+
+ALTER TABLE eval_cases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE eval_cases FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS eval_cases_read ON eval_cases;
+CREATE POLICY eval_cases_read ON eval_cases FOR SELECT
+    USING (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_dataset_versions version
+        JOIN eval_datasets dataset
+          ON dataset.tenant_id = version.tenant_id
+         AND dataset.id = version.dataset_id
+        WHERE version.tenant_id = eval_cases.tenant_id
+          AND version.id = eval_cases.version_id));
+DROP POLICY IF EXISTS eval_cases_insert ON eval_cases;
+CREATE POLICY eval_cases_insert ON eval_cases FOR INSERT
+    WITH CHECK (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_dataset_versions version
+        JOIN eval_datasets dataset
+          ON dataset.tenant_id = version.tenant_id
+         AND dataset.id = version.dataset_id
+        WHERE version.tenant_id = eval_cases.tenant_id
+          AND version.id = eval_cases.version_id
+          AND version.state = 'draft'
+          AND rag_eval_owner_can_write(dataset.owner_identity_id)));
+DROP POLICY IF EXISTS eval_cases_update ON eval_cases;
+CREATE POLICY eval_cases_update ON eval_cases FOR UPDATE
+    USING (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_dataset_versions version
+        JOIN eval_datasets dataset
+          ON dataset.tenant_id = version.tenant_id
+         AND dataset.id = version.dataset_id
+        WHERE version.tenant_id = eval_cases.tenant_id
+          AND version.id = eval_cases.version_id
+          AND version.state = 'draft'
+          AND rag_eval_owner_can_write(dataset.owner_identity_id)))
+    WITH CHECK (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_dataset_versions version
+        JOIN eval_datasets dataset
+          ON dataset.tenant_id = version.tenant_id
+         AND dataset.id = version.dataset_id
+        WHERE version.tenant_id = eval_cases.tenant_id
+          AND version.id = eval_cases.version_id
+          AND version.state = 'draft'
+          AND rag_eval_owner_can_write(dataset.owner_identity_id)));
+DROP POLICY IF EXISTS eval_cases_delete ON eval_cases;
+CREATE POLICY eval_cases_delete ON eval_cases FOR DELETE
+    USING (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_dataset_versions version
+        JOIN eval_datasets dataset
+          ON dataset.tenant_id = version.tenant_id
+         AND dataset.id = version.dataset_id
+        WHERE version.tenant_id = eval_cases.tenant_id
+          AND version.id = eval_cases.version_id
+          AND version.state = 'draft'
+          AND rag_eval_owner_can_write(dataset.owner_identity_id)));
+
+ALTER TABLE eval_dataset_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE eval_dataset_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS eval_events_read ON eval_dataset_events;
+CREATE POLICY eval_events_read ON eval_dataset_events FOR SELECT
+    USING (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_datasets dataset
+        WHERE dataset.tenant_id = eval_dataset_events.tenant_id
+          AND dataset.id = eval_dataset_events.dataset_id));
+DROP POLICY IF EXISTS eval_events_insert ON eval_dataset_events;
+CREATE POLICY eval_events_insert ON eval_dataset_events FOR INSERT
+    WITH CHECK (rag_service_access() OR EXISTS (
+        SELECT 1 FROM eval_datasets dataset
+        WHERE dataset.tenant_id = eval_dataset_events.tenant_id
+          AND dataset.id = eval_dataset_events.dataset_id
+          AND actor_id = rag_effective_actor()
+          AND rag_eval_owner_can_write(dataset.owner_identity_id)));
+
 -- No ANN index yet: this is a small, single-document demo dataset, and a
 -- sequential scan over `dense <=> query` / `sparse <#> query` is effectively
 -- instant at this scale. Add an HNSW index (e.g. `USING hnsw (dense

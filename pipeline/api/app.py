@@ -18,12 +18,13 @@ from fastapi import (
     UploadFile, File,
 )
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
 
 from pipeline.index import db
 from pipeline.index import ingest
 from pipeline.index import publication
+from pipeline.evaluation import datasets as eval_datasets
 from pipeline.index.attempt_contract import (
     AttemptAlreadyRunning,
     AttemptOutcome,
@@ -396,6 +397,17 @@ def require_evidence_actor(
     return principal
 
 
+def require_eval_writer(
+        principal=Depends(require_org_identity)):
+    """Require a real editor; hierarchy authority is rechecked by PostgreSQL."""
+    if (principal is None or principal.source != "openwebui"
+            or principal.subject_id is None
+            or not auth.permits(principal, "editor")):
+        raise HTTPException(status_code=403,
+                            detail="degerlendirme yazma rolu gerekli")
+    return principal
+
+
 class ChatMessage(BaseModel):
     role: str
     # OpenWebUI sends a plain string for text turns, but an OpenAI-vision-style
@@ -484,6 +496,32 @@ class ReviewDecisionRequest(BaseModel):
     decision: Literal["resolved", "dismissed"]
     resolution_code: Literal["corrected", "no_issue", "escalated"]
     reason_code: Literal["management_duty", "security_review"]
+
+
+class EvalDatasetCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    slug: str = Field(min_length=1, max_length=80,
+                      pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    label: str = Field(min_length=1, max_length=160)
+
+
+class EvalDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_revision: int = Field(ge=1)
+
+
+class EvalPublishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_revision: int = Field(ge=1)
+    expected_policy_epoch: int = Field(ge=1)
+    expected_draft_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+class EvalRetireRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_revision: int = Field(ge=1)
+    expected_policy_epoch: int = Field(ge=1)
 
 
 class OrgPositionRequest(BaseModel):
@@ -579,6 +617,257 @@ def replace_organization_topology(
     except db.OrgIdentityConflict as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
     return version
+
+
+def _eval_version_metadata(row, *, version_id=None):
+    item = {
+        "version_id": row.get("id", version_id),
+        "version_number": row["version_number"],
+        "state": row["state"],
+        "revision": row["revision"],
+        "case_count": row["case_count"],
+    }
+    digest = row.get("content_sha256")
+    if digest is not None:
+        item["content_sha256"] = digest
+    sealed_at = row.get("sealed_at")
+    if sealed_at is not None:
+        item["sealed_at"] = sealed_at
+    return item
+
+
+def _eval_dataset_metadata(row):
+    item = {
+        "dataset_id": row["id"],
+        "slug": row["slug"],
+        "label": row["label"],
+        "state": row["state"],
+        "revision": row["revision"],
+    }
+    for name in ("owner_label", "policy_epoch", "current_version_id",
+                 "current_version_number"):
+        if name in row:
+            item[name] = row[name]
+    latest_id = row.get("latest_version_id")
+    item["versions"] = ([] if latest_id is None else [{
+        "version_id": latest_id,
+        "version_number": row["latest_version_number"],
+        "state": row["latest_version_state"],
+        "revision": row["latest_version_revision"],
+        "case_count": row["latest_case_count"],
+    }])
+    return item
+
+
+def _eval_access_error():
+    return HTTPException(status_code=404,
+                         detail="degerlendirme seti bulunamadi")
+
+
+def _eval_state_error():
+    return HTTPException(status_code=409,
+                         detail="degerlendirme gecisi reddedildi")
+
+
+def _closed_json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value):
+    raise ValueError("constant")
+
+
+async def _eval_import_body(request):
+    """Bound and decode an import before FastAPI's ordinary JSON parser."""
+    length = request.headers.get("content-length")
+    if length is not None:
+        try:
+            if int(length) > eval_datasets.MAX_JSON_BYTES:
+                raise HTTPException(status_code=413,
+                                    detail="degerlendirme aktarimi cok buyuk")
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail="gecersiz istek uzunlugu") from None
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > eval_datasets.MAX_JSON_BYTES:
+            raise HTTPException(status_code=413,
+                                detail="degerlendirme aktarimi cok buyuk")
+    try:
+        text = bytes(raw).decode("utf-8", errors="strict")
+        if not text or text.startswith("\ufeff"):
+            raise ValueError("encoding")
+        value = json.loads(
+            text, object_pairs_hook=_closed_json_pairs,
+            parse_constant=_reject_json_constant)
+        if (type(value) is not dict
+                or set(value) != {"expected_revision", "cases"}
+                or type(value["expected_revision"]) is not int
+                or value["expected_revision"] < 1):
+            raise ValueError("shape")
+        cases = eval_datasets.normalize_cases(value["cases"])
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError,
+            ValueError, eval_datasets.EvalDatasetError):
+        raise HTTPException(status_code=422,
+                            detail="gecersiz degerlendirme aktarimi") from None
+    return value["expected_revision"], cases
+
+
+@app.get("/v1/eval/datasets")
+def eval_dataset_list(
+        limit: int = Query(100, ge=1, le=100),
+        principal=Depends(require_org_identity)):
+    try:
+        with db_conn() as conn:
+            rows = db.list_eval_datasets(
+                conn, actor_id=principal.subject_id, limit=limit)
+    except db.EvalDatasetAccessRefused:
+        raise _eval_access_error() from None
+    return {"datasets": [_eval_dataset_metadata(row) for row in rows]}
+
+
+@app.post("/v1/eval/datasets", status_code=201)
+def eval_dataset_create(
+        body: EvalDatasetCreateRequest,
+        principal=Depends(require_eval_writer)):
+    try:
+        with db_conn() as conn:
+            row = db.create_eval_dataset(
+                conn, actor_id=principal.subject_id,
+                slug=body.slug, label=body.label)
+    except db.EvalDatasetConflict:
+        raise HTTPException(status_code=409,
+                            detail="degerlendirme seti zaten var") from None
+    except db.EvalDatasetAccessRefused:
+        raise _eval_access_error() from None
+    return {"dataset": _eval_dataset_metadata(row)}
+
+
+@app.get("/v1/eval/datasets/{dataset_id}/versions")
+def eval_version_list(
+        dataset_id: UUID, principal=Depends(require_org_identity)):
+    try:
+        with db_conn() as conn:
+            rows = db.list_eval_versions(
+                conn, actor_id=principal.subject_id,
+                dataset_id=dataset_id)
+    except db.EvalDatasetAccessRefused:
+        raise _eval_access_error() from None
+    if not rows:
+        raise _eval_access_error()
+    return {"versions": [_eval_version_metadata(row) for row in rows]}
+
+
+@app.post("/v1/eval/datasets/{dataset_id}/drafts", status_code=201)
+def eval_draft_create(
+        dataset_id: UUID, body: EvalDraftRequest,
+        principal=Depends(require_eval_writer)):
+    try:
+        with db_conn() as conn:
+            row = db.create_eval_draft(
+                conn, actor_id=principal.subject_id,
+                dataset_id=dataset_id,
+                expected_revision=body.expected_revision)
+    except db.EvalDatasetConflict:
+        raise HTTPException(status_code=409,
+                            detail="degerlendirme revision degisti") from None
+    except db.EvalDatasetStateRefused:
+        raise _eval_state_error() from None
+    except db.EvalDatasetAccessRefused:
+        raise _eval_access_error() from None
+    return {"version": _eval_version_metadata(row)}
+
+
+@app.post("/v1/eval/datasets/{dataset_id}/versions/"
+          "{version_id}/cases/import")
+async def eval_cases_import(
+        dataset_id: UUID, version_id: UUID, request: Request,
+        principal=Depends(require_eval_writer)):
+    expected_revision, cases = await _eval_import_body(request)
+    try:
+        with db_conn() as conn:
+            row = db.replace_eval_cases(
+                conn, actor_id=principal.subject_id,
+                dataset_id=dataset_id, version_id=version_id,
+                expected_revision=expected_revision, cases=cases)
+    except db.EvalDatasetConflict:
+        raise HTTPException(status_code=409,
+                            detail="degerlendirme revision degisti") from None
+    except db.EvalDatasetStateRefused:
+        raise _eval_state_error() from None
+    except db.EvalDatasetAccessRefused:
+        raise _eval_access_error() from None
+    return {"version": _eval_version_metadata(row, version_id=version_id)}
+
+
+@app.get("/v1/eval/datasets/{dataset_id}/versions/{version_id}/cases")
+def eval_cases_read(
+        dataset_id: UUID, version_id: UUID, response: Response,
+        principal=Depends(require_org_identity)):
+    try:
+        with db_conn() as conn:
+            versions = db.list_eval_versions(
+                conn, actor_id=principal.subject_id,
+                dataset_id=dataset_id)
+            if not any(row["id"] == version_id for row in versions):
+                raise db.EvalDatasetAccessRefused("eval version bulunamadi")
+            cases = db.read_eval_cases(
+                conn, actor_id=principal.subject_id,
+                dataset_id=dataset_id, version_id=version_id)
+    except db.EvalDatasetAccessRefused:
+        raise _eval_access_error() from None
+    response.headers["Cache-Control"] = "no-store"
+    return {"dataset_id": dataset_id, "version_id": version_id,
+            "cases": cases}
+
+
+@app.post("/v1/eval/datasets/{dataset_id}/versions/{version_id}/publish")
+def eval_version_publish(
+        dataset_id: UUID, version_id: UUID, body: EvalPublishRequest,
+        principal=Depends(require_eval_writer)):
+    try:
+        with db_conn() as conn:
+            row = db.publish_eval_version(
+                conn, actor_id=principal.subject_id,
+                dataset_id=dataset_id, version_id=version_id,
+                expected_revision=body.expected_revision,
+                expected_policy_epoch=body.expected_policy_epoch,
+                expected_draft_sha256=body.expected_draft_sha256)
+    except db.EvalDatasetConflict:
+        raise HTTPException(status_code=409,
+                            detail="degerlendirme yayin kapisi degisti") from None
+    except db.EvalDatasetStateRefused:
+        raise _eval_state_error() from None
+    except db.EvalDatasetAccessRefused:
+        raise _eval_access_error() from None
+    return {"version": _eval_version_metadata(row, version_id=version_id)}
+
+
+@app.post("/v1/eval/datasets/{dataset_id}/retire")
+def eval_dataset_retire(
+        dataset_id: UUID, body: EvalRetireRequest,
+        principal=Depends(require_eval_writer)):
+    try:
+        with db_conn() as conn:
+            row = db.retire_eval_dataset(
+                conn, actor_id=principal.subject_id,
+                dataset_id=dataset_id,
+                expected_revision=body.expected_revision,
+                expected_policy_epoch=body.expected_policy_epoch)
+    except db.EvalDatasetConflict:
+        raise HTTPException(status_code=409,
+                            detail="degerlendirme emeklilik kapisi degisti") from None
+    except db.EvalDatasetStateRefused:
+        raise _eval_state_error() from None
+    except db.EvalDatasetAccessRefused:
+        raise _eval_access_error() from None
+    return {"dataset": _eval_dataset_metadata(row)}
 
 
 @app.get("/v1/models", dependencies=AUTH)

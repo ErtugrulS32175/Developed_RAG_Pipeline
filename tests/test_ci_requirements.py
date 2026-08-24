@@ -42,3 +42,12 @@ def test_the_omitted_package_is_actually_in_requirements():
     """Guards the guard: if vLLM leaves requirements.txt, CI_OMITS is stale and
     the exclusion above stops meaning anything."""
     assert CI_OMITS <= required_packages()
+
+
+@pytest.mark.parametrize("ci_file", CI_FILES, ids=lambda p: p.name)
+def test_eval_governance_uses_real_postgresql_in_every_ci(ci_file):
+    text = ci_file.read_text(encoding="utf-8")
+    assert "pgvector/pgvector:pg17" in text
+    assert "RAGTEST_EVAL_PG_DSN" in text
+    assert "RAGTEST_PG_TEST_DSN" in text
+    assert "RAGTEST_P0_GATE" in text

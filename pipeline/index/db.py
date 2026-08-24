@@ -32,7 +32,7 @@ load_dotenv()
 # password intentionally fails auth so a missing .env surfaces loudly
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv("PG_DSN", "postgresql://rag:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -96,6 +96,18 @@ class ReviewAccessRefused(RuntimeError):
 
 class ReviewConflict(RuntimeError):
     """A review mutation lost its revision or policy-epoch fence."""
+
+
+class EvalDatasetAccessRefused(RuntimeError):
+    """The current actor cannot access or mutate an evaluation dataset."""
+
+
+class EvalDatasetConflict(RuntimeError):
+    """An evaluation dataset/version lost a revision or policy fence."""
+
+
+class EvalDatasetStateRefused(RuntimeError):
+    """An evaluation lifecycle transition is not currently valid."""
 
 
 def set_tenant_context(conn, tenant_id=DEFAULT_TENANT_ID, *, service=False,
@@ -739,6 +751,434 @@ def decide_review_case(conn, *, reviewer_id, case_id, expected_revision,
     conn.commit()
     return {"state": decision, "revision": updated["revision"],
             "decided_at": updated["decided_at"]}
+
+
+def _eval_uuid(value):
+    try:
+        return uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise EvalDatasetAccessRefused("eval kimligi gecersiz") from exc
+
+
+def _eval_actor(actor_id):
+    actor = _eval_uuid(actor_id)
+    if actor.int == 0:
+        raise EvalDatasetAccessRefused("eval aktoru gecersiz")
+    return actor
+
+
+def _lock_eval_policy(cur, expected_policy_epoch=None):
+    """Freeze hierarchy/policy authority before any eval row is locked."""
+    cur.execute(
+        "SELECT policy_epoch FROM org_tenants "
+        "WHERE id = rag_effective_tenant() FOR SHARE")
+    row = cur.fetchone()
+    if row is None:
+        raise EvalDatasetAccessRefused("eval tenant bulunamadi")
+    epoch = row["policy_epoch"]
+    if (expected_policy_epoch is not None
+            and epoch != expected_policy_epoch):
+        raise EvalDatasetConflict("eval politikasi degisti")
+    return epoch
+
+
+def create_eval_dataset(conn, *, actor_id, slug, label):
+    """Create one owner-bound dataset and its first empty draft atomically."""
+    actor = _eval_actor(actor_id)
+    if (type(slug) is not str or not 1 <= len(slug) <= 80
+            or type(label) is not str or not 1 <= len(label) <= 160):
+        raise EvalDatasetAccessRefused("eval dataset tanimi gecersiz")
+    dataset_id, version_id = uuid.uuid4(), uuid.uuid4()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            _lock_eval_policy(cur)
+            cur.execute(
+                "INSERT INTO eval_datasets "
+                "(id, tenant_id, owner_identity_id, slug, label) "
+                "VALUES (%s, rag_effective_tenant(), %s, %s, %s) "
+                "RETURNING id, slug, label, state, revision, created_at",
+                (dataset_id, actor, slug, label))
+            dataset = dict(cur.fetchone())
+            cur.execute(
+                "INSERT INTO eval_dataset_versions "
+                "(id, tenant_id, dataset_id, version_number, created_by) "
+                "VALUES (%s, rag_effective_tenant(), %s, 1, %s) "
+                "RETURNING id, version_number, state, revision, case_count",
+                (version_id, dataset_id, actor))
+            version = dict(cur.fetchone())
+            cur.executemany(
+                "INSERT INTO eval_dataset_events "
+                "(id, tenant_id, dataset_id, version_id, actor_id, event_type, "
+                "resulting_revision, case_count) VALUES "
+                "(%s, rag_effective_tenant(), %s, %s, %s, %s, 1, %s)",
+                [
+                    (uuid.uuid4(), dataset_id, None, actor,
+                     "dataset_created", None),
+                    (uuid.uuid4(), dataset_id, version_id, actor,
+                     "version_created", 0),
+                ])
+    except psycopg.errors.UniqueViolation as exc:
+        conn.rollback()
+        raise EvalDatasetConflict("eval dataset slug zaten var") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    dataset.update({
+        "owner_identity_id": actor,
+        "latest_version_id": version["id"],
+        "latest_version_number": version["version_number"],
+        "latest_version_state": version["state"],
+        "latest_version_revision": version["revision"],
+        "latest_case_count": version["case_count"],
+    })
+    return dataset
+
+
+def list_eval_datasets(conn, *, actor_id, limit):
+    """Return a bounded metadata-only list under fresh hierarchy RLS."""
+    actor = _eval_actor(actor_id)
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise EvalDatasetAccessRefused("eval dataset sayfa siniri gecersiz")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT dataset.id, dataset.slug, dataset.label, dataset.state, "
+            "dataset.revision, dataset.created_at, dataset.updated_at, "
+            "dataset.owner_identity_id, owner.display_label AS owner_label, "
+            "tenant.policy_epoch, latest.id AS latest_version_id, "
+            "latest.version_number AS latest_version_number, "
+            "latest.state AS latest_version_state, "
+            "latest.revision AS latest_version_revision, "
+            "latest.case_count AS latest_case_count, "
+            "published.id AS current_version_id, "
+            "published.version_number AS current_version_number "
+            "FROM eval_datasets dataset "
+            "JOIN org_tenants tenant ON tenant.id = dataset.tenant_id "
+            "JOIN org_memberships owner ON owner.tenant_id = dataset.tenant_id "
+            "AND owner.identity_id = dataset.owner_identity_id "
+            "AND owner.state = 'active' "
+            "LEFT JOIN LATERAL (SELECT version.id, version.version_number, "
+            "version.state, version.revision, version.case_count "
+            "FROM eval_dataset_versions version "
+            "WHERE version.tenant_id = dataset.tenant_id "
+            "AND version.dataset_id = dataset.id "
+            "ORDER BY version.version_number DESC LIMIT 1) latest ON true "
+            "LEFT JOIN eval_dataset_versions published "
+            "ON published.tenant_id = dataset.tenant_id "
+            "AND published.id = dataset.current_version_id "
+            "WHERE rag_effective_actor() = %s "
+            "ORDER BY dataset.created_at DESC, dataset.id DESC LIMIT %s",
+            (actor, limit))
+        return [dict(row) for row in cur.fetchall()]
+
+
+def list_eval_versions(conn, *, actor_id, dataset_id):
+    """List version metadata without returning case content."""
+    actor, dataset = _eval_actor(actor_id), _eval_uuid(dataset_id)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT version.id, version.version_number, version.state, "
+            "version.schema_version, version.revision, version.case_count, "
+            "encode(version.content_sha256, 'hex') AS content_sha256, "
+            "version.created_at, version.sealed_at "
+            "FROM eval_dataset_versions version "
+            "JOIN eval_datasets dataset ON dataset.tenant_id = version.tenant_id "
+            "AND dataset.id = version.dataset_id "
+            "WHERE version.dataset_id = %s AND rag_effective_actor() = %s "
+            "ORDER BY version.version_number DESC LIMIT 100", (dataset, actor))
+        return [dict(row) for row in cur.fetchall()]
+
+
+def create_eval_draft(conn, *, actor_id, dataset_id, expected_revision):
+    """Open exactly one next draft from the current published version."""
+    actor, dataset_id = _eval_actor(actor_id), _eval_uuid(dataset_id)
+    if type(expected_revision) is not int or expected_revision < 1:
+        raise EvalDatasetConflict("eval dataset revision gecersiz")
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            _lock_eval_policy(cur)
+            cur.execute(
+                "SELECT id, state, revision, current_version_id "
+                "FROM eval_datasets WHERE id = %s "
+                "AND rag_effective_actor() = %s "
+                "AND rag_eval_owner_can_write(owner_identity_id) FOR UPDATE",
+                (dataset_id, actor))
+            dataset = cur.fetchone()
+            if dataset is None:
+                raise EvalDatasetAccessRefused("eval dataset bulunamadi")
+            if dataset["state"] != "active":
+                raise EvalDatasetStateRefused("eval dataset aktif degil")
+            if dataset["revision"] != expected_revision:
+                raise EvalDatasetConflict("eval dataset degisti")
+            cur.execute(
+                "SELECT id FROM eval_dataset_versions "
+                "WHERE dataset_id = %s AND state = 'draft'", (dataset_id,))
+            if cur.fetchone() is not None:
+                raise EvalDatasetStateRefused("eval draft zaten var")
+            cur.execute(
+                "SELECT COALESCE(max(version_number), 0) + 1 "
+                "AS next_version_number "
+                "FROM eval_dataset_versions WHERE dataset_id = %s",
+                (dataset_id,))
+            version_number = cur.fetchone()["next_version_number"]
+            version_id = uuid.uuid4()
+            cur.execute(
+                "INSERT INTO eval_dataset_versions "
+                "(id, tenant_id, dataset_id, version_number, parent_version_id, "
+                "created_by) VALUES "
+                "(%s, rag_effective_tenant(), %s, %s, %s, %s) "
+                "RETURNING id, version_number, state, revision, case_count",
+                (version_id, dataset_id, version_number,
+                 dataset["current_version_id"], actor))
+            version = dict(cur.fetchone())
+            cur.execute(
+                "UPDATE eval_datasets SET revision = revision + 1, "
+                "updated_at = now() WHERE id = %s RETURNING revision",
+                (dataset_id,))
+            resulting_revision = cur.fetchone()["revision"]
+            cur.execute(
+                "INSERT INTO eval_dataset_events "
+                "(id, tenant_id, dataset_id, version_id, actor_id, event_type, "
+                "base_revision, resulting_revision, case_count) VALUES "
+                "(%s, rag_effective_tenant(), %s, %s, %s, "
+                "'version_created', %s, %s, 0)",
+                (uuid.uuid4(), dataset_id, version_id, actor,
+                 expected_revision, resulting_revision))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    version["dataset_revision"] = resulting_revision
+    return version
+
+
+def replace_eval_cases(conn, *, actor_id, dataset_id, version_id,
+                       expected_revision, cases):
+    """Replace one draft's complete case set under a version revision fence."""
+    from pipeline.evaluation import datasets as eval_contract
+
+    actor = _eval_actor(actor_id)
+    dataset_id, version_id = _eval_uuid(dataset_id), _eval_uuid(version_id)
+    normalized = eval_contract.normalize_cases(cases)
+    if type(expected_revision) is not int or expected_revision < 1:
+        raise EvalDatasetConflict("eval version revision gecersiz")
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            _lock_eval_policy(cur)
+            cur.execute(
+                "SELECT id FROM eval_datasets WHERE id = %s "
+                "AND rag_effective_actor() = %s "
+                "AND rag_eval_owner_can_write(owner_identity_id) FOR UPDATE",
+                (dataset_id, actor))
+            if cur.fetchone() is None:
+                raise EvalDatasetAccessRefused("eval draft bulunamadi")
+            cur.execute(
+                "SELECT version.state, version.revision "
+                "FROM eval_dataset_versions version "
+                "WHERE version.id = %s AND version.dataset_id = %s "
+                "FOR UPDATE OF version",
+                (version_id, dataset_id))
+            version = cur.fetchone()
+            if version is None:
+                raise EvalDatasetAccessRefused("eval draft bulunamadi")
+            if version["state"] != "draft":
+                raise EvalDatasetStateRefused("eval version yayinlanmis")
+            if version["revision"] != expected_revision:
+                raise EvalDatasetConflict("eval version degisti")
+            cur.execute("DELETE FROM eval_cases WHERE version_id = %s",
+                        (version_id,))
+            rows = []
+            for ordinal, case in enumerate(normalized, 1):
+                rows.append((
+                    version_id, _eval_uuid(case["case_key"]), ordinal,
+                    case["q"], case["key"], case["answer"],
+                    list(case["pages"]), case["type"],
+                    bytes.fromhex(eval_contract.case_digest(case)),
+                ))
+            cur.executemany(
+                "INSERT INTO eval_cases "
+                "(tenant_id, version_id, case_key, ordinal, question, "
+                "document_key, expected_answer, pages, question_type, "
+                "content_sha256) VALUES "
+                "(rag_effective_tenant(), %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                rows)
+            digest = eval_contract.version_digest(normalized)
+            cur.execute(
+                "UPDATE eval_dataset_versions SET case_count = %s, "
+                "revision = revision + 1 WHERE id = %s "
+                "RETURNING version_number, state, revision, case_count",
+                (len(rows), version_id))
+            updated = dict(cur.fetchone())
+            cur.execute(
+                "INSERT INTO eval_dataset_events "
+                "(id, tenant_id, dataset_id, version_id, actor_id, event_type, "
+                "base_revision, resulting_revision, case_count, content_sha256) "
+                "VALUES (%s, rag_effective_tenant(), %s, %s, %s, "
+                "'version_cases_replaced', %s, %s, %s, %s)",
+                (uuid.uuid4(), dataset_id, version_id, actor,
+                 expected_revision, updated["revision"], len(rows),
+                 bytes.fromhex(digest)))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return {**updated, "content_sha256": digest}
+
+
+def publish_eval_version(conn, *, actor_id, dataset_id, version_id,
+                         expected_revision, expected_policy_epoch,
+                         expected_draft_sha256):
+    """Seal a draft using DB-read cases inside the publishing transaction."""
+    from pipeline.evaluation import datasets as eval_contract
+
+    actor = _eval_actor(actor_id)
+    dataset_id, version_id = _eval_uuid(dataset_id), _eval_uuid(version_id)
+    if (type(expected_revision) is not int or expected_revision < 1
+            or type(expected_policy_epoch) is not int
+            or expected_policy_epoch < 1
+            or type(expected_draft_sha256) is not str
+            or len(expected_draft_sha256) != 64
+            or any(char not in "0123456789abcdef"
+                   for char in expected_draft_sha256)):
+        raise EvalDatasetConflict("eval yayin kapisi gecersiz")
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            policy_epoch = _lock_eval_policy(cur, expected_policy_epoch)
+            cur.execute(
+                "SELECT revision, state FROM eval_datasets WHERE id = %s "
+                "AND rag_effective_actor() = %s "
+                "AND rag_eval_owner_can_write(owner_identity_id) FOR UPDATE",
+                (dataset_id, actor))
+            dataset = cur.fetchone()
+            if dataset is None:
+                raise EvalDatasetAccessRefused("eval version bulunamadi")
+            cur.execute(
+                "SELECT state, revision, version_number "
+                "FROM eval_dataset_versions WHERE id = %s "
+                "AND dataset_id = %s FOR UPDATE", (version_id, dataset_id))
+            version = cur.fetchone()
+            if version is None:
+                raise EvalDatasetAccessRefused("eval version bulunamadi")
+            if dataset["state"] != "active" or version["state"] != "draft":
+                raise EvalDatasetStateRefused("eval version yayinlanamaz")
+            if version["revision"] != expected_revision:
+                raise EvalDatasetConflict("eval version veya politika degisti")
+            cur.execute(
+                "SELECT case_key::text AS case_key, question AS q, "
+                "document_key AS key, "
+                "expected_answer AS answer, pages, question_type AS type "
+                "FROM eval_cases WHERE version_id = %s ORDER BY ordinal",
+                (version_id,))
+            cases = tuple(dict(row) for row in cur.fetchall())
+            normalized = eval_contract.normalize_cases(cases)
+            digest = bytes.fromhex(eval_contract.version_digest(normalized))
+            if digest.hex() != expected_draft_sha256:
+                raise EvalDatasetConflict("eval taslak ozeti degisti")
+            cur.execute(
+                "UPDATE eval_dataset_versions SET state = 'published', "
+                "published_by = %s, sealed_at = now(), case_count = %s, "
+                "content_sha256 = %s, revision = revision + 1 "
+                "WHERE id = %s AND revision = %s "
+                "RETURNING revision, case_count, sealed_at",
+                (actor, len(normalized), digest, version_id,
+                 expected_revision))
+            updated = cur.fetchone()
+            if updated is None:
+                raise EvalDatasetConflict("eval version degisti")
+            cur.execute(
+                "UPDATE eval_datasets SET current_version_id = %s, "
+                "revision = revision + 1, updated_at = now() "
+                "WHERE id = %s RETURNING revision", (version_id, dataset_id))
+            dataset_revision = cur.fetchone()["revision"]
+            cur.execute(
+                "INSERT INTO eval_dataset_events "
+                "(id, tenant_id, dataset_id, version_id, actor_id, event_type, "
+                "base_revision, resulting_revision, case_count, content_sha256) "
+                "VALUES (%s, rag_effective_tenant(), %s, %s, %s, "
+                "'version_published', %s, %s, %s, %s)",
+                (uuid.uuid4(), dataset_id, version_id, actor,
+                 dataset["revision"], dataset_revision,
+                 len(normalized), digest))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return {
+        "state": "published", "revision": updated["revision"],
+        "case_count": updated["case_count"],
+        "content_sha256": digest.hex(), "sealed_at": updated["sealed_at"],
+        "version_number": version["version_number"],
+        "dataset_revision": dataset_revision,
+        "policy_epoch": policy_epoch,
+    }
+
+
+def read_eval_cases(conn, *, actor_id, dataset_id, version_id):
+    """Return explicit authorized case content for one visible version."""
+    actor = _eval_actor(actor_id)
+    dataset_id, version_id = _eval_uuid(dataset_id), _eval_uuid(version_id)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT case_row.case_key, case_row.question AS q, "
+            "case_row.document_key AS key, "
+            "case_row.expected_answer AS answer, case_row.pages, "
+            "case_row.question_type AS type "
+            "FROM eval_cases case_row "
+            "JOIN eval_dataset_versions version "
+            "ON version.tenant_id = case_row.tenant_id "
+            "AND version.id = case_row.version_id "
+            "WHERE version.dataset_id = %s AND version.id = %s "
+            "AND rag_effective_actor() = %s ORDER BY case_row.ordinal",
+            (dataset_id, version_id, actor))
+        return [dict(row) for row in cur.fetchall()]
+
+
+def retire_eval_dataset(conn, *, actor_id, dataset_id, expected_revision,
+                        expected_policy_epoch):
+    """Retire one owner dataset without deleting its published evidence."""
+    actor, dataset_id = _eval_actor(actor_id), _eval_uuid(dataset_id)
+    if (type(expected_revision) is not int or expected_revision < 1
+            or type(expected_policy_epoch) is not int
+            or expected_policy_epoch < 1):
+        raise EvalDatasetConflict("eval emeklilik kapisi gecersiz")
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            _lock_eval_policy(cur, expected_policy_epoch)
+            cur.execute(
+                "SELECT state, revision FROM eval_datasets WHERE id = %s "
+                "AND rag_effective_actor() = %s "
+                "AND rag_eval_owner_can_write(owner_identity_id) FOR UPDATE",
+                (dataset_id, actor))
+            row = cur.fetchone()
+            if row is None:
+                raise EvalDatasetAccessRefused("eval dataset bulunamadi")
+            if row["state"] != "active":
+                raise EvalDatasetStateRefused("eval dataset aktif degil")
+            if row["revision"] != expected_revision:
+                raise EvalDatasetConflict("eval dataset veya politika degisti")
+            cur.execute(
+                "SELECT 1 FROM eval_dataset_versions WHERE dataset_id = %s "
+                "AND state = 'draft'", (dataset_id,))
+            if cur.fetchone() is not None:
+                raise EvalDatasetStateRefused("eval taslak acikken emekli edilemez")
+            cur.execute(
+                "UPDATE eval_datasets SET state = 'retired', "
+                "revision = revision + 1, updated_at = now() "
+                "WHERE id = %s RETURNING id, slug, label, state, revision, "
+                "updated_at", (dataset_id,))
+            updated = dict(cur.fetchone())
+            cur.execute(
+                "INSERT INTO eval_dataset_events "
+                "(id, tenant_id, dataset_id, actor_id, event_type, "
+                "base_revision, resulting_revision) VALUES "
+                "(%s, rag_effective_tenant(), %s, %s, 'dataset_retired', %s, %s)",
+                (uuid.uuid4(), dataset_id, actor, expected_revision,
+                 updated["revision"]))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return {"state": "retired", **updated}
 
 
 def org_topology(conn):
