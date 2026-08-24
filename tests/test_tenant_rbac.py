@@ -122,7 +122,8 @@ def test_request_connection_binds_and_clears_exact_tenant(monkeypatch):
     monkeypatch.setattr(api.db, "init_schema", lambda _conn: None)
     monkeypatch.setattr(api, "_schema_ready", True)
     monkeypatch.setattr(api.db, "set_tenant_context",
-                        lambda _conn, tenant: seen.append(tenant))
+                        lambda _conn, tenant, *, actor_id=None: seen.append(
+                            (tenant, actor_id)))
     monkeypatch.setattr(api.db, "clear_tenant_context",
                         lambda _conn: seen.append("clear"))
     monkeypatch.setattr(api.db, "get_document", lambda *_args: None)
@@ -130,7 +131,7 @@ def test_request_connection_binds_and_clears_exact_tenant(monkeypatch):
         "/documents/missing",
         headers={"Authorization": "Bearer reader-token"})
     assert response.status_code == 404
-    assert seen == [TENANT_A, "rollback", "clear"]
+    assert seen == [(TENANT_A, None), "rollback", "clear"]
 
 
 def test_non_default_tenant_storage_is_namespaced(tmp_path):

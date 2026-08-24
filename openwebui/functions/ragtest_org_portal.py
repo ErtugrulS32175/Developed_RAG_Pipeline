@@ -96,6 +96,8 @@ textarea{width:100%;min-height:420px;font:13px ui-monospace;box-sizing:border-bo
 <h1>Organizasyon Mimarisi</h1><p class="muted">Yetkiler OpenWebUI profilinden değil, RAGTest organizasyon sözleşmesinden gelir.</p>
 <section><h2>Hesabım</h2><div id="me">Yükleniyor…</div><div id="subject" class="muted"></div></section>
 <section><h2>Görebildiğim kullanıcılar</h2><button id="visible">Yönetim göreviyle getir</button><ul id="people"></ul></section>
+<section><h2>İnceleme kuyruğum</h2><p class="muted">Yalnız güncel hiyerarşide izleyebildiğiniz hesapların içeriksiz vakaları gösterilir.</p>
+<button id="reviews">Kuyruğu yenile</button> <span id="review-result"></span><ul id="cases"></ul></section>
 <section id="admin" hidden><h2>Mimari düzenleyici</h2><p>Değişiklik bütün topolojiyi atomik olarak değiştirir; eski sürümle kayıt 409 döner.</p>
 <textarea id="topology"></textarea><p><button id="save">Kaydet</button> <span id="result"></span></p></section>
 <script>
@@ -103,6 +105,8 @@ const j=async(url,opt={})=>{const r=await fetch(url,{...opt,headers:{'Content-Ty
 const text=(id,v)=>document.getElementById(id).textContent=v;
 async function load(){try{const own=await j('/ragtest-org/api/identity');text('subject',`OpenWebUI kimliği: ${own.openwebui_subject}`)}catch(e){text('subject',e.message)}try{const me=await j('/ragtest-org/api/me');const m=me.membership;text('me',m?`${m.display_label} — Seviye ${m.level}, ${m.title} (${m.kind})`:'İş hesabı yok; yalnız mimari yönetim yetkisi var.');if(me.architecture_admin){document.getElementById('admin').hidden=false;document.getElementById('topology').value=JSON.stringify(await j('/ragtest-org/api/topology'),null,2)}}catch(e){text('me',e.message)}}
 document.getElementById('visible').onclick=async()=>{const ul=document.getElementById('people');ul.replaceChildren();try{const b=await j('/ragtest-org/api/visible?reason_code=management_duty');for(const p of b.members){const li=document.createElement('li');li.textContent=`${p.display_label} — Seviye ${p.level}, ${p.title}`;ul.append(li)}}catch(e){const li=document.createElement('li');li.textContent=e.message;ul.append(li)}};
+async function reviews(){const ul=document.getElementById('cases');ul.replaceChildren();try{const b=await j('/ragtest-org/api/reviews?reason_code=management_duty');for(const c of b.cases){const li=document.createElement('li');const label=document.createElement('span');label.textContent=`${c.subject_label} — ${c.position_title}, ${c.trigger_code}`;li.append(label);for(const [caption,decision,resolution] of [['Düzeltildi','resolved','corrected'],['Sorun yok','dismissed','no_issue']]){const button=document.createElement('button');button.textContent=caption;button.onclick=async()=>{try{await j(`/ragtest-org/api/reviews/${c.case_id}/decision`,{method:'POST',body:JSON.stringify({expected_revision:c.revision,expected_policy_epoch:c.policy_epoch,decision:decision,resolution_code:resolution,reason_code:'management_duty'})});await reviews()}catch(e){text('review-result',e.message)}};li.append(' ',button)}ul.append(li)}}catch(e){const li=document.createElement('li');li.textContent=e.message;ul.append(li)}}
+document.getElementById('reviews').onclick=reviews;
 document.getElementById('save').onclick=async()=>{try{const b=JSON.parse(document.getElementById('topology').value);const payload={expected_version:b.architecture_version,name:b.name,positions:b.positions,members:b.members};const v=await j('/ragtest-org/api/topology',{method:'PUT',body:JSON.stringify(payload)});text('result',`Kaydedildi: sürüm ${v.architecture_version}`);await load()}catch(e){text('result',e.message)}};load();
 </script></html>"""
 
@@ -155,6 +159,39 @@ class Event:
                 user, "PUT", "/v1/org/admin/topology", payload)
             return JSONResponse(body, status_code=status)
 
+        async def reviews(
+                reason_code: str = Query(...),
+                user=Depends(get_verified_user)):
+            if reason_code not in {"management_duty", "security_review"}:
+                return JSONResponse({"detail": "gecersiz neden"}, status_code=422)
+            status, body = await _proxy(
+                user, "GET", "/v1/reviews/queue?limit=100&reason_code=" +
+                reason_code)
+            return JSONResponse(body, status_code=status)
+
+        async def review_decision(
+                case_id: str, payload: dict = Body(...),
+                user=Depends(get_verified_user)):
+            allowed = {
+                "expected_revision", "expected_policy_epoch", "decision",
+                "resolution_code", "reason_code",
+            }
+            if (set(payload) != allowed
+                    or type(payload["expected_revision"]) is not int
+                    or payload["expected_revision"] < 1
+                    or type(payload["expected_policy_epoch"]) is not int
+                    or payload["expected_policy_epoch"] < 1
+                    or payload["decision"] not in {"resolved", "dismissed"}
+                    or payload["resolution_code"] not in {
+                        "corrected", "no_issue", "escalated"}
+                    or payload["reason_code"] not in {
+                        "management_duty", "security_review"}):
+                return JSONResponse(
+                    {"detail": "gecersiz inceleme karari"}, status_code=422)
+            status, body = await _proxy(
+                user, "POST", "/v1/reviews/" + case_id + "/decision", payload)
+            return JSONResponse(body, status_code=status)
+
         app.add_api_route(PORTAL_PATH, page, methods=["GET"],
                           include_in_schema=False)
         app.add_api_route(PORTAL_PATH + "/api/me", me, methods=["GET"],
@@ -167,3 +204,8 @@ class Event:
                           methods=["GET"], include_in_schema=False)
         app.add_api_route(PORTAL_PATH + "/api/topology", topology_put,
                           methods=["PUT"], include_in_schema=False)
+        app.add_api_route(PORTAL_PATH + "/api/reviews", reviews,
+                          methods=["GET"], include_in_schema=False)
+        app.add_api_route(PORTAL_PATH + "/api/reviews/{case_id}/decision",
+                          review_decision, methods=["POST"],
+                          include_in_schema=False)

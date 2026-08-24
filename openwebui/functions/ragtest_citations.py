@@ -13,18 +13,21 @@ from pydantic import BaseModel
 
 _REF = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _SOURCES = frozenset({"model", "derived"})
-_KEYS = frozenset({"evidence_ref", "document_name", "page", "source"})
+_BASE_KEYS = frozenset({"evidence_ref", "document_name", "page", "source"})
+_FEEDBACK_KEYS = _BASE_KEYS | {"feedback_ref"}
 _DOCUMENT_HINT = "Kanıt içeriğini görmek için Kanıtı göster eylemini kullanın."
 
 
 def _closed_citation(value):
     """Return a UI-safe citation or ``None`` for any open/malformed shape."""
-    if not isinstance(value, dict) or frozenset(value) != _KEYS:
+    if (not isinstance(value, dict)
+            or frozenset(value) not in {_BASE_KEYS, _FEEDBACK_KEYS}):
         return None
     evidence_ref = value.get("evidence_ref")
     document_name = value.get("document_name")
     page = value.get("page")
     source = value.get("source")
+    feedback_ref = value.get("feedback_ref")
     if (not isinstance(evidence_ref, str)
             or _REF.fullmatch(evidence_ref) is None):
         return None
@@ -37,25 +40,32 @@ def _closed_citation(value):
         return None
     if source not in _SOURCES:
         return None
-    return evidence_ref, document_name, page
+    if ("feedback_ref" in value
+            and (not isinstance(feedback_ref, str)
+                 or _REF.fullmatch(feedback_ref) is None)):
+        return None
+    return evidence_ref, document_name, page, feedback_ref
 
 
-def source_event(value):
+def source_event(value, *, include_feedback=True):
     """Build Open WebUI's documented source-event shape without passage data."""
     citation = _closed_citation(value)
     if citation is None:
         return None
-    evidence_ref, document_name, page = citation
+    evidence_ref, document_name, page, feedback_ref = citation
+    metadata = {
+        "source": document_name,
+        "name": document_name,
+        "page": page,
+    }
+    if include_feedback and feedback_ref is not None:
+        metadata["ragtest_feedback_ref"] = feedback_ref
     return {
         "type": "source",
         "data": {
             "source": {"name": document_name, "id": evidence_ref},
             "document": [_DOCUMENT_HINT],
-            "metadata": [{
-                "source": document_name,
-                "name": document_name,
-                "page": page,
-            }],
+            "metadata": [metadata],
         },
     }
 
@@ -87,8 +97,16 @@ class Filter:
         if (event.get("rag_status") == "answered"
                 and isinstance(citations, list)
                 and __event_emitter__ is not None):
+            feedback_refs = {
+                value.get("feedback_ref")
+                for value in citations
+                if isinstance(value, dict)
+                and _REF.fullmatch(str(value.get("feedback_ref") or ""))
+            }
+            include_feedback = len(feedback_refs) <= 1
             for value in citations:
-                source = source_event(value)
+                source = source_event(
+                    value, include_feedback=include_feedback)
                 if source is None:
                     continue
                 evidence_ref = source["data"]["source"]["id"]

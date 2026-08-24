@@ -11,8 +11,8 @@ from scripts import db_snapshot, migrate_db, rollout_gate
 
 
 class _Cursor:
-    def __init__(self, row=None):
-        self.row = row
+    def __init__(self, rows=None):
+        self.rows = list(rows) if isinstance(rows, list) else [rows]
         self.calls = []
 
     def __enter__(self):
@@ -25,12 +25,12 @@ class _Cursor:
         self.calls.append((statement, params))
 
     def fetchone(self):
-        return self.row
+        return self.rows.pop(0) if self.rows else None
 
 
 class _Connection:
-    def __init__(self, row=None):
-        self.cursor_value = _Cursor(row)
+    def __init__(self, rows=None):
+        self.cursor_value = _Cursor(rows)
         self.commits = 0
         self.rollbacks = 0
 
@@ -52,23 +52,25 @@ def test_schema_migration_serializes_ddl_and_records_the_exact_source_digest():
     calls = conn.cursor_value.calls
     assert "pg_advisory_xact_lock" in calls[0][0]
     assert calls[0][1] == ("ragtest-schema-migration",)
-    assert "CREATE EXTENSION" in calls[1][0]
-    assert "CREATE TABLE IF NOT EXISTS rag_schema_state" in calls[2][0]
-    assert "CREATE TABLE IF NOT EXISTS rag_schema_history" in calls[3][0]
-    assert "SELECT schema_sha256 FROM rag_schema_history" in calls[4][0]
-    assert "INSERT INTO rag_schema_history" in calls[5][0]
-    assert "INSERT INTO rag_schema_state" in calls[6][0]
+    assert "CREATE TABLE IF NOT EXISTS rag_schema_state" in calls[1][0]
+    assert "CREATE TABLE IF NOT EXISTS rag_schema_history" in calls[2][0]
+    assert "CREATE TRIGGER rag_schema_state_monotonic" in calls[3][0]
+    assert "SELECT schema_version, schema_sha256" in calls[4][0]
+    assert "SELECT schema_sha256 FROM rag_schema_history" in calls[5][0]
+    assert "CREATE EXTENSION" in calls[6][0]
+    assert "INSERT INTO rag_schema_history" in calls[7][0]
+    assert "INSERT INTO rag_schema_state" in calls[8][0]
     version, digest = db.expected_schema_state()
-    assert calls[4][1] == (version,)
-    assert calls[5][1] == (version, digest)
-    assert calls[6][1] == (version, digest)
+    assert calls[5][1] == (version,)
+    assert calls[7][1] == (version, digest)
+    assert calls[8][1] == (version, digest)
     assert digest == hashlib.sha256(
         db.Path(db.__file__).with_name("schema.sql").read_bytes()).hexdigest()
     assert conn.commits == 1
 
 
 def test_schema_version_cannot_be_reused_for_different_bytes():
-    conn = _Connection(("f" * 64,))
+    conn = _Connection([None, ("f" * 64,)])
     with pytest.raises(RuntimeError, match="digest"):
         db.init_schema(conn)
     assert conn.commits == 0
@@ -224,7 +226,7 @@ def test_migration_cli_never_reflects_connection_exception_prose(
     assert migrate_db.main() == 1
     output = capsys.readouterr().out
     assert json.loads(output) == {
-        "migration_version": 4, "status": "failed"}
+        "migration_version": 5, "status": "failed"}
     assert "OZEL" not in output
 
 

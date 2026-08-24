@@ -66,7 +66,7 @@ def _document(**overrides):
 def test_schema_v3_integrates_immutable_versions_builds_and_all_bindings():
     schema = db.Path(db.__file__).with_name("schema.sql").read_text("utf-8")
 
-    assert db.SCHEMA_VERSION == 4
+    assert db.SCHEMA_VERSION == 5
     assert "CREATE TABLE IF NOT EXISTS document_versions" in schema
     assert "CREATE TABLE IF NOT EXISTS document_version_builds" in schema
     assert "CREATE TABLE IF NOT EXISTS document_version_events" in schema

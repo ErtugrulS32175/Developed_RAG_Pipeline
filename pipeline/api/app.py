@@ -137,6 +137,8 @@ _EVIDENCE_KEY_MATERIAL = (
 ).encode("utf-8")
 _EVIDENCE_HMAC_KEY = hashlib.sha256(
     b"ragtest-evidence-reference-v1\x00" + _EVIDENCE_KEY_MATERIAL).digest()
+_REVIEW_HMAC_KEY = hashlib.sha256(
+    b"ragtest-review-reference-v1\x00" + _EVIDENCE_KEY_MATERIAL).digest()
 EVIDENCE_TICKET_SECONDS = 50
 EVIDENCE_PASSAGE_MAX_CHARS = 4000
 if _GATEWAY_DIGEST is not None:
@@ -311,7 +313,9 @@ def db_conn():
         if not _schema_ready:
             db.init_schema(conn)
             _schema_ready = True
-        db.set_tenant_context(conn, auth.current_principal().tenant_id)
+        principal = auth.current_principal()
+        db.set_tenant_context(
+            conn, principal.tenant_id, actor_id=principal.subject_id)
         try:
             yield conn
         finally:
@@ -463,6 +467,23 @@ class EvidenceTicketRequest(BaseModel):
 class EvidencePreviewRequest(BaseModel):
     ticket: str = Field(min_length=43, max_length=43,
                         pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ReviewFeedbackRequest(BaseModel):
+    feedback_ref: str = Field(min_length=43, max_length=43,
+                              pattern=r"^[A-Za-z0-9_-]+$")
+    verdict: Literal["helpful", "not_helpful"]
+    reason_code: Literal[
+        "incorrect", "missing_evidence", "outdated", "unsafe", "other",
+    ] | None = None
+
+
+class ReviewDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    expected_policy_epoch: int = Field(ge=1)
+    decision: Literal["resolved", "dismissed"]
+    resolution_code: Literal["corrected", "no_issue", "escalated"]
+    reason_code: Literal["management_duty", "security_review"]
 
 
 class OrgPositionRequest(BaseModel):
@@ -671,7 +692,8 @@ def chat_completions(req: ChatRequest):
             log.error("RAG backend omitted requested retrieval trace")
             raise HTTPException(status_code=500,
                                 detail="gecersiz RAG izleme sozlesmesi")
-        return published
+        feedback_ref = _persist_review_interaction(result)
+        return (*published, feedback_ref)
 
     if req.stream:
         if is_table:
@@ -679,13 +701,14 @@ def chat_completions(req: ChatRequest):
                 req.messages, req.model,
                 namespace=auth.current_principal().tenant_id.hex)
         else:
-            status, answer, citations, trace = ask_checked()
+            status, answer, citations, trace, feedback_ref = ask_checked()
             gen = owui_chat.stream_text(
                 answer,
                 req.model,
                 rag_status=status,
                 rag_citations=_citation_payload(
-                    citations, persist=_browser_evidence_enabled()),
+                    citations, persist=_browser_evidence_enabled(),
+                    feedback_ref=feedback_ref),
                 rag_trace=(_trace_payload(trace)
                            if req.include_trace else None),
             )
@@ -701,7 +724,7 @@ def chat_completions(req: ChatRequest):
             raise HTTPException(
                 status_code=500, detail="tablo cikarimi basarisiz") from None
     else:
-        status, answer, citations, trace = ask_checked()
+        status, answer, citations, trace, feedback_ref = ask_checked()
 
     response = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:10]}",
@@ -715,7 +738,8 @@ def chat_completions(req: ChatRequest):
     if not is_table:
         response["rag_status"] = status
         response["rag_citations"] = _citation_payload(
-            citations, persist=_browser_evidence_enabled())
+            citations, persist=_browser_evidence_enabled(),
+            feedback_ref=feedback_ref)
         if req.include_trace:
             response["rag_trace"] = _trace_payload(trace)
     return response
@@ -728,7 +752,7 @@ def _browser_evidence_enabled():
             and auth.permits(principal, "reader"))
 
 
-def _citation_payload(citations, *, persist=False):
+def _citation_payload(citations, *, persist=False, feedback_ref=None):
     payload = []
     references = {}
     for citation in citations:
@@ -744,6 +768,8 @@ def _citation_payload(citations, *, persist=False):
                 "evidence_ref": _b64url(digest),
                 "document_name": citation.document_name,
             })
+            if feedback_ref is not None:
+                item["feedback_ref"] = feedback_ref
             references[digest] = citation.chunk_id
         payload.append(item)
     if persist and references:
@@ -755,6 +781,36 @@ def _citation_payload(citations, *, persist=False):
             raise HTTPException(status_code=500,
                                 detail="kanit referansi kaydedilemedi") from None
     return payload
+
+
+def _persist_review_interaction(result):
+    """Record only content-free metadata for verified browser publications."""
+    if not _browser_evidence_enabled():
+        return None
+    if result.status == ANSWERED:
+        if not any(citation.chunk_id is not None
+                   and citation.document_name is not None
+                   for citation in result.citations):
+            return None
+        interaction_id = uuid.uuid4()
+        digest = hmac.new(
+            _REVIEW_HMAC_KEY, b"interaction\x00" + interaction_id.bytes,
+            hashlib.sha256).digest()
+        with db_conn() as conn:
+            db.create_review_interaction(
+                conn, interaction_id=interaction_id,
+                actor_id=auth.current_principal().subject_id,
+                ref_digest=digest, outcome=ANSWERED,
+                citation_count=len(result.citations))
+        return _b64url(digest)
+    if result.status == REVIEW_REQUIRED:
+        with db_conn() as conn:
+            db.create_review_interaction(
+                conn, interaction_id=uuid.uuid4(),
+                actor_id=auth.current_principal().subject_id,
+                ref_digest=None, outcome=REVIEW_REQUIRED,
+                citation_count=len(result.citations))
+    return None
 
 
 def _b64url(raw):
@@ -840,6 +896,101 @@ def preview_evidence(
         "content_type": "passage",
         "passage": preview["passage"],
     }
+
+
+@app.post("/v1/reviews/feedback")
+def submit_review_feedback(
+        body: ReviewFeedbackRequest,
+        principal=Depends(require_evidence_actor)):
+    """Record one closed verdict; the opaque reference grants no authority."""
+    if ((body.verdict == "helpful" and body.reason_code is not None)
+            or (body.verdict == "not_helpful" and body.reason_code is None)):
+        raise HTTPException(status_code=422,
+                            detail="geri bildirim nedeni kararla uyusmuyor")
+    digest = _evidence_digest(body.feedback_ref)
+    if digest is None:
+        raise HTTPException(status_code=404,
+                            detail="geri bildirim hedefi bulunamadi")
+    try:
+        with db_conn() as conn:
+            result = db.submit_review_feedback(
+                conn, actor_id=principal.subject_id, ref_digest=digest,
+                verdict=body.verdict, reason_code=body.reason_code)
+    except db.ReviewAccessRefused:
+        raise HTTPException(status_code=404,
+                            detail="geri bildirim hedefi bulunamadi") from None
+    return {"status": "recorded", **result}
+
+
+@app.get("/v1/reviews/queue")
+def review_queue(
+        request: Request,
+        limit: int = Query(20, ge=1, le=100),
+        before_created_at: AwareDatetime | None = Query(default=None),
+        before_id: UUID | None = Query(default=None),
+        reason_code: Literal["management_duty", "security_review"] = Query(),
+        principal=Depends(require_org_identity)):
+    """List only fresh, strict-descendant cases; never return model content."""
+    if (before_created_at is None) != (before_id is None):
+        raise HTTPException(status_code=422,
+                            detail="inceleme imleci eksik")
+    before = (before_created_at, before_id) if before_id is not None else None
+    try:
+        with db_conn() as conn:
+            rows = db.list_review_cases(
+                conn, reviewer_id=principal.subject_id,
+                limit=limit, before=before)
+            db.record_org_decision(
+                conn, actor_id=principal.subject_id, subject_id=None,
+                action="review_queue_view", reason_code=reason_code,
+                allowed=True, request_id=request.state.request_id)
+    except db.ReviewAccessRefused:
+        raise HTTPException(status_code=403,
+                            detail="inceleme kuyrugu yetkisi yok") from None
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    items = [{
+        "case_id": row["id"],
+        "trigger_code": row["trigger_code"],
+        "state": row["state"],
+        "revision": row["revision"],
+        "created_at": row["created_at"],
+        "outcome": row["outcome"],
+        "citation_count": row["citation_count"],
+        "subject_label": row["display_label"],
+        "position_title": row["position_title"],
+        "policy_epoch": row["policy_epoch"],
+    } for row in page]
+    next_cursor = None
+    if has_more and page:
+        next_cursor = {
+            "before_created_at": page[-1]["created_at"],
+            "before_id": page[-1]["id"],
+        }
+    return {"cases": items, "has_more": has_more,
+            "next_cursor": next_cursor}
+
+
+@app.post("/v1/reviews/{case_id}/decision")
+def decide_review_case(
+        case_id: UUID, body: ReviewDecisionRequest, request: Request,
+        principal=Depends(require_org_identity)):
+    try:
+        with db_conn() as conn:
+            result = db.decide_review_case(
+                conn, reviewer_id=principal.subject_id, case_id=case_id,
+                expected_revision=body.expected_revision,
+                expected_policy_epoch=body.expected_policy_epoch,
+                decision=body.decision,
+                resolution_code=body.resolution_code,
+                reason_code=body.reason_code,
+                request_id=request.state.request_id)
+    except db.ReviewConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except db.ReviewAccessRefused:
+        raise HTTPException(status_code=404,
+                            detail="inceleme vakasi bulunamadi") from None
+    return result
 
 
 def _trace_payload(trace):

@@ -237,6 +237,11 @@ LANGUAGE sql STABLE AS $service$
     SELECT COALESCE(current_setting('rag.service', true), '') = '1'
 $service$;
 
+CREATE OR REPLACE FUNCTION rag_effective_actor() RETURNS uuid
+LANGUAGE sql STABLE AS $actor$
+    SELECT NULLIF(current_setting('rag.actor_id', true), '')::uuid
+$actor$;
+
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
     DEFAULT rag_effective_tenant();
 ALTER TABLE collections ADD COLUMN IF NOT EXISTS tenant_id uuid NOT NULL
@@ -809,7 +814,8 @@ CREATE TABLE IF NOT EXISTS org_audit_events (
     subject_id   uuid REFERENCES org_identities(id),
     action       text NOT NULL CHECK (action IN (
                    'monitor_view', 'topology_read', 'topology_change',
-                   'access_preview')),
+                   'access_preview', 'review_queue_view',
+                   'review_decision')),
     reason_code  text NOT NULL CHECK (reason_code IN (
                    'management_duty', 'security_review', 'system_operation',
                    'policy_preview')),
@@ -817,6 +823,12 @@ CREATE TABLE IF NOT EXISTS org_audit_events (
     request_id   text NOT NULL CHECK (length(request_id) BETWEEN 8 AND 64),
     created_at   timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE org_audit_events
+    DROP CONSTRAINT IF EXISTS org_audit_events_action_check;
+ALTER TABLE org_audit_events
+    ADD CONSTRAINT org_audit_events_action_check CHECK (action IN (
+        'monitor_view', 'topology_read', 'topology_change', 'access_preview',
+        'review_queue_view', 'review_decision'));
 CREATE INDEX IF NOT EXISTS org_audit_events_tenant_time_idx
     ON org_audit_events(tenant_id, created_at DESC, id);
 
@@ -974,6 +986,183 @@ DROP POLICY IF EXISTS tenant_isolation ON evidence_preview_tickets;
 CREATE POLICY tenant_isolation ON evidence_preview_tickets
     USING (rag_service_access() OR tenant_id = rag_effective_tenant())
     WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+-- Human feedback is bound to a checked publication without retaining the
+-- question, answer, passage, path or OpenWebUI message id.  The opaque digest
+-- is a locator only; every write rechecks the current actor and membership.
+CREATE TABLE IF NOT EXISTS review_interactions (
+    id                       uuid PRIMARY KEY,
+    tenant_id                uuid NOT NULL REFERENCES org_tenants(id)
+                             ON DELETE CASCADE,
+    actor_id                 uuid NOT NULL REFERENCES org_identities(id)
+                             ON DELETE RESTRICT,
+    ref_digest               bytea UNIQUE,
+    outcome                  text NOT NULL CHECK (outcome IN (
+                               'answered', 'review_required')),
+    citation_count           integer NOT NULL CHECK (
+                               citation_count BETWEEN 0 AND 100),
+    policy_epoch_at_creation bigint NOT NULL CHECK (
+                               policy_epoch_at_creation > 0),
+    created_at               timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, id, actor_id),
+    CHECK (ref_digest IS NULL OR octet_length(ref_digest) = 32),
+    CHECK ((outcome = 'answered') = (ref_digest IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS review_feedback (
+    tenant_id      uuid NOT NULL,
+    interaction_id uuid NOT NULL,
+    actor_id       uuid NOT NULL,
+    verdict        text NOT NULL CHECK (verdict IN ('helpful', 'not_helpful')),
+    reason_code    text CHECK (reason_code IN (
+                     'incorrect', 'missing_evidence', 'outdated',
+                     'unsafe', 'other')),
+    revision       bigint NOT NULL DEFAULT 1 CHECK (revision > 0),
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, interaction_id, actor_id),
+    FOREIGN KEY (tenant_id, interaction_id, actor_id)
+        REFERENCES review_interactions(tenant_id, id, actor_id)
+        ON DELETE CASCADE,
+    CHECK ((verdict = 'helpful' AND reason_code IS NULL) OR
+           (verdict = 'not_helpful' AND reason_code IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS review_cases (
+    id                uuid PRIMARY KEY,
+    tenant_id         uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    interaction_id    uuid NOT NULL,
+    subject_actor_id  uuid NOT NULL REFERENCES org_identities(id)
+                      ON DELETE RESTRICT,
+    trigger_code      text NOT NULL CHECK (trigger_code IN (
+                        'guard_review', 'user_feedback')),
+    state             text NOT NULL DEFAULT 'open' CHECK (state IN (
+                        'open', 'resolved', 'dismissed')),
+    revision          bigint NOT NULL DEFAULT 1 CHECK (revision > 0),
+    reviewer_id       uuid REFERENCES org_identities(id) ON DELETE RESTRICT,
+    resolution_code   text CHECK (resolution_code IN (
+                        'corrected', 'no_issue', 'escalated')),
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    decided_at        timestamptz,
+    UNIQUE (tenant_id, interaction_id),
+    UNIQUE (tenant_id, id),
+    FOREIGN KEY (tenant_id, interaction_id, subject_actor_id)
+        REFERENCES review_interactions(tenant_id, id, actor_id)
+        ON DELETE CASCADE,
+    CHECK ((state = 'open' AND reviewer_id IS NULL AND
+            resolution_code IS NULL AND decided_at IS NULL) OR
+           (state <> 'open' AND reviewer_id IS NOT NULL AND
+            resolution_code IS NOT NULL AND decided_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS review_cases_tenant_open_order_idx
+    ON review_cases(tenant_id, created_at DESC, id DESC)
+    WHERE state = 'open';
+
+CREATE TABLE IF NOT EXISTS review_case_events (
+    id                 uuid PRIMARY KEY,
+    tenant_id          uuid NOT NULL,
+    case_id            uuid NOT NULL,
+    subject_actor_id   uuid NOT NULL REFERENCES org_identities(id)
+                       ON DELETE RESTRICT,
+    reviewer_id        uuid NOT NULL REFERENCES org_identities(id)
+                       ON DELETE RESTRICT,
+    base_revision      bigint NOT NULL CHECK (base_revision > 0),
+    resulting_revision bigint NOT NULL CHECK (
+                         resulting_revision = base_revision + 1),
+    decision           text NOT NULL CHECK (decision IN ('resolved', 'dismissed')),
+    resolution_code    text NOT NULL CHECK (resolution_code IN (
+                         'corrected', 'no_issue', 'escalated')),
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (tenant_id, case_id)
+        REFERENCES review_cases(tenant_id, id) ON DELETE RESTRICT
+);
+
+CREATE OR REPLACE FUNCTION rag_can_monitor_identity(target_identity uuid)
+RETURNS boolean LANGUAGE sql STABLE AS $review_scope$
+    SELECT EXISTS (
+        SELECT 1
+        FROM org_memberships viewer
+        JOIN org_positions viewer_position
+          ON viewer_position.tenant_id = viewer.tenant_id
+         AND viewer_position.id = viewer.position_id
+        JOIN org_memberships target
+          ON target.tenant_id = viewer.tenant_id
+         AND target.identity_id = target_identity
+         AND target.state = 'active'
+        JOIN org_positions target_position
+          ON target_position.tenant_id = target.tenant_id
+         AND target_position.id = target.position_id
+        JOIN org_closure scope
+          ON scope.tenant_id = viewer.tenant_id
+         AND scope.ancestor_id = viewer.position_id
+         AND scope.descendant_id = target.position_id
+         AND scope.depth > 0
+        WHERE viewer.tenant_id = rag_effective_tenant()
+          AND viewer.identity_id = rag_effective_actor()
+          AND viewer.state = 'active'
+          AND viewer_position.can_monitor_descendants = true
+          AND target_position.protected_from_monitoring = false
+    )
+$review_scope$;
+
+ALTER TABLE review_interactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE review_interactions FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS review_interactions_read ON review_interactions;
+CREATE POLICY review_interactions_read ON review_interactions FOR SELECT
+    USING (rag_service_access() OR actor_id = rag_effective_actor() OR
+           rag_can_monitor_identity(actor_id));
+DROP POLICY IF EXISTS review_interactions_insert ON review_interactions;
+CREATE POLICY review_interactions_insert ON review_interactions FOR INSERT
+    WITH CHECK (rag_service_access() OR
+                (tenant_id = rag_effective_tenant() AND
+                 actor_id = rag_effective_actor()));
+
+ALTER TABLE review_feedback ENABLE ROW LEVEL SECURITY;
+ALTER TABLE review_feedback FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS review_feedback_read ON review_feedback;
+CREATE POLICY review_feedback_read ON review_feedback FOR SELECT
+    USING (rag_service_access() OR actor_id = rag_effective_actor() OR
+           rag_can_monitor_identity(actor_id));
+DROP POLICY IF EXISTS review_feedback_insert ON review_feedback;
+CREATE POLICY review_feedback_insert ON review_feedback FOR INSERT
+    WITH CHECK (rag_service_access() OR
+                (tenant_id = rag_effective_tenant() AND
+                 actor_id = rag_effective_actor()));
+DROP POLICY IF EXISTS review_feedback_update ON review_feedback;
+CREATE POLICY review_feedback_update ON review_feedback FOR UPDATE
+    USING (rag_service_access() OR actor_id = rag_effective_actor())
+    WITH CHECK (rag_service_access() OR actor_id = rag_effective_actor());
+
+ALTER TABLE review_cases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE review_cases FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS review_cases_read ON review_cases;
+CREATE POLICY review_cases_read ON review_cases FOR SELECT
+    USING (rag_service_access() OR subject_actor_id = rag_effective_actor() OR
+           rag_can_monitor_identity(subject_actor_id));
+DROP POLICY IF EXISTS review_cases_insert ON review_cases;
+CREATE POLICY review_cases_insert ON review_cases FOR INSERT
+    WITH CHECK (rag_service_access() OR
+                (tenant_id = rag_effective_tenant() AND
+                 subject_actor_id = rag_effective_actor()));
+DROP POLICY IF EXISTS review_cases_update ON review_cases;
+CREATE POLICY review_cases_update ON review_cases FOR UPDATE
+    USING (rag_service_access() OR
+           rag_can_monitor_identity(subject_actor_id))
+    WITH CHECK (rag_service_access() OR
+                rag_can_monitor_identity(subject_actor_id));
+
+ALTER TABLE review_case_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE review_case_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS review_case_events_read ON review_case_events;
+CREATE POLICY review_case_events_read ON review_case_events FOR SELECT
+    USING (rag_service_access() OR
+           rag_can_monitor_identity(subject_actor_id));
+DROP POLICY IF EXISTS review_case_events_insert ON review_case_events;
+CREATE POLICY review_case_events_insert ON review_case_events FOR INSERT
+    WITH CHECK (rag_service_access() OR
+                (tenant_id = rag_effective_tenant() AND
+                 reviewer_id = rag_effective_actor() AND
+                 rag_can_monitor_identity(subject_actor_id)));
 
 -- No ANN index yet: this is a small, single-document demo dataset, and a
 -- sequential scan over `dense <=> query` / `sparse <#> query` is effectively

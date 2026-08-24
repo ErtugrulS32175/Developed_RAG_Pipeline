@@ -32,10 +32,25 @@ load_dotenv()
 # password intentionally fails auth so a missing .env surfaces loudly
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv("PG_DSN", "postgresql://rag:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
+_SCHEMA_MONOTONIC_GUARD_DDL = """
+CREATE OR REPLACE FUNCTION rag_guard_schema_monotonic()
+RETURNS trigger LANGUAGE plpgsql AS $schema_guard$
+BEGIN
+    IF NEW.schema_version < OLD.schema_version THEN
+        RAISE EXCEPTION 'schema downgrade refused';
+    END IF;
+    RETURN NEW;
+END
+$schema_guard$;
+DROP TRIGGER IF EXISTS rag_schema_state_monotonic ON rag_schema_state;
+CREATE TRIGGER rag_schema_state_monotonic
+BEFORE UPDATE OF schema_version ON rag_schema_state
+FOR EACH ROW EXECUTE FUNCTION rag_guard_schema_monotonic();
+"""
 
 # fastembed's Qdrant/bm25 hashes tokens (no fixed vocabulary) into a range that
 # exceeds pgvector's sparsevec dimension cap (1_000_000_000). Every sparse index
@@ -75,7 +90,16 @@ class EvidenceAccessRefused(RuntimeError):
     """A citation ticket cannot be minted or consumed under fresh policy."""
 
 
-def set_tenant_context(conn, tenant_id=DEFAULT_TENANT_ID, *, service=False):
+class ReviewAccessRefused(RuntimeError):
+    """A feedback target or review case is not currently authorized."""
+
+
+class ReviewConflict(RuntimeError):
+    """A review mutation lost its revision or policy-epoch fence."""
+
+
+def set_tenant_context(conn, tenant_id=DEFAULT_TENANT_ID, *, service=False,
+                       actor_id=None):
     """Bind a connection session to one tenant or to the internal worker.
 
     Session scope is intentional: publication commits between its stage and
@@ -88,11 +112,19 @@ def set_tenant_context(conn, tenant_id=DEFAULT_TENANT_ID, *, service=False):
         tenant = uuid.UUID(str(tenant_id))
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError("tenant_id gecerli bir UUID olmali") from exc
+    actor = None
+    if actor_id is not None:
+        try:
+            actor = uuid.UUID(str(actor_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("actor_id gecerli bir UUID olmali") from exc
     with conn.cursor() as cur:
         cur.execute("SELECT set_config('rag.tenant_id', %s, false)",
                     (str(tenant),))
         cur.execute("SELECT set_config('rag.service', %s, false)",
                     ("1" if service else "0",))
+        cur.execute("SELECT set_config('rag.actor_id', %s, false)",
+                    ("" if actor is None else str(actor),))
 
 
 def clear_tenant_context(conn):
@@ -100,6 +132,7 @@ def clear_tenant_context(conn):
     with conn.cursor() as cur:
         cur.execute("RESET rag.tenant_id")
         cur.execute("RESET rag.service")
+        cur.execute("RESET rag.actor_id")
     conn.commit()
 
 
@@ -194,7 +227,11 @@ def init_schema(conn) -> None:
         # is released by commit/rollback even if the process dies midway.
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (_SCHEMA_LOCK_NAME,))
-        cur.execute(schema_sql)
+        # Migration metadata exists before product DDL so a same-version
+        # digest conflict or an attempted binary downgrade is refused before
+        # CREATE OR REPLACE can change a live schema.  The v5 schema also
+        # installs a database trigger: an older binary does not know this
+        # Python check, but its final state upsert is still rolled back.
         cur.execute(
             "CREATE TABLE IF NOT EXISTS rag_schema_state ("
             "singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), "
@@ -206,17 +243,32 @@ def init_schema(conn) -> None:
             "schema_version integer PRIMARY KEY CHECK (schema_version > 0), "
             "schema_sha256 text NOT NULL CHECK (length(schema_sha256) = 64), "
             "applied_at timestamptz NOT NULL DEFAULT now())")
+        # This guard belongs to migration metadata, not product schema.sql.
+        # Raw product-schema fixtures do not own rag_schema_state, while a v4
+        # binary following a completed v5 migration must still encounter this
+        # persistent trigger when it tries to write the state back to v4.
+        cur.execute(_SCHEMA_MONOTONIC_GUARD_DDL)
+        cur.execute(
+            "SELECT schema_version, schema_sha256 FROM rag_schema_state "
+            "WHERE singleton = true FOR UPDATE")
+        current = cur.fetchone()
+        if current is not None and current[0] > SCHEMA_VERSION:
+            raise RuntimeError("schema surumu geriye alinamaz")
+        if (current is not None and current[0] == SCHEMA_VERSION
+                and current[1] != schema_sha256):
+            raise RuntimeError("schema state digest ile uyusmuyor")
         cur.execute(
             "SELECT schema_sha256 FROM rag_schema_history "
             "WHERE schema_version = %s", (SCHEMA_VERSION,))
         history = cur.fetchone()
+        if history is not None and history[0] != schema_sha256:
+            raise RuntimeError("schema version digest ile daha once kullanildi")
+        cur.execute(schema_sql)
         if history is None:
             cur.execute(
                 "INSERT INTO rag_schema_history "
                 "(schema_version, schema_sha256, applied_at) "
                 "VALUES (%s, %s, now())", (SCHEMA_VERSION, schema_sha256))
-        elif history[0] != schema_sha256:
-            raise RuntimeError("schema version digest ile daha once kullanildi")
         cur.execute(
             "INSERT INTO rag_schema_state "
             "(singleton, schema_version, schema_sha256, applied_at) "
@@ -354,8 +406,7 @@ def visible_org_members(conn, viewer_id):
             ") root ON true "
             "WHERE viewer.identity_id = %s AND viewer.state = 'active' "
             "AND viewer_position.can_monitor_descendants = true "
-            "AND (viewer_position.kind = 'root' "
-            "OR position.protected_from_monitoring = false) "
+            "AND position.protected_from_monitoring = false "
             "ORDER BY scope.depth, target.display_label, target.identity_id",
             (viewer_id,))
         return [dict(row) for row in cur.fetchall()]
@@ -491,6 +542,203 @@ def consume_evidence_preview_ticket(conn, *, actor_id, token_digest,
         raise EvidenceAccessRefused("kanit bileti gecersiz")
     conn.commit()
     return dict(row)
+
+
+def create_review_interaction(conn, *, interaction_id, actor_id, ref_digest,
+                              outcome, citation_count):
+    """Record content-free publication metadata under a fresh membership."""
+    try:
+        interaction_id = uuid.UUID(str(interaction_id))
+        actor_id = uuid.UUID(str(actor_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ReviewAccessRefused("inceleme kimligi gecersiz") from exc
+    if (outcome not in {"answered", "review_required"}
+            or type(citation_count) is not int
+            or not 0 <= citation_count <= 100
+            or (outcome == "answered"
+                and (type(ref_digest) is not bytes or len(ref_digest) != 32))
+            or (outcome == "review_required" and ref_digest is not None)):
+        raise ReviewAccessRefused("inceleme hedefi gecersiz")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "INSERT INTO review_interactions "
+            "(id, tenant_id, actor_id, ref_digest, outcome, citation_count, "
+            "policy_epoch_at_creation) "
+            "SELECT %s, m.tenant_id, m.identity_id, %s, %s, %s, "
+            "t.policy_epoch FROM org_memberships m "
+            "JOIN org_identities i ON i.id = m.identity_id "
+            "JOIN org_tenants t ON t.id = m.tenant_id "
+            "WHERE m.tenant_id = rag_effective_tenant() "
+            "AND m.identity_id = %s AND m.state = 'active' "
+            "AND i.state = 'active' "
+            "RETURNING id, policy_epoch_at_creation",
+            (interaction_id, ref_digest, outcome, citation_count, actor_id))
+        row = cur.fetchone()
+        if row is None:
+            raise ReviewAccessRefused("inceleme hedefi yetkisiz")
+        if outcome == "review_required":
+            cur.execute(
+                "INSERT INTO review_cases "
+                "(id, tenant_id, interaction_id, subject_actor_id, trigger_code) "
+                "VALUES (%s, rag_effective_tenant(), %s, %s, 'guard_review')",
+                (uuid.uuid4(), interaction_id, actor_id))
+    conn.commit()
+    return dict(row)
+
+
+def submit_review_feedback(conn, *, actor_id, ref_digest, verdict,
+                           reason_code):
+    """Upsert one actor's closed feedback and open at most one review case."""
+    try:
+        actor_id = uuid.UUID(str(actor_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ReviewAccessRefused("geri bildirim kimligi gecersiz") from exc
+    reasons = {"incorrect", "missing_evidence", "outdated", "unsafe", "other"}
+    valid_shape = (
+        verdict == "helpful" and reason_code is None
+        or verdict == "not_helpful" and reason_code in reasons
+    )
+    if (type(ref_digest) is not bytes or len(ref_digest) != 32
+            or not valid_shape):
+        raise ReviewAccessRefused("geri bildirim gecersiz")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT interaction.id FROM review_interactions interaction "
+            "JOIN org_memberships membership "
+            "ON membership.tenant_id = interaction.tenant_id "
+            "AND membership.identity_id = interaction.actor_id "
+            "JOIN org_identities identity ON identity.id = interaction.actor_id "
+            "WHERE interaction.ref_digest = %s "
+            "AND interaction.actor_id = %s "
+            "AND membership.state = 'active' AND identity.state = 'active'",
+            (ref_digest, actor_id))
+        target = cur.fetchone()
+        if target is None:
+            raise ReviewAccessRefused("geri bildirim hedefi bulunamadi")
+        interaction_id = target["id"]
+        cur.execute(
+            "INSERT INTO review_feedback "
+            "(tenant_id, interaction_id, actor_id, verdict, reason_code) "
+            "VALUES (rag_effective_tenant(), %s, %s, %s, %s) "
+            "ON CONFLICT (tenant_id, interaction_id, actor_id) DO UPDATE SET "
+            "verdict = EXCLUDED.verdict, reason_code = EXCLUDED.reason_code, "
+            "revision = CASE WHEN review_feedback.verdict = EXCLUDED.verdict "
+            "AND review_feedback.reason_code IS NOT DISTINCT FROM "
+            "EXCLUDED.reason_code THEN review_feedback.revision "
+            "ELSE review_feedback.revision + 1 END, "
+            "updated_at = CASE WHEN review_feedback.verdict = EXCLUDED.verdict "
+            "AND review_feedback.reason_code IS NOT DISTINCT FROM "
+            "EXCLUDED.reason_code THEN review_feedback.updated_at ELSE now() END "
+            "RETURNING revision",
+            (interaction_id, actor_id, verdict, reason_code))
+        revision = cur.fetchone()["revision"]
+        if verdict == "not_helpful":
+            cur.execute(
+                "INSERT INTO review_cases "
+                "(id, tenant_id, interaction_id, subject_actor_id, trigger_code) "
+                "VALUES (%s, rag_effective_tenant(), %s, %s, 'user_feedback') "
+                "ON CONFLICT (tenant_id, interaction_id) DO NOTHING",
+                (uuid.uuid4(), interaction_id, actor_id))
+        cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM review_cases "
+            "WHERE tenant_id = rag_effective_tenant() "
+            "AND interaction_id = %s AND state = 'open') AS review_open",
+            (interaction_id,))
+        review_open = cur.fetchone()["review_open"]
+    conn.commit()
+    return {"revision": revision, "review_open": review_open}
+
+
+def list_review_cases(conn, *, reviewer_id, limit, before=None):
+    """Return a bounded, content-free queue under current tree visibility."""
+    try:
+        reviewer_id = uuid.UUID(str(reviewer_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ReviewAccessRefused("inceleyen kimligi gecersiz") from exc
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ReviewAccessRefused("inceleme sayfa siniri gecersiz")
+    before_time, before_id = (None, None) if before is None else before
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT c.id, c.trigger_code, c.state, c.revision, c.created_at, "
+            "i.outcome, i.citation_count, target.display_label, "
+            "position.title AS position_title, tenant.policy_epoch "
+            "FROM review_cases c "
+            "JOIN review_interactions i ON i.tenant_id = c.tenant_id "
+            "AND i.id = c.interaction_id "
+            "JOIN org_memberships target ON target.tenant_id = c.tenant_id "
+            "AND target.identity_id = c.subject_actor_id "
+            "AND target.state = 'active' "
+            "JOIN org_positions position ON position.tenant_id = target.tenant_id "
+            "AND position.id = target.position_id "
+            "JOIN org_tenants tenant ON tenant.id = c.tenant_id "
+            "WHERE c.state = 'open' AND rag_effective_actor() = %s "
+            "AND rag_can_monitor_identity(c.subject_actor_id) "
+            "AND (%s::timestamptz IS NULL OR (c.created_at, c.id) < (%s, %s)) "
+            "ORDER BY c.created_at DESC, c.id DESC LIMIT %s",
+            (reviewer_id, before_time, before_time, before_id, limit + 1))
+        rows = [dict(row) for row in cur.fetchall()]
+    return rows
+
+
+def decide_review_case(conn, *, reviewer_id, case_id, expected_revision,
+                       expected_policy_epoch, decision, resolution_code,
+                       reason_code, request_id):
+    """Close one visible case under revision, policy and hierarchy fences."""
+    try:
+        reviewer_id = uuid.UUID(str(reviewer_id))
+        case_id = uuid.UUID(str(case_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ReviewAccessRefused("inceleme karari kimligi gecersiz") from exc
+    if (decision not in {"resolved", "dismissed"}
+            or resolution_code not in {"corrected", "no_issue", "escalated"}
+            or reason_code not in {"management_duty", "security_review"}
+            or type(expected_revision) is not int or expected_revision < 1
+            or type(expected_policy_epoch) is not int
+            or expected_policy_epoch < 1):
+        raise ReviewAccessRefused("inceleme karari gecersiz")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT c.subject_actor_id, c.revision, tenant.policy_epoch "
+            "FROM review_cases c JOIN org_tenants tenant ON tenant.id = c.tenant_id "
+            "WHERE c.id = %s AND c.state = 'open' "
+            "AND rag_effective_actor() = %s "
+            "AND rag_can_monitor_identity(c.subject_actor_id) FOR UPDATE OF c",
+            (case_id, reviewer_id))
+        row = cur.fetchone()
+        if row is None:
+            raise ReviewAccessRefused("inceleme vakasi bulunamadi")
+        if (row["revision"] != expected_revision
+                or row["policy_epoch"] != expected_policy_epoch):
+            raise ReviewConflict("inceleme vakasi veya politika degisti")
+        cur.execute(
+            "UPDATE review_cases SET state = %s, reviewer_id = %s, "
+            "resolution_code = %s, revision = revision + 1, decided_at = now() "
+            "WHERE id = %s AND revision = %s RETURNING revision, decided_at",
+            (decision, reviewer_id, resolution_code, case_id,
+             expected_revision))
+        updated = cur.fetchone()
+        if updated is None:
+            raise ReviewConflict("inceleme vakasi degisti")
+        cur.execute(
+            "INSERT INTO review_case_events "
+            "(id, tenant_id, case_id, subject_actor_id, reviewer_id, "
+            "base_revision, resulting_revision, decision, resolution_code) "
+            "VALUES (%s, rag_effective_tenant(), %s, %s, %s, %s, %s, %s, %s)",
+            (uuid.uuid4(), case_id, row["subject_actor_id"], reviewer_id,
+             expected_revision, updated["revision"], decision,
+             resolution_code))
+        cur.execute(
+            "INSERT INTO org_audit_events "
+            "(id, tenant_id, actor_id, subject_id, action, reason_code, "
+            "decision, request_id) VALUES "
+            "(%s, rag_effective_tenant(), %s, %s, 'review_decision', %s, "
+            "'allowed', %s)",
+            (uuid.uuid4(), reviewer_id, row["subject_actor_id"],
+             reason_code, request_id))
+    conn.commit()
+    return {"state": decision, "revision": updated["revision"],
+            "decided_at": updated["decided_at"]}
 
 
 def org_topology(conn):

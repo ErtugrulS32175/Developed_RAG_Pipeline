@@ -136,7 +136,11 @@ In OpenWebUI Admin → Functions, import
 `openwebui/functions/ragtest_org_portal.py` and enable it as a global Event
 Function. Signed-in users then open `/ragtest-org`: everyone sees their own
 level and title, managers see only the descendant list they are authorized to
-monitor, and an architecture admin receives the versioned tree editor. A save
+monitor, and their content-free review queue; an architecture admin receives
+the versioned tree editor. Queue decisions carry both case revision and current
+policy epoch, so a hierarchy or policy change makes a stale browser decision
+fail instead of applying old authority. Protected positions are absent even
+from a root user's monitoring results. A save
 replaces the topology atomically; a stale editor receives 409 instead of
 overwriting a newer design. The portal is a same-origin OpenWebUI route and
 keeps both bridge secrets on the server.
@@ -144,7 +148,8 @@ keeps both bridge secrets on the server.
 ### Citation evidence in OpenWebUI
 
 Import `openwebui/functions/ragtest_citations.py` as a global Filter and
-`openwebui/functions/ragtest_evidence_action.py` as an Action. Checked RAG
+`openwebui/functions/ragtest_evidence_action.py` and
+`openwebui/functions/ragtest_feedback_action.py` as Actions. Checked RAG
 answers then publish OpenWebUI `source` events containing only a document
 label, page and opaque evidence reference. The initial answer never contains a
 passage, source path, ticket or raw chunk id.
@@ -163,6 +168,13 @@ Organization-architecture authority alone grants no evidence access. The
 preview is shown transiently rather than saved into chat history, so revoking
 access is not defeated by a durable copy created by the plugin itself.
 
+The feedback Action offers only closed helpful/not-helpful choices and closed
+reason codes. It sends an opaque reference, never the question, answer,
+passage, chat id or free text. A negative answer opens one idempotent review
+case. A `review_required` result opens its case server-side without inventing a
+browser feedback target. Direct API-key calls, citationless answers and
+non-persisted publications deliberately expose no feedback target.
+
 ### Production operations
 
 Apply migrations before sending traffic to a new application version:
@@ -177,6 +189,9 @@ The migration takes a transaction-scoped PostgreSQL advisory lock, applies the
 DDL and its schema receipt in one transaction, and prints closed JSON.
 Readiness remains false if either the version or digest differs, so a process
 cannot silently serve against a partially or incorrectly migrated database.
+Schema receipts are monotonic: an older binary is refused before product DDL,
+and a database trigger prevents a schema-state downgrade even if a stale
+process reaches the receipt table.
 
 Backups use PostgreSQL custom format and a SHA-256 sidecar. Credentials reach
 `pg_dump` and `pg_restore` through the process environment, never argv or JSON

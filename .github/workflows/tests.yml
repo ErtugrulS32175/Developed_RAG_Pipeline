@@ -10,6 +10,28 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: CHANGE_ME
+          POSTGRES_DB: ragtest_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ragtest_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RAGTEST_OPERATIONS_PG_DSN: postgresql://postgres:CHANGE_ME@localhost:5432/ragtest_ci
+      RAGTEST_TENANT_PG_DSN: postgresql://postgres:CHANGE_ME@localhost:5432/ragtest_ci
+      RAGTEST_EVIDENCE_PG_DSN: postgresql://postgres:CHANGE_ME@localhost:5432/ragtest_ci
+      RAGTEST_REVIEW_PG_DSN: postgresql://postgres:CHANGE_ME@localhost:5432/ragtest_ci
+      RAGTEST_JOB_PG_DSN: postgresql://postgres:CHANGE_ME@localhost:5432/ragtest_ci
+      RAGTEST_SCOPE_PG_DSN: postgresql://postgres:CHANGE_ME@localhost:5432/ragtest_ci
+      RAGTEST_SCOPE_GATE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -46,7 +46,22 @@ def test_portal_keeps_secrets_server_side_and_renders_values_as_text(monkeypatch
 
 def test_portal_registers_only_session_authenticated_routes():
     source = PLUGIN.read_text(encoding="utf-8")
-    assert source.count("Depends(get_verified_user)") == 6
-    assert source.count("app.add_api_route(") == 6
+    assert source.count("Depends(get_verified_user)") == 8
+    assert source.count("app.add_api_route(") == 8
     assert "Authorization\": f\"Bearer {GATEWAY_KEY}" in source
     assert "X-OpenWebUI-User-Jwt" in source
+
+
+def test_portal_review_queue_is_content_free_and_decisions_are_closed(
+        monkeypatch):
+    module = _module(monkeypatch)
+    html = module.PORTAL_HTML
+    assert "/ragtest-org/api/reviews?reason_code=management_duty" in html
+    assert "expected_revision:c.revision" in html
+    assert "expected_policy_epoch:c.policy_epoch" in html
+    assert "c.question" not in html and "c.answer" not in html
+    assert "innerHTML" not in html
+    source = PLUGIN.read_text(encoding="utf-8")
+    assert 'set(payload) != allowed' in source
+    assert '{"resolved", "dismissed"}' in source
+    assert '{"detail": "gecersiz inceleme karari"}' in source

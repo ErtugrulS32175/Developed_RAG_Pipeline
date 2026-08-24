@@ -41,7 +41,7 @@ def migrated_connection():
             admin.close()
 
 
-def test_real_migration_is_repeatable_and_readiness_detects_digest_drift(
+def test_real_migration_is_repeatable_and_readiness_refuses_digest_drift(
         migrated_connection):
     db.init_schema(migrated_connection)
     assert db.schema_is_current(migrated_connection)
@@ -53,5 +53,7 @@ def test_real_migration_is_repeatable_and_readiness_detects_digest_drift(
     migrated_connection.commit()
     assert not db.schema_is_current(migrated_connection)
 
-    db.init_schema(migrated_connection)
-    assert db.schema_is_current(migrated_connection)
+    with pytest.raises(RuntimeError, match="digest"):
+        db.init_schema(migrated_connection)
+    migrated_connection.rollback()
+    assert not db.schema_is_current(migrated_connection)
