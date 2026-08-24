@@ -1182,6 +1182,62 @@ CREATE POLICY tenant_isolation ON evidence_preview_tickets
     USING (rag_service_access() OR tenant_id = rag_effective_tenant())
     WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
 
+-- Table exports are storage capabilities, not public filenames.  The durable
+-- record carries only an opaque storage name, fixed-size digests and bounded
+-- measurements; no source path, cell text, prompt or user-facing filename is
+-- persisted.  A reference locates this row but grants nothing.  Download is
+-- authorized by a fresh active membership and an actor-bound, single-use,
+-- short-lived ticket.
+CREATE TABLE IF NOT EXISTS table_exports (
+    id            uuid PRIMARY KEY,
+    tenant_id     uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    actor_id      uuid NOT NULL REFERENCES org_identities(id) ON DELETE CASCADE,
+    ref_digest    bytea NOT NULL UNIQUE CHECK (octet_length(ref_digest) = 32),
+    storage_name  text NOT NULL CHECK (
+                    storage_name ~ '^[0-9a-f]{32}\.xlsx$'),
+    file_sha256   bytea NOT NULL CHECK (octet_length(file_sha256) = 32),
+    file_size     integer NOT NULL CHECK (file_size BETWEEN 1 AND 33554432),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    expires_at    timestamptz NOT NULL,
+    UNIQUE (tenant_id, actor_id, storage_name),
+    UNIQUE (tenant_id, id),
+    CHECK (expires_at > created_at)
+);
+
+CREATE TABLE IF NOT EXISTS table_export_tickets (
+    token_digest  bytea PRIMARY KEY CHECK (octet_length(token_digest) = 32),
+    tenant_id     uuid NOT NULL REFERENCES org_tenants(id) ON DELETE CASCADE,
+    actor_id      uuid NOT NULL REFERENCES org_identities(id) ON DELETE CASCADE,
+    export_id     uuid NOT NULL,
+    purpose       text NOT NULL CHECK (purpose = 'download'),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    expires_at    timestamptz NOT NULL,
+    consumed_at   timestamptz,
+    FOREIGN KEY (tenant_id, export_id)
+        REFERENCES table_exports(tenant_id, id) ON DELETE CASCADE,
+    CHECK (expires_at > created_at),
+    CHECK (consumed_at IS NULL OR consumed_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS table_exports_expiry_idx
+    ON table_exports(expires_at);
+CREATE INDEX IF NOT EXISTS table_export_tickets_expiry_idx
+    ON table_export_tickets(expires_at);
+
+ALTER TABLE table_exports ENABLE ROW LEVEL SECURITY;
+ALTER TABLE table_exports FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON table_exports;
+CREATE POLICY tenant_isolation ON table_exports
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE table_export_tickets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE table_export_tickets FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON table_export_tickets;
+CREATE POLICY tenant_isolation ON table_export_tickets
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
 -- Human feedback is bound to a checked publication without retaining the
 -- question, answer, passage, path or OpenWebUI message id.  The opaque digest
 -- is a locator only; every write rechecks the current actor and membership.

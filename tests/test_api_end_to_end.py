@@ -2979,8 +2979,13 @@ def test_the_table_route_is_unaffected_by_the_new_field(monkeypatch):
     from pipeline.api import app as api
 
     counted = _refusal_gates(monkeypatch)
-    monkeypatch.setattr(api.owui_chat, "tables_reply",
-                        lambda _messages, **_kwargs: "KURGU_TABLO_CEVABI")
+    handed = {}
+
+    def table_reply(_messages, **kwargs):
+        handed.update(kwargs)
+        return "KURGU_TABLO_CEVABI"
+
+    monkeypatch.setattr(api.owui_chat, "tables_reply", table_reply)
 
     response = _chat(api, "ragtest-table", document_ids=[IC_BELGE])
 
@@ -2989,6 +2994,10 @@ def test_the_table_route_is_unaffected_by_the_new_field(monkeypatch):
         "KURGU_TABLO_CEVABI")
     assert "rag_status" not in response.json()
     assert counted["backend"] == 0
+    assert callable(handed["export_ref_for"])
+    # A direct API-key principal may extract a table but never acquires an
+    # OpenWebUI actor-bound export reference.
+    assert handed["export_ref_for"]("a" * 32 + ".xlsx") is None
 
 
 def test_the_chat_route_keeps_the_same_auth_dependency_object():

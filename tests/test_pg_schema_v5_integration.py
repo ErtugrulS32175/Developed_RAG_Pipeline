@@ -84,12 +84,12 @@ def test_v4_receipt_advances_to_current_and_repeated_init_is_idempotent(
     db.init_schema(conn)
     assert db.schema_is_current(conn)
     version, digest = db.expected_schema_state()
-    assert version == 7 and digest != V4_DIGEST
+    assert version == 8 and digest != V4_DIGEST
     with conn.cursor() as cur:
         cur.execute(
             "SELECT schema_version, schema_sha256 FROM rag_schema_history "
             "ORDER BY schema_version")
-        assert cur.fetchall() == [(4, V4_DIGEST), (7, digest)]
+        assert cur.fetchall() == [(4, V4_DIGEST), (8, digest)]
         for table in ("review_interactions", "review_feedback", "review_cases",
                       "review_case_events"):
             cur.execute("SELECT to_regclass(%s)", (table,))
@@ -137,7 +137,7 @@ def test_database_trigger_rolls_back_a_legacy_downgrade_transaction(
 def test_same_version_wrong_digest_is_refused_before_product_ddl(
         migration_database):
     conn = migration_database
-    _legacy_receipt(conn, version=7, digest="0" * 64)
+    _legacy_receipt(conn, version=db.SCHEMA_VERSION, digest="0" * 64)
     with pytest.raises(RuntimeError, match="digest"):
         db.init_schema(conn)
     conn.rollback()

@@ -217,6 +217,24 @@ case. A `review_required` result opens its case server-side without inventing a
 browser feedback target. Direct API-key calls, citationless answers and
 non-persisted publications deliberately expose no feedback target.
 
+### Actor-bound table exports
+
+Table extraction never publishes a storage filename or a guessable download
+URL. A successful OpenWebUI table reply carries only an opaque
+`ragtest-export:` reference. A signed-in content actor exchanges that reference
+with `POST /v1/exports/tickets`, then consumes the returned 50-second ticket
+exactly once through `POST /v1/exports/download`. Both steps recheck the active
+tenant membership and the exact actor that created the export; an API key,
+organization-architect capability, peer, other tenant or replay is not a
+download authority.
+
+Generated workbooks use random code names. PostgreSQL stores only that code
+name, byte length and SHA-256, never workbook cells or source content. The
+download opens the file through no-follow directory handles under a 32 MiB
+ceiling and returns it only if its current length and digest still match the
+registration. The current OpenWebUI table reply displays the opaque reference;
+a browser Action for the binary hand-off remains a separate UI integration.
+
 ### Production operations
 
 Apply migrations before sending traffic to a new application version:

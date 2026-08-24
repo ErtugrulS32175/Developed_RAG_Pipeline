@@ -56,19 +56,22 @@ def test_the_scheme_has_to_be_bearer(secured):
 def test_every_data_endpoint_is_covered(secured):
     """A single unprotected route is enough to read or add documents, so the
     whole surface is checked rather than a sample of it."""
-    for method, path in [
-        ("get", "/v1/models"),
-        ("post", "/v1/chat/completions"),
-        ("post", "/documents/upload"),
-        ("post", "/documents/abc/process"),
-        ("post", "/documents/11111111-1111-1111-1111-111111111111/ingest-jobs"),
-        ("get", "/ingest-jobs/22222222-2222-2222-2222-222222222222"),
-        ("delete", "/ingest-jobs/22222222-2222-2222-2222-222222222222"),
-        ("get", "/documents/abc"),
-        ("get", "/files/guessed.xlsx"),
+    for method, path, expected in [
+        ("get", "/v1/models", 401),
+        ("post", "/v1/chat/completions", 401),
+        ("post", "/documents/upload", 401),
+        ("post", "/documents/abc/process", 401),
+        ("post", "/documents/11111111-1111-1111-1111-111111111111/ingest-jobs", 401),
+        ("get", "/ingest-jobs/22222222-2222-2222-2222-222222222222", 401),
+        ("delete", "/ingest-jobs/22222222-2222-2222-2222-222222222222", 401),
+        ("get", "/documents/abc", 401),
+        # Actor-bound content routes reject the API-key principal one layer
+        # later: authenticated, but not an OpenWebUI content actor.
+        ("post", "/v1/exports/tickets", 403),
+        ("post", "/v1/exports/download", 403),
     ]:
         r = getattr(secured, method)(path)
-        assert r.status_code == 401, f"{method.upper()} {path} korumasiz"
+        assert r.status_code == expected, f"{method.upper()} {path} korumasiz"
 
 
 def test_liveness_stays_open(secured):
@@ -109,11 +112,9 @@ def test_readiness_reports_status_without_leaking_connection_detail(monkeypatch)
 
 
 def test_the_download_link_is_not_a_public_filename_capability(secured):
-    assert secured.get("/files/guessed.xlsx").status_code == 401
-    assert secured.get(
-        "/files/..%2Fsecret.xlsx",
-        headers={"Authorization": "Bearer zeta-gamma-test-key"},
-    ).status_code in (400, 404)
+    assert secured.get("/files/guessed.xlsx").status_code == 404
+    assert secured.post("/v1/exports/tickets").status_code == 403
+    assert secured.post("/v1/exports/download").status_code == 403
 
 
 # --- deliberately insecure local startup ---

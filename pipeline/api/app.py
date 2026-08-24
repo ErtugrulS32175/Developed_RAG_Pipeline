@@ -17,13 +17,14 @@ from fastapi import (
     Depends, FastAPI, Header, HTTPException, Query, Request, Response,
     UploadFile, File,
 )
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
 
 from pipeline.index import db
 from pipeline.index import ingest
 from pipeline.index import publication
+from pipeline.storage import handle_transport
 from pipeline.evaluation import datasets as eval_datasets
 from pipeline.index.attempt_contract import (
     AttemptAlreadyRunning,
@@ -150,6 +151,11 @@ _REVIEW_HMAC_KEY = hashlib.sha256(
     b"ragtest-review-reference-v1\x00" + _EVIDENCE_KEY_MATERIAL).digest()
 EVIDENCE_TICKET_SECONDS = 50
 EVIDENCE_PASSAGE_MAX_CHARS = 4000
+EXPORT_TICKET_SECONDS = 50
+EXPORT_RECORD_SECONDS = 3600
+EXPORT_MAX_BYTES = 32 << 20
+_EXPORT_HMAC_KEY = hashlib.sha256(
+    b"ragtest-table-export-v1\x00" + _EVIDENCE_KEY_MATERIAL).digest()
 if _GATEWAY_DIGEST is not None:
     if any(hmac.compare_digest(_GATEWAY_DIGEST, item.digest)
            for item in AUTH_REGISTRY.credentials):
@@ -315,7 +321,7 @@ def _require_current_schema(conn):
 
 
 @contextmanager
-def db_conn():
+def _principal_db_conn(principal):
     """One pooled connection per request, connected on first use rather than at
     import so this module stays importable without a running database.
 
@@ -325,7 +331,6 @@ def db_conn():
     exactly what the previous single cached module-level connection did."""
     with db.get_pool().connection() as conn:
         _require_current_schema(conn)
-        principal = auth.current_principal()
         db.set_tenant_context(
             conn, principal.tenant_id, actor_id=principal.subject_id)
         try:
@@ -333,6 +338,12 @@ def db_conn():
         finally:
             conn.rollback()
             db.clear_tenant_context(conn)
+
+
+@contextmanager
+def db_conn():
+    with _principal_db_conn(auth.current_principal()) as conn:
+        yield conn
 
 
 # Shared-secret or forwarded identity auth.  The only unauthenticated mode is
@@ -498,6 +509,18 @@ class EvidenceTicketRequest(BaseModel):
 
 
 class EvidencePreviewRequest(BaseModel):
+    ticket: str = Field(min_length=43, max_length=43,
+                        pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ExportTicketRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    export_ref: str = Field(min_length=43, max_length=43,
+                            pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ExportDownloadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
     ticket: str = Field(min_length=43, max_length=43,
                         pattern=r"^[A-Za-z0-9_-]+$")
 
@@ -968,6 +991,10 @@ def chat_completions(req: ChatRequest):
 
     is_table = req.model == TABLE_MODEL_ID
     backend = RAG_MODELS.get(req.model)
+    table_principal = auth.current_principal() if is_table else None
+    export_ref_for = (
+        (lambda name: _register_export_reference(table_principal, name))
+        if table_principal is not None else None)
     # Canonicalised BEFORE the first backend call and outside the closure, so
     # both branches offer the same dimensions.  Their meaning is settled in
     # the backend transaction.  The table route reads none of this.
@@ -1008,7 +1035,8 @@ def chat_completions(req: ChatRequest):
         if is_table:
             gen = owui_chat.stream_tables(
                 req.messages, req.model,
-                namespace=auth.current_principal().tenant_id.hex)
+                namespace=table_principal.tenant_id.hex,
+                export_ref_for=export_ref_for)
         else:
             status, answer, citations, trace, feedback_ref = ask_checked()
             gen = owui_chat.stream_text(
@@ -1027,7 +1055,8 @@ def chat_completions(req: ChatRequest):
         try:
             answer = owui_chat.tables_reply(
                 req.messages,
-                namespace=auth.current_principal().tenant_id.hex)
+                namespace=table_principal.tenant_id.hex,
+                export_ref_for=export_ref_for)
         except Exception as error:
             _log_safe_failure(error, "tablo_cikarimi_hatasi")
             raise HTTPException(
@@ -1156,6 +1185,76 @@ def _evidence_digest(reference):
     return raw
 
 
+def _export_reference_digest(export_id):
+    return hmac.new(
+        _EXPORT_HMAC_KEY, b"export\x00" + UUID(str(export_id)).bytes,
+        hashlib.sha256).digest()
+
+
+def _export_id_for_storage(storage_name):
+    """Give one random code-name a stable, non-reversible database identity."""
+    if (type(storage_name) is not str
+            or owui_chat.EXPORT_NAME_RE.fullmatch(storage_name) is None):
+        raise db.ExportAccessRefused("disari aktarim dosyasi gecersiz")
+    material = hmac.new(
+        _EXPORT_HMAC_KEY, b"storage\x00" + storage_name.encode("ascii"),
+        hashlib.sha256).digest()
+    return uuid.UUID(bytes=material[:16], version=4)
+
+
+def _decode_export_reference(reference):
+    """Decode one opaque export locator; it grants no download authority."""
+    return _evidence_digest(reference)
+
+
+def _read_export_bytes(storage_name):
+    """Read one code-named export through no-follow handles under a ceiling."""
+    if (type(storage_name) is not str
+            or owui_chat.EXPORT_NAME_RE.fullmatch(storage_name) is None):
+        raise db.ExportAccessRefused("disari aktarim dosyasi gecersiz")
+    root = file_handle = None
+    file_closed = root_closed = True
+    try:
+        root = handle_transport.open_root(owui_chat.EXPORT_DIR)
+        file_handle = handle_transport.open_child_file(root, storage_name)
+        body = handle_transport.read_all(file_handle, EXPORT_MAX_BYTES)
+    except handle_transport.TransportError as exc:
+        raise db.ExportAccessRefused(
+            "disari aktarim dosyasi kullanilamiyor") from exc
+    finally:
+        if file_handle is not None:
+            file_closed = handle_transport.close_handle_quietly(file_handle)
+        if root is not None:
+            root_closed = handle_transport.close_directory_quietly(root)
+    if not file_closed or not root_closed or not body:
+        raise db.ExportAccessRefused("disari aktarim dosyasi kullanilamiyor")
+    return body
+
+
+def _register_export_reference(principal, storage_name):
+    """Measure and bind one generated file without persisting its contents."""
+    if principal.subject_id is None or principal.source != "openwebui":
+        return None
+    try:
+        body = _read_export_bytes(storage_name)
+        export_id = _export_id_for_storage(storage_name)
+        ref_digest = _export_reference_digest(export_id)
+        with _principal_db_conn(principal) as conn:
+            db.register_table_export(
+                conn,
+                export_id=export_id,
+                actor_id=principal.subject_id,
+                ref_digest=ref_digest,
+                storage_name=storage_name,
+                file_sha256=hashlib.sha256(body).digest(),
+                file_size=len(body),
+                ttl_seconds=EXPORT_RECORD_SECONDS,
+            )
+    except db.ExportAccessRefused:
+        return None
+    return _b64url(ref_digest)
+
+
 @app.post("/v1/evidence/tickets")
 def create_evidence_ticket(
         body: EvidenceTicketRequest, response: Response,
@@ -1205,6 +1304,75 @@ def preview_evidence(
         "content_type": "passage",
         "passage": preview["passage"],
     }
+
+
+@app.post("/v1/exports/tickets")
+def create_export_ticket(
+        body: ExportTicketRequest, response: Response,
+        principal=Depends(require_evidence_actor)):
+    """Exchange an opaque export locator for one 50-second actor ticket."""
+    ref_digest = _decode_export_reference(body.export_ref)
+    if ref_digest is None:
+        raise HTTPException(status_code=404,
+                            detail="disari aktarim bulunamadi")
+    ticket = secrets.token_urlsafe(32)
+    token_digest = hashlib.sha256(ticket.encode("ascii")).digest()
+    try:
+        with db_conn() as conn:
+            db.mint_table_export_ticket(
+                conn,
+                actor_id=principal.subject_id,
+                ref_digest=ref_digest,
+                token_digest=token_digest,
+                ttl_seconds=EXPORT_TICKET_SECONDS,
+            )
+    except db.ExportAccessRefused:
+        raise HTTPException(status_code=404,
+                            detail="disari aktarim bulunamadi") from None
+    response.headers["Cache-Control"] = "no-store"
+    return {"ticket": ticket, "expires_in": EXPORT_TICKET_SECONDS}
+
+
+@app.post("/v1/exports/download")
+def download_export(
+        body: ExportDownloadRequest,
+        principal=Depends(require_evidence_actor)):
+    """Atomically consume one actor ticket, then serve its measured bytes."""
+    token_digest = hashlib.sha256(body.ticket.encode("ascii")).digest()
+    try:
+        with db_conn() as conn:
+            measured = db.consume_table_export_ticket(
+                conn, actor_id=principal.subject_id,
+                token_digest=token_digest)
+        if set(measured) != {"storage_name", "file_sha256", "file_size"}:
+            raise db.ExportAccessRefused("disari aktarim sozlesmesi gecersiz")
+        digest_value = measured["file_sha256"]
+        if (type(measured["storage_name"]) is not str
+                or type(measured["file_size"]) is not int
+                or isinstance(measured["file_size"], bool)
+                or not isinstance(digest_value, (bytes, bytearray, memoryview))):
+            raise db.ExportAccessRefused("disari aktarim sozlesmesi gecersiz")
+        expected_digest = bytes(digest_value)
+        if len(expected_digest) != 32:
+            raise db.ExportAccessRefused("disari aktarim sozlesmesi gecersiz")
+        body_bytes = _read_export_bytes(measured["storage_name"])
+        if (len(body_bytes) != measured["file_size"]
+                or not hmac.compare_digest(
+                    hashlib.sha256(body_bytes).digest(), expected_digest)):
+            raise db.ExportAccessRefused("disari aktarim olcumu degisti")
+    except db.ExportAccessRefused:
+        raise HTTPException(status_code=404,
+                            detail="disari aktarim bileti gecersiz") from None
+    return Response(
+        content=body_bytes,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"),
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": 'attachment; filename="table-export.xlsx"',
+        },
+    )
 
 
 @app.post("/v1/reviews/feedback")
@@ -1412,26 +1580,6 @@ def _safe_upload_filename(filename):
 # ATTEMPT, a request's failure is the HTTP status, and a source file
 # that has gone missing is a storage problem that says nothing about the
 # generation currently being served.
-
-
-@app.get("/files/{name}", dependencies=AUTH)
-def download_export(name: str):
-    """Serve an export only to an authenticated API principal.
-
-    A guessed or leaked filename is not authorization. Actor-bound browser
-    tickets are added with the OpenWebUI identity bridge; until then the normal
-    API credential is required.
-    """
-    if not owui_chat.EXPORT_NAME_RE.match(name):
-        raise HTTPException(status_code=400, detail="gecersiz dosya adi")
-    path = owui_chat.EXPORT_DIR / name
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="dosya bulunamadi")
-    return FileResponse(
-        path,
-        filename=name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 
 
 # The endpoint used to keep a per-filename lock of its own, IN THIS

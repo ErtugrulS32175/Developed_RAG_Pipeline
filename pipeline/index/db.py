@@ -36,7 +36,7 @@ load_dotenv()
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv(
     "PG_DSN", "postgresql://rag_runtime:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -95,6 +95,10 @@ class OrgIdentityConflict(RuntimeError):
 
 class EvidenceAccessRefused(RuntimeError):
     """A citation ticket cannot be minted or consumed under fresh policy."""
+
+
+class ExportAccessRefused(RuntimeError):
+    """A table export or its one-use download ticket is not authorized."""
 
 
 class ReviewAccessRefused(RuntimeError):
@@ -670,6 +674,115 @@ def consume_evidence_preview_ticket(conn, *, actor_id, token_digest,
         row = cur.fetchone()
     if row is None:
         raise EvidenceAccessRefused("kanit bileti gecersiz")
+    conn.commit()
+    return dict(row)
+
+
+def register_table_export(conn, *, export_id, actor_id, ref_digest,
+                          storage_name, file_sha256, file_size,
+                          ttl_seconds=3600):
+    """Bind one opaque export file to the current tenant and active actor."""
+    try:
+        export_id = uuid.UUID(str(export_id))
+        actor_id = uuid.UUID(str(actor_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ExportAccessRefused("disari aktarim kimligi gecersiz") from exc
+    if (type(ref_digest) is not bytes or len(ref_digest) != 32
+            or type(file_sha256) is not bytes or len(file_sha256) != 32
+            or type(storage_name) is not str
+            or len(storage_name) != 37
+            or not storage_name.endswith(".xlsx")
+            or any(char not in "0123456789abcdef"
+                   for char in storage_name[:-5])
+            or isinstance(file_size, bool) or type(file_size) is not int
+            or not 1 <= file_size <= 33_554_432
+            or isinstance(ttl_seconds, bool) or type(ttl_seconds) is not int
+            or not 300 <= ttl_seconds <= 86_400):
+        raise ExportAccessRefused("disari aktarim sinirlari gecersiz")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "INSERT INTO table_exports "
+            "(id, tenant_id, actor_id, ref_digest, storage_name, "
+            "file_sha256, file_size, expires_at) "
+            "SELECT %s, m.tenant_id, %s, %s, %s, %s, %s, "
+            "now() + (%s * interval '1 second') "
+            "FROM org_memberships m "
+            "WHERE m.identity_id = %s AND m.state = 'active' "
+            "AND m.app_role IN ('reader', 'editor', 'admin') "
+            "ON CONFLICT (tenant_id, actor_id, storage_name) DO UPDATE SET "
+            "ref_digest = EXCLUDED.ref_digest, "
+            "file_sha256 = EXCLUDED.file_sha256, "
+            "file_size = EXCLUDED.file_size, created_at = now(), "
+            "expires_at = EXCLUDED.expires_at "
+            "RETURNING ref_digest, expires_at",
+            (export_id, actor_id, ref_digest, storage_name, file_sha256,
+             file_size, ttl_seconds, actor_id))
+        row = cur.fetchone()
+    if row is None:
+        raise ExportAccessRefused("disari aktarim yetkisi yok")
+    conn.commit()
+    return dict(row)
+
+
+def mint_table_export_ticket(conn, *, actor_id, ref_digest, token_digest,
+                             ttl_seconds=50):
+    """Mint one actor-bound ticket after a fresh export/membership check."""
+    try:
+        actor_id = uuid.UUID(str(actor_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ExportAccessRefused("disari aktarim kimligi gecersiz") from exc
+    if (type(ref_digest) is not bytes or len(ref_digest) != 32
+            or type(token_digest) is not bytes or len(token_digest) != 32
+            or isinstance(ttl_seconds, bool) or type(ttl_seconds) is not int
+            or not 45 <= ttl_seconds <= 60):
+        raise ExportAccessRefused("disari aktarim bileti gecersiz")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "INSERT INTO table_export_tickets "
+            "(token_digest, tenant_id, actor_id, export_id, purpose, "
+            "expires_at) "
+            "SELECT %s, e.tenant_id, %s, e.id, 'download', "
+            "now() + (%s * interval '1 second') "
+            "FROM table_exports e "
+            "JOIN org_memberships m ON m.tenant_id = e.tenant_id "
+            "AND m.identity_id = %s AND m.state = 'active' "
+            "AND m.app_role IN ('reader', 'editor', 'admin') "
+            "WHERE e.ref_digest = %s AND e.actor_id = %s "
+            "AND e.expires_at > now() RETURNING expires_at",
+            (token_digest, actor_id, ttl_seconds, actor_id, ref_digest,
+             actor_id))
+        row = cur.fetchone()
+    if row is None:
+        raise ExportAccessRefused("disari aktarim bulunamadi")
+    conn.commit()
+    return row["expires_at"]
+
+
+def consume_table_export_ticket(conn, *, actor_id, token_digest):
+    """Consume once and return only the closed storage measurement tuple."""
+    try:
+        actor_id = uuid.UUID(str(actor_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ExportAccessRefused("disari aktarim kimligi gecersiz") from exc
+    if type(token_digest) is not bytes or len(token_digest) != 32:
+        raise ExportAccessRefused("disari aktarim bileti gecersiz")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "UPDATE table_export_tickets t SET consumed_at = now() "
+            "FROM table_exports e "
+            "JOIN org_memberships m ON m.tenant_id = e.tenant_id "
+            "AND m.identity_id = %s AND m.state = 'active' "
+            "AND m.app_role IN ('reader', 'editor', 'admin') "
+            "WHERE t.token_digest = %s AND t.actor_id = %s "
+            "AND t.tenant_id = e.tenant_id AND t.export_id = e.id "
+            "AND e.actor_id = %s AND e.expires_at > now() "
+            "AND t.purpose = 'download' AND t.consumed_at IS NULL "
+            "AND t.expires_at > now() "
+            "RETURNING e.storage_name, e.file_sha256, e.file_size",
+            (actor_id, token_digest, actor_id, actor_id))
+        row = cur.fetchone()
+    if row is None:
+        raise ExportAccessRefused("disari aktarim bileti gecersiz")
     conn.commit()
     return dict(row)
 

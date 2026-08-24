@@ -103,6 +103,29 @@ def test_extract_tables_caches_by_image_content(tmp_path, monkeypatch):
     assert first is second
 
 
+def test_export_storage_name_is_random_opaque_and_not_content_derived(
+        tmp_path, monkeypatch):
+    written = []
+    monkeypatch.setattr(
+        owui_chat, "run_consensus",
+        lambda _path: [{"headers": ["A"], "rows": [["1"]],
+                        "confidence": 1.0}])
+    monkeypatch.setattr(
+        owui_chat, "export_result_xlsx",
+        lambda _result, path: written.append(path))
+    monkeypatch.setattr(owui_chat, "UPLOAD_DIR", tmp_path / "up")
+    monkeypatch.setattr(owui_chat, "EXPORT_DIR", tmp_path / "out")
+    monkeypatch.setattr(owui_chat, "_CACHE", {})
+    raw = b"name-must-not-describe-these-bytes"
+    entry = owui_chat.extract_tables(_data_url(raw), "1" * 32)
+    name = entry["files"][0]
+    digest = __import__("hashlib").sha256(raw).hexdigest()
+    assert owui_chat.EXPORT_NAME_RE.fullmatch(name)
+    assert digest[:16] not in name
+    assert "1" * 32 not in name
+    assert written == [str(tmp_path / "out" / name)]
+
+
 def test_extract_tables_survives_a_failing_export(tmp_path, monkeypatch):
     def boom(result, path):
         raise RuntimeError("openpyxl patladi")
@@ -164,12 +187,13 @@ def _entry(needs_review=False, disagreements=(), name="abc-0.xlsx"):
     }
 
 
-def test_render_includes_table_confidence_and_download_link():
-    md = owui_chat.render_tables(_entry())
+def test_render_includes_confidence_and_only_an_opaque_export_reference():
+    md = owui_chat.render_tables(_entry(), lambda _name: "A" * 43)
     assert "| Kod | Tutar |" in md
     assert "0.97" in md
-    assert "/files/abc-0.xlsx" in md
-    assert owui_chat.PUBLIC_BASE_URL in md
+    assert "ragtest-export:" + "A" * 43 in md
+    assert "/files/" not in md
+    assert "abc-0.xlsx" not in md
 
 
 def test_render_reports_disagreement_count_when_review_needed():
@@ -183,8 +207,9 @@ def test_render_warns_without_count_when_no_disagreement_listed():
 
 
 def test_render_omits_link_when_export_failed():
-    md = owui_chat.render_tables(_entry(name=None))
-    assert "/files/" not in md
+    md = owui_chat.render_tables(_entry(), lambda _name: None)
+    assert "ragtest-export:" not in md
+    assert "None" not in md
 
 
 # --- reply routing ---
@@ -205,6 +230,19 @@ def test_tables_reply_reports_when_no_table_found(monkeypatch):
         lambda url, namespace="": {"results": [], "files": []})
     messages = [{"role": "user", "content": [_img_part(_data_url())]}]
     assert owui_chat.tables_reply(messages) == owui_chat.NO_TABLE_MSG
+
+
+def test_tables_reply_uses_the_actor_reference_callback(monkeypatch):
+    monkeypatch.setattr(
+        owui_chat, "extract_tables",
+        lambda _url, _namespace="": _entry(name="a" * 32 + ".xlsx"))
+    seen = []
+    messages = [{"role": "user", "content": [_img_part(_data_url())]}]
+    answer = owui_chat.tables_reply(
+        messages, export_ref_for=lambda name: seen.append(name) or "R" * 43)
+    assert seen == ["a" * 32 + ".xlsx"]
+    assert "ragtest-export:" + "R" * 43 in answer
+    assert "a" * 32 not in answer
 
 
 def test_tables_reply_propagates_extraction_failure(monkeypatch):
@@ -278,11 +316,13 @@ def test_stream_tables_renders_result_after_progress(monkeypatch):
         owui_chat, "extract_tables", lambda url, namespace="": _entry())
 
     messages = [{"role": "user", "content": [_img_part(_data_url())]}]
-    chunks = list(owui_chat.stream_tables(messages, "m"))
+    chunks = list(owui_chat.stream_tables(
+        messages, "m", export_ref_for=lambda _name: "S" * 43))
     text = "".join(p["choices"][0]["delta"].get("content", "") for p in _payloads(chunks))
 
     assert "çalıştırılıyor" in text
     assert "| Kod | Tutar |" in text
+    assert "ragtest-export:" + "S" * 43 in text
     assert chunks[-1] == "data: [DONE]\n\n"
 
 

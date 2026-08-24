@@ -21,11 +21,6 @@ from pipeline.extraction.table_export import table_to_markdown, export_result_xl
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./data/uploads"))
 EXPORT_DIR = Path(os.getenv("EXPORT_DIR", "./output/owui"))
 
-# Base URL for download links. OpenWebUI reaches the API from inside its
-# container (host.docker.internal), but the Excel link is clicked in the user's
-# browser on the host -- those are different origins, so the link can't reuse
-# whatever URL OpenWebUI itself was configured with.
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 # How often the streaming reply emits a progress tick while the models run.
 STREAM_TICK_SECONDS = float(os.getenv("STREAM_TICK_SECONDS", "5"))
 # Checked far more often than a tick is emitted, so a cache hit (which finishes
@@ -36,7 +31,7 @@ DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTAL
 MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp"}
 # Only ever serve files we named ourselves -- keeps a crafted request from
 # walking out of EXPORT_DIR.
-EXPORT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+\.xlsx$")
+EXPORT_NAME_RE = re.compile(r"^[0-9a-f]{32}\.xlsx$")
 
 NO_IMAGE_MSG = ("Tablo çıkarımı için bir tablo görüntüsü yükleyin: sohbet "
                 "kutusundaki + ile bir PNG/JPG ekleyip gönderin.")
@@ -133,7 +128,7 @@ def extract_tables(data_url: str, namespace: str = ""):
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     files = []
     for i, r in enumerate(results):
-        name = f"{prefix}{digest}-{i}.xlsx"
+        name = f"{uuid.uuid4().hex}.xlsx"
         try:
             export_result_xlsx(r, str(EXPORT_DIR / name))
             files.append(name)
@@ -148,9 +143,9 @@ def extract_tables(data_url: str, namespace: str = ""):
     return entry
 
 
-def render_tables(entry) -> str:
+def render_tables(entry, export_ref_for=None) -> str:
     """Render consensus results as markdown OpenWebUI can display inline, each
-    with its confidence, review warning and Excel download link."""
+    with its confidence, review warning and opaque Excel export reference."""
     blocks = []
     for i, (r, name) in enumerate(zip(entry["results"], entry["files"]), 1):
         md = table_to_markdown(r["headers"], r["rows"])
@@ -159,13 +154,16 @@ def render_tables(entry) -> str:
             n = len(r.get("disagreements", []))
             note += (f" — ⚠️ {n} hücrede modeller uyuşmuyor, gözden geçirin"
                      if n else " — ⚠️ gözden geçirilmeli")
-        if name:
-            note += f"\n\n[📥 Excel indir (uyuşmazlıklar işaretli)]({PUBLIC_BASE_URL}/files/{name})"
+        if name and export_ref_for is not None:
+            reference = export_ref_for(name)
+            if reference:
+                note += ("\n\n📦 Excel dışa aktarım referansı: "
+                         f"`ragtest-export:{reference}`")
         blocks.append(f"**Tablo {i}**\n\n{md}\n\n{note}")
     return "\n\n---\n\n".join(blocks)
 
 
-def tables_reply(messages, namespace: str = "") -> str:
+def tables_reply(messages, namespace: str = "", export_ref_for=None) -> str:
     """Full non-streaming reply for the table model. Propagates extraction
     failures so the caller can turn them into an HTTP error."""
     url = latest_image_url(messages)
@@ -176,7 +174,7 @@ def tables_reply(messages, namespace: str = "") -> str:
         return BAD_IMAGE_MSG
     if not entry["results"]:
         return NO_TABLE_MSG
-    return render_tables(entry)
+    return render_tables(entry, export_ref_for)
 
 
 def sse_chunk(
@@ -208,7 +206,7 @@ def sse_chunk(
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def stream_tables(messages, model, namespace: str = ""):
+def stream_tables(messages, model, namespace: str = "", export_ref_for=None):
     """Progress-reporting SSE for the table model. Two VLMs on one image take
     minutes; without ticks an unbroken spinner is indistinguishable from a hang.
     The work runs in a thread so the generator stays free to emit them."""
@@ -231,7 +229,7 @@ def stream_tables(messages, model, namespace: str = ""):
                 entry = fut.result()
                 text = (BAD_IMAGE_MSG if entry is None
                         else NO_TABLE_MSG if not entry["results"]
-                        else render_tables(entry))
+                        else render_tables(entry, export_ref_for))
             except Exception:
                 # Headers are already sent, so a fixed content-safe message is
                 # the only honest failure channel. Exception prose can carry a

@@ -77,14 +77,14 @@ def test_v5_receipt_advances_to_current_with_forced_rls_and_is_idempotent(
     db.init_schema(conn)
 
     version, digest = db.expected_schema_state()
-    assert version == db.SCHEMA_VERSION == 7
+    assert version == db.SCHEMA_VERSION == 8
     assert digest != V5_DIGEST
     assert db.schema_is_current(conn)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT schema_version, schema_sha256 FROM rag_schema_history "
             "ORDER BY schema_version")
-        assert cur.fetchall() == [(5, V5_DIGEST), (7, digest)]
+        assert cur.fetchall() == [(5, V5_DIGEST), (8, digest)]
         for table in ("eval_datasets", "eval_dataset_versions", "eval_cases",
                       "eval_dataset_events"):
             cur.execute("SELECT to_regclass(%s)", (table,))
@@ -148,7 +148,7 @@ def test_database_trigger_rolls_back_a_v5_binary_downgrade_transaction(
 def test_same_version_wrong_digest_is_refused_before_eval_product_ddl(
         migration_database):
     conn = migration_database
-    _legacy_receipt(conn, version=7, digest="0" * 64)
+    _legacy_receipt(conn, version=db.SCHEMA_VERSION, digest="0" * 64)
     with pytest.raises(RuntimeError, match="digest"):
         db.init_schema(conn)
     conn.rollback()
