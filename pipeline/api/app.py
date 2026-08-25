@@ -693,7 +693,8 @@ def organization_topology(
     return topology
 
 
-@app.get("/v1/org/admin/audit-events")
+@app.get("/v1/org/admin/audit-events",
+         response_model=api_contracts.OrgAuditEventListResponse)
 def organization_audit_events(
         request: Request,
         limit: int = Query(20, ge=1, le=100),
@@ -807,7 +808,8 @@ def update_organization_membership(
     }
 
 
-@app.get("/v1/org/admin/retention-policy")
+@app.get("/v1/org/admin/retention-policy",
+         response_model=api_contracts.RetentionPolicyResponse)
 def organization_retention_policy(
         principal=Depends(require_org_architect)):
     try:
@@ -818,7 +820,8 @@ def organization_retention_policy(
         raise HTTPException(status_code=403, detail=str(error)) from None
 
 
-@app.get("/v1/org/admin/retention-documents")
+@app.get("/v1/org/admin/retention-documents",
+         response_model=api_contracts.RetentionDocumentListResponse)
 def organization_retention_documents(
         request: Request,
         limit: int = Query(50, ge=1, le=100),
@@ -874,7 +877,8 @@ def organization_retention_documents(
     }
 
 
-@app.put("/v1/org/admin/retention-policy")
+@app.put("/v1/org/admin/retention-policy",
+         response_model=api_contracts.RetentionPolicyResponse)
 def update_organization_retention_policy(
         body: RetentionPolicyUpdateRequest, request: Request,
         principal=Depends(require_org_architect)):
@@ -893,7 +897,8 @@ def update_organization_retention_policy(
         raise HTTPException(status_code=422, detail=str(error)) from None
 
 
-@app.get("/documents/{document_id}/legal-holds")
+@app.get("/documents/{document_id}/legal-holds",
+         response_model=api_contracts.LegalHoldListResponse)
 def document_legal_holds(
         document_id: UUID, principal=Depends(require_org_architect)):
     try:
@@ -905,7 +910,9 @@ def document_legal_holds(
         raise HTTPException(status_code=403, detail=str(error)) from None
 
 
-@app.post("/documents/{document_id}/legal-holds", status_code=201)
+@app.post("/documents/{document_id}/legal-holds", status_code=201,
+          response_model=api_contracts.LegalHoldResponse,
+          response_model_exclude_unset=True)
 def create_document_legal_hold(
         document_id: UUID, body: LegalHoldCreateRequest, request: Request,
         principal=Depends(require_org_architect)):
@@ -925,7 +932,9 @@ def create_document_legal_hold(
         raise HTTPException(status_code=422, detail=str(error)) from None
 
 
-@app.post("/documents/{document_id}/legal-holds/{hold_id}/release")
+@app.post("/documents/{document_id}/legal-holds/{hold_id}/release",
+          response_model=api_contracts.LegalHoldResponse,
+          response_model_exclude_unset=True)
 def release_document_legal_hold(
         document_id: UUID, hold_id: UUID, body: LegalHoldReleaseRequest,
         request: Request, principal=Depends(require_org_architect)):
@@ -944,7 +953,9 @@ def release_document_legal_hold(
         raise HTTPException(status_code=422, detail=str(error)) from None
 
 
-@app.get("/documents/{document_id}/purge-jobs")
+@app.get("/documents/{document_id}/purge-jobs",
+         response_model=api_contracts.PurgeJobListResponse,
+         response_model_exclude_unset=True)
 def document_purge_jobs(
         document_id: UUID, principal=Depends(require_org_architect)):
     try:
@@ -956,7 +967,9 @@ def document_purge_jobs(
         raise HTTPException(status_code=403, detail=str(error)) from None
 
 
-@app.post("/documents/{document_id}/purge-jobs", status_code=202)
+@app.post("/documents/{document_id}/purge-jobs", status_code=202,
+          response_model=api_contracts.PurgeJobResponse,
+          response_model_exclude_unset=True)
 def schedule_document_purge(
         document_id: UUID, body: PurgeScheduleRequest, request: Request,
         principal=Depends(require_org_architect)):
