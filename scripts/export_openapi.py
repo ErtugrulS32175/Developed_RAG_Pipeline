@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import types
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,8 +27,22 @@ def openapi_document():
     os.environ.setdefault("EXPORT_DIR", str(root / "export"))
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    from pipeline.api.app import app
-    return app.openapi()
+    # Route registration only needs endpoint signatures. Importing the real
+    # ingest runtime here would initialize its tokenizer and turn a deterministic
+    # schema check into a model-cache/network dependency on clean CI runners.
+    # The placeholder is process-local, is never invoked, and is removed again
+    # after the application module has been imported.
+    module_name = "pipeline.index.ingest"
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = types.ModuleType(module_name)
+    try:
+        from pipeline.api.app import app
+        return app.openapi()
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
 
 
 def canonical_bytes(document):

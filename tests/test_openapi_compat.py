@@ -1,7 +1,14 @@
 """Permanent regression tests for the checked OpenAPI compatibility gate."""
 from copy import deepcopy
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 from scripts.check_openapi_compat import incompatibilities
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _document():
@@ -57,3 +64,28 @@ def test_request_response_parameter_and_security_drift_are_each_refused():
         assert incompatibilities(baseline, current) == (
             f"operation {key} changed: GET /items",
         )
+
+
+def test_openapi_export_needs_no_huggingface_cache(tmp_path):
+    env = os.environ.copy()
+    env.update({
+        "HF_HOME": str(tmp_path / "empty-huggingface-cache"),
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    })
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "export_openapi.py"),
+            "--check",
+            str(ROOT / "contracts" / "openapi.json"),
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "OpenAPI snapshot is current"
