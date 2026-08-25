@@ -69,7 +69,8 @@ def test_schema_is_fixed_and_closed_to_operational_facts_only():
             "control_identity_route_digests", "control_platform_operators",
             "control_platform_operator_digests", "control_service_accounts",
             "control_service_account_scopes",
-            "control_service_account_credentials", "control_admin_events"):
+            "control_service_account_credentials",
+            "control_service_account_events", "control_admin_events"):
         assert f"rag_control.{table}" in text
 
     lowered = text.lower()
@@ -84,18 +85,25 @@ def test_schema_is_fixed_and_closed_to_operational_facts_only():
     assert "CHECK (position('@' in connection_ref) = 0)" in text
     assert "ON DELETE CASCADE" not in text
     assert "SET search_path FROM CURRENT" not in text
-    assert text.count("SET search_path = pg_catalog, rag_control") == 4
+    assert text.count("SET search_path = pg_catalog, rag_control") == 9
 
 
 def test_runtime_role_has_only_lookup_function_authority():
     script = (
         ROOT / "scripts" / "init_control_runtime_role.sh"
     ).read_text(encoding="utf-8")
-    assert "NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT" in script
+    assert ("NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT "
+            "NOREPLICATION") in script
+    assert "ALTER ROLE rag_control_runtime LOGIN PASSWORD :'runtime_password'" in script
+    assert "\\getenv runtime_password CONTROL_RUNTIME_PASSWORD" in script
+    assert "--set=runtime_password" not in script
     assert "REVOKE ALL ON ALL TABLES IN SCHEMA rag_control" in script
     assert "REVOKE ALL ON ALL SEQUENCES IN SCHEMA rag_control" in script
+    assert "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA rag_control" in script
+    assert "REVOKE CREATE ON DATABASE" in script
     assert "rag_control.control_tenant_facts(uuid)" in script
     assert "rag_control.control_resolve_identity(integer, bytea)" in script
+    assert "rag_control.control_resolve_platform_operator(" in script
     assert "rag_control.control_resolve_service_account(" in script
     assert "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES" not in script
 
@@ -103,11 +111,14 @@ def test_runtime_role_has_only_lookup_function_authority():
 def test_events_are_owner_immutable_and_public_exec_is_revoked():
     text = SCHEMA.read_text(encoding="utf-8")
     assert "BEFORE UPDATE OR DELETE ON rag_control.control_admin_events" in text
+    assert ("BEFORE UPDATE OR DELETE ON "
+            "rag_control.control_service_account_events") in text
     assert "ERRCODE = '55000'" in text
     assert "MESSAGE = 'control_event_immutable'" in text
-    assert text.count("STABLE SECURITY DEFINER") == 3
+    assert text.count("STABLE SECURITY DEFINER") == 5
     assert "control_tenant_facts(uuid) FROM PUBLIC" in text
     assert "control_resolve_identity(integer, bytea)" in text
+    assert "control_resolve_platform_operator(" in text
     assert "control_resolve_service_account(" in text
 
 
@@ -200,7 +211,7 @@ def test_invalid_digest_versions_and_shapes_fail_before_sql(version, digest):
 
 
 def test_control_schema_version_binds_the_shipped_bytes():
-    assert db.CONTROL_SCHEMA_VERSION == 2
+    assert db.CONTROL_SCHEMA_VERSION == 3
     digest = hashlib.sha256(SCHEMA.read_bytes()).hexdigest()
     assert len(digest) == 64
     assert db._SCHEMA_LOCK_NAME == "ragtest-control-schema-migration"

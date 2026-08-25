@@ -207,7 +207,9 @@ def test_database_not_the_caller_owns_credential_time():
               "control" / "schema.sql").read_text(encoding="utf-8")
     resolver = schema.split(
         "CREATE OR REPLACE FUNCTION rag_control.control_resolve_service_account",
-        1)[1]
+        1)[1].split(
+            "CREATE OR REPLACE FUNCTION "
+            "rag_control.control_require_platform_security", 1)[0]
     assert "requested_at" not in resolver
     assert resolver.count("statement_timestamp()") == 3
 
