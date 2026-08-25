@@ -282,7 +282,7 @@ def _provider_endpoint(value, config):
     return endpoint
 
 
-def _absolute_url(value, name, *, allow_loopback_http, query, 
+def _absolute_url(value, name, *, allow_loopback_http, query,
                   refusal=OIDCConfigurationError):
     if type(value) is not str or not value or value != value.strip():
         raise refusal(f"OIDC {name} is invalid")
