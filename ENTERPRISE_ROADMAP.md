@@ -75,9 +75,9 @@ Status: `[x]` completed on 2026-08-25.
 
 Provider selections remain deploy-time decisions, not code defaults:
 
-- [ ] Select and record the first OIDC provider for the pilot.
+- [x] Select and record Keycloak as the first OIDC provider for the pilot.
 - [ ] Select and record the first S3-compatible or managed object store.
-- [ ] Select and record the custom frontend stack and secure BFF/session model.
+- [x] Select and record a server-held BFF/session model for browser identity.
 - [ ] Approve pilot RPO, RTO, SLO, data-residency, and compliance requirements.
 
 ## E1 - Closed API contracts and domain boundaries
@@ -119,7 +119,7 @@ full tests, leak scan, and CI remain green.
 
 ## E2 - Enterprise identity and content-free control plane
 
-Status: `[ ]` not started.
+Status: `[~]` in progress.
 
 - [ ] Verify OIDC authorization-code/PKCE sessions through issuer, audience,
   client, expiry, and rotating JWKS keys.

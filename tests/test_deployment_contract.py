@@ -78,3 +78,52 @@ def test_the_operator_rule_names_the_cache_that_invalidated_a_real_run():
     assert "including `--collect-only`" in readme
     assert "even `.pytest_cache`" in readme
     assert "disposable clone pinned to the run's baseline" in readme
+
+
+def test_enterprise_identity_decisions_are_closed_and_content_free():
+    decision = (
+        ROOT / "docs" / "enterprise_identity.md"
+    ).read_text(encoding="utf-8")
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    for fact in (
+            "pilot provider is **Keycloak**",
+            "authorization code flow with PKCE `S256`",
+            "`Secure`,\n`HttpOnly`, and `SameSite=Lax`",
+            "OIDC users and the retained signed OpenWebUI bridge",
+            "separate control-plane repository and connection pool",
+            "there is no fallback",
+            "Platform administration and tenant administration are different",
+            "Break-glass is never a standing role"):
+        assert fact in decision
+
+    required_empty = {
+        "OIDC_ISSUER",
+        "OIDC_CLIENT_ID",
+        "OIDC_CLIENT_SECRET",
+        "OIDC_REDIRECT_URI",
+        "OIDC_POST_LOGOUT_REDIRECT_URI",
+        "OIDC_SESSION_SECRET",
+        "CONTROL_IDENTITY_HMAC_SECRET",
+        "PG_CONTROL_DSN",
+        "PG_CONTROL_MIGRATION_DSN",
+    }
+    values = {}
+    for line in example.splitlines():
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    assert required_empty <= values.keys()
+    assert all(values[key] == "" for key in required_empty)
+    assert "prompts, messages, documents, chunks, embeddings" in decision
+    assert "raw issuer/subject values, secrets, DSNs" in decision
+
+
+def test_roadmap_records_the_selected_identity_decisions_and_active_phase():
+    roadmap = (ROOT / "ENTERPRISE_ROADMAP.md").read_text(encoding="utf-8")
+    assert "[x] Select and record Keycloak" in roadmap
+    assert "[x] Select and record a server-held BFF/session model" in roadmap
+    e2 = roadmap.split(
+        "## E2 - Enterprise identity and content-free control plane", 1
+    )[1].split("## E3 -", 1)[0]
+    assert "Status: `[~]` in progress." in e2
