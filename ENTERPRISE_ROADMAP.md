@@ -82,7 +82,7 @@ Provider selections remain deploy-time decisions, not code defaults:
 
 ## E1 - Closed API contracts and domain boundaries
 
-Status: `[~]` in progress.
+Status: `[x]` complete.
 
 - [x] Introduce closed response models without changing response bytes.
   - [x] Liveness, readiness, and OpenAI model-list response contracts.
@@ -337,3 +337,20 @@ SLOs; the rollback window has closed.
 - Verified the slice with 307 focused org, document, auth, RBAC, and RAG tests.
   Governance audit/retention and the remaining document lifecycle operations
   stay open and are not counted as complete.
+
+### 2026-08-25 - E1 closed API contracts and domain boundaries complete
+
+- Closed every JSON response and chat SSE event contract, introduced the
+  versioned content-free error vocabulary, and preserved the compatibility
+  transition for existing FastAPI `detail` clients.
+- Added checked OpenAPI current/floor snapshots, backwards-compatibility gates,
+  and a generated TypeScript client that compiles under strict settings.
+- Standardized pagination, cursor, idempotency, conflict, and deprecation
+  metadata in one machine-readable protocol contract.
+- Assigned all 53 HTTP handlers to seven domain routers. Split API database
+  access into six frozen, fail-closed domain repositories while retaining
+  `pipeline.index.db` as the only SQL and authorization authority.
+- Verified the completed phase with 3062 passed and 141 skipped Python tests,
+  a current OpenAPI snapshot, a passing OpenAPI compatibility check, and a
+  clean generated TypeScript diff and typecheck. Final hygiene and leak-scan
+  evidence is taken from this completed roadmap state before publication.
