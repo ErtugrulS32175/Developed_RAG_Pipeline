@@ -36,7 +36,7 @@ load_dotenv()
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv(
     "PG_DSN", "postgresql://rag_runtime:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -600,7 +600,8 @@ def list_org_audit_events(conn, *, limit, before=None, actions=None,
         "monitor_view", "topology_read", "topology_change",
         "access_preview", "review_queue_view", "review_decision",
         "events_view", "membership_change", "retention_policy_change",
-        "legal_hold_change", "purge_schedule", "purge_execute",
+        "legal_hold_change", "retention_inventory_view", "purge_schedule",
+        "purge_execute",
     }
     allowed_decisions = {"allowed", "denied"}
     allowed_reasons = {
@@ -1929,6 +1930,59 @@ def get_tenant_retention_policy(conn, *, actor_id):
     if row is None:
         raise DocumentRetentionRefused("retention mimari yetkisi yok")
     return dict(row)
+
+
+def list_retention_documents(conn, *, actor_id, limit, before=None):
+    """List opaque document governance facts for one content-blind architect.
+
+    Filenames, content hashes, status notes and candidate identifiers are
+    intentionally absent.  The keyset is stable under concurrent inserts and
+    gives the portal exactly the revision and lifecycle facts required by the
+    legal-hold and purge CAS gates.
+    """
+    actor = _retention_uuid(actor_id, "actor_id")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise DocumentRetentionRefused("retention belge limiti gecersiz")
+    before_uploaded_at = before_id = None
+    if before is not None:
+        if type(before) not in (tuple, list) or len(before) != 2:
+            raise DocumentRetentionRefused("retention belge cursor'u bozuk")
+        before_uploaded_at, before_id = before
+        if (type(before_uploaded_at) is not datetime
+                or before_uploaded_at.tzinfo is None):
+            raise DocumentRetentionRefused(
+                "retention belge cursor zamani gecersiz")
+        before_id = _retention_uuid(before_id, "before_id")
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        _lock_retention_architect(cur, actor)
+        params = []
+        cursor_clause = ""
+        if before is not None:
+            cursor_clause = (
+                "AND (document.uploaded_at, document.id) < (%s, %s) ")
+            params.extend((before_uploaded_at, before_id))
+        params.append(limit + 1)
+        cur.execute(
+            "SELECT document.id AS document_id, document.status, "
+            "document.revision, document.uploaded_at, document.archived_at, "
+            "document.purged_at, "
+            "(SELECT count(*) FROM document_legal_holds hold "
+            " WHERE hold.document_id = document.id "
+            " AND hold.state = 'active') active_hold_count, "
+            "latest.id AS latest_purge_job_id, "
+            "latest.state AS latest_purge_state "
+            "FROM documents document LEFT JOIN LATERAL ("
+            " SELECT job.id, job.state FROM document_purge_jobs job "
+            " WHERE job.document_id = document.id "
+            " ORDER BY job.created_at DESC, job.id DESC LIMIT 1"
+            ") latest ON true WHERE document.tenant_id = rag_effective_tenant() "
+            + cursor_clause +
+            "ORDER BY document.uploaded_at DESC, document.id DESC LIMIT %s",
+            tuple(params))
+        rows = [dict(row) for row in cur.fetchall()]
+    conn.rollback()
+    return rows
 
 
 def update_tenant_retention_policy(

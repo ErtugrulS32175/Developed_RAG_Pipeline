@@ -404,6 +404,8 @@ def require_org_architect(
             action = "membership_change"
         elif path == "/v1/org/admin/retention-policy":
             action = "retention_policy_change"
+        elif path == "/v1/org/admin/retention-documents":
+            action = "retention_inventory_view"
         elif "/legal-holds" in path:
             action = "legal_hold_change"
         elif "/purge-jobs" in path:
@@ -698,7 +700,8 @@ def organization_audit_events(
             "monitor_view", "topology_read", "topology_change",
             "access_preview", "review_queue_view", "review_decision",
             "events_view", "membership_change", "retention_policy_change",
-            "legal_hold_change", "purge_schedule", "purge_execute"
+            "legal_hold_change", "retention_inventory_view",
+            "purge_schedule", "purge_execute"
         ]] | None = Query(default=None),
         decision: list[Literal["allowed", "denied"]] | None = Query(
             default=None),
@@ -808,6 +811,62 @@ def organization_retention_policy(
                 conn, actor_id=principal.subject_id)
     except db.DocumentRetentionRefused as error:
         raise HTTPException(status_code=403, detail=str(error)) from None
+
+
+@app.get("/v1/org/admin/retention-documents")
+def organization_retention_documents(
+        request: Request,
+        limit: int = Query(50, ge=1, le=100),
+        before_uploaded_at: AwareDatetime | None = Query(default=None),
+        before_id: UUID | None = Query(default=None),
+        principal=Depends(require_org_architect)):
+    """List content-free document lifecycle facts for the admin portal."""
+    if (before_uploaded_at is None) != (before_id is None):
+        raise HTTPException(status_code=422,
+                            detail="retention belge imleci eksik")
+    before = ((before_uploaded_at, before_id)
+              if before_id is not None else None)
+    try:
+        with db_conn() as conn:
+            rows = db.list_retention_documents(
+                conn, actor_id=principal.subject_id, limit=limit,
+                before=before)
+            db.record_org_decision(
+                conn, actor_id=principal.subject_id, subject_id=None,
+                action="retention_inventory_view",
+                reason_code="system_operation", allowed=True,
+                request_id=request.state.request_id)
+    except db.DocumentRetentionRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    page = rows[:limit]
+    has_more = len(rows) > limit
+    next_cursor = None
+    if has_more and page:
+        next_cursor = {
+            "before_uploaded_at": page[-1]["uploaded_at"],
+            "before_id": str(page[-1]["document_id"]),
+        }
+    documents = []
+    for row in page:
+        documents.append({
+            "document_id": str(row["document_id"]),
+            "status": row["status"],
+            "revision": int(row["revision"]),
+            "uploaded_at": row["uploaded_at"],
+            "archived_at": row["archived_at"],
+            "purged_at": row["purged_at"],
+            "active_hold_count": int(row["active_hold_count"]),
+            "latest_purge_job_id": (
+                None if row["latest_purge_job_id"] is None
+                else str(row["latest_purge_job_id"])),
+            "latest_purge_state": row["latest_purge_state"],
+        })
+    return {
+        "documents": documents,
+        "limit": limit,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }
 
 
 @app.put("/v1/org/admin/retention-policy")

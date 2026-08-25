@@ -1,5 +1,6 @@
 """Closed retention, legal-hold and purge API contracts."""
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import uuid
 
 import pytest
@@ -59,7 +60,7 @@ def test_retention_models_are_strict_and_closed():
 def test_schema_carries_closed_retention_evidence_and_rls():
     schema = db.Path(db.__file__).with_name("schema.sql").read_text(
         encoding="utf-8")
-    assert db.SCHEMA_VERSION == 10
+    assert db.SCHEMA_VERSION == 11
     for table in (
             "tenant_retention_policies", "document_legal_holds",
             "document_purge_jobs", "document_retention_events"):
@@ -70,6 +71,68 @@ def test_schema_carries_closed_retention_evidence_and_rls():
     assert "CREATE TRIGGER documents_guard_purge_state" in schema
     assert "WHERE state IN ('pending', 'running')" in schema
     assert "purge_execute" in schema
+    assert "retention_inventory_view" in schema
+
+
+def test_retention_inventory_is_opaque_keyset_paginated_and_audited(
+        retention_api, monkeypatch):
+    client, _current = retention_api
+    uploaded = datetime(2026, 8, 25, 7, 0, tzinfo=timezone.utc)
+    later = uuid.UUID("43000000-0000-4000-8000-000000000005")
+    captured = []
+    audited = []
+    rows = [
+        {
+            "document_id": DOCUMENT, "status": "archived", "revision": 4,
+            "uploaded_at": uploaded, "archived_at": uploaded,
+            "purged_at": None, "active_hold_count": 1,
+            "latest_purge_job_id": HOLD,
+            "latest_purge_state": "cancelled",
+        },
+        {
+            "document_id": later, "status": "purged", "revision": 5,
+            "uploaded_at": uploaded, "archived_at": uploaded,
+            "purged_at": uploaded, "active_hold_count": 0,
+            "latest_purge_job_id": None, "latest_purge_state": None,
+        },
+    ]
+    monkeypatch.setattr(
+        api.db, "list_retention_documents",
+        lambda _conn, **fields: captured.append(fields) or rows)
+    monkeypatch.setattr(
+        api.db, "record_org_decision",
+        lambda _conn, **fields: audited.append(fields))
+
+    response = client.get("/v1/org/admin/retention-documents?limit=1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["has_more"] is True
+    assert body["documents"] == [{
+        "document_id": str(DOCUMENT), "status": "archived", "revision": 4,
+        "uploaded_at": uploaded.isoformat(),
+        "archived_at": uploaded.isoformat(), "purged_at": None,
+        "active_hold_count": 1, "latest_purge_job_id": str(HOLD),
+        "latest_purge_state": "cancelled",
+    }]
+    assert set(body["documents"][0]).isdisjoint({
+        "filename", "status_note", "content_sha256", "candidate_id",
+    })
+    assert body["next_cursor"] == {
+        "before_uploaded_at": uploaded.isoformat(),
+        "before_id": str(DOCUMENT),
+    }
+    assert captured == [{"actor_id": ARCHITECT, "limit": 1,
+                         "before": None}]
+    assert audited[0]["action"] == "retention_inventory_view"
+    assert audited[0]["allowed"] is True
+
+
+def test_retention_inventory_requires_a_complete_cursor(retention_api):
+    client, _current = retention_api
+    response = client.get(
+        "/v1/org/admin/retention-documents?before_id=" + str(DOCUMENT))
+    assert response.status_code == 422
 
 
 def test_policy_endpoints_preserve_cas_and_request_identity(
@@ -176,3 +239,9 @@ def test_document_admin_without_architect_capability_is_refused_and_audited(
         "allowed": False,
         "request_id": response.headers["X-Request-ID"],
     }]
+
+    recorded.clear()
+    response = client.get("/v1/org/admin/retention-documents")
+    assert response.status_code == 403
+    assert recorded[0]["action"] == "retention_inventory_view"
+    assert recorded[0]["allowed"] is False

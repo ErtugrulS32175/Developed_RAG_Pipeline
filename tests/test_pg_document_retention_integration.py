@@ -165,6 +165,16 @@ def test_hold_retention_and_worker_purge_form_one_terminal_chain(
     archived = db.set_document_archived(
         retention_database, str(document), True)
     assert archived["archived"] is True
+    inventory = db.list_retention_documents(
+        retention_database, actor_id=ARCHITECT, limit=100)
+    inventory_row = next(
+        row for row in inventory if row["document_id"] == document)
+    assert set(inventory_row) == {
+        "document_id", "status", "revision", "uploaded_at", "archived_at",
+        "purged_at", "active_hold_count", "latest_purge_job_id",
+        "latest_purge_state",
+    }
+    assert inventory_row["archived_at"] is not None
     with pytest.raises(db.DocumentRetentionRefused, match="retention"):
         db.schedule_document_purge(
             retention_database, actor_id=ARCHITECT,
@@ -306,6 +316,11 @@ def test_cross_tenant_document_identity_cannot_create_or_reveal_a_hold(
     _actor_context(retention_database)
     policy_epoch = db.get_tenant_retention_policy(
         retention_database, actor_id=ARCHITECT)["policy_epoch"]
+
+    inventory = db.list_retention_documents(
+        retention_database, actor_id=ARCHITECT, limit=100)
+    assert OTHER_DOCUMENT not in {
+        row["document_id"] for row in inventory}
 
     assert db.list_document_legal_holds(
         retention_database, actor_id=ARCHITECT,

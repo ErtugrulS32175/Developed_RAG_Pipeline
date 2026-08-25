@@ -969,7 +969,7 @@ CREATE TABLE IF NOT EXISTS org_audit_events (
                     'monitor_view', 'topology_read', 'topology_change',
                     'access_preview', 'review_queue_view',
                     'review_decision', 'events_view',
-                    'membership_change')),
+                    'membership_change', 'retention_inventory_view')),
     reason_code  text NOT NULL CHECK (reason_code IN (
                    'management_duty', 'security_review', 'system_operation',
                    'policy_preview')),
@@ -983,7 +983,7 @@ ALTER TABLE org_audit_events
     ADD CONSTRAINT org_audit_events_action_check CHECK (action IN (
         'monitor_view', 'topology_read', 'topology_change', 'access_preview',
         'review_queue_view', 'review_decision', 'events_view',
-        'membership_change'));
+        'membership_change', 'retention_inventory_view'));
 
 ALTER TABLE org_audit_events
     DROP CONSTRAINT IF EXISTS org_audit_events_tenant_id_fkey;
@@ -2142,4 +2142,4 @@ ALTER TABLE org_audit_events
         'monitor_view', 'topology_read', 'topology_change', 'access_preview',
         'review_queue_view', 'review_decision', 'events_view',
         'membership_change', 'retention_policy_change', 'legal_hold_change',
-        'purge_schedule', 'purge_execute'));
+        'retention_inventory_view', 'purge_schedule', 'purge_execute'));

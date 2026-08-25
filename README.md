@@ -150,14 +150,24 @@ In OpenWebUI Admin → Functions, import
 `openwebui/functions/ragtest_org_portal.py` and enable it as a global Event
 Function. Signed-in users then open `/ragtest-org`: everyone sees their own
 level and title, managers see only the descendant list they are authorized to
-monitor, and their content-free review queue; an architecture admin receives
-the versioned tree editor. Queue decisions carry both case revision and current
-policy epoch, so a hierarchy or policy change makes a stale browser decision
-fail instead of applying old authority. Protected positions are absent even
-from a root user's monitoring results. A save
-replaces the topology atomically; a stale editor receives 409 instead of
-overwriting a newer design. The portal is a same-origin OpenWebUI route and
-keeps both bridge secrets on the server.
+monitor, and their content-free review queue. A system architect receives the
+production administration panel: a visual hierarchy and membership editor,
+filtered governance-event history, retention-policy controls, content-blind
+document lifecycle inventory, legal-hold management and purge scheduling.
+Architecture and policy writes use version/epoch compare-and-swap gates. The
+topology save replaces the whole draft atomically, while individual membership,
+retention, hold and purge actions use their own narrow forms; a stale browser
+receives 409 instead of overwriting newer authority. Queue decisions likewise
+carry both case revision and current policy epoch. Protected positions remain
+absent even from a root user's monitoring results.
+
+The administration panel deliberately never displays filenames, document
+content, hashes, status notes or candidate identifiers. Its document inventory
+is made only of opaque ids and lifecycle/governance fields, so architecture
+authority does not become document-reading authority. Mutations require the
+same-origin portal header and closed JSON bodies; inline script and style bytes
+are pinned by the response CSP. The route keeps both identity-bridge secrets on
+the server and sends no-store, nosniff and no-referrer headers.
 
 ### Governed evaluation datasets in OpenWebUI
 
