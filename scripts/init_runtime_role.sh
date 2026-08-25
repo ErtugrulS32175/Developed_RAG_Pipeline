@@ -27,6 +27,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO rag_runtime;
 REVOKE ALL ON rag_context_secrets FROM rag_runtime;
+REVOKE ALL ON rag_service_account_assertion_keys FROM rag_runtime;
 REVOKE ALL ON org_identity_tenant_bindings FROM rag_runtime;
 SELECT 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
        'ON rag_schema_state FROM rag_runtime'

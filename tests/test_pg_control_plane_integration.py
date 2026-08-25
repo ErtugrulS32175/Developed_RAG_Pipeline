@@ -1019,6 +1019,23 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
         control_database):
     with control_database.cursor() as cursor:
         cursor.execute(
+            "DROP FUNCTION rag_control."
+            "control_consume_service_account_assertion(smallint,text,integer,"
+            "uuid,bytea,bigint,uuid,bigint,uuid,bytea,integer,bigint,bigint,"
+            "bytea,bytea)")
+        cursor.execute(
+            "DROP FUNCTION rag_control."
+            "control_service_account_assertion_payload(text,integer,uuid,"
+            "bytea,bigint,uuid,bigint,uuid,bytea,integer,bigint,bigint,"
+            "bytea)")
+        cursor.execute(
+            "DROP FUNCTION rag_control.control_secure_bytea_equal(bytea,bytea)")
+        cursor.execute(
+            "DROP TABLE rag_control."
+            "control_service_account_assertion_nonces")
+        cursor.execute(
+            "DROP TABLE rag_control.control_service_account_assertion_keys")
+        cursor.execute(
             "DROP FUNCTION rag_control.control_redeem_service_account_issue("
             "uuid,uuid,uuid,bigint,bytea,bigint,bytea,bytea,bytea)")
         cursor.execute(
@@ -1067,7 +1084,7 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
             "rag_control.control_schema_state")
         cursor.execute(
             "DELETE FROM rag_control.control_schema_history "
-            "WHERE schema_version = 4")
+            "WHERE schema_version = 5")
         cursor.execute(
             "UPDATE rag_control.control_schema_state SET schema_version = 3, "
             "schema_sha256 = repeat('3', 64)")
@@ -1087,14 +1104,14 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
         cursor.execute(
             "SELECT schema_version, schema_sha256 FROM "
             "rag_control.control_schema_state")
-        assert cursor.fetchone() == (4, expected_digest)
+        assert cursor.fetchone() == (5, expected_digest)
         cursor.execute(
             "SELECT array_agg(schema_version ORDER BY schema_version), "
-            "max(schema_sha256) FILTER (WHERE schema_version = 4) "
+            "max(schema_sha256) FILTER (WHERE schema_version = 5) "
             "FROM rag_control.control_schema_history")
-        history, v4_digest = cursor.fetchone()
-        assert history[-2:] == [3, 4]
-        assert v4_digest == expected_digest
+        history, v5_digest = cursor.fetchone()
+        assert history[-2:] == [3, 5]
+        assert v5_digest == expected_digest
         cursor.execute(
             "SELECT count(*) FROM information_schema.tables "
             "WHERE table_schema = 'rag_control' AND table_name IN ("
@@ -1126,6 +1143,13 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
             "control_redeem_service_account_rotation(uuid,uuid,uuid,bigint,"
             "bytea,bigint,bytea,bytea,bytea)",
             "control_seal_service_account_approval_event()",
+            "control_service_account_assertion_payload(text,integer,uuid,"
+            "bytea,bigint,uuid,bigint,uuid,bytea,integer,bigint,bigint,"
+            "bytea)",
+            "control_secure_bytea_equal(bytea,bytea)",
+            "control_consume_service_account_assertion(smallint,text,integer,"
+            "uuid,bytea,bigint,uuid,bigint,uuid,bytea,integer,bigint,bigint,"
+            "bytea,bytea)",
         )
         for signature in signatures:
             qualified = "rag_control." + signature

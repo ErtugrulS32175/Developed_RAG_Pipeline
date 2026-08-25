@@ -101,7 +101,7 @@ def test_lifecycle_events_are_content_free_and_immutable():
     event = SCHEMA.split(
         "CREATE TABLE IF NOT EXISTS "
         "rag_control.control_service_account_events", 1)[1].split(
-            "CREATE TABLE IF NOT EXISTS rag_control.control_admin_events", 1)[0]
+            "ALTER TABLE rag_control.control_service_account_events", 1)[0]
     for field in (
             "operator_id", "target_tenant_id", "service_account_id", "action",
             "reason_code", "expected_revision", "resulting_revision",

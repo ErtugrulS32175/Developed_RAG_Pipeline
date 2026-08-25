@@ -94,13 +94,13 @@ def test_approval_schema_is_closed_content_free_and_short_lived():
     table = SCHEMA.split(
         "CREATE TABLE IF NOT EXISTS "
         "rag_control.control_service_account_approvals", 1)[1].split(
-            "CREATE TABLE IF NOT EXISTS "
-            "rag_control.control_service_account_approval_events", 1)[0]
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "control_one_pending_account_approval", 1)[0]
     assert "interval '15 minutes'" in table
     assert "action IN ('issue', 'rotate')" in table
     assert "'approved', 'redeemed', 'cancelled'" in table
-    assert "control_one_pending_account_approval" in table
-    assert "WHERE state = 'approved'" in table
+    assert "control_one_pending_account_approval" in SCHEMA
+    assert "WHERE state = 'approved'" in SCHEMA
     for forbidden in (
             "token", "secret", "credential_digest", "subject", "email",
             "display_name", "filename", "prompt", "content"):
@@ -267,17 +267,25 @@ def test_listing_rejects_expired_or_future_created_rows(created, expires):
             _Connection([row]), TENANT)
 
 
-@pytest.mark.parametrize("rows,limit", [
-    ([_listed(), _listed()], 2),
-    ([_listed(), {**_listed(), "approval_id": uuid.uuid4()}], 1),
-    ([
-        {**_listed(), "approval_id": uuid.uuid4(),
-         "created_at": datetime.now(timezone.utc) + timedelta(seconds=2),
-         "expires_at": datetime.now(timezone.utc) + timedelta(minutes=14)},
-        _listed(),
-    ], 2),
+@pytest.mark.parametrize("shape,limit", [
+    ("duplicate", 2),
+    ("excess", 1),
+    ("out_of_order", 2),
 ])
-def test_listing_rejects_duplicate_excess_or_out_of_order_rows(rows, limit):
+def test_listing_rejects_duplicate_excess_or_out_of_order_rows(shape, limit):
+    first = _listed()
+    second = _listed()
+    if shape == "duplicate":
+        rows = [first, {**first}]
+    elif shape == "excess":
+        rows = [first, {**second, "approval_id": uuid.uuid4()}]
+    else:
+        rows = [
+            {**first, "approval_id": uuid.uuid4(),
+             "created_at": first["created_at"] + timedelta(seconds=2),
+             "expires_at": first["expires_at"]},
+            second,
+        ]
     with pytest.raises(db.ControlPlaneRefused) as refused:
         db.list_redeemable_service_account_approvals(
             _Connection(rows), TENANT, limit=limit)
@@ -376,7 +384,7 @@ def test_cancel_wrapper_is_platform_proof_and_revision_bound(monkeypatch):
 
 
 def test_control_schema_version_advances_for_the_approval_authority():
-    assert db.CONTROL_SCHEMA_VERSION == 4
+    assert db.CONTROL_SCHEMA_VERSION == 5
 
 
 def test_tenant_redemption_gate_locks_both_authority_rows():

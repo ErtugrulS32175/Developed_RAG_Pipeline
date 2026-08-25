@@ -68,6 +68,7 @@ def governance_database():
                     sql.Identifier(schema), sql.Identifier(request_role)))
             cur.execute(sql.SQL(
                 "REVOKE ALL ON rag_context_secrets, "
+                "rag_service_account_assertion_keys, "
                 "org_identity_tenant_bindings FROM {}").format(
                     sql.Identifier(request_role)))
             cur.execute(sql.SQL(
@@ -197,6 +198,28 @@ def test_a_request_role_cannot_enable_service_access_with_the_guc_alone(
         cur.execute("SELECT set_config('rag.service', '1', false)")
         cur.execute("SELECT rag_service_access()")
         assert cur.fetchone()[0] is False
+
+
+def test_runtime_readiness_refuses_an_accidental_mint_grant(
+        governance_database):
+    from psycopg import sql
+
+    owner, requester = governance_database
+    role = sql.Identifier(requester.info.user)
+    signature = sql.SQL(
+        "rag_mint_service_account_assertion("
+        "uuid,bigint,text,uuid,bigint,uuid,bytea,integer)")
+    assert db.runtime_role_is_safe(requester) is True
+    with owner.cursor() as cur:
+        cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
+            signature, role))
+    owner.commit()
+    assert db.runtime_role_is_safe(requester) is False
+    with owner.cursor() as cur:
+        cur.execute(sql.SQL("REVOKE EXECUTE ON FUNCTION {} FROM {}").format(
+            signature, role))
+    owner.commit()
+    assert db.runtime_role_is_safe(requester) is True
 
 
 def test_a_runtime_role_cannot_rewrite_control_plane_authority(

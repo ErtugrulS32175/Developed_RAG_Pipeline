@@ -1787,11 +1787,50 @@ CREATE POLICY eval_events_insert ON eval_dataset_events FOR INSERT
 -- tuple with a deployment secret; this owner-defined function verifies it on
 -- every policy decision. Replaying a current signature can reproduce only the
 -- same tenant, actor and service bit -- it cannot widen any of them.
+CREATE TABLE IF NOT EXISTS rag_service_account_assertion_keys (
+    key_version integer PRIMARY KEY CHECK (key_version > 0),
+    secret bytea NOT NULL CHECK (octet_length(secret) = 32),
+    state text NOT NULL CHECK (state IN (
+        'staged', 'active', 'verify_only', 'retired')),
+    not_before timestamptz NOT NULL,
+    verify_until timestamptz,
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    CHECK (verify_until IS NULL OR verify_until > not_before),
+    CHECK ((state = 'verify_only') = (verify_until IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS rag_one_active_assertion_key
+    ON rag_service_account_assertion_keys ((state)) WHERE state = 'active';
+REVOKE ALL ON rag_service_account_assertion_keys FROM PUBLIC;
+
 CREATE TABLE IF NOT EXISTS rag_context_secrets (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     secret bytea NOT NULL CHECK (octet_length(secret) >= 32)
 );
 REVOKE ALL ON rag_context_secrets FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION rag_secure_bytea_equal_32(
+    left_value bytea, right_value bytea)
+RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE
+SET search_path = pg_catalog
+AS $secure_bytea_equal$
+DECLARE
+    difference integer := 0;
+    byte_index integer;
+BEGIN
+    IF left_value IS NULL OR right_value IS NULL
+       OR octet_length(left_value) <> 32
+       OR octet_length(right_value) <> 32 THEN
+        RETURN false;
+    END IF;
+    FOR byte_index IN 0..31 LOOP
+        difference := difference
+            | (get_byte(left_value, byte_index)
+               # get_byte(right_value, byte_index));
+    END LOOP;
+    RETURN difference = 0;
+END
+$secure_bytea_equal$;
 
 CREATE OR REPLACE FUNCTION rag_context_valid()
 RETURNS boolean
@@ -1817,15 +1856,26 @@ AS $context_valid$
     )
     SELECT COALESCE(bool_or(
         abs(extract(epoch FROM now())::bigint - issued::bigint) <= 120
-        AND public.hmac(
+        AND rag_secure_bytea_equal_32(public.hmac(
             convert_to(tenant_id || '|' || actor_id || '|' || service ||
                        '|' || issued || '|' || nonce, 'UTF8'),
             key.secret,
-            'sha256') = decode(sig, 'hex')
+            'sha256'), decode(sig, 'hex'))
     ), false)
     FROM closed CROSS JOIN rag_context_secrets key
     WHERE key.singleton = true
 $context_valid$;
+
+DO $harden_context_search_path$
+DECLARE
+    product_schema name := current_schema();
+BEGIN
+    EXECUTE format(
+        'ALTER FUNCTION %I.rag_context_valid() '
+        'SET search_path TO pg_catalog, %I, pg_temp',
+        product_schema, product_schema);
+END
+$harden_context_search_path$;
 
 CREATE OR REPLACE FUNCTION rag_effective_tenant() RETURNS uuid
 LANGUAGE sql STABLE AS $tenant$
@@ -1847,6 +1897,218 @@ LANGUAGE sql STABLE AS $actor$
         ELSE NULL::uuid END
 $actor$;
 
+-- Both databases implement this byte layout independently.  Fixed-width
+-- fields use PostgreSQL's network-order send functions; nullable fields carry
+-- a one-byte presence tag.  No JSON, locale or textual UUID formatting can
+-- therefore change the signed meaning.
+CREATE OR REPLACE FUNCTION rag_service_account_assertion_payload(
+    requested_purpose text,
+    requested_key_version integer,
+    requested_tenant_id uuid,
+    requested_tenant_actor_digest bytea,
+    requested_org_policy_epoch bigint,
+    requested_approval_id uuid,
+    requested_approval_revision bigint,
+    requested_service_account_id uuid,
+    requested_credential_digest bytea,
+    requested_limit integer,
+    requested_issued_at bigint,
+    requested_expires_at bigint,
+    requested_nonce bytea)
+RETURNS bytea
+LANGUAGE plpgsql IMMUTABLE
+SET search_path = pg_catalog, public, pg_temp
+AS $service_account_assertion_payload$
+DECLARE
+    purpose_bytes bytea;
+BEGIN
+    IF requested_purpose IS NULL
+       OR requested_purpose NOT IN (
+           'approval_list', 'approval_get',
+           'approval_redeem_issue', 'approval_redeem_rotate')
+       OR requested_key_version IS NULL OR requested_key_version < 1
+       OR requested_tenant_id IS NULL
+       OR requested_tenant_actor_digest IS NULL
+       OR octet_length(requested_tenant_actor_digest) <> 32
+       OR requested_org_policy_epoch IS NULL
+       OR requested_org_policy_epoch < 1
+       OR requested_issued_at IS NULL OR requested_expires_at IS NULL
+       OR requested_expires_at - requested_issued_at <> 30
+       OR requested_nonce IS NULL OR octet_length(requested_nonce) <> 16
+       OR (requested_purpose = 'approval_list'
+           AND (requested_approval_id IS NOT NULL
+                OR requested_approval_revision IS NOT NULL
+                OR requested_service_account_id IS NOT NULL
+                OR requested_credential_digest IS NOT NULL
+                OR requested_limit IS NULL
+                OR requested_limit < 1 OR requested_limit > 100))
+       OR (requested_purpose = 'approval_get'
+           AND (requested_approval_id IS NULL
+                OR requested_approval_revision IS NULL
+                OR requested_approval_revision < 1
+                OR requested_service_account_id IS NULL
+                OR requested_credential_digest IS NOT NULL
+                OR requested_limit IS NOT NULL))
+       OR (requested_purpose IN (
+               'approval_redeem_issue', 'approval_redeem_rotate')
+           AND (requested_approval_id IS NULL
+                OR requested_approval_revision IS NULL
+                OR requested_approval_revision < 1
+                OR requested_service_account_id IS NULL
+                OR requested_credential_digest IS NULL
+                OR octet_length(requested_credential_digest) <> 32
+                OR requested_limit IS NOT NULL))
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '22023',
+            MESSAGE = 'service_account_assertion_invalid';
+    END IF;
+    purpose_bytes := convert_to(requested_purpose, 'UTF8');
+    RETURN convert_to('ragtest.service-account.assertion.v1', 'UTF8')
+        || int4send(octet_length(purpose_bytes)) || purpose_bytes
+        || int4send(requested_key_version)
+        || uuid_send(requested_tenant_id)
+        || requested_tenant_actor_digest
+        || int8send(requested_org_policy_epoch)
+        || CASE WHEN requested_approval_id IS NULL
+                THEN decode('00', 'hex')
+                ELSE decode('01', 'hex')
+                     || uuid_send(requested_approval_id) END
+        || CASE WHEN requested_approval_revision IS NULL
+                THEN decode('00', 'hex')
+                ELSE decode('01', 'hex')
+                     || int8send(requested_approval_revision) END
+        || CASE WHEN requested_service_account_id IS NULL
+                THEN decode('00', 'hex')
+                ELSE decode('01', 'hex')
+                     || uuid_send(requested_service_account_id) END
+        || CASE WHEN requested_credential_digest IS NULL
+                THEN decode('00', 'hex')
+                ELSE decode('01', 'hex')
+                     || requested_credential_digest END
+        || CASE WHEN requested_limit IS NULL
+                THEN decode('00', 'hex')
+                ELSE decode('01', 'hex') || int4send(requested_limit) END
+        || int8send(requested_issued_at)
+        || int8send(requested_expires_at)
+        || requested_nonce;
+END
+$service_account_assertion_payload$;
+
+CREATE OR REPLACE FUNCTION rag_mint_service_account_assertion(
+    requested_actor_id uuid,
+    requested_expected_policy_epoch bigint,
+    requested_purpose text,
+    requested_approval_id uuid,
+    requested_approval_revision bigint,
+    requested_service_account_id uuid,
+    requested_credential_digest bytea,
+    requested_limit integer)
+RETURNS TABLE (
+    assertion_version smallint,
+    purpose text,
+    key_version integer,
+    tenant_id uuid,
+    tenant_actor_digest bytea,
+    org_policy_epoch bigint,
+    approval_id uuid,
+    approval_revision bigint,
+    service_account_id uuid,
+    credential_digest bytea,
+    assertion_limit integer,
+    issued_at bigint,
+    expires_at bigint,
+    nonce bytea,
+    mac bytea)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path FROM CURRENT
+AS $mint_service_account_assertion$
+DECLARE
+    authority record;
+    signing_key rag_service_account_assertion_keys%ROWTYPE;
+    issued bigint;
+    actor_digest bytea;
+    assertion_nonce bytea;
+    payload bytea;
+BEGIN
+    SELECT tenant.id AS tenant_id, tenant.policy_epoch
+    INTO authority
+    FROM org_tenants AS tenant
+    JOIN org_architects AS architect
+      ON architect.tenant_id = tenant.id
+    JOIN org_identities AS identity
+      ON identity.id = architect.identity_id
+    JOIN org_memberships AS membership
+      ON membership.tenant_id = tenant.id
+     AND membership.identity_id = architect.identity_id
+    WHERE tenant.id = rag_effective_tenant()
+      AND architect.identity_id = requested_actor_id
+      AND architect.active = true
+      AND identity.state = 'active'
+      AND membership.state = 'active'
+      AND membership.app_role = 'admin'
+      AND rag_effective_actor() = requested_actor_id
+      AND NOT rag_service_access()
+    FOR UPDATE OF tenant, architect, identity, membership;
+    IF authority.tenant_id IS NULL
+       OR authority.policy_epoch <> requested_expected_policy_epoch
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '42501',
+            MESSAGE = 'service_account_assertion_denied';
+    END IF;
+    SELECT key.* INTO signing_key
+    FROM rag_service_account_assertion_keys AS key
+    WHERE key.state = 'active'
+      AND key.not_before <= statement_timestamp()
+      AND (key.verify_until IS NULL
+           OR key.verify_until > statement_timestamp())
+    FOR SHARE;
+    IF signing_key.key_version IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '55000',
+            MESSAGE = 'service_account_assertion_unavailable';
+    END IF;
+    issued := floor(extract(epoch FROM statement_timestamp()))::bigint;
+    assertion_nonce := public.gen_random_bytes(16);
+    actor_digest := public.hmac(
+        convert_to('ragtest.service-account.actor.v1', 'UTF8')
+        || uuid_send(authority.tenant_id) || uuid_send(requested_actor_id),
+        signing_key.secret, 'sha256');
+    payload := rag_service_account_assertion_payload(
+        requested_purpose, signing_key.key_version, authority.tenant_id,
+        actor_digest, requested_expected_policy_epoch,
+        requested_approval_id, requested_approval_revision,
+        requested_service_account_id, requested_credential_digest,
+        requested_limit,
+        issued, issued + 30, assertion_nonce);
+    RETURN QUERY SELECT 1::smallint, requested_purpose,
+        signing_key.key_version, authority.tenant_id, actor_digest,
+        requested_expected_policy_epoch, requested_approval_id,
+        requested_approval_revision, requested_service_account_id,
+        requested_credential_digest, requested_limit,
+        issued, issued + 30, assertion_nonce,
+        public.hmac(payload, signing_key.secret, 'sha256');
+END
+$mint_service_account_assertion$;
+
+DO $harden_assertion_search_path$
+DECLARE
+    product_schema name := current_schema();
+BEGIN
+    EXECUTE format(
+        'ALTER FUNCTION %I.rag_mint_service_account_assertion('
+        'uuid,bigint,text,uuid,bigint,uuid,bytea,integer) '
+        'SET search_path TO pg_catalog, %I, pg_temp',
+        product_schema, product_schema);
+END
+$harden_assertion_search_path$;
+
+REVOKE ALL ON FUNCTION rag_service_account_assertion_payload(
+    text, integer, uuid, bytea, bigint, uuid, bigint, uuid, bytea, integer,
+    bigint, bigint, bytea)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_mint_service_account_assertion(
+    uuid, bigint, text, uuid, bigint, uuid, bytea, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_secure_bytea_equal_32(bytea, bytea) FROM PUBLIC;
+
 -- The runtime role receives broad product-table DML and relies on forced RLS,
 -- but these four tables are control-plane authority rather than product data.
 -- Default privileges may grant newly-created migration metadata before this
@@ -1858,8 +2120,9 @@ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rag_runtime') THEN
         EXECUTE format(
             'REVOKE ALL ON TABLE %I.rag_context_secrets, '
+            '%I.rag_service_account_assertion_keys, '
             '%I.org_identity_tenant_bindings FROM rag_runtime',
-            product_schema, product_schema);
+            product_schema, product_schema, product_schema);
         IF to_regclass(format('%I.rag_schema_state', product_schema))
                 IS NOT NULL THEN
             EXECUTE format(

@@ -17,7 +17,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 
-CONTROL_SCHEMA_VERSION = 4
+CONTROL_SCHEMA_VERSION = 5
 _SCHEMA_LOCK_NAME = "ragtest-control-schema-migration"
 _SCHEMA_MONOTONIC_GUARD_DDL = """
 CREATE OR REPLACE FUNCTION rag_control.control_guard_schema_monotonic()

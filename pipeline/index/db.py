@@ -36,7 +36,7 @@ load_dotenv()
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv(
     "PG_DSN", "postgresql://rag_runtime:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -433,6 +433,14 @@ def runtime_role_is_safe(conn) -> bool:
                 "AND NOT has_table_privilege(current_user, "
                 "format('%I.org_identity_tenant_bindings', current_schema()), "
                 "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
+                "AND NOT has_table_privilege(current_user, "
+                "format('%I.rag_service_account_assertion_keys', "
+                "current_schema()), "
+                "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
+                "AND NOT has_function_privilege(current_user, "
+                "format('%I.rag_mint_service_account_assertion("
+                "uuid,bigint,text,uuid,bigint,uuid,bytea,integer)', "
+                "current_schema()), 'EXECUTE') "
                 "AND NOT has_table_privilege(current_user, "
                 "format('%I.rag_schema_state', current_schema()), "
                 "'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
