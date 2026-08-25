@@ -35,6 +35,7 @@ from pipeline.index.attempt_contract import (
 )
 from pipeline.api import owui_chat
 from pipeline.api import auth
+from pipeline.api import contracts as api_contracts
 from pipeline.api import identity
 from pipeline.api import metrics
 from pipeline.api import org_policy
@@ -646,7 +647,7 @@ class PurgeScheduleRequest(BaseModel):
     expected_policy_epoch: int = Field(ge=1, strict=True)
 
 
-@app.get("/v1/org/me")
+@app.get("/v1/org/me", response_model=api_contracts.OrganizationMeResponse)
 def organization_me(principal=Depends(require_org_identity)):
     """Show only the caller's own level and content-free organization facts."""
     with db_conn() as conn:
@@ -659,7 +660,8 @@ def organization_me(principal=Depends(require_org_identity)):
     }
 
 
-@app.get("/v1/org/visible-members")
+@app.get("/v1/org/visible-members",
+         response_model=api_contracts.VisibleOrgMembersResponse)
 def organization_visible_members(
         request: Request,
         reason_code: Literal["management_duty", "security_review"] = Query(),
@@ -674,7 +676,8 @@ def organization_visible_members(
     return {"members": members}
 
 
-@app.get("/v1/org/admin/topology")
+@app.get("/v1/org/admin/topology",
+         response_model=api_contracts.OrgTopologyResponse)
 def organization_topology(
         request: Request,
         principal=Depends(require_org_architect)):
@@ -741,7 +744,8 @@ def organization_audit_events(
     }
 
 
-@app.put("/v1/org/admin/topology")
+@app.put("/v1/org/admin/topology",
+         response_model=api_contracts.OrgVersionResponse)
 def replace_organization_topology(
         body: OrgTopologyRequest, request: Request,
         principal=Depends(require_org_architect)):
@@ -765,7 +769,8 @@ def replace_organization_topology(
     return version
 
 
-@app.put("/v1/org/admin/members/{identity_id}")
+@app.put("/v1/org/admin/members/{identity_id}",
+         response_model=api_contracts.OrgMembershipResponse)
 def update_organization_membership(
         identity_id: UUID, body: OrgMembershipUpdateRequest, request: Request,
         principal=Depends(require_org_architect)):
@@ -1221,7 +1226,8 @@ def eval_dataset_retire(
     return {"dataset": _eval_dataset_metadata(row)}
 
 
-@app.get("/v1/models", dependencies=AUTH)
+@app.get("/v1/models", dependencies=AUTH,
+         response_model=api_contracts.ModelListResponse)
 def list_models():
     """OpenWebUI (or any OpenAI-compatible client) calls this to discover which
     model ids to send chat completions requests for. Mark the table model as
@@ -2234,6 +2240,22 @@ DOCUMENT_VERSION_LIST_FIELDS = (
     "document_revision",
 )
 
+DOCUMENT_DETAIL_FIELDS = (
+    "id",
+    "filename",
+    "file_type",
+    "uploaded_at",
+    "status",
+    "status_note",
+    "active_generation",
+    "content_sha256",
+    "candidate_id",
+    "active_version_id",
+    "revision",
+    "archived_at",
+    "purged_at",
+)
+
 # A page nobody sized is a full table scan waiting for its first large
 # corpus; a cap that only the database enforces is a scan that already
 # started. Both bounds are decided here, in the signature, so an
@@ -2291,6 +2313,10 @@ def _document_version_summary(row):
     return {field: row.get(field) for field in DOCUMENT_VERSION_LIST_FIELDS}
 
 
+def _document_detail(row):
+    return {field: row[field] for field in DOCUMENT_DETAIL_FIELDS if field in row}
+
+
 def _org_audit_event_summary(row):
     return {
         "event_id": str(row["id"]),
@@ -2305,7 +2331,8 @@ def _org_audit_event_summary(row):
     }
 
 
-@app.get("/documents", dependencies=AUTH)
+@app.get("/documents", dependencies=AUTH,
+         response_model=api_contracts.DocumentListResponse)
 def list_documents(
     limit: int = Query(DOCUMENT_PAGE_DEFAULT, ge=1, le=DOCUMENT_PAGE_MAX),
     offset: int = Query(0, ge=0),
@@ -2521,17 +2548,20 @@ def _set_document_lifecycle(document_id: str, archived: bool):
     return result
 
 
-@app.post("/documents/{document_id}/archive", dependencies=ADMIN_AUTH)
+@app.post("/documents/{document_id}/archive", dependencies=ADMIN_AUTH,
+          response_model=api_contracts.DocumentLifecycleResponse)
 def archive_document(document_id: str):
     return _set_document_lifecycle(document_id, True)
 
 
-@app.post("/documents/{document_id}/restore", dependencies=ADMIN_AUTH)
+@app.post("/documents/{document_id}/restore", dependencies=ADMIN_AUTH,
+          response_model=api_contracts.DocumentLifecycleResponse)
 def restore_document(document_id: str):
     return _set_document_lifecycle(document_id, False)
 
 
-@app.get("/documents/{document_id}/versions", dependencies=AUTH)
+@app.get("/documents/{document_id}/versions", dependencies=AUTH,
+         response_model=api_contracts.DocumentVersionListResponse)
 def list_document_versions(
     document_id: UUID,
     limit: int = Query(DOCUMENT_PAGE_DEFAULT, ge=1, le=DOCUMENT_PAGE_MAX),
@@ -2560,6 +2590,7 @@ def list_document_versions(
 @app.post(
     "/documents/{document_id}/versions/{version_id}/activate",
     dependencies=ADMIN_AUTH,
+    response_model=api_contracts.DocumentVersionActivationResponse,
 )
 def activate_document_version(
     document_id: UUID,
@@ -2618,16 +2649,18 @@ def activate_document_version(
     return activated
 
 
-@app.get("/documents/{document_id}", dependencies=AUTH)
+@app.get("/documents/{document_id}", dependencies=AUTH,
+         response_model=api_contracts.DocumentDetailResponse,
+         response_model_exclude_unset=True)
 def read_document(document_id: str):
     with db_conn() as conn:
         doc = db.get_document(conn, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
-    return doc
+    return _document_detail(doc)
 
 
-@app.get("/health")
+@app.get("/health", response_model=api_contracts.HealthResponse)
 def health():
     """Liveness: the process is up. Deliberately touches nothing else, so a
     restart loop is never triggered by a dependency being briefly unavailable."""
@@ -2656,7 +2689,7 @@ def _probe(name, fn):
         return name, False
 
 
-@app.get("/ready")
+@app.get("/ready", response_model=api_contracts.ReadinessResponse)
 def ready(response: Response):
     """Readiness: can this instance actually serve a request?
 
