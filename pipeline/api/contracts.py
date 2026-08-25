@@ -520,3 +520,39 @@ class ChatCompletionChunkResponse(_ClosedResponse):
     rag_status: Literal["answered", "abstained", "review_required"] | None = None
     rag_citations: list[RagCitationResponse] | None = None
     rag_trace: RetrievalTraceResponse | None = None
+
+
+class CollectionCreatedResponse(_ClosedResponse):
+    collection_id: WireId
+    name: str
+    created_at: WireTimestamp | None
+
+
+class CollectionSummaryResponse(CollectionCreatedResponse):
+    document_count: int = Field(ge=0)
+
+
+class CollectionListResponse(_ClosedResponse):
+    collections: list[CollectionSummaryResponse]
+
+
+class TagSummaryResponse(_ClosedResponse):
+    tag_id: WireId
+    name: str
+    created_at: WireTimestamp | None
+    document_count: int = Field(ge=0)
+
+
+class TagListResponse(_ClosedResponse):
+    tags: list[TagSummaryResponse]
+
+
+class CollectionMembershipResponse(_ClosedResponse):
+    collection_id: WireId
+    document_id: WireId
+    present: bool
+
+
+class DocumentTagsResponse(_ClosedResponse):
+    document_id: WireId
+    tags: list[str]

@@ -96,6 +96,15 @@ def _route(path, method="GET"):
     ("/v1/eval/datasets/{dataset_id}/retire", "POST",
      contracts.EvalDatasetResponse),
     ("/v1/chat/completions", "POST", contracts.ChatCompletionResponse),
+    ("/collections", "POST", contracts.CollectionCreatedResponse),
+    ("/collections", "GET", contracts.CollectionListResponse),
+    ("/tags", "GET", contracts.TagListResponse),
+    ("/collections/{collection_id}/documents/{document_id}", "PUT",
+     contracts.CollectionMembershipResponse),
+    ("/collections/{collection_id}/documents/{document_id}", "DELETE",
+     contracts.CollectionMembershipResponse),
+    ("/documents/{document_id}/tags", "PUT",
+     contracts.DocumentTagsResponse),
 ])
 def test_enterprise_routes_enforce_named_response_models(path, method, model):
     assert _route(path, method).response_model is model
@@ -137,7 +146,10 @@ def test_the_response_models_are_recursively_closed_in_openapi():
             "EvalCaseListResponse", "RagCitationResponse",
             "RetrievalTraceStagesResponse", "RetrievalTraceResponse",
             "ChatMessageResponse", "ChatChoiceResponse",
-            "ChatCompletionResponse"):
+            "ChatCompletionResponse", "CollectionCreatedResponse",
+            "CollectionSummaryResponse", "CollectionListResponse",
+            "TagSummaryResponse", "TagListResponse",
+            "CollectionMembershipResponse", "DocumentTagsResponse"):
         assert schemas[name]["additionalProperties"] is False
 
 

@@ -2531,7 +2531,8 @@ def list_documents(
     }
 
 
-@app.post("/collections", dependencies=EDITOR_AUTH)
+@app.post("/collections", dependencies=EDITOR_AUTH,
+          response_model=api_contracts.CollectionCreatedResponse)
 def create_collection(request: CollectionRequest):
     try:
         with db_conn() as conn:
@@ -2540,13 +2541,15 @@ def create_collection(request: CollectionRequest):
         raise HTTPException(status_code=422, detail=str(error)) from None
 
 
-@app.get("/collections", dependencies=AUTH)
+@app.get("/collections", dependencies=AUTH,
+         response_model=api_contracts.CollectionListResponse)
 def list_collections():
     with db_conn() as conn:
         return {"collections": db.list_collections(conn)}
 
 
-@app.get("/tags", dependencies=AUTH)
+@app.get("/tags", dependencies=AUTH,
+         response_model=api_contracts.TagListResponse)
 def list_tags():
     with db_conn() as conn:
         return {"tags": db.list_tags(conn)}
@@ -2583,18 +2586,21 @@ def _set_collection_membership(collection_id: UUID, document_id: UUID,
 
 
 @app.put("/collections/{collection_id}/documents/{document_id}",
-         dependencies=EDITOR_AUTH)
+         dependencies=EDITOR_AUTH,
+         response_model=api_contracts.CollectionMembershipResponse)
 def add_collection_document(collection_id: UUID, document_id: UUID):
     return _set_collection_membership(collection_id, document_id, True)
 
 
 @app.delete("/collections/{collection_id}/documents/{document_id}",
-            dependencies=EDITOR_AUTH)
+            dependencies=EDITOR_AUTH,
+            response_model=api_contracts.CollectionMembershipResponse)
 def remove_collection_document(collection_id: UUID, document_id: UUID):
     return _set_collection_membership(collection_id, document_id, False)
 
 
-@app.put("/documents/{document_id}/tags", dependencies=EDITOR_AUTH)
+@app.put("/documents/{document_id}/tags", dependencies=EDITOR_AUTH,
+         response_model=api_contracts.DocumentTagsResponse)
 def replace_document_tags(document_id: UUID, request: DocumentTagsRequest):
     try:
         with db_conn() as conn:
