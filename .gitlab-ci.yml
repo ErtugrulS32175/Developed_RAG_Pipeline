@@ -17,6 +17,7 @@ variables:
   RAGTEST_PG_TEST_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
   RAGTEST_P0_GATE: "1"
   RAGTEST_SCOPE_PG_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
+  RAGTEST_CONTROL_PG_DSN: postgresql://postgres:CHANGE_ME@postgres:5432/ragtest_ci
   RAGTEST_SCOPE_GATE: "1"
 
 cache:

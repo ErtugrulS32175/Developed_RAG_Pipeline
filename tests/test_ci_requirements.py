@@ -64,3 +64,4 @@ def test_eval_governance_uses_real_postgresql_in_every_ci(ci_file):
     assert "RAGTEST_EVAL_PG_DSN" in text
     assert "RAGTEST_PG_TEST_DSN" in text
     assert "RAGTEST_P0_GATE" in text
+    assert "RAGTEST_CONTROL_PG_DSN" in text
