@@ -17,7 +17,7 @@ from fastapi import (
     Depends, FastAPI, Header, HTTPException, Query, Request, Response,
     UploadFile, File,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
 
@@ -45,6 +45,8 @@ from pipeline.api import contracts as api_contracts
 from pipeline.api import errors as api_errors
 from pipeline.api import identity
 from pipeline.api import metrics
+from pipeline.api import oidc
+from pipeline.api import oidc_session
 from pipeline.api import org_policy
 from pipeline.api import protocols as api_protocols
 from pipeline.api import routers as domain_routers
@@ -65,6 +67,7 @@ from pipeline.validation.rag.answer_guard import (
     PageCitation,
     is_abstention,
 )
+from pipeline.control import db as control_db
 
 load_dotenv()
 
@@ -118,12 +121,27 @@ API_KEYS_JSON = os.getenv("API_KEYS_JSON", "").strip()
 OPENWEBUI_GATEWAY_KEY = os.getenv("OPENWEBUI_GATEWAY_KEY", "").strip()
 OPENWEBUI_USER_JWT_SECRET = os.getenv(
     "OPENWEBUI_USER_JWT_SECRET", "").strip()
+OIDC_ISSUER = os.getenv("OIDC_ISSUER", "").strip()
+OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID", "").strip()
+OIDC_CLIENT_SECRET = os.getenv("OIDC_CLIENT_SECRET", "").strip()
+OIDC_REDIRECT_URI = os.getenv("OIDC_REDIRECT_URI", "").strip()
+OIDC_SESSION_SECRET = os.getenv("OIDC_SESSION_SECRET", "").strip()
+_OIDC_VALUES = (
+    OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI,
+    OIDC_SESSION_SECRET,
+    os.getenv("CONTROL_IDENTITY_HMAC_SECRET", "").strip(),
+    os.getenv("PG_CONTROL_DSN", "").strip(),
+)
+if any(_OIDC_VALUES) and not all(_OIDC_VALUES):
+    raise oidc.OIDCConfigurationError(
+        "OIDC browser identity configuration is incomplete")
+OIDC_ENABLED = bool(OIDC_ISSUER)
 ALLOW_INSECURE_LOCAL = os.getenv("ALLOW_INSECURE_LOCAL", "").strip() == "1"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "").strip()
 AUTH_REGISTRY = auth.load_registry(
     API_KEY,
     API_KEYS_JSON,
-    external_auth=bool(OPENWEBUI_GATEWAY_KEY),
+    external_auth=bool(OPENWEBUI_GATEWAY_KEY or OIDC_ENABLED),
     allow_insecure_local=ALLOW_INSECURE_LOCAL,
     bind_host=API_BIND_HOST,
 )
@@ -132,7 +150,7 @@ if (EVIDENCE_HMAC_SECRET
         and len(EVIDENCE_HMAC_SECRET.encode("utf-8")) < 32):
     raise identity.IdentityConfigurationError(
         "evidence HMAC anahtari en az 32 bayt olmali")
-if OPENWEBUI_GATEWAY_KEY and not EVIDENCE_HMAC_SECRET:
+if (OPENWEBUI_GATEWAY_KEY or OIDC_ENABLED) and not EVIDENCE_HMAC_SECRET:
     raise identity.IdentityConfigurationError(
         "kimlik dogrulamali kurulumda evidence HMAC anahtari gerekli")
 if bool(OPENWEBUI_GATEWAY_KEY) != bool(OPENWEBUI_USER_JWT_SECRET):
@@ -150,6 +168,38 @@ OPENWEBUI_IDENTITY = (
             "OPENWEBUI_USER_JWT_CLOCK_SKEW", "5")),
     ) if OPENWEBUI_GATEWAY_KEY else None
 )
+if OIDC_ENABLED:
+    _oidc_config = oidc.OIDCConfig.configured(
+        issuer=OIDC_ISSUER,
+        client_id=OIDC_CLIENT_ID,
+        redirect_uri=OIDC_REDIRECT_URI,
+        clock_skew_seconds=int(os.getenv("OIDC_CLOCK_SKEW_SECONDS", "30")),
+        jwks_cache_seconds=int(os.getenv("OIDC_JWKS_CACHE_SECONDS", "300")),
+        jwks_overlap_seconds=int(os.getenv(
+            "OIDC_JWKS_OVERLAP_SECONDS", "900")),
+        allow_loopback_http=(
+            ALLOW_INSECURE_LOCAL and API_BIND_HOST in {
+                "127.0.0.1", "::1", "localhost"}),
+    )
+    _oidc_store = oidc_session.SessionStore(
+        OIDC_SESSION_SECRET,
+        login_seconds=int(os.getenv("OIDC_LOGIN_MAX_SECONDS", "300")),
+        session_seconds=int(os.getenv("OIDC_SESSION_MAX_SECONDS", "28800")),
+    )
+    OIDC_CLIENT = oidc_session.OIDCClient(
+        _oidc_config, OIDC_CLIENT_SECRET, _oidc_store)
+    try:
+        OIDC_IDENTITY_KEY_VERSION = int(os.getenv(
+            "CONTROL_IDENTITY_HMAC_KEY_VERSION", "1"))
+    except ValueError as exc:
+        raise oidc.OIDCConfigurationError(
+            "control identity key version is invalid") from exc
+    if not 1 <= OIDC_IDENTITY_KEY_VERSION <= 2147483647:
+        raise oidc.OIDCConfigurationError(
+            "control identity key version is invalid")
+else:
+    OIDC_CLIENT = None
+    OIDC_IDENTITY_KEY_VERSION = 0
 _GATEWAY_DIGEST = (
     hashlib.sha256(OPENWEBUI_GATEWAY_KEY.encode("utf-8")).digest()
     if OPENWEBUI_GATEWAY_KEY else None
@@ -181,7 +231,9 @@ if _GATEWAY_DIGEST is not None:
     # Configuring the gateway is a production auth boundary: absence of a
     # legacy key must not reactivate the local-development open principal.
     AUTH_REGISTRY = auth.Registry(AUTH_REGISTRY.credentials, None)
-_DOCS_OPEN = not (AUTH_REGISTRY.configured or OPENWEBUI_IDENTITY is not None)
+_DOCS_OPEN = not (
+    AUTH_REGISTRY.configured or OPENWEBUI_IDENTITY is not None
+    or OIDC_CLIENT is not None)
 
 
 @asynccontextmanager
@@ -191,6 +243,7 @@ async def _lifespan(_app):
     # instead of leaving idle connections to the OS.
     yield
     runtime_repository.close_pool()
+    control_db.close_pool()
 
 
 app = FastAPI(
@@ -227,7 +280,7 @@ def _gateway_offered(authorization):
         _GATEWAY_DIGEST, hashlib.sha256(token.encode("utf-8")).digest())
 
 
-def _resolve_forwarded_principal(assertion):
+def _resolve_external_principal(assertion, source):
     """Resolve a verified subject; display claims never reach this seam."""
     conn = runtime_repository.get_conn(service=True)
     try:
@@ -242,14 +295,50 @@ def _resolve_forwarded_principal(assertion):
         tenant_id=resolved["tenant_id"],
         role=resolved["role"],
         subject_id=resolved["identity_id"],
-        source="openwebui",
+        source=source,
         position_id=resolved["position_id"],
         org_architect=resolved["org_architect"],
     )
 
 
+def _resolve_forwarded_principal(assertion):
+    return _resolve_external_principal(assertion, "openwebui")
+
+
+def _resolve_oidc_principal(assertion):
+    """Require an active control route before touching the tenant data plane."""
+    digest = control_db.identity_digest(assertion.issuer, assertion.subject)
+    with control_db.get_pool().connection() as connection:
+        route = control_db.resolve_identity(
+            connection, OIDC_IDENTITY_KEY_VERSION, digest)
+    if route is None:
+        return None
+    principal = _resolve_external_principal(assertion, "oidc")
+    if principal is None or principal.tenant_id != route.facts.tenant_id:
+        return None
+    return principal
+
+
 def _request_principal(request):
     authorizations = request.headers.getlist("authorization")
+    if OIDC_CLIENT is not None:
+        session = OIDC_CLIENT.store.authenticate(
+            request.cookies.get(oidc_session.COOKIE_NAME))
+        if session is not None:
+            if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                csrf_values = request.headers.getlist(
+                    oidc_session.CSRF_HEADER)
+                if (len(csrf_values) != 1
+                        or not secrets.compare_digest(
+                            csrf_values[0], session.csrf_token)):
+                    return None
+            try:
+                return _resolve_oidc_principal(session.identity)
+            except Exception:
+                # Authentication fails closed. Provider/database exception
+                # prose can carry hosts, subjects or credentials and is never
+                # copied into a response or request log.
+                return None
     if not authorizations and AUTH_REGISTRY.open_principal is not None:
         # Local development deliberately keeps the historical open principal.
         # Configuring either legacy credentials or the OpenWebUI gateway sets
@@ -416,9 +505,9 @@ ADMIN_AUTH = [Depends(require_admin)]
 
 
 def require_org_identity():
-    """Require a database-resolved OpenWebUI subject, not a legacy API key."""
+    """Require a database-resolved human subject, not a legacy API key."""
     principal = auth.bound_principal()
-    if (principal is None or principal.source != "openwebui"
+    if (principal is None or principal.source not in {"openwebui", "oidc"}
             or principal.subject_id is None):
         raise HTTPException(status_code=403,
                             detail="organizasyon kimligi gerekli")
@@ -479,7 +568,7 @@ def require_evidence_actor(
 def require_eval_writer(
         principal=Depends(require_org_identity)):
     """Require a real editor; hierarchy authority is rechecked by PostgreSQL."""
-    if (principal is None or principal.source != "openwebui"
+    if (principal is None or principal.source not in {"openwebui", "oidc"}
             or principal.subject_id is None
             or not auth.permits(principal, "editor")):
         raise HTTPException(status_code=403,
@@ -1490,7 +1579,8 @@ def chat_completions(req: ChatRequest):
 
 def _browser_evidence_enabled():
     principal = auth.bound_principal()
-    return (principal is not None and principal.source == "openwebui"
+    return (principal is not None
+            and principal.source in {"openwebui", "oidc"}
             and principal.subject_id is not None
             and auth.permits(principal, "reader"))
 
@@ -1638,7 +1728,8 @@ def _read_export_bytes(storage_name):
 
 def _register_export_reference(principal, storage_name):
     """Measure and bind one generated file without persisting its contents."""
-    if principal.subject_id is None or principal.source != "openwebui":
+    if (principal.subject_id is None
+            or principal.source not in {"openwebui", "oidc"}):
         return None
     try:
         body = _read_export_bytes(storage_name)
@@ -2798,6 +2889,77 @@ def read_document(document_id: str):
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
     return _document_detail(doc)
+
+
+@system_routes.router.get("/auth/login", include_in_schema=False)
+def oidc_login():
+    if OIDC_CLIENT is None:
+        raise HTTPException(status_code=404, detail="OIDC login is disabled")
+    try:
+        start = OIDC_CLIENT.begin()
+    except oidc_session.OIDCSessionRefused:
+        raise HTTPException(
+            status_code=503, detail="OIDC login is unavailable") from None
+    return RedirectResponse(start.authorization_url, status_code=302)
+
+
+@system_routes.router.get("/auth/callback", include_in_schema=False)
+def oidc_callback(state: str = Query(...), code: str = Query(...)):
+    if OIDC_CLIENT is None:
+        raise HTTPException(status_code=404, detail="OIDC login is disabled")
+    try:
+        cookie, session = OIDC_CLIENT.callback(state=state, code=code)
+    except oidc_session.OIDCSessionRefused:
+        raise HTTPException(
+            status_code=401, detail="OIDC callback was refused") from None
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(
+        oidc_session.COOKIE_NAME,
+        cookie,
+        max_age=max(1, session.expires_at - int(time.time())),
+        secure=OIDC_REDIRECT_URI.startswith("https://"),
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@system_routes.router.get(
+    "/auth/session", response_model=api_contracts.BrowserSessionResponse)
+def oidc_browser_session(request: Request):
+    if OIDC_CLIENT is None:
+        raise HTTPException(status_code=401, detail="OIDC session is absent")
+    session = OIDC_CLIENT.store.authenticate(
+        request.cookies.get(oidc_session.COOKIE_NAME))
+    principal = auth.bound_principal()
+    if (session is None or principal is None or principal.source != "oidc"
+            or principal.subject_id is None):
+        raise HTTPException(status_code=401, detail="OIDC session is absent")
+    return {
+        "authenticated": True,
+        "tenant_id": principal.tenant_id,
+        "role": principal.role,
+        "source": "oidc",
+        "position_id": principal.position_id,
+        "org_architect": principal.org_architect,
+        "csrf_token": session.csrf_token,
+        "expires_at": session.expires_at,
+    }
+
+
+@system_routes.router.post("/auth/logout", status_code=204)
+def oidc_logout(
+        request: Request,
+        csrf_token: str = Header(default="", alias="X-RAGTest-CSRF")):
+    if (OIDC_CLIENT is None or not OIDC_CLIENT.store.revoke(
+            request.cookies.get(oidc_session.COOKIE_NAME), csrf_token)):
+        raise HTTPException(status_code=403, detail="OIDC logout was refused")
+    response = Response(status_code=204)
+    response.delete_cookie(
+        oidc_session.COOKIE_NAME, path="/", httponly=True,
+        secure=OIDC_REDIRECT_URI.startswith("https://"), samesite="lax")
+    return response
 
 
 @system_routes.router.get(

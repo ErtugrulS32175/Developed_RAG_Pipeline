@@ -121,15 +121,15 @@ full tests, leak scan, and CI remain green.
 
 Status: `[~]` in progress.
 
-- [ ] Verify OIDC authorization-code/PKCE sessions through issuer, audience,
+- [x] Verify OIDC authorization-code/PKCE sessions through issuer, audience,
   client, expiry, and rotating JWKS keys.
 - [ ] Add service-account issuance, rotation, revocation, and audit evidence.
 - [ ] Add controlled provisioning/SCIM and IdP group-to-role policy.
 - [ ] Separate platform administration from customer-tenant administration.
-- [ ] Add tenant routing, deployment profile, feature, region, and quota facts
+- [x] Add tenant routing, deployment profile, feature, region, and quota facts
   to a content-free control plane.
 - [ ] Add time-bounded, reasoned, audited break-glass authorization.
-- [ ] Keep the OpenWebUI signed bridge during migration, mapping both identity
+- [x] Keep the OpenWebUI signed bridge during migration, mapping both identity
   roads to the same closed principal contract.
 
 Exit gate: forged issuer/audience/tenant/role, stale keys, disabled membership,
@@ -354,3 +354,23 @@ SLOs; the rollback window has closed.
   a current OpenAPI snapshot, a passing OpenAPI compatibility check, and a
   clean generated TypeScript diff and typecheck. Final hygiene and leak-scan
   evidence is taken from this completed roadmap state before publication.
+
+### 2026-08-25 - E2 control plane and OIDC browser identity
+
+- Added a physically separable, content-free control plane for tenant route,
+  region, deployment profile, feature, declared quota, identity digest and
+  immutable platform-event facts. Runtime and migration credentials are
+  separate and there is no fallback to the tenant data-plane DSN.
+- Added strict OIDC discovery and RS256/JWKS verification with exact issuer,
+  audience/client, nonce, time and subject checks. Unknown keys receive one
+  bounded refresh and retired keys expire after a bounded overlap.
+- Added authorization-code/PKCE login, one-use state and nonce, bounded token
+  exchange, an opaque server-held browser session, global unsafe-method CSRF,
+  logout revocation and a closed `/auth/session` response. Provider tokens and
+  raw external identity coordinates are not published or persisted.
+- Kept the signed OpenWebUI bridge and resolved both human identity roads to
+  the same tenant-owned principal. Control-plane routing is proven before a
+  tenant data-plane identity lookup; absent or conflicting routes fail closed.
+- Current browser sessions are process-local and intentionally bounded. A
+  shared highly available session backend is a deployment/resilience concern
+  for E7; multi-replica rollout is not claimed by this E2 slice.

@@ -131,6 +131,9 @@ def _startup(tmp_path, *, allow=None, bind=None):
     for name in (
             "API_KEY", "API_KEYS_JSON", "OPENWEBUI_GATEWAY_KEY",
             "OPENWEBUI_USER_JWT_SECRET", "EVIDENCE_HMAC_SECRET",
+            "OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET",
+            "OIDC_REDIRECT_URI", "OIDC_SESSION_SECRET",
+            "CONTROL_IDENTITY_HMAC_SECRET", "PG_CONTROL_DSN",
             "ALLOW_INSECURE_LOCAL", "API_BIND_HOST"):
         environment.pop(name, None)
     environment["PYTHON_DOTENV_DISABLED"] = "1"

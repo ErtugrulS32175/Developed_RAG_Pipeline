@@ -18,6 +18,14 @@ The callback accepts a code only with the same one-use state, nonce, redirect
 URI, and verifier issued for that browser attempt. State and code redemption
 are single-use.
 
+The first BFF implementation keeps only bounded login and session records in
+the API process. State and cookie values are indexed by keyed digests, provider
+tokens are discarded after verification, and an OIDC deployment disables the
+local unauthenticated principal. Every unsafe cookie-authenticated method
+requires the one session-bound CSRF value; safe reads do not. This process-local
+store is suitable for the single-instance pilot only. Shared-session failover
+and multi-replica rollout remain an E7 deployment/resilience gate.
+
 The verifier accepts only `RS256` identity tokens whose signature matches a
 key from the configured issuer's discovered `jwks_uri`. It checks exact
 issuer, client/audience, expiry, issued-at, nonce, and subject. Unknown keys

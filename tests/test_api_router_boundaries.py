@@ -21,7 +21,11 @@ EXPECTED_ENDPOINTS = {
         "eval_draft_create", "eval_cases_import", "eval_cases_read",
         "eval_version_publish", "eval_dataset_retire",
     },
-    "system": {"list_models", "health", "prometheus_metrics", "ready"},
+    "system": {
+        "list_models", "oidc_login", "oidc_callback",
+        "oidc_browser_session", "oidc_logout", "health",
+        "prometheus_metrics", "ready",
+    },
     "chat": {"chat_completions"},
     "evidence": {
         "create_evidence_ticket", "preview_evidence",
@@ -52,7 +56,7 @@ def test_every_http_handler_has_one_domain_owner():
             (method, route.path, route.endpoint.__name__)
             for route in router.routes for method in route.methods)
     assert observed == EXPECTED_ENDPOINTS
-    assert len(all_routes) == 53
+    assert len(all_routes) == 57
     assert len(all_routes) == len(set(all_routes))
 
 

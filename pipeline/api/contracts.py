@@ -82,6 +82,17 @@ class ModelListResponse(_ClosedResponse):
     data: tuple[ModelDescriptor, ...] = Field(min_length=1, max_length=20)
 
 
+class BrowserSessionResponse(_ClosedResponse):
+    authenticated: Literal[True]
+    tenant_id: WireId
+    role: Literal["reader", "editor", "admin", "org_architect"]
+    source: Literal["oidc"]
+    position_id: WireId | None
+    org_architect: bool
+    csrf_token: str = Field(min_length=32, max_length=128)
+    expires_at: int = Field(gt=0)
+
+
 class OrgSelfMembership(_ClosedResponse):
     identity_id: WireId
     position_id: WireId

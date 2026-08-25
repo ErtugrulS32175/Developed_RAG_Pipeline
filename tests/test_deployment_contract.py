@@ -99,11 +99,10 @@ def test_enterprise_identity_decisions_are_closed_and_content_free():
 
     required_empty = {
         "OIDC_ISSUER",
-        "OIDC_CLIENT_ID",
-        "OIDC_CLIENT_SECRET",
-        "OIDC_REDIRECT_URI",
-        "OIDC_POST_LOGOUT_REDIRECT_URI",
-        "OIDC_SESSION_SECRET",
+            "OIDC_CLIENT_ID",
+            "OIDC_CLIENT_SECRET",
+            "OIDC_REDIRECT_URI",
+            "OIDC_SESSION_SECRET",
         "CONTROL_IDENTITY_HMAC_SECRET",
         "PG_CONTROL_DSN",
         "PG_CONTROL_MIGRATION_DSN",

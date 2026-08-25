@@ -27,6 +27,7 @@ def _route(path, method="GET"):
     ("/health", "GET", contracts.HealthResponse),
     ("/ready", "GET", contracts.ReadinessResponse),
     ("/v1/models", "GET", contracts.ModelListResponse),
+    ("/auth/session", "GET", contracts.BrowserSessionResponse),
     ("/v1/org/me", "GET", contracts.OrganizationMeResponse),
     ("/v1/org/visible-members", "GET",
      contracts.VisibleOrgMembersResponse),
@@ -122,6 +123,7 @@ def test_the_response_models_are_recursively_closed_in_openapi():
     schemas = api.app.openapi()["components"]["schemas"]
     for name in (
             "HealthResponse", "ReadinessChecks", "ReadinessResponse",
+            "BrowserSessionResponse",
             "ModelDescriptor", "ModelListResponse", "OrgSelfMembership",
             "OrganizationMeResponse", "VisibleOrgMember",
             "VisibleOrgMembersResponse", "OrgPositionResponse",
