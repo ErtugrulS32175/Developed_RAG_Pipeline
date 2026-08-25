@@ -136,7 +136,11 @@ def test_planner_rejects_an_oversized_question_before_database_or_network(
         },
     )
     assert response.status_code == 422
-    assert response.json() == {"detail": "gecersiz retrieval istegi"}
+    body = response.json()
+    assert body["detail"] == "gecersiz retrieval istegi"
+    assert body["error"]["version"] == 1
+    assert body["error"]["code"] == "validation_failed"
+    assert body["error"]["request_id"] == response.headers["X-Request-ID"]
 
 
 @pytest.mark.parametrize("stream", [False, True])

@@ -84,13 +84,13 @@ Provider selections remain deploy-time decisions, not code defaults:
 
 Status: `[~]` in progress.
 
-- [~] Introduce closed response models without changing response bytes.
+- [x] Introduce closed response models without changing response bytes.
   - [x] Liveness, readiness, and OpenAI model-list response contracts.
-  - [~] Organization and membership responses.
+  - [x] Organization and membership responses.
     - [x] Self context, visible members, topology read/replace, and membership
       mutation responses.
     - [x] Governance audit and retention-administration responses.
-  - [~] Document inventory, detail, version, and lifecycle responses.
+  - [x] Document inventory, detail, version, and lifecycle responses.
     - [x] Inventory, detail, archive/restore, version inventory, and version
       activation responses.
     - [x] Upload/process/ingest-job and retention/legal-hold/purge responses.
@@ -100,8 +100,9 @@ Status: `[~]` in progress.
     - [x] Evidence ticket/preview, export ticket/download media, and review
       feedback/queue/decision responses.
     - [x] Evaluation dataset and release responses.
-  - [ ] Chat non-streaming response and SSE event contracts.
-- [ ] Introduce one versioned, content-free error envelope and error-code
+  - [x] Chat non-streaming response and SSE event contracts.
+  - [x] Collection, tag, and document-organization responses.
+- [x] Introduce one versioned, content-free error envelope and error-code
   vocabulary with an explicit compatibility transition from FastAPI `detail`.
 - [ ] Add an OpenAPI snapshot and backwards-compatibility CI gate.
 - [ ] Generate and compile a TypeScript client from the checked OpenAPI schema.

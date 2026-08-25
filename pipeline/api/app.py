@@ -36,6 +36,7 @@ from pipeline.index.attempt_contract import (
 from pipeline.api import owui_chat
 from pipeline.api import auth
 from pipeline.api import contracts as api_contracts
+from pipeline.api import errors as api_errors
 from pipeline.api import identity
 from pipeline.api import metrics
 from pipeline.api import org_policy
@@ -182,7 +183,9 @@ app = FastAPI(
     docs_url="/docs" if _DOCS_OPEN else None,
     redoc_url="/redoc" if _DOCS_OPEN else None,
     openapi_url="/openapi.json" if _DOCS_OPEN else None,
+    responses=dict(api_errors.ERROR_RESPONSES),
 )
+api_errors.install(app)
 
 
 def _gateway_offered(authorization):

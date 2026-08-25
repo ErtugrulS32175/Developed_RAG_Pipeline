@@ -29,6 +29,31 @@ WireTimestamp = Annotated[
 ]
 WireId = str | UUID
 
+ErrorCode = Literal[
+    "invalid_request", "authentication_required", "permission_denied",
+    "resource_not_found", "method_not_allowed", "conflict",
+    "payload_too_large", "validation_failed", "rate_limited",
+    "internal_error", "upstream_failed", "service_unavailable",
+    "request_failed",
+]
+
+
+class ErrorEnvelopeResponse(_ClosedResponse):
+    version: Literal[1]
+    code: ErrorCode
+    request_id: str = Field(pattern=r"^(?:[a-f0-9]{8}|unavailable)$")
+
+
+class LegacyValidationIssueResponse(_ClosedResponse):
+    type: str
+    loc: list[str | int]
+    msg: str
+
+
+class ErrorResponse(_ClosedResponse):
+    error: ErrorEnvelopeResponse
+    detail: str | list[LegacyValidationIssueResponse]
+
 
 class HealthResponse(_ClosedResponse):
     status: Literal["ok"]
