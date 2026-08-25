@@ -10,6 +10,7 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Literal, Union
 from uuid import UUID
 
@@ -68,6 +69,7 @@ from pipeline.validation.rag.answer_guard import (
     is_abstention,
 )
 from pipeline.control import db as control_db
+from pipeline.control import service_accounts
 
 load_dotenv()
 
@@ -126,6 +128,10 @@ OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID", "").strip()
 OIDC_CLIENT_SECRET = os.getenv("OIDC_CLIENT_SECRET", "").strip()
 OIDC_REDIRECT_URI = os.getenv("OIDC_REDIRECT_URI", "").strip()
 OIDC_SESSION_SECRET = os.getenv("OIDC_SESSION_SECRET", "").strip()
+SERVICE_ACCOUNT_AUTH_ENABLED = (
+    os.getenv("SERVICE_ACCOUNT_AUTH_ENABLED", "").strip() == "1")
+if SERVICE_ACCOUNT_AUTH_ENABLED:
+    service_accounts.validate_configuration()
 _OIDC_VALUES = (
     OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI,
     OIDC_SESSION_SECRET,
@@ -141,7 +147,8 @@ API_BIND_HOST = os.getenv("API_BIND_HOST", "").strip()
 AUTH_REGISTRY = auth.load_registry(
     API_KEY,
     API_KEYS_JSON,
-    external_auth=bool(OPENWEBUI_GATEWAY_KEY or OIDC_ENABLED),
+    external_auth=bool(
+        OPENWEBUI_GATEWAY_KEY or OIDC_ENABLED or SERVICE_ACCOUNT_AUTH_ENABLED),
     allow_insecure_local=ALLOW_INSECURE_LOCAL,
     bind_host=API_BIND_HOST,
 )
@@ -319,12 +326,41 @@ def _resolve_oidc_principal(assertion):
     return principal
 
 
+def _resolve_service_account(authorization):
+    """Resolve one opaque machine credential without creating a human actor."""
+    if not SERVICE_ACCOUNT_AUTH_ENABLED or type(authorization) is not str:
+        return None
+    scheme, separator, token = authorization.partition(" ")
+    if separator != " " or scheme.lower() != "bearer" or not token:
+        return None
+    try:
+        proof = service_accounts.parse_credential(token)
+        with control_db.get_pool().connection() as connection:
+            route = control_db.resolve_service_account(
+                connection,
+                proof.service_account_id,
+                proof.credential_version,
+                proof.digest,
+            )
+    except Exception:
+        return None
+    if route is None:
+        return None
+    return auth.ServicePrincipal(
+        tenant_id=route.facts.tenant_id,
+        service_account_id=route.service_account_id,
+        scopes=frozenset(route.scopes),
+    )
+
+
 def _request_principal(request):
     authorizations = request.headers.getlist("authorization")
     if OIDC_CLIENT is not None:
         session = OIDC_CLIENT.store.authenticate(
             request.cookies.get(oidc_session.COOKIE_NAME))
         if session is not None:
+            if authorizations:
+                return None
             if request.method not in {"GET", "HEAD", "OPTIONS"}:
                 csrf_values = request.headers.getlist(
                     oidc_session.CSRF_HEADER)
@@ -347,6 +383,11 @@ def _request_principal(request):
     if len(authorizations) != 1:
         return None
     authorization = authorizations[0]
+    scheme, separator, offered_token = authorization.partition(" ")
+    if (separator == " " and scheme.lower() == "bearer"
+            and offered_token.casefold().startswith(service_accounts.PREFIX)):
+        # The reserved namespace never falls through to the legacy registry.
+        return _resolve_service_account(authorization)
     principal = auth.authenticate(AUTH_REGISTRY, authorization)
     if principal is not None:
         return principal
@@ -454,7 +495,12 @@ def _principal_db_conn(principal):
     with runtime_repository.get_pool().connection() as conn:
         _require_current_schema(conn)
         runtime_repository.set_tenant_context(
-            conn, principal.tenant_id, actor_id=principal.subject_id)
+            conn,
+            principal.tenant_id,
+            actor_id=(principal.subject_id
+                      if type(principal) is auth.Principal else None),
+            service=False,
+        )
         try:
             yield conn
         finally:
@@ -474,29 +520,76 @@ if not (AUTH_REGISTRY.configured or OPENWEBUI_IDENTITY is not None):
     log.warning("Kimliksiz yerel gelistirme modu acik; dis aga baglanamaz.")
 
 
-def _require_role(minimum_role, authorization):
+SERVICE_ROUTE_SCOPES = MappingProxyType({
+    ("GET", "/v1/models"): "rag.query",
+    ("POST", "/v1/chat/completions"): "rag.query",
+    ("POST", "/documents/upload"): "documents.write",
+    ("POST", "/documents/{document_id}/process"): "documents.lifecycle",
+    ("POST", "/documents/{document_id}/ingest-jobs"):
+        "documents.lifecycle",
+    ("GET", "/ingest-jobs/{job_id}"): "documents.read",
+    ("DELETE", "/ingest-jobs/{job_id}"): "documents.lifecycle",
+    ("GET", "/documents"): "documents.read",
+    ("GET", "/documents/{document_id}"): "documents.read",
+    ("GET", "/documents/{document_id}/versions"): "documents.read",
+    ("POST", "/documents/{document_id}/archive"): "documents.lifecycle",
+    ("POST", "/documents/{document_id}/restore"): "documents.lifecycle",
+    ("POST", "/documents/{document_id}/versions/{version_id}/activate"):
+        "documents.lifecycle",
+    ("POST", "/collections"): "collections.manage",
+    ("GET", "/collections"): "collections.manage",
+    ("DELETE", "/collections/{collection_id}"): "collections.manage",
+    ("PUT", "/collections/{collection_id}/documents/{document_id}"):
+        "collections.manage",
+    ("DELETE", "/collections/{collection_id}/documents/{document_id}"):
+        "collections.manage",
+    ("GET", "/tags"): "collections.manage",
+    ("DELETE", "/tags/{tag_id}"): "collections.manage",
+    ("PUT", "/documents/{document_id}/tags"): "collections.manage",
+})
+
+
+def _service_scope(request):
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    if type(route_path) is not str:
+        return None
+    return SERVICE_ROUTE_SCOPES.get((request.method, route_path))
+
+
+def _require_role(minimum_role, authorization, request):
     principal = auth.bound_principal()
-    if principal is None:
+    reserved_service_token = (
+        type(authorization) is str
+        and authorization.lower().startswith(
+            "bearer " + service_accounts.PREFIX))
+    if principal is None and not reserved_service_token:
         principal = auth.authenticate(AUTH_REGISTRY, authorization)
     if principal is None:
         raise HTTPException(status_code=401,
                             detail="gecersiz veya eksik API anahtari")
+    if type(principal) is auth.ServicePrincipal:
+        required_scope = _service_scope(request)
+        if not auth.permits_service(principal, required_scope):
+            raise HTTPException(
+                status_code=403, detail="bu islem icin kapsam yetersiz")
+        return principal
     if not auth.permits(principal, minimum_role):
         raise HTTPException(status_code=403, detail="bu islem icin rol yetersiz")
     return principal
 
 
-def require_api_key(authorization: str = Header(default="")):
+def require_api_key(request: Request, authorization: str = Header(default="")):
     """Backward-compatible reader dependency for every data-bearing route."""
-    return _require_role("reader", authorization)
+    return _require_role("reader", authorization, request)
 
 
-def require_editor(authorization: str = Header(default="")):
-    return _require_role("editor", authorization)
+def require_editor(request: Request, authorization: str = Header(default="")):
+    return _require_role("editor", authorization, request)
 
 
-def require_admin(authorization: str = Header(default="")):
-    return _require_role("admin", authorization)
+def require_admin(request: Request, authorization: str = Header(default="")):
+    return _require_role("admin", authorization, request)
 
 
 AUTH = [Depends(require_api_key)]
@@ -507,7 +600,8 @@ ADMIN_AUTH = [Depends(require_admin)]
 def require_org_identity():
     """Require a database-resolved human subject, not a legacy API key."""
     principal = auth.bound_principal()
-    if (principal is None or principal.source not in {"openwebui", "oidc"}
+    if (type(principal) is not auth.Principal
+            or principal.source not in {"openwebui", "oidc"}
             or principal.subject_id is None):
         raise HTTPException(status_code=403,
                             detail="organizasyon kimligi gerekli")
@@ -1480,6 +1574,12 @@ def chat_completions(req: ChatRequest):
     """
     if req.model not in {*RAG_MODELS, TABLE_MODEL_ID}:
         raise HTTPException(status_code=404, detail="bilinmeyen model")
+    principal = auth.current_principal()
+    if (type(principal) is auth.ServicePrincipal
+            and req.model == TABLE_MODEL_ID
+            and not auth.permits_service(principal, "tables.extract")):
+        raise HTTPException(
+            status_code=403, detail="bu islem icin kapsam yetersiz")
     if not req.messages:
         raise HTTPException(status_code=400, detail="en az bir mesaj gerekli")
 

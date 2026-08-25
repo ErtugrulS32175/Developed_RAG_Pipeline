@@ -42,6 +42,10 @@ def _key() -> bytes:
     return encoded
 
 
+def validate_configuration() -> None:
+    _key()
+
+
 def _digest(account_id: uuid.UUID, version: int, secret: str) -> bytes:
     material = (
         b"ragtest-service-account-v1\x00" + account_id.bytes

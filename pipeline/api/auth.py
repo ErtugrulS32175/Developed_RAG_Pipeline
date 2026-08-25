@@ -30,6 +30,13 @@ class Principal:
 
 
 @dataclass(frozen=True, slots=True)
+class ServicePrincipal:
+    tenant_id: UUID
+    service_account_id: UUID
+    scopes: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class Credential:
     digest: bytes
     principal: Principal
@@ -142,9 +149,15 @@ def authenticate(registry, authorization):
 
 
 def permits(principal, minimum_role):
-    if principal is None or minimum_role not in ROLES:
+    if type(principal) is not Principal or minimum_role not in ROLES:
         return False
     return ROLES.get(principal.role, 0) >= ROLES[minimum_role]
+
+
+def permits_service(principal, required_scope):
+    return (type(principal) is ServicePrincipal
+            and type(required_scope) is str
+            and required_scope in principal.scopes)
 
 
 def bind(principal):
