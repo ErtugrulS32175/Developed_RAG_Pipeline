@@ -110,7 +110,7 @@ Status: `[~]` in progress.
   contracts.
 - [x] Split `pipeline/api/app.py` into domain routers without changing route
   behavior or authorization dependencies.
-- [ ] Split the database facade into bounded domain repositories without
+- [x] Split the database facade into bounded domain repositories without
   creating a second SQL or authorization authority.
 
 Exit gate: every JSON route has a closed response contract; OpenAPI drift is

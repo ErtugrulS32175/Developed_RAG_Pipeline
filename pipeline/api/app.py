@@ -24,6 +24,12 @@ from dotenv import load_dotenv
 from pipeline.index import db
 from pipeline.index import ingest
 from pipeline.index import publication
+from pipeline.index.repositories import documents as document_repository
+from pipeline.index.repositories import evaluation as evaluation_repository
+from pipeline.index.repositories import evidence as evidence_repository
+from pipeline.index.repositories import governance as governance_repository
+from pipeline.index.repositories import reviews as review_repository
+from pipeline.index.repositories import runtime as runtime_repository
 from pipeline.storage import handle_transport
 from pipeline.evaluation import datasets as eval_datasets
 from pipeline.index.attempt_contract import (
@@ -184,7 +190,7 @@ async def _lifespan(_app):
     # Closing it explicitly makes reloads and test processes deterministic
     # instead of leaving idle connections to the OS.
     yield
-    db.close_pool()
+    runtime_repository.close_pool()
 
 
 app = FastAPI(
@@ -223,10 +229,10 @@ def _gateway_offered(authorization):
 
 def _resolve_forwarded_principal(assertion):
     """Resolve a verified subject; display claims never reach this seam."""
-    conn = db.get_conn(service=True)
+    conn = runtime_repository.get_conn(service=True)
     try:
         _require_current_schema(conn)
-        resolved = db.resolve_org_identity(
+        resolved = runtime_repository.resolve_org_identity(
             conn, assertion.issuer, assertion.subject)
     finally:
         conn.close()
@@ -343,7 +349,7 @@ def _require_current_schema(conn):
     global _schema_ready
     if _schema_ready:
         return
-    db.require_runtime_ready(conn)
+    runtime_repository.require_runtime_ready(conn)
     _schema_ready = True
 
 
@@ -356,15 +362,15 @@ def _principal_db_conn(principal):
     exception, and checkout revalidates the connection -- so one failed
     statement can no longer poison every request that follows, which is
     exactly what the previous single cached module-level connection did."""
-    with db.get_pool().connection() as conn:
+    with runtime_repository.get_pool().connection() as conn:
         _require_current_schema(conn)
-        db.set_tenant_context(
+        runtime_repository.set_tenant_context(
             conn, principal.tenant_id, actor_id=principal.subject_id)
         try:
             yield conn
         finally:
             conn.rollback()
-            db.clear_tenant_context(conn)
+            runtime_repository.clear_tenant_context(conn)
 
 
 @contextmanager
@@ -441,7 +447,7 @@ def require_org_architect(
             action = ("topology_change" if request.method == "PUT"
                       else "topology_read")
         with db_conn() as conn:
-            db.record_org_decision(
+            governance_repository.record_org_decision(
                 conn,
                 actor_id=principal.subject_id,
                 subject_id=None,
@@ -678,7 +684,8 @@ class PurgeScheduleRequest(BaseModel):
 def organization_me(principal=Depends(require_org_identity)):
     """Show only the caller's own level and content-free organization facts."""
     with db_conn() as conn:
-        membership = db.org_context(conn, principal.subject_id)
+        membership = governance_repository.org_context(
+            conn, principal.subject_id)
     return {
         "tenant_id": principal.tenant_id,
         "identity_id": principal.subject_id,
@@ -695,8 +702,9 @@ def organization_visible_members(
         principal=Depends(require_org_identity)):
     """Return strict descendants only; peers, ancestors and protected users stay out."""
     with db_conn() as conn:
-        members = db.visible_org_members(conn, principal.subject_id)
-        db.record_org_decision(
+        members = governance_repository.visible_org_members(
+            conn, principal.subject_id)
+        governance_repository.record_org_decision(
             conn, actor_id=principal.subject_id, subject_id=None,
             action="monitor_view", reason_code=reason_code, allowed=True,
             request_id=request.state.request_id)
@@ -709,11 +717,11 @@ def organization_topology(
         request: Request,
         principal=Depends(require_org_architect)):
     with db_conn() as conn:
-        topology = db.org_topology(conn)
+        topology = governance_repository.org_topology(conn)
         if topology is None:
             raise HTTPException(status_code=404,
                                 detail="organizasyon bulunamadi")
-        db.record_org_decision(
+        governance_repository.record_org_decision(
             conn, actor_id=principal.subject_id, subject_id=None,
             action="topology_read", reason_code="system_operation",
             allowed=True, request_id=request.state.request_id)
@@ -751,10 +759,10 @@ def organization_audit_events(
         raise HTTPException(status_code=422, detail=str(error)) from None
     try:
         with db_conn() as conn:
-            rows = db.list_org_audit_events(
+            rows = governance_repository.list_org_audit_events(
                 conn, limit=limit, before=before, actions=action,
                 decisions=decision, reasons=reason_code)
-            db.record_org_decision(
+            governance_repository.record_org_decision(
                 conn, actor_id=principal.subject_id, subject_id=None,
                 action="events_view", reason_code="system_operation",
                 allowed=True, request_id=request.state.request_id)
@@ -786,7 +794,7 @@ def replace_organization_topology(
         raise HTTPException(status_code=422, detail=str(error)) from None
     try:
         with db_conn() as conn:
-            version = db.replace_org_topology(
+            version = governance_repository.replace_org_topology(
                 conn, expected_version=body.expected_version, name=body.name,
                 positions=ordered, members=members,
                 actor_id=principal.subject_id,
@@ -809,7 +817,7 @@ def update_organization_membership(
                             detail="uyelik degisikligi belirtilmedi")
     try:
         with db_conn() as conn:
-            updated = db.update_org_member(
+            updated = governance_repository.update_org_member(
                 conn, actor_id=principal.subject_id,
                 target_identity_id=identity_id,
                 expected_architecture_version=body.expected_architecture_version,
@@ -842,7 +850,7 @@ def organization_retention_policy(
         principal=Depends(require_org_architect)):
     try:
         with db_conn() as conn:
-            return db.get_tenant_retention_policy(
+            return governance_repository.get_tenant_retention_policy(
                 conn, actor_id=principal.subject_id)
     except db.DocumentRetentionRefused as error:
         raise HTTPException(status_code=403, detail=str(error)) from None
@@ -867,10 +875,10 @@ def organization_retention_documents(
         raise HTTPException(status_code=422, detail=str(error)) from None
     try:
         with db_conn() as conn:
-            rows = db.list_retention_documents(
+            rows = governance_repository.list_retention_documents(
                 conn, actor_id=principal.subject_id, limit=limit,
                 before=before)
-            db.record_org_decision(
+            governance_repository.record_org_decision(
                 conn, actor_id=principal.subject_id, subject_id=None,
                 action="retention_inventory_view",
                 reason_code="system_operation", allowed=True,
@@ -912,7 +920,7 @@ def update_organization_retention_policy(
         principal=Depends(require_org_architect)):
     try:
         with db_conn() as conn:
-            return db.update_tenant_retention_policy(
+            return governance_repository.update_tenant_retention_policy(
                 conn, actor_id=principal.subject_id,
                 archive_retention_days=body.archive_retention_days,
                 expected_revision=body.expected_revision,
@@ -931,7 +939,7 @@ def document_legal_holds(
         document_id: UUID, principal=Depends(require_org_architect)):
     try:
         with db_conn() as conn:
-            return {"holds": db.list_document_legal_holds(
+            return {"holds": governance_repository.list_document_legal_holds(
                 conn, actor_id=principal.subject_id,
                 document_id=document_id)}
     except db.DocumentRetentionRefused as error:
@@ -947,7 +955,7 @@ def create_document_legal_hold(
         principal=Depends(require_org_architect)):
     try:
         with db_conn() as conn:
-            return db.create_document_legal_hold(
+            return governance_repository.create_document_legal_hold(
                 conn, actor_id=principal.subject_id,
                 document_id=document_id,
                 reason_code=body.reason_code,
@@ -970,7 +978,7 @@ def release_document_legal_hold(
         request: Request, principal=Depends(require_org_architect)):
     try:
         with db_conn() as conn:
-            return db.release_document_legal_hold(
+            return governance_repository.release_document_legal_hold(
                 conn, actor_id=principal.subject_id,
                 document_id=document_id, hold_id=hold_id,
                 expected_revision=body.expected_revision,
@@ -990,7 +998,7 @@ def document_purge_jobs(
         document_id: UUID, principal=Depends(require_org_architect)):
     try:
         with db_conn() as conn:
-            return {"jobs": db.list_document_purge_jobs(
+            return {"jobs": governance_repository.list_document_purge_jobs(
                 conn, actor_id=principal.subject_id,
                 document_id=document_id)}
     except db.DocumentRetentionRefused as error:
@@ -1006,7 +1014,7 @@ def schedule_document_purge(
         principal=Depends(require_org_architect)):
     try:
         with db_conn() as conn:
-            return db.schedule_document_purge(
+            return governance_repository.schedule_document_purge(
                 conn, actor_id=principal.subject_id,
                 document_id=document_id,
                 expected_revision=body.expected_document_revision,
@@ -1127,7 +1135,7 @@ def eval_dataset_list(
         principal=Depends(require_org_identity)):
     try:
         with db_conn() as conn:
-            rows = db.list_eval_datasets(
+            rows = evaluation_repository.list_eval_datasets(
                 conn, actor_id=principal.subject_id, limit=limit)
     except db.EvalDatasetAccessRefused:
         raise _eval_access_error() from None
@@ -1142,7 +1150,7 @@ def eval_dataset_create(
         principal=Depends(require_eval_writer)):
     try:
         with db_conn() as conn:
-            row = db.create_eval_dataset(
+            row = evaluation_repository.create_eval_dataset(
                 conn, actor_id=principal.subject_id,
                 slug=body.slug, label=body.label)
     except db.EvalDatasetConflict:
@@ -1160,7 +1168,7 @@ def eval_version_list(
         dataset_id: UUID, principal=Depends(require_org_identity)):
     try:
         with db_conn() as conn:
-            rows = db.list_eval_versions(
+            rows = evaluation_repository.list_eval_versions(
                 conn, actor_id=principal.subject_id,
                 dataset_id=dataset_id)
     except db.EvalDatasetAccessRefused:
@@ -1179,7 +1187,7 @@ def eval_draft_create(
         principal=Depends(require_eval_writer)):
     try:
         with db_conn() as conn:
-            row = db.create_eval_draft(
+            row = evaluation_repository.create_eval_draft(
                 conn, actor_id=principal.subject_id,
                 dataset_id=dataset_id,
                 expected_revision=body.expected_revision)
@@ -1203,7 +1211,7 @@ async def eval_cases_import(
     expected_revision, cases = await _eval_import_body(request)
     try:
         with db_conn() as conn:
-            row = db.replace_eval_cases(
+            row = evaluation_repository.replace_eval_cases(
                 conn, actor_id=principal.subject_id,
                 dataset_id=dataset_id, version_id=version_id,
                 expected_revision=expected_revision, cases=cases)
@@ -1225,12 +1233,12 @@ def eval_cases_read(
         principal=Depends(require_org_identity)):
     try:
         with db_conn() as conn:
-            versions = db.list_eval_versions(
+            versions = evaluation_repository.list_eval_versions(
                 conn, actor_id=principal.subject_id,
                 dataset_id=dataset_id)
             if not any(row["id"] == version_id for row in versions):
                 raise db.EvalDatasetAccessRefused("eval version bulunamadi")
-            cases = db.read_eval_cases(
+            cases = evaluation_repository.read_eval_cases(
                 conn, actor_id=principal.subject_id,
                 dataset_id=dataset_id, version_id=version_id)
     except db.EvalDatasetAccessRefused:
@@ -1249,7 +1257,7 @@ def eval_version_publish(
         principal=Depends(require_eval_writer)):
     try:
         with db_conn() as conn:
-            row = db.publish_eval_version(
+            row = evaluation_repository.publish_eval_version(
                 conn, actor_id=principal.subject_id,
                 dataset_id=dataset_id, version_id=version_id,
                 expected_revision=body.expected_revision,
@@ -1273,7 +1281,7 @@ def eval_dataset_retire(
         principal=Depends(require_eval_writer)):
     try:
         with db_conn() as conn:
-            row = db.retire_eval_dataset(
+            row = evaluation_repository.retire_eval_dataset(
                 conn, actor_id=principal.subject_id,
                 dataset_id=dataset_id,
                 expected_revision=body.expected_revision,
@@ -1404,7 +1412,7 @@ def chat_completions(req: ChatRequest):
         # Forwarded only when a scope was asked for: an unscoped request
         # must reach the backend as the call it has always been.
         principal = auth.current_principal()
-        tenant_token = db.bind_execution_tenant(
+        tenant_token = runtime_repository.bind_execution_tenant(
             principal.tenant_id, actor_id=principal.subject_id)
         try:
             result = rag_backends.answer_checked(question, backend=backend,
@@ -1419,7 +1427,7 @@ def chat_completions(req: ChatRequest):
             _log_rag_failure(e, backend)
             raise HTTPException(status_code=502, detail=RAG_FAILURE_MESSAGE)
         finally:
-            db.reset_execution_tenant(tenant_token)
+            runtime_repository.reset_execution_tenant(tenant_token)
         published = _publish_checked(result)
         if req.include_trace and published[3] is None:
             log.error("RAG backend omitted requested retrieval trace")
@@ -1510,7 +1518,7 @@ def _citation_payload(citations, *, persist=False, feedback_ref=None):
     if persist and references:
         try:
             with db_conn() as conn:
-                db.register_evidence_references(
+                evidence_repository.register_evidence_references(
                     conn, tuple(sorted(references.items())))
         except db.EvidenceAccessRefused:
             raise HTTPException(status_code=500,
@@ -1532,7 +1540,7 @@ def _persist_review_interaction(result):
             _REVIEW_HMAC_KEY, b"interaction\x00" + interaction_id.bytes,
             hashlib.sha256).digest()
         with db_conn() as conn:
-            db.create_review_interaction(
+            review_repository.create_review_interaction(
                 conn, interaction_id=interaction_id,
                 actor_id=auth.current_principal().subject_id,
                 ref_digest=digest, outcome=ANSWERED,
@@ -1540,7 +1548,7 @@ def _persist_review_interaction(result):
         return _b64url(digest)
     if result.status == REVIEW_REQUIRED:
         with db_conn() as conn:
-            db.create_review_interaction(
+            review_repository.create_review_interaction(
                 conn, interaction_id=uuid.uuid4(),
                 actor_id=auth.current_principal().subject_id,
                 ref_digest=None, outcome=REVIEW_REQUIRED,
@@ -1637,7 +1645,7 @@ def _register_export_reference(principal, storage_name):
         export_id = _export_id_for_storage(storage_name)
         ref_digest = _export_reference_digest(export_id)
         with _principal_db_conn(principal) as conn:
-            db.register_table_export(
+            evidence_repository.register_table_export(
                 conn,
                 export_id=export_id,
                 actor_id=principal.subject_id,
@@ -1665,7 +1673,7 @@ def create_evidence_ticket(
     digest = hashlib.sha256(ticket.encode("ascii")).digest()
     try:
         with db_conn() as conn:
-            db.mint_evidence_preview_ticket(
+            evidence_repository.mint_evidence_preview_ticket(
                 conn, actor_id=principal.subject_id, ref_digest=ref_digest,
                 token_digest=digest, ttl_seconds=EVIDENCE_TICKET_SECONDS)
     except db.EvidenceAccessRefused:
@@ -1684,7 +1692,7 @@ def preview_evidence(
     digest = hashlib.sha256(body.ticket.encode("ascii")).digest()
     try:
         with db_conn() as conn:
-            preview = db.consume_evidence_preview_ticket(
+            preview = evidence_repository.consume_evidence_preview_ticket(
                 conn, actor_id=principal.subject_id, token_digest=digest,
                 passage_max_chars=EVIDENCE_PASSAGE_MAX_CHARS)
     except db.EvidenceAccessRefused:
@@ -1719,7 +1727,7 @@ def create_export_ticket(
     token_digest = hashlib.sha256(ticket.encode("ascii")).digest()
     try:
         with db_conn() as conn:
-            db.mint_table_export_ticket(
+            evidence_repository.mint_table_export_ticket(
                 conn,
                 actor_id=principal.subject_id,
                 ref_digest=ref_digest,
@@ -1749,7 +1757,7 @@ def download_export(
     token_digest = hashlib.sha256(body.ticket.encode("ascii")).digest()
     try:
         with db_conn() as conn:
-            measured = db.consume_table_export_ticket(
+            measured = evidence_repository.consume_table_export_ticket(
                 conn, actor_id=principal.subject_id,
                 token_digest=token_digest)
         if set(measured) != {"storage_name", "file_sha256", "file_size"}:
@@ -1799,7 +1807,7 @@ def submit_review_feedback(
                             detail="geri bildirim hedefi bulunamadi")
     try:
         with db_conn() as conn:
-            result = db.submit_review_feedback(
+            result = review_repository.submit_review_feedback(
                 conn, actor_id=principal.subject_id, ref_digest=digest,
                 verdict=body.verdict, reason_code=body.reason_code)
     except db.ReviewAccessRefused:
@@ -1828,10 +1836,10 @@ def review_queue(
         raise HTTPException(status_code=422, detail=str(error)) from None
     try:
         with db_conn() as conn:
-            rows = db.list_review_cases(
+            rows = review_repository.list_review_cases(
                 conn, reviewer_id=principal.subject_id,
                 limit=limit, before=before)
-            db.record_org_decision(
+            governance_repository.record_org_decision(
                 conn, actor_id=principal.subject_id, subject_id=None,
                 action="review_queue_view", reason_code=reason_code,
                 allowed=True, request_id=request.state.request_id)
@@ -1866,7 +1874,7 @@ def decide_review_case(
         principal=Depends(require_org_identity)):
     try:
         with db_conn() as conn:
-            result = db.decide_review_case(
+            result = review_repository.decide_review_case(
                 conn, reviewer_id=principal.subject_id, case_id=case_id,
                 expected_revision=body.expected_revision,
                 expected_policy_epoch=body.expected_policy_epoch,
@@ -2128,8 +2136,8 @@ def process_document(document_id: str):
     # request: ingest can run for minutes on its own connection, and a pooled
     # connection parked here for that long would starve every other request.
     with db_conn() as conn:
-        doc = db.get_document(conn, document_id)
-        queued_job = db.active_ingest_job(conn, document_id)
+        doc = document_repository.get_document(conn, document_id)
+        queued_job = document_repository.active_ingest_job(conn, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
     if queued_job is not None:
@@ -2178,7 +2186,7 @@ def process_document(document_id: str):
     # stamped the document `error` while the upload returned 200 pending.
     with db_conn() as conn:
         try:
-            attempt = db.begin_attempt(conn, document_id)
+            attempt = document_repository.begin_attempt(conn, document_id)
         except CandidateNotPublished:
             raise HTTPException(
                 status_code=409,
@@ -2286,7 +2294,7 @@ def enqueue_ingest_job(
 ):
     try:
         with db_conn() as conn:
-            job = db.enqueue_ingest_job(
+            job = document_repository.enqueue_ingest_job(
                 conn, str(document_id), idempotency_key)
     except (db.IngestJobConflict, db.DocumentLifecycleConflict,
             CandidateNotPublished) as error:
@@ -2303,7 +2311,7 @@ def enqueue_ingest_job(
          response_model_exclude_unset=True)
 def read_ingest_job(job_id: UUID):
     with db_conn() as conn:
-        job = db.get_ingest_job(conn, str(job_id))
+        job = document_repository.get_ingest_job(conn, str(job_id))
     if job is None:
         raise HTTPException(status_code=404, detail="ingest job not found")
     return job
@@ -2316,7 +2324,7 @@ def read_ingest_job(job_id: UUID):
 def cancel_ingest_job(job_id: UUID):
     try:
         with db_conn() as conn:
-            job = db.cancel_ingest_job(conn, str(job_id))
+            job = document_repository.cancel_ingest_job(conn, str(job_id))
     except db.IngestJobConflict as error:
         raise HTTPException(status_code=409, detail=str(error)) from None
     if job is None:
@@ -2556,7 +2564,8 @@ def list_documents(
                 filters["tag"] = tag
             if before is not None:
                 filters["before"] = (before[0], str(before[1]))
-            rows = db.list_documents(conn, limit=limit, offset=offset, **filters)
+            rows = document_repository.list_documents(
+                conn, limit=limit, offset=offset, **filters)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
     window = api_protocols.page_window(rows, limit, lambda row: {
@@ -2578,7 +2587,7 @@ def list_documents(
 def create_collection(request: CollectionRequest):
     try:
         with db_conn() as conn:
-            return db.create_collection(conn, request.name)
+            return document_repository.create_collection(conn, request.name)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
 
@@ -2587,20 +2596,20 @@ def create_collection(request: CollectionRequest):
          response_model=api_contracts.CollectionListResponse)
 def list_collections():
     with db_conn() as conn:
-        return {"collections": db.list_collections(conn)}
+        return {"collections": document_repository.list_collections(conn)}
 
 
 @document_routes.router.get("/tags", dependencies=AUTH,
          response_model=api_contracts.TagListResponse)
 def list_tags():
     with db_conn() as conn:
-        return {"tags": db.list_tags(conn)}
+        return {"tags": document_repository.list_tags(conn)}
 
 
 @document_routes.router.delete("/tags/{tag_id}", dependencies=ADMIN_AUTH)
 def delete_tag(tag_id: UUID):
     with db_conn() as conn:
-        deleted = db.delete_tag(conn, str(tag_id))
+        deleted = document_repository.delete_tag(conn, str(tag_id))
     if not deleted:
         raise HTTPException(status_code=404, detail="tag not found")
     return Response(status_code=204)
@@ -2610,7 +2619,8 @@ def delete_tag(tag_id: UUID):
     "/collections/{collection_id}", dependencies=ADMIN_AUTH)
 def delete_collection(collection_id: UUID):
     with db_conn() as conn:
-        deleted = db.delete_collection(conn, str(collection_id))
+        deleted = document_repository.delete_collection(
+            conn, str(collection_id))
     if not deleted:
         raise HTTPException(status_code=404, detail="collection not found")
     return Response(status_code=204)
@@ -2619,7 +2629,7 @@ def delete_collection(collection_id: UUID):
 def _set_collection_membership(collection_id: UUID, document_id: UUID,
                                present: bool):
     with db_conn() as conn:
-        result = db.set_collection_document(
+        result = document_repository.set_collection_document(
             conn, str(collection_id), str(document_id), present)
     if result is None:
         raise HTTPException(status_code=404,
@@ -2650,7 +2660,7 @@ def remove_collection_document(collection_id: UUID, document_id: UUID):
 def replace_document_tags(document_id: UUID, request: DocumentTagsRequest):
     try:
         with db_conn() as conn:
-            result = db.replace_document_tags(
+            result = document_repository.replace_document_tags(
                 conn, str(document_id), request.tags)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
@@ -2662,7 +2672,8 @@ def replace_document_tags(document_id: UUID, request: DocumentTagsRequest):
 def _set_document_lifecycle(document_id: str, archived: bool):
     try:
         with db_conn() as conn:
-            result = db.set_document_archived(conn, document_id, archived)
+            result = document_repository.set_document_archived(
+                conn, document_id, archived)
     except db.DocumentLifecycleConflict:
         raise HTTPException(
             status_code=409,
@@ -2697,7 +2708,7 @@ def list_document_versions(
     """List content-safe immutable version metadata, newest first."""
     try:
         with db_conn() as conn:
-            rows = db.list_document_versions(
+            rows = document_repository.list_document_versions(
                 conn, str(document_id), limit=limit,
                 before_version_number=before_version_number)
     except ValueError as error:
@@ -2730,7 +2741,7 @@ def activate_document_version(
     document_text = str(document_id)
     version_text = str(version_id)
     with db_conn() as conn:
-        digest = db.document_version_source_digest(
+        digest = document_repository.document_version_source_digest(
             conn, document_text, version_text)
         if digest is None:
             raise HTTPException(status_code=404,
@@ -2753,7 +2764,7 @@ def activate_document_version(
                                 detail="document version source invalid") \
                 from None
         try:
-            activated = db.activate_document_version(
+            activated = document_repository.activate_document_version(
                 conn,
                 document_text,
                 version_text,
@@ -2783,7 +2794,7 @@ def activate_document_version(
          response_model_exclude_unset=True)
 def read_document(document_id: str):
     with db_conn() as conn:
-        doc = db.get_document(conn, document_id)
+        doc = document_repository.get_document(conn, document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="document not found")
     return _document_detail(doc)
@@ -2839,7 +2850,7 @@ def ready(response: Response):
 
     def check_schema():
         with db_conn() as conn:
-            if not db.schema_is_current(conn):
+            if not runtime_repository.schema_is_current(conn):
                 raise RuntimeError("schema drift")
 
     def check_embed():
