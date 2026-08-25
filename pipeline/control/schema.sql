@@ -116,6 +116,46 @@ CREATE TABLE IF NOT EXISTS rag_control.control_platform_operator_digests (
     UNIQUE (key_version, digest)
 );
 
+CREATE TABLE IF NOT EXISTS rag_control.control_service_accounts (
+    service_account_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id uuid NOT NULL REFERENCES rag_control.control_tenants(tenant_id)
+        ON DELETE RESTRICT,
+    state text NOT NULL CHECK (state IN ('active', 'revoked')),
+    expires_at timestamptz NOT NULL,
+    revision bigint NOT NULL DEFAULT 1 CHECK (revision > 0),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (expires_at > created_at)
+);
+
+CREATE TABLE IF NOT EXISTS rag_control.control_service_account_scopes (
+    service_account_id uuid NOT NULL
+        REFERENCES rag_control.control_service_accounts(service_account_id)
+        ON DELETE RESTRICT,
+    scope_code text NOT NULL CHECK (scope_code IN (
+        'rag.query', 'documents.read', 'documents.write',
+        'documents.lifecycle', 'collections.manage', 'tables.extract')),
+    PRIMARY KEY (service_account_id, scope_code)
+);
+
+CREATE TABLE IF NOT EXISTS rag_control.control_service_account_credentials (
+    service_account_id uuid NOT NULL
+        REFERENCES rag_control.control_service_accounts(service_account_id)
+        ON DELETE RESTRICT,
+    credential_version integer NOT NULL CHECK (credential_version > 0),
+    digest bytea NOT NULL CHECK (octet_length(digest) = 32),
+    state text NOT NULL CHECK (state IN ('active', 'retired', 'revoked')),
+    not_before timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (expires_at > not_before),
+    PRIMARY KEY (service_account_id, credential_version),
+    UNIQUE (digest)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS control_one_active_service_credential
+ON rag_control.control_service_account_credentials (service_account_id)
+WHERE state = 'active';
+
 CREATE TABLE IF NOT EXISTS rag_control.control_admin_events (
     sequence_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     event_id uuid NOT NULL UNIQUE DEFAULT gen_random_uuid(),
@@ -242,7 +282,59 @@ AS $resolve_identity$
       AND octet_length(requested_digest) = 32
 $resolve_identity$;
 
+CREATE OR REPLACE FUNCTION rag_control.control_resolve_service_account(
+    requested_account_id uuid,
+    requested_credential_version integer,
+    requested_digest bytea)
+RETURNS TABLE (
+    service_account_id uuid,
+    tenant_id uuid,
+    scopes text[],
+    deployment_profile text,
+    region_code text,
+    route_kind text,
+    connection_ref text,
+    configuration_revision bigint,
+    policy_revision bigint,
+    features jsonb,
+    quotas jsonb,
+    quota_enforcement text
+)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $resolve_service_account$
+    SELECT account.service_account_id, facts.tenant_id, scope_set.scopes,
+           facts.deployment_profile, facts.region_code,
+           facts.route_kind, route.connection_ref,
+           facts.configuration_revision, facts.policy_revision,
+           facts.features, facts.quotas, facts.quota_enforcement
+    FROM rag_control.control_service_accounts AS account
+    JOIN rag_control.control_service_account_credentials AS credential
+      ON credential.service_account_id = account.service_account_id
+    JOIN rag_control.control_tenant_routes AS route
+      ON route.tenant_id = account.tenant_id
+    CROSS JOIN LATERAL (
+        SELECT array_agg(scope.scope_code ORDER BY scope.scope_code) AS scopes
+        FROM rag_control.control_service_account_scopes AS scope
+        WHERE scope.service_account_id = account.service_account_id
+    ) AS scope_set
+    CROSS JOIN LATERAL rag_control.control_tenant_facts(
+        account.tenant_id) AS facts
+    WHERE account.service_account_id = requested_account_id
+      AND credential.credential_version = requested_credential_version
+      AND credential.digest = requested_digest
+      AND account.state = 'active'
+      AND credential.state = 'active'
+      AND statement_timestamp() >= credential.not_before
+      AND statement_timestamp() < credential.expires_at
+      AND statement_timestamp() < account.expires_at
+      AND octet_length(requested_digest) = 32
+      AND cardinality(scope_set.scopes) > 0
+$resolve_service_account$;
+
 REVOKE ALL ON FUNCTION rag_control.control_events_immutable() FROM PUBLIC;
 REVOKE ALL ON FUNCTION rag_control.control_tenant_facts(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION rag_control.control_resolve_identity(integer, bytea)
     FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_control.control_resolve_service_account(
+    uuid, integer, bytea) FROM PUBLIC;

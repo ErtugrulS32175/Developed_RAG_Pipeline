@@ -14,9 +14,35 @@ import psycopg
 from psycopg.rows import dict_row
 
 
-CONTROL_SCHEMA_VERSION = 1
+CONTROL_SCHEMA_VERSION = 2
 _SCHEMA_LOCK_NAME = "ragtest-control-schema-migration"
+_SCHEMA_MONOTONIC_GUARD_DDL = """
+CREATE OR REPLACE FUNCTION rag_control.control_guard_schema_monotonic()
+RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, rag_control
+AS $control_schema_guard$
+BEGIN
+    IF NEW.schema_version < OLD.schema_version THEN
+        RAISE EXCEPTION 'control schema downgrade refused';
+    END IF;
+    RETURN NEW;
+END
+$control_schema_guard$;
+DROP TRIGGER IF EXISTS control_schema_state_monotonic
+    ON rag_control.control_schema_state;
+CREATE TRIGGER control_schema_state_monotonic
+BEFORE UPDATE OF schema_version ON rag_control.control_schema_state
+FOR EACH ROW EXECUTE FUNCTION rag_control.control_guard_schema_monotonic();
+"""
 _pool = None
+SERVICE_ACCOUNT_SCOPES = (
+    "collections.manage",
+    "documents.lifecycle",
+    "documents.read",
+    "documents.write",
+    "rag.query",
+    "tables.extract",
+)
 
 
 class ControlPlaneRefused(RuntimeError):
@@ -40,6 +66,14 @@ class TenantFacts:
 class TenantRoute:
     facts: TenantFacts
     connection_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceAccountRoute:
+    service_account_id: uuid.UUID
+    facts: TenantFacts
+    connection_ref: str
+    scopes: tuple[str, ...]
 
 
 def _required_dsn(name: str) -> str:
@@ -122,6 +156,13 @@ def init_schema(conn: psycopg.Connection) -> None:
             "applied_at timestamptz NOT NULL DEFAULT now())"
         )
         cursor.execute(
+            "CREATE TABLE IF NOT EXISTS rag_control.control_schema_history ("
+            "schema_version integer PRIMARY KEY CHECK (schema_version > 0), "
+            "schema_sha256 text NOT NULL CHECK (length(schema_sha256) = 64), "
+            "applied_at timestamptz NOT NULL DEFAULT now())"
+        )
+        cursor.execute(_SCHEMA_MONOTONIC_GUARD_DDL)
+        cursor.execute(
             "SELECT schema_version, schema_sha256 "
             "FROM rag_control.control_schema_state "
             "WHERE singleton FOR UPDATE"
@@ -133,13 +174,21 @@ def init_schema(conn: psycopg.Connection) -> None:
                 raise ControlPlaneRefused("control schema downgrade refused")
             if version == CONTROL_SCHEMA_VERSION and digest != schema_sha256:
                 raise ControlPlaneRefused("control schema digest mismatch")
-        cursor.execute(schema_sql)
         cursor.execute(
-            "INSERT INTO rag_control.control_schema_history "
-            "(schema_version, schema_sha256) VALUES (%s, %s) "
-            "ON CONFLICT (schema_version) DO NOTHING",
-            (CONTROL_SCHEMA_VERSION, schema_sha256),
+            "SELECT schema_sha256 FROM rag_control.control_schema_history "
+            "WHERE schema_version = %s FOR UPDATE",
+            (CONTROL_SCHEMA_VERSION,),
         )
+        receipt = cursor.fetchone()
+        if receipt is not None and receipt[0] != schema_sha256:
+            raise ControlPlaneRefused("control schema history mismatch")
+        cursor.execute(schema_sql)
+        if receipt is None:
+            cursor.execute(
+                "INSERT INTO rag_control.control_schema_history "
+                "(schema_version, schema_sha256) VALUES (%s, %s)",
+                (CONTROL_SCHEMA_VERSION, schema_sha256),
+            )
         cursor.execute(
             "INSERT INTO rag_control.control_schema_state "
             "(singleton, schema_version, schema_sha256) VALUES "
@@ -212,6 +261,49 @@ def resolve_identity(conn, key_version: int, digest: bytes) -> TenantRoute | Non
     row = rows[0]
     facts = _facts(row, route=True)
     return TenantRoute(facts=facts, connection_ref=row["connection_ref"])
+
+
+def resolve_service_account(
+        conn, account_id, credential_version: int,
+        digest: bytes) -> ServiceAccountRoute | None:
+    try:
+        account = uuid.UUID(str(account_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ControlPlaneRefused("service account id is invalid") from exc
+    if (type(credential_version) is not int or credential_version < 1
+            or type(digest) is not bytes or len(digest) != 32):
+        raise ControlPlaneRefused("service account credential is invalid")
+    with conn.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            "SELECT * FROM rag_control.control_resolve_service_account("
+            "%s, %s, %s)",
+            (account, credential_version, digest))
+        rows = cursor.fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise ControlPlaneRefused("service account route is ambiguous")
+    row = rows[0]
+    extra = {"service_account_id", "scopes"}
+    facts_row = {key: value for key, value in row.items() if key not in extra}
+    facts = _facts(facts_row, route=True)
+    try:
+        service_account_id = uuid.UUID(str(row["service_account_id"]))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ControlPlaneRefused(
+            "service account result is invalid") from exc
+    scopes = row["scopes"]
+    if (type(scopes) is not list or not scopes
+            or any(type(scope) is not str for scope in scopes)
+            or tuple(scopes) != tuple(sorted(set(scopes)))
+            or not set(scopes).issubset(SERVICE_ACCOUNT_SCOPES)):
+        raise ControlPlaneRefused("service account result is invalid")
+    return ServiceAccountRoute(
+        service_account_id=service_account_id,
+        facts=facts,
+        connection_ref=row["connection_ref"],
+        scopes=tuple(scopes),
+    )
 
 
 def tenant_facts(conn, tenant_id) -> TenantFacts | None:

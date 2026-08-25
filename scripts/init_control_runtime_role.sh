@@ -26,5 +26,7 @@ GRANT EXECUTE ON FUNCTION rag_control.control_tenant_facts(uuid)
     TO rag_control_runtime;
 GRANT EXECUTE ON FUNCTION rag_control.control_resolve_identity(integer, bytea)
     TO rag_control_runtime;
+GRANT EXECUTE ON FUNCTION rag_control.control_resolve_service_account(
+    uuid, integer, bytea) TO rag_control_runtime;
 GRANT SELECT ON rag_control.control_schema_state TO rag_control_runtime;
 SQL

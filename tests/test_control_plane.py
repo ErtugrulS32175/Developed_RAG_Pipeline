@@ -67,7 +67,9 @@ def test_schema_is_fixed_and_closed_to_operational_facts_only():
             "control_feature_catalog", "control_tenant_features",
             "control_tenant_quotas", "control_identity_routes",
             "control_identity_route_digests", "control_platform_operators",
-            "control_platform_operator_digests", "control_admin_events"):
+            "control_platform_operator_digests", "control_service_accounts",
+            "control_service_account_scopes",
+            "control_service_account_credentials", "control_admin_events"):
         assert f"rag_control.{table}" in text
 
     lowered = text.lower()
@@ -76,13 +78,13 @@ def test_schema_is_fixed_and_closed_to_operational_facts_only():
             "embedding", "filename", "email", "display_name", " dsn",
             "bucket", "object_key", "jsonb default"):
         assert forbidden not in lowered
-    assert text.count("octet_length(digest) = 32") == 2
+    assert text.count("octet_length(digest) = 32") == 3
     assert "CHECK (quota_enforcement = 'declared')" in text
     assert "CHECK (position('://' in connection_ref) = 0)" in text
     assert "CHECK (position('@' in connection_ref) = 0)" in text
     assert "ON DELETE CASCADE" not in text
     assert "SET search_path FROM CURRENT" not in text
-    assert text.count("SET search_path = pg_catalog, rag_control") == 3
+    assert text.count("SET search_path = pg_catalog, rag_control") == 4
 
 
 def test_runtime_role_has_only_lookup_function_authority():
@@ -94,6 +96,7 @@ def test_runtime_role_has_only_lookup_function_authority():
     assert "REVOKE ALL ON ALL SEQUENCES IN SCHEMA rag_control" in script
     assert "rag_control.control_tenant_facts(uuid)" in script
     assert "rag_control.control_resolve_identity(integer, bytea)" in script
+    assert "rag_control.control_resolve_service_account(" in script
     assert "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES" not in script
 
 
@@ -102,9 +105,10 @@ def test_events_are_owner_immutable_and_public_exec_is_revoked():
     assert "BEFORE UPDATE OR DELETE ON rag_control.control_admin_events" in text
     assert "ERRCODE = '55000'" in text
     assert "MESSAGE = 'control_event_immutable'" in text
-    assert text.count("STABLE SECURITY DEFINER") == 2
+    assert text.count("STABLE SECURITY DEFINER") == 3
     assert "control_tenant_facts(uuid) FROM PUBLIC" in text
     assert "control_resolve_identity(integer, bytea)" in text
+    assert "control_resolve_service_account(" in text
 
 
 class _Cursor:
@@ -196,7 +200,51 @@ def test_invalid_digest_versions_and_shapes_fail_before_sql(version, digest):
 
 
 def test_control_schema_version_binds_the_shipped_bytes():
-    assert db.CONTROL_SCHEMA_VERSION == 1
+    assert db.CONTROL_SCHEMA_VERSION == 2
     digest = hashlib.sha256(SCHEMA.read_bytes()).hexdigest()
     assert len(digest) == 64
     assert db._SCHEMA_LOCK_NAME == "ragtest-control-schema-migration"
+    assert "control_schema_state_monotonic" in db._SCHEMA_MONOTONIC_GUARD_DDL
+
+
+class _InitCursor:
+    def __init__(self, results):
+        self.results = iter(results)
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, query, params=None):
+        self.calls.append((query, params))
+
+    def fetchone(self):
+        return next(self.results)
+
+
+class _InitConnection:
+    def __init__(self, results):
+        self.cursor_instance = _InitCursor(results)
+        self.committed = False
+
+    def cursor(self):
+        return self.cursor_instance
+
+    def commit(self):
+        self.committed = True
+
+
+def test_conflicting_schema_history_receipt_is_refused():
+    connection = _InitConnection([None, ("0" * 64,)])
+    with pytest.raises(db.ControlPlaneRefused, match="history mismatch"):
+        db.init_schema(connection)
+    assert not connection.committed
+    assert any(
+        "SELECT schema_sha256 FROM rag_control.control_schema_history" in query
+        for query, _params in connection.cursor_instance.calls)
+    schema_sql = SCHEMA.read_text(encoding="utf-8")
+    assert not any(
+        query == schema_sql for query, _params in connection.cursor_instance.calls)

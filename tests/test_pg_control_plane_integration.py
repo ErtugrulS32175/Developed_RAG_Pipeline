@@ -1,4 +1,5 @@
 """Real PostgreSQL proof for the content-free routing control plane."""
+from datetime import datetime, timedelta, timezone
 import os
 import uuid
 
@@ -118,6 +119,57 @@ def test_digest_rotation_and_revocation_stay_bound_to_one_identity(
     assert db.resolve_identity(control_database, 1, b"a" * 32) is None
     assert db.resolve_identity(control_database, 2, b"b" * 32) is not None
 
+
+def test_service_account_resolver_uses_database_time_and_one_live_credential(
+        control_database):
+    tenant = uuid.UUID("10000000-0000-0000-0000-000000000001")
+    account = uuid.UUID("30000000-0000-0000-0000-000000000003")
+    now = datetime.now(timezone.utc)
+    with control_database.cursor() as cursor:
+        cursor.execute(
+            "UPDATE rag_control.control_tenants SET lifecycle = 'active' "
+            "WHERE tenant_id = %s", (tenant,))
+        cursor.execute(
+            "INSERT INTO rag_control.control_service_accounts "
+            "(service_account_id, tenant_id, state, expires_at) "
+            "VALUES (%s, %s, 'active', %s)",
+            (account, tenant, now + timedelta(hours=2)))
+        cursor.execute(
+            "INSERT INTO rag_control.control_service_account_scopes "
+            "VALUES (%s, 'rag.query'), (%s, 'documents.read')",
+            (account, account))
+        cursor.execute(
+            "INSERT INTO rag_control.control_service_account_credentials "
+            "(service_account_id, credential_version, digest, state, "
+            "not_before, expires_at) VALUES (%s, 1, %s, 'active', %s, %s)",
+            (account, b"s" * 32, now - timedelta(minutes=1),
+             now + timedelta(hours=1)))
+    control_database.commit()
+
+    route = db.resolve_service_account(control_database, account, 1, b"s" * 32)
+    assert route is not None
+    assert route.facts.tenant_id == tenant
+    assert route.scopes == ("documents.read", "rag.query")
+
+    with pytest.raises(Exception) as overlap:
+        with control_database.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO rag_control.control_service_account_credentials "
+                "(service_account_id, credential_version, digest, state, "
+                "not_before, expires_at) "
+                "VALUES (%s, 2, %s, 'active', %s, %s)",
+                (account, b"t" * 32, now - timedelta(minutes=1),
+                 now + timedelta(hours=1)))
+    control_database.rollback()
+    assert type(overlap.value).__name__ == "UniqueViolation"
+
+    with control_database.cursor() as cursor:
+        cursor.execute(
+            "UPDATE rag_control.control_service_account_credentials "
+            "SET state = 'revoked' WHERE service_account_id = %s", (account,))
+    control_database.commit()
+    assert db.resolve_service_account(
+        control_database, account, 1, b"s" * 32) is None
 
 def test_digest_is_globally_unique_and_events_are_owner_immutable(
         control_database):
