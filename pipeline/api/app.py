@@ -41,6 +41,14 @@ from pipeline.api import identity
 from pipeline.api import metrics
 from pipeline.api import org_policy
 from pipeline.api import protocols as api_protocols
+from pipeline.api import routers as domain_routers
+from pipeline.api.routers import chat as chat_routes
+from pipeline.api.routers import documents as document_routes
+from pipeline.api.routers import evaluation as evaluation_routes
+from pipeline.api.routers import evidence as evidence_routes
+from pipeline.api.routers import governance as governance_routes
+from pipeline.api.routers import reviews as review_routes
+from pipeline.api.routers import system as system_routes
 from pipeline.retrieval import planner, rag_backends
 from pipeline.retrieval.trace import RetrievalTrace
 from pipeline.validation.rag.answer_guard import (
@@ -188,6 +196,19 @@ app = FastAPI(
 )
 api_errors.install(app)
 api_protocols.install(app)
+
+# Test processes and development reloaders import this module more than once.
+# A module-global APIRouter would retain old endpoint and Depends identities,
+# then silently register a duplicate surface on the new app. Every assembly
+# therefore receives fresh domain routers; already-built app instances retain
+# their own route objects.
+ROUTERS_BY_DOMAIN = {
+    name: module.new_router()
+    for name, module in domain_routers.ROUTER_MODULES.items()
+}
+for name, module in domain_routers.ROUTER_MODULES.items():
+    module.router = ROUTERS_BY_DOMAIN[name]
+DOMAIN_ROUTERS = tuple(ROUTERS_BY_DOMAIN.values())
 
 
 def _gateway_offered(authorization):
@@ -652,7 +673,8 @@ class PurgeScheduleRequest(BaseModel):
     expected_policy_epoch: int = Field(ge=1, strict=True)
 
 
-@app.get("/v1/org/me", response_model=api_contracts.OrganizationMeResponse)
+@governance_routes.router.get(
+    "/v1/org/me", response_model=api_contracts.OrganizationMeResponse)
 def organization_me(principal=Depends(require_org_identity)):
     """Show only the caller's own level and content-free organization facts."""
     with db_conn() as conn:
@@ -665,7 +687,7 @@ def organization_me(principal=Depends(require_org_identity)):
     }
 
 
-@app.get("/v1/org/visible-members",
+@governance_routes.router.get("/v1/org/visible-members",
          response_model=api_contracts.VisibleOrgMembersResponse)
 def organization_visible_members(
         request: Request,
@@ -681,7 +703,7 @@ def organization_visible_members(
     return {"members": members}
 
 
-@app.get("/v1/org/admin/topology",
+@governance_routes.router.get("/v1/org/admin/topology",
          response_model=api_contracts.OrgTopologyResponse)
 def organization_topology(
         request: Request,
@@ -698,7 +720,7 @@ def organization_topology(
     return topology
 
 
-@app.get("/v1/org/admin/audit-events",
+@governance_routes.router.get("/v1/org/admin/audit-events",
          response_model=api_contracts.OrgAuditEventListResponse)
 def organization_audit_events(
         request: Request,
@@ -751,7 +773,7 @@ def organization_audit_events(
     }
 
 
-@app.put("/v1/org/admin/topology",
+@governance_routes.router.put("/v1/org/admin/topology",
          response_model=api_contracts.OrgVersionResponse)
 def replace_organization_topology(
         body: OrgTopologyRequest, request: Request,
@@ -776,7 +798,7 @@ def replace_organization_topology(
     return version
 
 
-@app.put("/v1/org/admin/members/{identity_id}",
+@governance_routes.router.put("/v1/org/admin/members/{identity_id}",
          response_model=api_contracts.OrgMembershipResponse)
 def update_organization_membership(
         identity_id: UUID, body: OrgMembershipUpdateRequest, request: Request,
@@ -814,7 +836,7 @@ def update_organization_membership(
     }
 
 
-@app.get("/v1/org/admin/retention-policy",
+@governance_routes.router.get("/v1/org/admin/retention-policy",
          response_model=api_contracts.RetentionPolicyResponse)
 def organization_retention_policy(
         principal=Depends(require_org_architect)):
@@ -826,7 +848,7 @@ def organization_retention_policy(
         raise HTTPException(status_code=403, detail=str(error)) from None
 
 
-@app.get("/v1/org/admin/retention-documents",
+@governance_routes.router.get("/v1/org/admin/retention-documents",
          response_model=api_contracts.RetentionDocumentListResponse)
 def organization_retention_documents(
         request: Request,
@@ -883,7 +905,7 @@ def organization_retention_documents(
     }
 
 
-@app.put("/v1/org/admin/retention-policy",
+@governance_routes.router.put("/v1/org/admin/retention-policy",
          response_model=api_contracts.RetentionPolicyResponse)
 def update_organization_retention_policy(
         body: RetentionPolicyUpdateRequest, request: Request,
@@ -903,7 +925,7 @@ def update_organization_retention_policy(
         raise HTTPException(status_code=422, detail=str(error)) from None
 
 
-@app.get("/documents/{document_id}/legal-holds",
+@governance_routes.router.get("/documents/{document_id}/legal-holds",
          response_model=api_contracts.LegalHoldListResponse)
 def document_legal_holds(
         document_id: UUID, principal=Depends(require_org_architect)):
@@ -916,7 +938,8 @@ def document_legal_holds(
         raise HTTPException(status_code=403, detail=str(error)) from None
 
 
-@app.post("/documents/{document_id}/legal-holds", status_code=201,
+@governance_routes.router.post(
+          "/documents/{document_id}/legal-holds", status_code=201,
           response_model=api_contracts.LegalHoldResponse,
           response_model_exclude_unset=True)
 def create_document_legal_hold(
@@ -938,7 +961,8 @@ def create_document_legal_hold(
         raise HTTPException(status_code=422, detail=str(error)) from None
 
 
-@app.post("/documents/{document_id}/legal-holds/{hold_id}/release",
+@governance_routes.router.post(
+          "/documents/{document_id}/legal-holds/{hold_id}/release",
           response_model=api_contracts.LegalHoldResponse,
           response_model_exclude_unset=True)
 def release_document_legal_hold(
@@ -959,7 +983,7 @@ def release_document_legal_hold(
         raise HTTPException(status_code=422, detail=str(error)) from None
 
 
-@app.get("/documents/{document_id}/purge-jobs",
+@governance_routes.router.get("/documents/{document_id}/purge-jobs",
          response_model=api_contracts.PurgeJobListResponse,
          response_model_exclude_unset=True)
 def document_purge_jobs(
@@ -973,7 +997,8 @@ def document_purge_jobs(
         raise HTTPException(status_code=403, detail=str(error)) from None
 
 
-@app.post("/documents/{document_id}/purge-jobs", status_code=202,
+@governance_routes.router.post(
+          "/documents/{document_id}/purge-jobs", status_code=202,
           response_model=api_contracts.PurgeJobResponse,
           response_model_exclude_unset=True)
 def schedule_document_purge(
@@ -1094,7 +1119,7 @@ async def _eval_import_body(request):
     return value["expected_revision"], cases
 
 
-@app.get("/v1/eval/datasets",
+@evaluation_routes.router.get("/v1/eval/datasets",
          response_model=api_contracts.EvalDatasetListResponse,
          response_model_exclude_unset=True)
 def eval_dataset_list(
@@ -1109,7 +1134,7 @@ def eval_dataset_list(
     return {"datasets": [_eval_dataset_metadata(row) for row in rows]}
 
 
-@app.post("/v1/eval/datasets", status_code=201,
+@evaluation_routes.router.post("/v1/eval/datasets", status_code=201,
           response_model=api_contracts.EvalDatasetResponse,
           response_model_exclude_unset=True)
 def eval_dataset_create(
@@ -1128,7 +1153,7 @@ def eval_dataset_create(
     return {"dataset": _eval_dataset_metadata(row)}
 
 
-@app.get("/v1/eval/datasets/{dataset_id}/versions",
+@evaluation_routes.router.get("/v1/eval/datasets/{dataset_id}/versions",
          response_model=api_contracts.EvalVersionListResponse,
          response_model_exclude_unset=True)
 def eval_version_list(
@@ -1145,7 +1170,8 @@ def eval_version_list(
     return {"versions": [_eval_version_metadata(row) for row in rows]}
 
 
-@app.post("/v1/eval/datasets/{dataset_id}/drafts", status_code=201,
+@evaluation_routes.router.post(
+          "/v1/eval/datasets/{dataset_id}/drafts", status_code=201,
           response_model=api_contracts.EvalVersionResponse,
           response_model_exclude_unset=True)
 def eval_draft_create(
@@ -1167,7 +1193,7 @@ def eval_draft_create(
     return {"version": _eval_version_metadata(row)}
 
 
-@app.post("/v1/eval/datasets/{dataset_id}/versions/"
+@evaluation_routes.router.post("/v1/eval/datasets/{dataset_id}/versions/"
           "{version_id}/cases/import",
           response_model=api_contracts.EvalVersionResponse,
           response_model_exclude_unset=True)
@@ -1191,7 +1217,8 @@ async def eval_cases_import(
     return {"version": _eval_version_metadata(row, version_id=version_id)}
 
 
-@app.get("/v1/eval/datasets/{dataset_id}/versions/{version_id}/cases",
+@evaluation_routes.router.get(
+         "/v1/eval/datasets/{dataset_id}/versions/{version_id}/cases",
          response_model=api_contracts.EvalCaseListResponse)
 def eval_cases_read(
         dataset_id: UUID, version_id: UUID, response: Response,
@@ -1213,7 +1240,8 @@ def eval_cases_read(
             "cases": cases}
 
 
-@app.post("/v1/eval/datasets/{dataset_id}/versions/{version_id}/publish",
+@evaluation_routes.router.post(
+          "/v1/eval/datasets/{dataset_id}/versions/{version_id}/publish",
           response_model=api_contracts.EvalVersionResponse,
           response_model_exclude_unset=True)
 def eval_version_publish(
@@ -1237,7 +1265,7 @@ def eval_version_publish(
     return {"version": _eval_version_metadata(row, version_id=version_id)}
 
 
-@app.post("/v1/eval/datasets/{dataset_id}/retire",
+@evaluation_routes.router.post("/v1/eval/datasets/{dataset_id}/retire",
           response_model=api_contracts.EvalDatasetResponse,
           response_model_exclude_unset=True)
 def eval_dataset_retire(
@@ -1260,7 +1288,7 @@ def eval_dataset_retire(
     return {"dataset": _eval_dataset_metadata(row)}
 
 
-@app.get("/v1/models", dependencies=AUTH,
+@system_routes.router.get("/v1/models", dependencies=AUTH,
          response_model=api_contracts.ModelListResponse)
 def list_models():
     """OpenWebUI (or any OpenAI-compatible client) calls this to discover which
@@ -1317,7 +1345,7 @@ def _chat_retrieval_scope(req: ChatRequest):
     }
 
 
-@app.post(
+@chat_routes.router.post(
     "/v1/chat/completions",
     dependencies=AUTH,
     response_model=api_contracts.ChatCompletionResponse,
@@ -1624,7 +1652,7 @@ def _register_export_reference(principal, storage_name):
     return _b64url(ref_digest)
 
 
-@app.post("/v1/evidence/tickets",
+@evidence_routes.router.post("/v1/evidence/tickets",
           response_model=api_contracts.ShortLivedTicketResponse)
 def create_evidence_ticket(
         body: EvidenceTicketRequest, response: Response,
@@ -1647,7 +1675,7 @@ def create_evidence_ticket(
     return {"ticket": ticket, "expires_in": EVIDENCE_TICKET_SECONDS}
 
 
-@app.post("/v1/evidence/preview",
+@evidence_routes.router.post("/v1/evidence/preview",
           response_model=api_contracts.EvidencePreviewResponse)
 def preview_evidence(
         body: EvidencePreviewRequest, response: Response,
@@ -1677,7 +1705,7 @@ def preview_evidence(
     }
 
 
-@app.post("/v1/exports/tickets",
+@evidence_routes.router.post("/v1/exports/tickets",
           response_model=api_contracts.ShortLivedTicketResponse)
 def create_export_ticket(
         body: ExportTicketRequest, response: Response,
@@ -1705,7 +1733,7 @@ def create_export_ticket(
     return {"ticket": ticket, "expires_in": EXPORT_TICKET_SECONDS}
 
 
-@app.post(
+@evidence_routes.router.post(
     "/v1/exports/download",
     response_class=Response,
     responses={
@@ -1755,7 +1783,7 @@ def download_export(
     )
 
 
-@app.post("/v1/reviews/feedback",
+@review_routes.router.post("/v1/reviews/feedback",
           response_model=api_contracts.ReviewFeedbackResponse)
 def submit_review_feedback(
         body: ReviewFeedbackRequest,
@@ -1780,7 +1808,7 @@ def submit_review_feedback(
     return {"status": "recorded", **result}
 
 
-@app.get("/v1/reviews/queue",
+@review_routes.router.get("/v1/reviews/queue",
          response_model=api_contracts.ReviewQueueResponse)
 def review_queue(
         request: Request,
@@ -1831,7 +1859,7 @@ def review_queue(
             "next_cursor": window.next_cursor}
 
 
-@app.post("/v1/reviews/{case_id}/decision",
+@review_routes.router.post("/v1/reviews/{case_id}/decision",
           response_model=api_contracts.ReviewDecisionResponse)
 def decide_review_case(
         case_id: UUID, body: ReviewDecisionRequest, request: Request,
@@ -1972,7 +2000,7 @@ def _safe_upload_filename(filename):
 # holds a database SESSION lock, which serialises across PROCESSES and
 # therefore across every worker, not just this one. A second, weaker lock
 # in front of it fenced nothing the first did not already fence.
-@app.post("/documents/upload", dependencies=EDITOR_AUTH,
+@document_routes.router.post("/documents/upload", dependencies=EDITOR_AUTH,
           response_model=api_contracts.DocumentUploadResponse)
 async def upload_document(file: UploadFile = File(...), replace: bool = False):
     """Publish a candidate -- through the SHARED SERVICE and nothing else.
@@ -2091,7 +2119,8 @@ def _reported_outcome(returned):
     return None
 
 
-@app.post("/documents/{document_id}/process", dependencies=EDITOR_AUTH,
+@document_routes.router.post(
+          "/documents/{document_id}/process", dependencies=EDITOR_AUTH,
           response_model=api_contracts.DocumentProcessResponse,
           response_model_exclude_unset=True)
 def process_document(document_id: str):
@@ -2242,7 +2271,8 @@ def process_document(document_id: str):
     return response
 
 
-@app.post("/documents/{document_id}/ingest-jobs", dependencies=EDITOR_AUTH,
+@document_routes.router.post(
+          "/documents/{document_id}/ingest-jobs", dependencies=EDITOR_AUTH,
           status_code=202, response_model=api_contracts.IngestJobResponse,
           response_model_exclude_unset=True)
 def enqueue_ingest_job(
@@ -2268,7 +2298,7 @@ def enqueue_ingest_job(
     return job
 
 
-@app.get("/ingest-jobs/{job_id}", dependencies=AUTH,
+@document_routes.router.get("/ingest-jobs/{job_id}", dependencies=AUTH,
          response_model=api_contracts.IngestJobResponse,
          response_model_exclude_unset=True)
 def read_ingest_job(job_id: UUID):
@@ -2279,7 +2309,8 @@ def read_ingest_job(job_id: UUID):
     return job
 
 
-@app.delete("/ingest-jobs/{job_id}", dependencies=EDITOR_AUTH,
+@document_routes.router.delete(
+            "/ingest-jobs/{job_id}", dependencies=EDITOR_AUTH,
             response_model=api_contracts.IngestJobResponse,
             response_model_exclude_unset=True)
 def cancel_ingest_job(job_id: UUID):
@@ -2414,7 +2445,7 @@ def _org_audit_event_summary(row):
     }
 
 
-@app.get("/documents", dependencies=AUTH,
+@document_routes.router.get("/documents", dependencies=AUTH,
          response_model=api_contracts.DocumentListResponse)
 def list_documents(
     limit: int = Query(DOCUMENT_PAGE_DEFAULT, ge=1, le=DOCUMENT_PAGE_MAX),
@@ -2542,7 +2573,7 @@ def list_documents(
     }
 
 
-@app.post("/collections", dependencies=EDITOR_AUTH,
+@document_routes.router.post("/collections", dependencies=EDITOR_AUTH,
           response_model=api_contracts.CollectionCreatedResponse)
 def create_collection(request: CollectionRequest):
     try:
@@ -2552,21 +2583,21 @@ def create_collection(request: CollectionRequest):
         raise HTTPException(status_code=422, detail=str(error)) from None
 
 
-@app.get("/collections", dependencies=AUTH,
+@document_routes.router.get("/collections", dependencies=AUTH,
          response_model=api_contracts.CollectionListResponse)
 def list_collections():
     with db_conn() as conn:
         return {"collections": db.list_collections(conn)}
 
 
-@app.get("/tags", dependencies=AUTH,
+@document_routes.router.get("/tags", dependencies=AUTH,
          response_model=api_contracts.TagListResponse)
 def list_tags():
     with db_conn() as conn:
         return {"tags": db.list_tags(conn)}
 
 
-@app.delete("/tags/{tag_id}", dependencies=ADMIN_AUTH)
+@document_routes.router.delete("/tags/{tag_id}", dependencies=ADMIN_AUTH)
 def delete_tag(tag_id: UUID):
     with db_conn() as conn:
         deleted = db.delete_tag(conn, str(tag_id))
@@ -2575,7 +2606,8 @@ def delete_tag(tag_id: UUID):
     return Response(status_code=204)
 
 
-@app.delete("/collections/{collection_id}", dependencies=ADMIN_AUTH)
+@document_routes.router.delete(
+    "/collections/{collection_id}", dependencies=ADMIN_AUTH)
 def delete_collection(collection_id: UUID):
     with db_conn() as conn:
         deleted = db.delete_collection(conn, str(collection_id))
@@ -2596,21 +2628,24 @@ def _set_collection_membership(collection_id: UUID, document_id: UUID,
             "document_id": str(document_id), "present": result}
 
 
-@app.put("/collections/{collection_id}/documents/{document_id}",
+@document_routes.router.put(
+         "/collections/{collection_id}/documents/{document_id}",
          dependencies=EDITOR_AUTH,
          response_model=api_contracts.CollectionMembershipResponse)
 def add_collection_document(collection_id: UUID, document_id: UUID):
     return _set_collection_membership(collection_id, document_id, True)
 
 
-@app.delete("/collections/{collection_id}/documents/{document_id}",
+@document_routes.router.delete(
+            "/collections/{collection_id}/documents/{document_id}",
             dependencies=EDITOR_AUTH,
             response_model=api_contracts.CollectionMembershipResponse)
 def remove_collection_document(collection_id: UUID, document_id: UUID):
     return _set_collection_membership(collection_id, document_id, False)
 
 
-@app.put("/documents/{document_id}/tags", dependencies=EDITOR_AUTH,
+@document_routes.router.put(
+         "/documents/{document_id}/tags", dependencies=EDITOR_AUTH,
          response_model=api_contracts.DocumentTagsResponse)
 def replace_document_tags(document_id: UUID, request: DocumentTagsRequest):
     try:
@@ -2637,19 +2672,22 @@ def _set_document_lifecycle(document_id: str, archived: bool):
     return result
 
 
-@app.post("/documents/{document_id}/archive", dependencies=ADMIN_AUTH,
+@document_routes.router.post(
+          "/documents/{document_id}/archive", dependencies=ADMIN_AUTH,
           response_model=api_contracts.DocumentLifecycleResponse)
 def archive_document(document_id: str):
     return _set_document_lifecycle(document_id, True)
 
 
-@app.post("/documents/{document_id}/restore", dependencies=ADMIN_AUTH,
+@document_routes.router.post(
+          "/documents/{document_id}/restore", dependencies=ADMIN_AUTH,
           response_model=api_contracts.DocumentLifecycleResponse)
 def restore_document(document_id: str):
     return _set_document_lifecycle(document_id, False)
 
 
-@app.get("/documents/{document_id}/versions", dependencies=AUTH,
+@document_routes.router.get(
+         "/documents/{document_id}/versions", dependencies=AUTH,
          response_model=api_contracts.DocumentVersionListResponse)
 def list_document_versions(
     document_id: UUID,
@@ -2678,7 +2716,7 @@ def list_document_versions(
     }
 
 
-@app.post(
+@document_routes.router.post(
     "/documents/{document_id}/versions/{version_id}/activate",
     dependencies=ADMIN_AUTH,
     response_model=api_contracts.DocumentVersionActivationResponse,
@@ -2740,7 +2778,7 @@ def activate_document_version(
     return activated
 
 
-@app.get("/documents/{document_id}", dependencies=AUTH,
+@document_routes.router.get("/documents/{document_id}", dependencies=AUTH,
          response_model=api_contracts.DocumentDetailResponse,
          response_model_exclude_unset=True)
 def read_document(document_id: str):
@@ -2751,14 +2789,15 @@ def read_document(document_id: str):
     return _document_detail(doc)
 
 
-@app.get("/health", response_model=api_contracts.HealthResponse)
+@system_routes.router.get(
+    "/health", response_model=api_contracts.HealthResponse)
 def health():
     """Liveness: the process is up. Deliberately touches nothing else, so a
     restart loop is never triggered by a dependency being briefly unavailable."""
     return {"status": "ok"}
 
 
-@app.get("/metrics")
+@system_routes.router.get("/metrics")
 def prometheus_metrics():
     """Public monitoring surface containing route templates and counts only."""
     return Response(metrics.render(), media_type="text/plain; version=0.0.4")
@@ -2780,7 +2819,8 @@ def _probe(name, fn):
         return name, False
 
 
-@app.get("/ready", response_model=api_contracts.ReadinessResponse)
+@system_routes.router.get(
+    "/ready", response_model=api_contracts.ReadinessResponse)
 def ready(response: Response):
     """Readiness: can this instance actually serve a request?
 
@@ -2814,3 +2854,7 @@ def ready(response: Response):
     healthy = all(checks.values())
     response.status_code = 200 if healthy else 503
     return {"status": "ready" if healthy else "degraded", "kontroller": checks}
+
+
+for domain_router in DOMAIN_ROUTERS:
+    app.router.routes.extend(domain_router.routes)

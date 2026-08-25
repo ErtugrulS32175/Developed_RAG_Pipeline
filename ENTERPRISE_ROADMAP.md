@@ -108,7 +108,7 @@ Status: `[~]` in progress.
 - [x] Generate and compile a TypeScript client from the checked OpenAPI schema.
 - [x] Standardize cursor, pagination, idempotency, conflict, and deprecation
   contracts.
-- [ ] Split `pipeline/api/app.py` into domain routers without changing route
+- [x] Split `pipeline/api/app.py` into domain routers without changing route
   behavior or authorization dependencies.
 - [ ] Split the database facade into bounded domain repositories without
   creating a second SQL or authorization authority.
