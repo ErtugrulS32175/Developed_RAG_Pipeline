@@ -1,5 +1,6 @@
 """The first closed response contracts for the enterprise API surface."""
 from datetime import datetime, timezone
+import json
 
 from fastapi import Response
 from fastapi.routing import APIRoute
@@ -9,6 +10,7 @@ from pydantic import ValidationError
 
 from pipeline.api import app as api
 from pipeline.api import contracts
+from pipeline.api import owui_chat
 
 
 def _route(path, method="GET"):
@@ -93,6 +95,7 @@ def _route(path, method="GET"):
      contracts.EvalVersionResponse),
     ("/v1/eval/datasets/{dataset_id}/retire", "POST",
      contracts.EvalDatasetResponse),
+    ("/v1/chat/completions", "POST", contracts.ChatCompletionResponse),
 ])
 def test_enterprise_routes_enforce_named_response_models(path, method, model):
     assert _route(path, method).response_model is model
@@ -131,8 +134,95 @@ def test_the_response_models_are_recursively_closed_in_openapi():
             "EvalVersionMetadata", "EvalDatasetMetadata",
             "EvalDatasetListResponse", "EvalDatasetResponse",
             "EvalVersionListResponse", "EvalVersionResponse", "EvalCase",
-            "EvalCaseListResponse"):
+            "EvalCaseListResponse", "RagCitationResponse",
+            "RetrievalTraceStagesResponse", "RetrievalTraceResponse",
+            "ChatMessageResponse", "ChatChoiceResponse",
+            "ChatCompletionResponse"):
         assert schemas[name]["additionalProperties"] is False
+
+
+def _trace_contract():
+    return {
+        "trace_version": 2,
+        "trace_id": "a" * 32,
+        "backend": "native",
+        "planner_policy_version": 1,
+        "query_class": "factual",
+        "retrieval_mode": "hybrid_balanced",
+        "fallback": "none",
+        "scope_kind": "all_visible",
+        "policy_epoch": 1,
+        "top_k": 15,
+        "candidate_limit": 60,
+        "scope_document_count": None,
+        "retrieved_count": 1,
+        "reranked_count": 1,
+        "context_passage_count": 1,
+        "context_utf8_bytes": 10,
+        "stages_ms": {
+            "plan": 1,
+            "retrieve": 2,
+            "rerank": 3,
+            "context": 4,
+            "generate": 5,
+            "validate": 6,
+        },
+    }
+
+
+def test_chat_openapi_distinguishes_json_from_event_stream():
+    content = api.app.openapi()["paths"]["/v1/chat/completions"]["post"][
+        "responses"]["200"]["content"]
+    assert set(content) == {"application/json", "text/event-stream"}
+    assert content["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ChatCompletionResponse"
+    }
+    assert content["text/event-stream"]["schema"]["type"] == "string"
+
+
+def test_every_stream_event_has_a_closed_chunk_contract():
+    chunks = tuple(owui_chat.stream_text(
+        "checked answer",
+        "ragtest-rag",
+        rag_status="answered",
+        rag_citations=[{"page": 1, "source": "model"}],
+        rag_trace=_trace_contract(),
+    ))
+    assert chunks[-1] == "data: [DONE]\n\n"
+    for chunk in chunks[:-1]:
+        assert chunk.startswith("data: ") and chunk.endswith("\n\n")
+        payload = json.loads(chunk[len("data: "):-2])
+        contracts.ChatCompletionChunkResponse.model_validate(payload)
+
+
+def test_stream_chunk_contract_is_recursively_closed():
+    schema = contracts.ChatCompletionChunkResponse.model_json_schema()
+    assert schema["additionalProperties"] is False
+    for nested in schema["$defs"].values():
+        if nested.get("type") == "object":
+            assert nested["additionalProperties"] is False
+
+
+def test_chat_contract_refuses_unknown_fields_in_nested_rag_evidence():
+    payload = {
+        "id": "chatcmpl-fixed",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "ragtest-rag",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "answer"},
+            "finish_reason": "stop",
+        }],
+        "rag_status": "answered",
+        "rag_citations": [{
+            "page": 1,
+            "source": "model",
+            "private_chunk_text": "must-not-pass",
+        }],
+    }
+    with pytest.raises(ValidationError):
+        contracts.ChatCompletionResponse.model_validate(payload)
 
 
 def test_timestamp_contract_preserves_legacy_wire_spelling():

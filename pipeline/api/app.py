@@ -1311,7 +1311,29 @@ def _chat_retrieval_scope(req: ChatRequest):
     }
 
 
-@app.post("/v1/chat/completions", dependencies=AUTH)
+@app.post(
+    "/v1/chat/completions",
+    dependencies=AUTH,
+    response_model=api_contracts.ChatCompletionResponse,
+    response_model_exclude_unset=True,
+    responses={
+        200: {
+            "description": "JSON completion or an SSE event stream",
+            "content": {
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "description": (
+                            "Each data event validates as "
+                            "ChatCompletionChunkResponse; the terminal event "
+                            "is the literal [DONE]."
+                        ),
+                    },
+                },
+            },
+        },
+    },
+)
 def chat_completions(req: ChatRequest):
     """OpenAI-compatible wrapper with a checked publication boundary.
 

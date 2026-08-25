@@ -436,3 +436,87 @@ class EvalCaseListResponse(_ClosedResponse):
     dataset_id: WireId
     version_id: WireId
     cases: list[EvalCase]
+
+
+class RagCitationResponse(_ClosedResponse):
+    page: int = Field(ge=1)
+    source: Literal["model", "derived"]
+    evidence_ref: str | None = None
+    document_name: str | None = None
+    feedback_ref: str | None = None
+
+
+class RetrievalTraceStagesResponse(_ClosedResponse):
+    plan: int = Field(ge=0)
+    retrieve: int = Field(ge=0)
+    rerank: int | None = Field(default=None, ge=0)
+    context: int = Field(ge=0)
+    generate: int = Field(ge=0)
+    validate_ms: int = Field(alias="validate", serialization_alias="validate",
+                             ge=0)
+
+
+class RetrievalTraceResponse(_ClosedResponse):
+    trace_version: Literal[2]
+    trace_id: str
+    backend: Literal["native", "llamaindex"]
+    planner_policy_version: Literal[1]
+    query_class: Literal["factual"]
+    retrieval_mode: Literal["hybrid_balanced"]
+    fallback: Literal["none"]
+    scope_kind: Literal[
+        "all_visible", "explicit_documents", "metadata_filters",
+        "intersection", "empty",
+    ]
+    policy_epoch: int = Field(ge=1)
+    top_k: int = Field(ge=1)
+    candidate_limit: int = Field(ge=1)
+    scope_document_count: int | None = Field(default=None, ge=0)
+    retrieved_count: int = Field(ge=0)
+    reranked_count: int | None = Field(default=None, ge=0)
+    context_passage_count: int = Field(ge=0)
+    context_utf8_bytes: int = Field(ge=0)
+    stages_ms: RetrievalTraceStagesResponse
+
+
+class ChatMessageResponse(_ClosedResponse):
+    role: Literal["assistant"]
+    content: str
+
+
+class ChatChoiceResponse(_ClosedResponse):
+    index: Literal[0]
+    message: ChatMessageResponse
+    finish_reason: Literal["stop"]
+
+
+class ChatCompletionResponse(_ClosedResponse):
+    id: str
+    object: Literal["chat.completion"]
+    created: int = Field(ge=0)
+    model: str
+    choices: list[ChatChoiceResponse] = Field(min_length=1, max_length=1)
+    rag_status: Literal["answered", "abstained", "review_required"] | None = None
+    rag_citations: list[RagCitationResponse] | None = None
+    rag_trace: RetrievalTraceResponse | None = None
+
+
+class ChatDeltaResponse(_ClosedResponse):
+    content: str | None = None
+
+
+class ChatChunkChoiceResponse(_ClosedResponse):
+    index: Literal[0]
+    delta: ChatDeltaResponse
+    finish_reason: Literal["stop"] | None
+
+
+class ChatCompletionChunkResponse(_ClosedResponse):
+    id: str
+    object: Literal["chat.completion.chunk"]
+    created: int = Field(ge=0)
+    model: str
+    choices: list[ChatChunkChoiceResponse] = Field(min_length=1, max_length=1)
+    rag_status: Literal["answered", "abstained", "review_required"] | None = None
+    rag_citations: list[RagCitationResponse] | None = None
+    rag_trace: RetrievalTraceResponse | None = None
