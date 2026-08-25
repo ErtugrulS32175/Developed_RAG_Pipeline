@@ -380,3 +380,59 @@ class ReviewDecisionResponse(_ClosedResponse):
     state: Literal["resolved", "dismissed"]
     revision: int = Field(ge=2)
     decided_at: WireTimestamp
+
+
+
+
+class EvalVersionMetadata(_ClosedResponse):
+    version_id: WireId
+    version_number: int = Field(ge=1)
+    state: Literal["draft", "published"]
+    revision: int = Field(ge=1)
+    case_count: int = Field(ge=0)
+    content_sha256: str | None = None
+    sealed_at: WireTimestamp | None = None
+
+
+class EvalDatasetMetadata(_ClosedResponse):
+    dataset_id: WireId
+    slug: str
+    label: str
+    state: Literal["active", "retired"]
+    revision: int = Field(ge=1)
+    owner_label: str | None = None
+    policy_epoch: int | None = Field(default=None, ge=1)
+    current_version_id: WireId | None = None
+    current_version_number: int | None = Field(default=None, ge=1)
+    versions: list[EvalVersionMetadata]
+
+
+class EvalDatasetListResponse(_ClosedResponse):
+    datasets: list[EvalDatasetMetadata]
+
+
+class EvalDatasetResponse(_ClosedResponse):
+    dataset: EvalDatasetMetadata
+
+
+class EvalVersionListResponse(_ClosedResponse):
+    versions: list[EvalVersionMetadata]
+
+
+class EvalVersionResponse(_ClosedResponse):
+    version: EvalVersionMetadata
+
+
+class EvalCase(_ClosedResponse):
+    case_key: WireId
+    q: str
+    key: str
+    answer: str
+    pages: list[int]
+    type: Literal["metin", "sayisal", "tablo"]
+
+
+class EvalCaseListResponse(_ClosedResponse):
+    dataset_id: WireId
+    version_id: WireId
+    cases: list[EvalCase]

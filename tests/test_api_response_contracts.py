@@ -79,6 +79,20 @@ def _route(path, method="GET"):
     ("/v1/reviews/queue", "GET", contracts.ReviewQueueResponse),
     ("/v1/reviews/{case_id}/decision", "POST",
      contracts.ReviewDecisionResponse),
+    ("/v1/eval/datasets", "GET", contracts.EvalDatasetListResponse),
+    ("/v1/eval/datasets", "POST", contracts.EvalDatasetResponse),
+    ("/v1/eval/datasets/{dataset_id}/versions", "GET",
+     contracts.EvalVersionListResponse),
+    ("/v1/eval/datasets/{dataset_id}/drafts", "POST",
+     contracts.EvalVersionResponse),
+    ("/v1/eval/datasets/{dataset_id}/versions/{version_id}/cases/import",
+     "POST", contracts.EvalVersionResponse),
+    ("/v1/eval/datasets/{dataset_id}/versions/{version_id}/cases", "GET",
+     contracts.EvalCaseListResponse),
+    ("/v1/eval/datasets/{dataset_id}/versions/{version_id}/publish", "POST",
+     contracts.EvalVersionResponse),
+    ("/v1/eval/datasets/{dataset_id}/retire", "POST",
+     contracts.EvalDatasetResponse),
 ])
 def test_enterprise_routes_enforce_named_response_models(path, method, model):
     assert _route(path, method).response_model is model
@@ -113,7 +127,11 @@ def test_the_response_models_are_recursively_closed_in_openapi():
             "DocumentProcessResponse", "IngestJobResponse",
             "ShortLivedTicketResponse", "EvidencePreviewResponse",
             "ReviewFeedbackResponse", "ReviewCase", "ReviewCursor",
-            "ReviewQueueResponse", "ReviewDecisionResponse"):
+            "ReviewQueueResponse", "ReviewDecisionResponse",
+            "EvalVersionMetadata", "EvalDatasetMetadata",
+            "EvalDatasetListResponse", "EvalDatasetResponse",
+            "EvalVersionListResponse", "EvalVersionResponse", "EvalCase",
+            "EvalCaseListResponse"):
         assert schemas[name]["additionalProperties"] is False
 
 

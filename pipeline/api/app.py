@@ -1088,7 +1088,9 @@ async def _eval_import_body(request):
     return value["expected_revision"], cases
 
 
-@app.get("/v1/eval/datasets")
+@app.get("/v1/eval/datasets",
+         response_model=api_contracts.EvalDatasetListResponse,
+         response_model_exclude_unset=True)
 def eval_dataset_list(
         limit: int = Query(100, ge=1, le=100),
         principal=Depends(require_org_identity)):
@@ -1101,7 +1103,9 @@ def eval_dataset_list(
     return {"datasets": [_eval_dataset_metadata(row) for row in rows]}
 
 
-@app.post("/v1/eval/datasets", status_code=201)
+@app.post("/v1/eval/datasets", status_code=201,
+          response_model=api_contracts.EvalDatasetResponse,
+          response_model_exclude_unset=True)
 def eval_dataset_create(
         body: EvalDatasetCreateRequest,
         principal=Depends(require_eval_writer)):
@@ -1118,7 +1122,9 @@ def eval_dataset_create(
     return {"dataset": _eval_dataset_metadata(row)}
 
 
-@app.get("/v1/eval/datasets/{dataset_id}/versions")
+@app.get("/v1/eval/datasets/{dataset_id}/versions",
+         response_model=api_contracts.EvalVersionListResponse,
+         response_model_exclude_unset=True)
 def eval_version_list(
         dataset_id: UUID, principal=Depends(require_org_identity)):
     try:
@@ -1133,7 +1139,9 @@ def eval_version_list(
     return {"versions": [_eval_version_metadata(row) for row in rows]}
 
 
-@app.post("/v1/eval/datasets/{dataset_id}/drafts", status_code=201)
+@app.post("/v1/eval/datasets/{dataset_id}/drafts", status_code=201,
+          response_model=api_contracts.EvalVersionResponse,
+          response_model_exclude_unset=True)
 def eval_draft_create(
         dataset_id: UUID, body: EvalDraftRequest,
         principal=Depends(require_eval_writer)):
@@ -1154,7 +1162,9 @@ def eval_draft_create(
 
 
 @app.post("/v1/eval/datasets/{dataset_id}/versions/"
-          "{version_id}/cases/import")
+          "{version_id}/cases/import",
+          response_model=api_contracts.EvalVersionResponse,
+          response_model_exclude_unset=True)
 async def eval_cases_import(
         dataset_id: UUID, version_id: UUID, request: Request,
         principal=Depends(require_eval_writer)):
@@ -1175,7 +1185,8 @@ async def eval_cases_import(
     return {"version": _eval_version_metadata(row, version_id=version_id)}
 
 
-@app.get("/v1/eval/datasets/{dataset_id}/versions/{version_id}/cases")
+@app.get("/v1/eval/datasets/{dataset_id}/versions/{version_id}/cases",
+         response_model=api_contracts.EvalCaseListResponse)
 def eval_cases_read(
         dataset_id: UUID, version_id: UUID, response: Response,
         principal=Depends(require_org_identity)):
@@ -1196,7 +1207,9 @@ def eval_cases_read(
             "cases": cases}
 
 
-@app.post("/v1/eval/datasets/{dataset_id}/versions/{version_id}/publish")
+@app.post("/v1/eval/datasets/{dataset_id}/versions/{version_id}/publish",
+          response_model=api_contracts.EvalVersionResponse,
+          response_model_exclude_unset=True)
 def eval_version_publish(
         dataset_id: UUID, version_id: UUID, body: EvalPublishRequest,
         principal=Depends(require_eval_writer)):
@@ -1218,7 +1231,9 @@ def eval_version_publish(
     return {"version": _eval_version_metadata(row, version_id=version_id)}
 
 
-@app.post("/v1/eval/datasets/{dataset_id}/retire")
+@app.post("/v1/eval/datasets/{dataset_id}/retire",
+          response_model=api_contracts.EvalDatasetResponse,
+          response_model_exclude_unset=True)
 def eval_dataset_retire(
         dataset_id: UUID, body: EvalRetireRequest,
         principal=Depends(require_eval_writer)):

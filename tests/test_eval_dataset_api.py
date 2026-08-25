@@ -281,8 +281,7 @@ def test_missing_case_version_is_404_without_reading_content(monkeypatch):
 def test_eval_routes_never_offer_an_admin_or_architect_bypass():
     source = api.Path(api.__file__).read_text("utf-8")
     eval_surface = source.split(
-        '@app.get("/v1/eval/datasets")', 1)[1].split(
-            '@app.get("/v1/models"', 1)[0]
+        "def eval_dataset_list(", 1)[1].split("def list_models(", 1)[0]
     assert "require_admin" not in eval_surface
     assert "require_org_architect" not in eval_surface
     assert "require_org_identity" in eval_surface
