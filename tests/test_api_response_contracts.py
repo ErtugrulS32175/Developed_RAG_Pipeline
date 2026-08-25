@@ -61,6 +61,13 @@ def _route(path, method="GET"):
      contracts.DocumentVersionListResponse),
     ("/documents/{document_id}/versions/{version_id}/activate", "POST",
      contracts.DocumentVersionActivationResponse),
+    ("/documents/upload", "POST", contracts.DocumentUploadResponse),
+    ("/documents/{document_id}/process", "POST",
+     contracts.DocumentProcessResponse),
+    ("/documents/{document_id}/ingest-jobs", "POST",
+     contracts.IngestJobResponse),
+    ("/ingest-jobs/{job_id}", "GET", contracts.IngestJobResponse),
+    ("/ingest-jobs/{job_id}", "DELETE", contracts.IngestJobResponse),
 ])
 def test_enterprise_routes_enforce_named_response_models(path, method, model):
     assert _route(path, method).response_model is model
@@ -83,7 +90,8 @@ def test_the_response_models_are_recursively_closed_in_openapi():
             "DocumentListResponse", "DocumentDetailResponse",
             "DocumentLifecycleResponse", "DocumentVersion",
             "DocumentVersionListResponse",
-            "DocumentVersionActivationResponse"):
+            "DocumentVersionActivationResponse", "DocumentUploadResponse",
+            "DocumentProcessResponse", "IngestJobResponse"):
         assert schemas[name]["additionalProperties"] is False
 
 

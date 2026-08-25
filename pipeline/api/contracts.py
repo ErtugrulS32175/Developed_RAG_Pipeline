@@ -299,3 +299,34 @@ class DocumentVersionActivationResponse(_ClosedResponse):
     active_generation: int = Field(ge=0)
     revision: int = Field(ge=0)
     changed: bool
+
+
+
+
+class DocumentUploadResponse(_ClosedResponse):
+    document_id: WireId
+    filename: str
+    candidate_id: WireId
+    version_id: WireId
+    status: Literal["pending"]
+
+
+class DocumentProcessResponse(_ClosedResponse):
+    document_id: WireId
+    status: Literal["done", "partial"]
+    status_note: str | None = None
+
+
+class IngestJobResponse(_ClosedResponse):
+    job_id: WireId
+    document_id: WireId
+    candidate_id: WireId
+    version_id: WireId | None = None
+    status: Literal[
+        "queued", "running", "succeeded", "partial", "failed", "cancelled"
+    ]
+    attempt_count: int = Field(ge=0)
+    created_at: WireTimestamp | None
+    started_at: WireTimestamp | None
+    finished_at: WireTimestamp | None
+    outcome_note: str | None

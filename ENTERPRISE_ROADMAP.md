@@ -93,9 +93,9 @@ Status: `[~]` in progress.
   - [~] Document inventory, detail, version, and lifecycle responses.
     - [x] Inventory, detail, archive/restore, version inventory, and version
       activation responses.
-    - [~] Upload/process/ingest-job and retention/legal-hold/purge responses.
+    - [x] Upload/process/ingest-job and retention/legal-hold/purge responses.
       - [x] Retention inventory/policy, legal-hold, and purge responses.
-      - [ ] Upload, process, and ingest-job responses.
+      - [x] Upload, process, and ingest-job responses.
   - [ ] Evidence, export, review, and evaluation responses.
   - [ ] Chat non-streaming response and SSE event contracts.
 - [ ] Introduce one versioned, content-free error envelope and error-code

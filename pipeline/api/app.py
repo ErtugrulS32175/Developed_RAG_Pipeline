@@ -1914,7 +1914,8 @@ def _safe_upload_filename(filename):
 # holds a database SESSION lock, which serialises across PROCESSES and
 # therefore across every worker, not just this one. A second, weaker lock
 # in front of it fenced nothing the first did not already fence.
-@app.post("/documents/upload", dependencies=EDITOR_AUTH)
+@app.post("/documents/upload", dependencies=EDITOR_AUTH,
+          response_model=api_contracts.DocumentUploadResponse)
 async def upload_document(file: UploadFile = File(...), replace: bool = False):
     """Publish a candidate -- through the SHARED SERVICE and nothing else.
 
@@ -2032,7 +2033,9 @@ def _reported_outcome(returned):
     return None
 
 
-@app.post("/documents/{document_id}/process", dependencies=EDITOR_AUTH)
+@app.post("/documents/{document_id}/process", dependencies=EDITOR_AUTH,
+          response_model=api_contracts.DocumentProcessResponse,
+          response_model_exclude_unset=True)
 def process_document(document_id: str):
     # Three SHORT borrows instead of one connection held across the whole
     # request: ingest can run for minutes on its own connection, and a pooled
@@ -2182,7 +2185,8 @@ def process_document(document_id: str):
 
 
 @app.post("/documents/{document_id}/ingest-jobs", dependencies=EDITOR_AUTH,
-          status_code=202)
+          status_code=202, response_model=api_contracts.IngestJobResponse,
+          response_model_exclude_unset=True)
 def enqueue_ingest_job(
         document_id: UUID,
         idempotency_key: Annotated[
@@ -2202,7 +2206,9 @@ def enqueue_ingest_job(
     return job
 
 
-@app.get("/ingest-jobs/{job_id}", dependencies=AUTH)
+@app.get("/ingest-jobs/{job_id}", dependencies=AUTH,
+         response_model=api_contracts.IngestJobResponse,
+         response_model_exclude_unset=True)
 def read_ingest_job(job_id: UUID):
     with db_conn() as conn:
         job = db.get_ingest_job(conn, str(job_id))
@@ -2211,7 +2217,9 @@ def read_ingest_job(job_id: UUID):
     return job
 
 
-@app.delete("/ingest-jobs/{job_id}", dependencies=EDITOR_AUTH)
+@app.delete("/ingest-jobs/{job_id}", dependencies=EDITOR_AUTH,
+            response_model=api_contracts.IngestJobResponse,
+            response_model_exclude_unset=True)
 def cancel_ingest_job(job_id: UUID):
     try:
         with db_conn() as conn:
