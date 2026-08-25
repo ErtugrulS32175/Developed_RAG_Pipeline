@@ -66,7 +66,7 @@ jobs:
         run: |
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
           pip install docling docling-core transformers 'psycopg[binary,pool]' pgvector fastembed python-dotenv requests openpyxl fastapi uvicorn python-multipart
-          pip install pytest httpx jsonschema
+          pip install pytest httpx jsonschema cryptography
       - name: Verify OpenAPI compatibility and generated client
         run: |
           npm ci

@@ -48,7 +48,7 @@ test:
     # drag in several GB of CUDA libraries.
     - pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
     - pip install docling docling-core transformers 'psycopg[binary,pool]' pgvector fastembed python-dotenv requests openpyxl fastapi uvicorn python-multipart
-    - pip install pytest httpx jsonschema
+    - pip install pytest httpx jsonschema cryptography
   script:
     - npm ci
     - python scripts/export_openapi.py --check contracts/openapi.json
