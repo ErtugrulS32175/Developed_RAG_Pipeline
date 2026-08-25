@@ -106,7 +106,7 @@ Status: `[~]` in progress.
   vocabulary with an explicit compatibility transition from FastAPI `detail`.
 - [x] Add an OpenAPI snapshot and backwards-compatibility CI gate.
 - [x] Generate and compile a TypeScript client from the checked OpenAPI schema.
-- [ ] Standardize cursor, pagination, idempotency, conflict, and deprecation
+- [x] Standardize cursor, pagination, idempotency, conflict, and deprecation
   contracts.
 - [ ] Split `pipeline/api/app.py` into domain routers without changing route
   behavior or authorization dependencies.

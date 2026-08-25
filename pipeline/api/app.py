@@ -40,6 +40,7 @@ from pipeline.api import errors as api_errors
 from pipeline.api import identity
 from pipeline.api import metrics
 from pipeline.api import org_policy
+from pipeline.api import protocols as api_protocols
 from pipeline.retrieval import planner, rag_backends
 from pipeline.retrieval.trace import RetrievalTrace
 from pipeline.validation.rag.answer_guard import (
@@ -186,6 +187,7 @@ app = FastAPI(
     responses=dict(api_errors.ERROR_RESPONSES),
 )
 api_errors.install(app)
+api_protocols.install(app)
 
 
 def _gateway_offered(authorization):
@@ -700,7 +702,8 @@ def organization_topology(
          response_model=api_contracts.OrgAuditEventListResponse)
 def organization_audit_events(
         request: Request,
-        limit: int = Query(20, ge=1, le=100),
+        limit: int = Query(20, ge=api_protocols.PAGE_LIMIT_MIN,
+                           le=api_protocols.PAGE_LIMIT_MAX),
         before_created_at: AwareDatetime | None = Query(default=None),
         before_id: UUID | None = Query(default=None),
         action: list[Literal[
@@ -717,10 +720,13 @@ def organization_audit_events(
                       | None = Query(default=None),
         principal=Depends(require_org_architect)):
     """List immutable governance decisions with closed query filters."""
-    if (before_created_at is None) != (before_id is None):
-        raise HTTPException(status_code=422,
-                            detail="governance imlec parametreleri eksik")
-    before = (before_created_at, before_id) if before_id is not None else None
+    try:
+        before = api_protocols.paired_cursor(
+            before_created_at, before_id,
+            first_name="before_created_at", second_name="before_id",
+            error_message="governance imlec parametreleri eksik")
+    except api_protocols.PaginationRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
     try:
         with db_conn() as conn:
             rows = db.list_org_audit_events(
@@ -732,19 +738,16 @@ def organization_audit_events(
                 allowed=True, request_id=request.state.request_id)
     except db.OrgAuditQueryRefused as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
-    page = rows[:limit]
-    has_more = len(rows) > limit
-    next_cursor = None
-    if has_more and page:
-        next_cursor = {
-            "before_created_at": page[-1]["created_at"],
-            "before_id": str(page[-1]["id"]),
-        }
+    window = api_protocols.page_window(rows, limit, lambda row: {
+        "before_created_at": row["created_at"],
+        "before_id": str(row["id"]),
+    })
+    page = list(window.items)
     return {
         "events": [_org_audit_event_summary(row) for row in page],
         "limit": limit,
-        "has_more": has_more,
-        "next_cursor": next_cursor,
+        "has_more": window.has_more,
+        "next_cursor": window.next_cursor,
     }
 
 
@@ -827,16 +830,19 @@ def organization_retention_policy(
          response_model=api_contracts.RetentionDocumentListResponse)
 def organization_retention_documents(
         request: Request,
-        limit: int = Query(50, ge=1, le=100),
+        limit: int = Query(50, ge=api_protocols.PAGE_LIMIT_MIN,
+                           le=api_protocols.PAGE_LIMIT_MAX),
         before_uploaded_at: AwareDatetime | None = Query(default=None),
         before_id: UUID | None = Query(default=None),
         principal=Depends(require_org_architect)):
     """List content-free document lifecycle facts for the admin portal."""
-    if (before_uploaded_at is None) != (before_id is None):
-        raise HTTPException(status_code=422,
-                            detail="retention belge imleci eksik")
-    before = ((before_uploaded_at, before_id)
-              if before_id is not None else None)
+    try:
+        before = api_protocols.paired_cursor(
+            before_uploaded_at, before_id,
+            first_name="before_uploaded_at", second_name="before_id",
+            error_message="retention belge imleci eksik")
+    except api_protocols.PaginationRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
     try:
         with db_conn() as conn:
             rows = db.list_retention_documents(
@@ -849,14 +855,11 @@ def organization_retention_documents(
                 request_id=request.state.request_id)
     except db.DocumentRetentionRefused as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
-    page = rows[:limit]
-    has_more = len(rows) > limit
-    next_cursor = None
-    if has_more and page:
-        next_cursor = {
-            "before_uploaded_at": page[-1]["uploaded_at"],
-            "before_id": str(page[-1]["document_id"]),
-        }
+    window = api_protocols.page_window(rows, limit, lambda row: {
+        "before_uploaded_at": row["uploaded_at"],
+        "before_id": str(row["document_id"]),
+    })
+    page = list(window.items)
     documents = []
     for row in page:
         documents.append({
@@ -875,8 +878,8 @@ def organization_retention_documents(
     return {
         "documents": documents,
         "limit": limit,
-        "has_more": has_more,
-        "next_cursor": next_cursor,
+        "has_more": window.has_more,
+        "next_cursor": window.next_cursor,
     }
 
 
@@ -1781,16 +1784,20 @@ def submit_review_feedback(
          response_model=api_contracts.ReviewQueueResponse)
 def review_queue(
         request: Request,
-        limit: int = Query(20, ge=1, le=100),
+        limit: int = Query(20, ge=api_protocols.PAGE_LIMIT_MIN,
+                           le=api_protocols.PAGE_LIMIT_MAX),
         before_created_at: AwareDatetime | None = Query(default=None),
         before_id: UUID | None = Query(default=None),
         reason_code: Literal["management_duty", "security_review"] = Query(),
         principal=Depends(require_org_identity)):
     """List only fresh, strict-descendant cases; never return model content."""
-    if (before_created_at is None) != (before_id is None):
-        raise HTTPException(status_code=422,
-                            detail="inceleme imleci eksik")
-    before = (before_created_at, before_id) if before_id is not None else None
+    try:
+        before = api_protocols.paired_cursor(
+            before_created_at, before_id,
+            first_name="before_created_at", second_name="before_id",
+            error_message="inceleme imleci eksik")
+    except api_protocols.PaginationRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
     try:
         with db_conn() as conn:
             rows = db.list_review_cases(
@@ -1803,8 +1810,11 @@ def review_queue(
     except db.ReviewAccessRefused:
         raise HTTPException(status_code=403,
                             detail="inceleme kuyrugu yetkisi yok") from None
-    has_more = len(rows) > limit
-    page = rows[:limit]
+    window = api_protocols.page_window(rows, limit, lambda row: {
+        "before_created_at": row["created_at"],
+        "before_id": row["id"],
+    })
+    page = list(window.items)
     items = [{
         "case_id": row["id"],
         "trigger_code": row["trigger_code"],
@@ -1817,14 +1827,8 @@ def review_queue(
         "position_title": row["position_title"],
         "policy_epoch": row["policy_epoch"],
     } for row in page]
-    next_cursor = None
-    if has_more and page:
-        next_cursor = {
-            "before_created_at": page[-1]["created_at"],
-            "before_id": page[-1]["id"],
-        }
-    return {"cases": items, "has_more": has_more,
-            "next_cursor": next_cursor}
+    return {"cases": items, "has_more": window.has_more,
+            "next_cursor": window.next_cursor}
 
 
 @app.post("/v1/reviews/{case_id}/decision",
@@ -2244,7 +2248,11 @@ def process_document(document_id: str):
 def enqueue_ingest_job(
         document_id: UUID,
         idempotency_key: Annotated[
-            str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+            str, Header(
+                alias=api_protocols.IDEMPOTENCY_KEY_HEADER,
+                min_length=api_protocols.IDEMPOTENCY_KEY_MIN,
+                max_length=api_protocols.IDEMPOTENCY_KEY_MAX,
+            )],
 ):
     try:
         with db_conn() as conn:
@@ -2336,7 +2344,7 @@ DOCUMENT_DETAIL_FIELDS = (
 # started. Both bounds are decided here, in the signature, so an
 # out-of-range page never reaches a connection at all.
 DOCUMENT_PAGE_DEFAULT = 20
-DOCUMENT_PAGE_MAX = 100
+DOCUMENT_PAGE_MAX = api_protocols.PAGE_LIMIT_MAX
 
 # The inventory filters are OPEN text by design: `documents.status` has no
 # CHECK constraint (the closed done/error/partial/superseded set belongs to
@@ -2493,10 +2501,12 @@ def list_documents(
             status_code=422,
             detail="uploaded_after, uploaded_before'dan kesin olarak once "
                    "olmali")
-    if (before_uploaded_at is None) != (before_id is None):
-        raise HTTPException(
-            status_code=422,
-            detail="before_uploaded_at ve before_id birlikte verilmeli")
+    try:
+        before = api_protocols.paired_cursor(
+            before_uploaded_at, before_id,
+            first_name="before_uploaded_at", second_name="before_id")
+    except api_protocols.PaginationRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
     if before_uploaded_at is not None and offset != 0:
         raise HTTPException(
             status_code=422,
@@ -2513,24 +2523,22 @@ def list_documents(
                 filters["collection_id"] = str(collection_id)
             if tag is not None:
                 filters["tag"] = tag
-            if before_uploaded_at is not None:
-                filters["before"] = (before_uploaded_at, str(before_id))
+            if before is not None:
+                filters["before"] = (before[0], str(before[1]))
             rows = db.list_documents(conn, limit=limit, offset=offset, **filters)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit and page:
-        next_cursor = {
-            "before_uploaded_at": page[-1]["uploaded_at"],
-            "before_id": page[-1]["document_id"],
-        }
+    window = api_protocols.page_window(rows, limit, lambda row: {
+        "before_uploaded_at": row["uploaded_at"],
+        "before_id": row["document_id"],
+    })
+    page = list(window.items)
     return {
         "documents": [_document_summary(row) for row in page],
         "limit": limit,
         "offset": offset,
-        "has_more": len(rows) > limit,
-        "next_cursor": next_cursor,
+        "has_more": window.has_more,
+        "next_cursor": window.next_cursor,
     }
 
 
@@ -2656,15 +2664,17 @@ def list_document_versions(
                 before_version_number=before_version_number)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
-    has_more = len(rows) > limit
-    page = [_document_version_summary(row) for row in rows[:limit]]
+    window = api_protocols.page_window(
+        rows, limit,
+        lambda row: int(row["version_number"]),
+    )
+    page = [_document_version_summary(row) for row in window.items]
     return {
         "versions": page,
         "limit": limit,
         "before_version_number": before_version_number,
-        "has_more": has_more,
-        "next_before_version_number": (
-            page[-1]["version_number"] if has_more and page else None),
+        "has_more": window.has_more,
+        "next_before_version_number": window.next_cursor,
     }
 
 

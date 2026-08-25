@@ -5151,7 +5151,17 @@
             "description": "Closed error response (service_unavailable)"
           }
         },
-        "summary": "List Documents"
+        "summary": "List Documents",
+        "x-ragtest-pagination": {
+          "cursor_fields": [
+            "before_uploaded_at",
+            "before_id"
+          ],
+          "legacy_offset_field": "offset",
+          "mode": "cursor_or_offset",
+          "response_cursor_field": "next_cursor",
+          "version": 1
+        }
       }
     },
     "/documents/upload": {
@@ -5811,7 +5821,15 @@
             "description": "Closed error response (service_unavailable)"
           }
         },
-        "summary": "Enqueue Ingest Job"
+        "summary": "Enqueue Ingest Job",
+        "x-ragtest-idempotency": {
+          "conflict_status": 409,
+          "header": "Idempotency-Key",
+          "replay": "same_job",
+          "scope": "document_lifetime",
+          "storage": "sha256_digest_only",
+          "version": 1
+        }
       }
     },
     "/documents/{document_id}/legal-holds": {
@@ -7275,7 +7293,15 @@
             "description": "Closed error response (service_unavailable)"
           }
         },
-        "summary": "List Document Versions"
+        "summary": "List Document Versions",
+        "x-ragtest-pagination": {
+          "cursor_fields": [
+            "before_version_number"
+          ],
+          "mode": "cursor",
+          "response_cursor_field": "next_before_version_number",
+          "version": 1
+        }
       }
     },
     "/documents/{document_id}/versions/{version_id}/activate": {
@@ -10934,7 +10960,16 @@
             "description": "Closed error response (service_unavailable)"
           }
         },
-        "summary": "Organization Audit Events"
+        "summary": "Organization Audit Events",
+        "x-ragtest-pagination": {
+          "cursor_fields": [
+            "before_created_at",
+            "before_id"
+          ],
+          "mode": "cursor",
+          "response_cursor_field": "next_cursor",
+          "version": 1
+        }
       }
     },
     "/v1/org/admin/members/{identity_id}": {
@@ -11281,7 +11316,16 @@
             "description": "Closed error response (service_unavailable)"
           }
         },
-        "summary": "Organization Retention Documents"
+        "summary": "Organization Retention Documents",
+        "x-ragtest-pagination": {
+          "cursor_fields": [
+            "before_uploaded_at",
+            "before_id"
+          ],
+          "mode": "cursor",
+          "response_cursor_field": "next_cursor",
+          "version": 1
+        }
       }
     },
     "/v1/org/admin/retention-policy": {
@@ -12491,7 +12535,16 @@
             "description": "Closed error response (service_unavailable)"
           }
         },
-        "summary": "Review Queue"
+        "summary": "Review Queue",
+        "x-ragtest-pagination": {
+          "cursor_fields": [
+            "before_created_at",
+            "before_id"
+          ],
+          "mode": "cursor",
+          "response_cursor_field": "next_cursor",
+          "version": 1
+        }
       }
     },
     "/v1/reviews/{case_id}/decision": {
@@ -12654,5 +12707,41 @@
         "summary": "Decide Review Case"
       }
     }
+  },
+  "x-ragtest-protocols": {
+    "conflict": {
+      "automatic_mutation_retry": false,
+      "error_code": "conflict",
+      "recovery": "refresh_authoritative_state",
+      "status": 409
+    },
+    "deprecation": {
+      "openapi_flag": "deprecated",
+      "required_extension": "x-ragtest-deprecation",
+      "required_fields": [
+        "replacement",
+        "sunset"
+      ],
+      "required_headers": [
+        "Deprecation",
+        "Sunset",
+        "Link"
+      ]
+    },
+    "idempotency": {
+      "header": "Idempotency-Key",
+      "key_max_length": 200,
+      "key_min_length": 1,
+      "raw_key_persisted": false
+    },
+    "pagination": {
+      "continuation": "exclusive_before_cursor",
+      "has_more": "limit_plus_one_probe",
+      "incomplete_cursor_status": 422,
+      "limit_maximum": 100,
+      "limit_minimum": 1,
+      "ordering": "stable_descending"
+    },
+    "version": 1
   }
 }
