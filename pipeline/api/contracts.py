@@ -330,3 +330,53 @@ class IngestJobResponse(_ClosedResponse):
     started_at: WireTimestamp | None
     finished_at: WireTimestamp | None
     outcome_note: str | None
+
+
+
+
+class ShortLivedTicketResponse(_ClosedResponse):
+    ticket: str
+    expires_in: int = Field(ge=1)
+
+
+class EvidencePreviewResponse(_ClosedResponse):
+    document_name: str
+    page: int = Field(ge=0)
+    content_type: Literal["passage"]
+    passage: str
+
+
+class ReviewFeedbackResponse(_ClosedResponse):
+    status: Literal["recorded"]
+    revision: int = Field(ge=1)
+    review_open: bool
+
+
+class ReviewCase(_ClosedResponse):
+    case_id: WireId
+    trigger_code: Literal["user_feedback", "guard_review"]
+    state: Literal["open"]
+    revision: int = Field(ge=1)
+    created_at: WireTimestamp
+    outcome: Literal["answered", "review_required"]
+    citation_count: int = Field(ge=0)
+    subject_label: str
+    position_title: str
+    policy_epoch: int = Field(ge=1)
+
+
+class ReviewCursor(_ClosedResponse):
+    before_created_at: WireTimestamp
+    before_id: WireId
+
+
+class ReviewQueueResponse(_ClosedResponse):
+    cases: list[ReviewCase]
+    has_more: bool
+    next_cursor: ReviewCursor | None
+
+
+class ReviewDecisionResponse(_ClosedResponse):
+    state: Literal["resolved", "dismissed"]
+    revision: int = Field(ge=2)
+    decided_at: WireTimestamp

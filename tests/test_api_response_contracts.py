@@ -68,9 +68,28 @@ def _route(path, method="GET"):
      contracts.IngestJobResponse),
     ("/ingest-jobs/{job_id}", "GET", contracts.IngestJobResponse),
     ("/ingest-jobs/{job_id}", "DELETE", contracts.IngestJobResponse),
+    ("/v1/evidence/tickets", "POST",
+     contracts.ShortLivedTicketResponse),
+    ("/v1/evidence/preview", "POST",
+     contracts.EvidencePreviewResponse),
+    ("/v1/exports/tickets", "POST",
+     contracts.ShortLivedTicketResponse),
+    ("/v1/reviews/feedback", "POST",
+     contracts.ReviewFeedbackResponse),
+    ("/v1/reviews/queue", "GET", contracts.ReviewQueueResponse),
+    ("/v1/reviews/{case_id}/decision", "POST",
+     contracts.ReviewDecisionResponse),
 ])
 def test_enterprise_routes_enforce_named_response_models(path, method, model):
     assert _route(path, method).response_model is model
+
+
+def test_export_download_declares_only_its_binary_media_type():
+    response = api.app.openapi()["paths"]["/v1/exports/download"]["post"][
+        "responses"]["200"]
+    assert set(response["content"]) == {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    }
 
 
 def test_the_response_models_are_recursively_closed_in_openapi():
@@ -91,7 +110,10 @@ def test_the_response_models_are_recursively_closed_in_openapi():
             "DocumentLifecycleResponse", "DocumentVersion",
             "DocumentVersionListResponse",
             "DocumentVersionActivationResponse", "DocumentUploadResponse",
-            "DocumentProcessResponse", "IngestJobResponse"):
+            "DocumentProcessResponse", "IngestJobResponse",
+            "ShortLivedTicketResponse", "EvidencePreviewResponse",
+            "ReviewFeedbackResponse", "ReviewCase", "ReviewCursor",
+            "ReviewQueueResponse", "ReviewDecisionResponse"):
         assert schemas[name]["additionalProperties"] is False
 
 

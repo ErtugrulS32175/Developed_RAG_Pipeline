@@ -1581,7 +1581,8 @@ def _register_export_reference(principal, storage_name):
     return _b64url(ref_digest)
 
 
-@app.post("/v1/evidence/tickets")
+@app.post("/v1/evidence/tickets",
+          response_model=api_contracts.ShortLivedTicketResponse)
 def create_evidence_ticket(
         body: EvidenceTicketRequest, response: Response,
         principal=Depends(require_evidence_actor)):
@@ -1603,7 +1604,8 @@ def create_evidence_ticket(
     return {"ticket": ticket, "expires_in": EVIDENCE_TICKET_SECONDS}
 
 
-@app.post("/v1/evidence/preview")
+@app.post("/v1/evidence/preview",
+          response_model=api_contracts.EvidencePreviewResponse)
 def preview_evidence(
         body: EvidencePreviewRequest, response: Response,
         principal=Depends(require_evidence_actor)):
@@ -1632,7 +1634,8 @@ def preview_evidence(
     }
 
 
-@app.post("/v1/exports/tickets")
+@app.post("/v1/exports/tickets",
+          response_model=api_contracts.ShortLivedTicketResponse)
 def create_export_ticket(
         body: ExportTicketRequest, response: Response,
         principal=Depends(require_evidence_actor)):
@@ -1659,7 +1662,15 @@ def create_export_ticket(
     return {"ticket": ticket, "expires_in": EXPORT_TICKET_SECONDS}
 
 
-@app.post("/v1/exports/download")
+@app.post(
+    "/v1/exports/download",
+    response_class=Response,
+    responses={
+        200: {"content": {
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet": {}}},
+    },
+)
 def download_export(
         body: ExportDownloadRequest,
         principal=Depends(require_evidence_actor)):
@@ -1701,7 +1712,8 @@ def download_export(
     )
 
 
-@app.post("/v1/reviews/feedback")
+@app.post("/v1/reviews/feedback",
+          response_model=api_contracts.ReviewFeedbackResponse)
 def submit_review_feedback(
         body: ReviewFeedbackRequest,
         principal=Depends(require_evidence_actor)):
@@ -1725,7 +1737,8 @@ def submit_review_feedback(
     return {"status": "recorded", **result}
 
 
-@app.get("/v1/reviews/queue")
+@app.get("/v1/reviews/queue",
+         response_model=api_contracts.ReviewQueueResponse)
 def review_queue(
         request: Request,
         limit: int = Query(20, ge=1, le=100),
@@ -1774,7 +1787,8 @@ def review_queue(
             "next_cursor": next_cursor}
 
 
-@app.post("/v1/reviews/{case_id}/decision")
+@app.post("/v1/reviews/{case_id}/decision",
+          response_model=api_contracts.ReviewDecisionResponse)
 def decide_review_case(
         case_id: UUID, body: ReviewDecisionRequest, request: Request,
         principal=Depends(require_org_identity)):

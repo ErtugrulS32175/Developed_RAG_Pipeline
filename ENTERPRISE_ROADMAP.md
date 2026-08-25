@@ -96,7 +96,10 @@ Status: `[~]` in progress.
     - [x] Upload/process/ingest-job and retention/legal-hold/purge responses.
       - [x] Retention inventory/policy, legal-hold, and purge responses.
       - [x] Upload, process, and ingest-job responses.
-  - [ ] Evidence, export, review, and evaluation responses.
+  - [~] Evidence, export, review, and evaluation responses.
+    - [x] Evidence ticket/preview, export ticket/download media, and review
+      feedback/queue/decision responses.
+    - [ ] Evaluation dataset and release responses.
   - [ ] Chat non-streaming response and SSE event contracts.
 - [ ] Introduce one versioned, content-free error envelope and error-code
   vocabulary with an explicit compatibility transition from FastAPI `detail`.
