@@ -119,7 +119,7 @@ def test_lifecycle_events_are_content_free_and_immutable():
     assert "FOREIGN KEY (target_tenant_id, service_account_id)" in SCHEMA
 
 
-def test_admin_role_can_execute_only_the_three_lifecycle_functions():
+def test_admin_role_can_approve_cancel_and_revoke_but_never_redeem():
     script = (ROOT / "scripts" / "init_control_admin_role.sh").read_text(
         encoding="utf-8")
     assert ("NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT "
@@ -132,13 +132,26 @@ def test_admin_role_can_execute_only_the_three_lifecycle_functions():
     assert "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA rag_control" in script
     assert "REVOKE CREATE ON DATABASE" in script
     for name in (
-            "control_issue_service_account", "control_rotate_service_account",
+            "control_approve_service_account_issue",
+            "control_approve_service_account_rotation",
+            "control_cancel_service_account_approval",
             "control_revoke_service_account"):
         assert f"GRANT EXECUTE ON FUNCTION rag_control.{name}" in script
+    for name in (
+            "control_list_redeemable_service_account_approvals",
+            "control_redeem_service_account_issue",
+            "control_redeem_service_account_rotation"):
+        assert f"GRANT EXECUTE ON FUNCTION rag_control.{name}" not in script
+    for forbidden in (
+            "control_issue_service_account", "control_rotate_service_account"):
+        assert f"GRANT EXECUTE ON FUNCTION rag_control.{forbidden}" not in script
     assert "GRANT INSERT" not in script
     assert "GRANT UPDATE" not in script
     assert "GRANT DELETE" not in script
     assert "control_resolve_identity" not in script
+    assert not (ROOT / "scripts" / "init_control_redeemer_role.sh").exists()
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "PG_CONTROL_REDEMPTION_DSN" not in env_example
 
 
 def test_admin_connection_never_falls_back_to_runtime_or_data(monkeypatch):
@@ -150,7 +163,9 @@ def test_admin_connection_never_falls_back_to_runtime_or_data(monkeypatch):
         db.get_admin_pool()
 
 
-def _role_facts(role_name, *, runtime):
+def _role_facts(role_name, *, kind):
+    runtime = kind == "runtime"
+    admin = kind == "admin"
     return {
         "role_name": role_name,
         "session_role": role_name,
@@ -167,46 +182,51 @@ def _role_facts(role_name, *, runtime):
         "identity_execute": runtime,
         "operator_execute": runtime,
         "service_execute": runtime,
-        "issue_execute": not runtime,
-        "rotate_execute": not runtime,
-        "revoke_execute": not runtime,
+        "issue_execute": False,
+        "rotate_execute": False,
+        "revoke_execute": admin,
+        "approve_issue_execute": admin,
+        "approve_rotate_execute": admin,
+        "list_approvals_execute": False,
+        "cancel_approval_execute": admin,
+        "redeem_issue_execute": False,
+        "redeem_rotate_execute": False,
         "unexpected_function_execute": False,
     }
 
 
 def test_each_pool_proves_its_exact_role_and_privilege_shape():
     db._configure_runtime_connection(_Connection([
-        _role_facts("rag_control_runtime", runtime=True)]))
+        _role_facts("rag_control_runtime", kind="runtime")]))
     db._configure_admin_connection(_Connection([
-        _role_facts("rag_control_admin", runtime=False)]))
-
+        _role_facts("rag_control_admin", kind="admin")]))
     for configure, row in (
             (db._configure_runtime_connection,
-             _role_facts("rag_control_admin", runtime=True)),
+             _role_facts("rag_control_admin", kind="runtime")),
             (db._configure_admin_connection,
-             _role_facts("rag_control_runtime", runtime=False)),
+             _role_facts("rag_control_runtime", kind="admin")),
             (db._configure_runtime_connection, {
-                **_role_facts("rag_control_runtime", runtime=True),
+                **_role_facts("rag_control_runtime", kind="runtime"),
                 "issue_execute": True,
             }),
             (db._configure_admin_connection, {
-                **_role_facts("rag_control_admin", runtime=False),
+                **_role_facts("rag_control_admin", kind="admin"),
                 "table_power": True,
             }),
             (db._configure_runtime_connection, {
-                **_role_facts("rag_control_runtime", runtime=True),
+                **_role_facts("rag_control_runtime", kind="runtime"),
                 "unexpected_function_execute": True,
             }),
             (db._configure_admin_connection, {
-                **_role_facts("rag_control_admin", runtime=False),
+                **_role_facts("rag_control_admin", kind="admin"),
                 "role_membership_power": True,
             }),
             (db._configure_runtime_connection, {
-                **_role_facts("rag_control_runtime", runtime=True),
+                **_role_facts("rag_control_runtime", kind="runtime"),
                 "database_create": True,
             }),
             (db._configure_runtime_connection, {
-                **_role_facts("rag_control_runtime", runtime=True),
+                **_role_facts("rag_control_runtime", kind="runtime"),
                 "session_role": "schema_owner",
             })):
         with pytest.raises(db.ControlPlaneRefused):

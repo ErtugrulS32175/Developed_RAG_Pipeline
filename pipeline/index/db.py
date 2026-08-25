@@ -141,6 +141,10 @@ class DocumentRetentionRefused(RuntimeError):
     """A legal-hold or purge transition is not currently permitted."""
 
 
+class ServiceAccountRedemptionRefused(RuntimeError):
+    """The human actor lacked the exact tenant redemption authority."""
+
+
 class PurgeJobOwnershipLost(RuntimeError):
     """A purge worker no longer owns the durable job it is completing."""
 
@@ -1907,6 +1911,38 @@ def _lock_retention_architect(cur, actor_id, expected_policy_epoch=None):
             and int(tenant["policy_epoch"]) != expected_policy_epoch):
         raise OrgPolicyConflict("organizasyon politikasi degisti")
     return actor, tenant
+
+
+def lock_service_account_redeemer(conn, *, actor_id, expected_policy_epoch):
+    """Lock and prove active architect plus active tenant-admin membership."""
+    actor = _retention_uuid(actor_id, "actor_id")
+    epoch = _retention_positive(expected_policy_epoch, "expected_policy_epoch")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT tenant.id AS tenant_id, tenant.policy_epoch "
+            "FROM org_tenants tenant JOIN org_architects architect "
+            "ON architect.tenant_id = tenant.id "
+            "JOIN org_memberships membership "
+            "ON membership.tenant_id = tenant.id "
+            "AND membership.identity_id = architect.identity_id "
+            "WHERE tenant.id = rag_effective_tenant() "
+            "AND architect.identity_id = %s AND architect.active = true "
+            "AND membership.identity_id = %s "
+            "AND membership.state = 'active' "
+            "AND membership.app_role = 'admin' "
+            "AND rag_effective_actor() = %s "
+            "FOR UPDATE OF tenant, architect, membership",
+            (actor, actor, actor))
+        row = cur.fetchone()
+    if row is None:
+        raise ServiceAccountRedemptionRefused(
+            "servis hesabi teslim yetkisi yok")
+    if set(row) != {"tenant_id", "policy_epoch"}:
+        raise ServiceAccountRedemptionRefused(
+            "servis hesabi teslim yetkisi gecersiz")
+    if int(row["policy_epoch"]) != epoch:
+        raise OrgPolicyConflict("organizasyon politikasi degisti")
+    return {"tenant_id": row["tenant_id"], "policy_epoch": epoch}
 
 
 def get_tenant_retention_policy(conn, *, actor_id):

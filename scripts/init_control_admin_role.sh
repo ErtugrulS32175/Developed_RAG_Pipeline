@@ -25,12 +25,14 @@ GRANT USAGE ON SCHEMA rag_control TO rag_control_admin;
 REVOKE ALL ON ALL TABLES IN SCHEMA rag_control FROM rag_control_admin;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA rag_control FROM rag_control_admin;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA rag_control FROM rag_control_admin;
-GRANT EXECUTE ON FUNCTION rag_control.control_issue_service_account(
-    integer, bytea, uuid, uuid, bytea, text[], timestamptz, timestamptz,
-    text, bytea, bytea) TO rag_control_admin;
-GRANT EXECUTE ON FUNCTION rag_control.control_rotate_service_account(
-    integer, bytea, uuid, uuid, bigint, bytea, timestamptz, text, bytea,
-    bytea)
+GRANT EXECUTE ON FUNCTION rag_control.control_approve_service_account_issue(
+    integer, bytea, uuid, uuid, uuid, text[], timestamptz, timestamptz,
+    bigint, text, bytea, bytea) TO rag_control_admin;
+GRANT EXECUTE ON FUNCTION rag_control.control_approve_service_account_rotation(
+    integer, bytea, uuid, uuid, uuid, bigint, timestamptz, bigint, text,
+    bytea, bytea) TO rag_control_admin;
+GRANT EXECUTE ON FUNCTION rag_control.control_cancel_service_account_approval(
+    integer, bytea, uuid, uuid, uuid, bigint, text)
     TO rag_control_admin;
 GRANT EXECUTE ON FUNCTION rag_control.control_revoke_service_account(
     integer, bytea, uuid, uuid, bigint, text, bytea, bytea)

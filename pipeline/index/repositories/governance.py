@@ -12,6 +12,7 @@ repository = BoundedRepository(
         "list_document_purge_jobs",
         "list_org_audit_events",
         "list_retention_documents",
+        "lock_service_account_redeemer",
         "org_context",
         "org_topology",
         "record_org_decision",

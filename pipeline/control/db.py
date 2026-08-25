@@ -8,7 +8,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -17,7 +17,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 
-CONTROL_SCHEMA_VERSION = 3
+CONTROL_SCHEMA_VERSION = 4
 _SCHEMA_LOCK_NAME = "ragtest-control-schema-migration"
 _SCHEMA_MONOTONIC_GUARD_DDL = """
 CREATE OR REPLACE FUNCTION rag_control.control_guard_schema_monotonic()
@@ -112,6 +112,29 @@ SELECT current_user AS role_name,
        has_function_privilege(current_user,
            'rag_control.control_revoke_service_account(integer,bytea,uuid,uuid,'
            'bigint,text,bytea,bytea)', 'EXECUTE') AS revoke_execute,
+       has_function_privilege(current_user,
+           'rag_control.control_approve_service_account_issue('
+           'integer,bytea,uuid,uuid,uuid,text[],timestamptz,timestamptz,'
+           'bigint,text,bytea,bytea)', 'EXECUTE') AS approve_issue_execute,
+       has_function_privilege(current_user,
+           'rag_control.control_approve_service_account_rotation('
+           'integer,bytea,uuid,uuid,uuid,bigint,timestamptz,bigint,text,'
+           'bytea,bytea)', 'EXECUTE') AS approve_rotate_execute,
+       has_function_privilege(current_user,
+           'rag_control.control_list_redeemable_service_account_approvals('
+           'uuid,integer)', 'EXECUTE') AS list_approvals_execute,
+       has_function_privilege(current_user,
+           'rag_control.control_cancel_service_account_approval('
+           'integer,bytea,uuid,uuid,uuid,bigint,text)', 'EXECUTE')
+           AS cancel_approval_execute,
+       has_function_privilege(current_user,
+           'rag_control.control_redeem_service_account_issue('
+           'uuid,uuid,uuid,bigint,bytea,bigint,bytea,bytea,bytea)', 'EXECUTE')
+           AS redeem_issue_execute,
+       has_function_privilege(current_user,
+           'rag_control.control_redeem_service_account_rotation('
+           'uuid,uuid,uuid,bigint,bytea,bigint,bytea,bytea,bytea)', 'EXECUTE')
+           AS redeem_rotate_execute,
        EXISTS (
            SELECT 1
            FROM pg_catalog.pg_proc AS procedure
@@ -130,17 +153,20 @@ SELECT current_user AS role_name,
                       'integer,bytea)'::regprocedure,
                       'rag_control.control_resolve_service_account('
                       'uuid,integer,bytea)'::regprocedure))
-                 OR (current_user = 'rag_control_admin'
-                     AND procedure.oid IN (
-                         'rag_control.control_issue_service_account('
-                         'integer,bytea,uuid,uuid,bytea,text[],timestamptz,'
-                         'timestamptz,text,bytea,bytea)'::regprocedure,
-                         'rag_control.control_rotate_service_account('
-                         'integer,bytea,uuid,uuid,bigint,bytea,timestamptz,'
-                         'text,bytea,bytea)'::regprocedure,
-                         'rag_control.control_revoke_service_account('
+                  OR (current_user = 'rag_control_admin'
+                      AND procedure.oid IN (
+                          'rag_control.control_revoke_service_account('
                          'integer,bytea,uuid,uuid,bigint,text,bytea,'
-                         'bytea)'::regprocedure))
+                         'bytea)'::regprocedure,
+                         'rag_control.control_approve_service_account_issue('
+                         'integer,bytea,uuid,uuid,uuid,text[],timestamptz,'
+                         'timestamptz,bigint,text,bytea,bytea)'::regprocedure,
+                         'rag_control.control_approve_service_account_rotation('
+                         'integer,bytea,uuid,uuid,uuid,bigint,timestamptz,'
+                          'bigint,text,bytea,bytea)'::regprocedure,
+                          'rag_control.control_cancel_service_account_approval('
+                          'integer,bytea,uuid,uuid,uuid,bigint,text)'
+                          ::regprocedure))
              )
        ) AS unexpected_function_execute
 FROM pg_catalog.pg_roles AS role
@@ -210,6 +236,33 @@ class PlatformOperator:
     operator_id: uuid.UUID
     role: str
     revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceAccountApproval:
+    approval_id: uuid.UUID
+    tenant_id: uuid.UUID
+    service_account_id: uuid.UUID
+    action: str
+    state: str
+    approval_revision: int
+    reason_code: str
+    scopes: tuple[str, ...] | None
+    account_expires_at: datetime | None
+    credential_expires_at: datetime
+    expected_account_revision: int | None
+    control_policy_revision: int
+    expires_at: datetime
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceAccountRedemption:
+    service_account_id: uuid.UUID
+    account_revision: int
+    credential_version: int
+    account_expires_at: datetime
+    credential_expires_at: datetime
 
 
 def _required_dsn(name: str) -> str:
@@ -307,6 +360,10 @@ def _configure_runtime_connection(conn) -> None:
         "operator_execute": True, "service_execute": True,
         "issue_execute": False, "rotate_execute": False,
         "revoke_execute": False, "unexpected_function_execute": False,
+        "approve_issue_execute": False, "approve_rotate_execute": False,
+        "list_approvals_execute": False,
+        "cancel_approval_execute": False,
+        "redeem_issue_execute": False, "redeem_rotate_execute": False,
     })
 
 
@@ -320,8 +377,11 @@ def _configure_admin_connection(conn) -> None:
         "schema_state_select": True,
         "tenant_facts_execute": False, "identity_execute": False,
         "operator_execute": False, "service_execute": False,
-        "issue_execute": True, "rotate_execute": True,
+        "issue_execute": False, "rotate_execute": False,
         "revoke_execute": True, "unexpected_function_execute": False,
+        "approve_issue_execute": True, "approve_rotate_execute": True,
+        "list_approvals_execute": False, "cancel_approval_execute": True,
+        "redeem_issue_execute": False, "redeem_rotate_execute": False,
     })
 
 
@@ -641,6 +701,334 @@ def _mutation_revision(conn, query: str, params: tuple) -> int:
             or type(row[0]) is not int or row[0] < 1):
         raise ControlPlaneRefused("service account lifecycle result is invalid")
     return row[0]
+
+
+def _positive_revision(value, name: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ControlPlaneRefused(f"{name} is invalid")
+    return value
+
+
+def _approval_created(conn, query: str, params: tuple) -> dict:
+    try:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+    except psycopg.Error as exc:
+        if exc.sqlstate == "42501":
+            raise ControlPlaneDenied("service account approval denied") from None
+        if exc.sqlstate in {"40001", "23505"}:
+            raise ControlPlaneConflict(
+                "service account approval conflict") from None
+        raise ControlPlaneRefused("service account approval refused") from None
+    if (len(rows) != 1 or type(rows[0]) is not dict
+            or set(rows[0]) != {
+                "approval_revision", "control_policy_revision",
+                "created_at", "expires_at"}):
+        raise ControlPlaneRefused("service account approval result is invalid")
+    row = rows[0]
+    _positive_revision(row["approval_revision"], "approval_revision")
+    _positive_revision(
+        row["control_policy_revision"], "control_policy_revision")
+    created = _expiry(row["created_at"], "created_at")
+    expiry = _expiry(row["expires_at"], "expires_at")
+    if (row["approval_revision"] != 1 or expiry <= created
+            or expiry - created > timedelta(minutes=15)):
+        raise ControlPlaneRefused("service account approval result is invalid")
+    return row
+
+
+def approve_service_account_issue(
+        conn, *, operator_key_version: int, operator_digest: bytes,
+        approval_id, tenant_id, account_id, scopes: tuple[str, ...],
+        account_expires_at: datetime, credential_expires_at: datetime,
+        expected_policy_revision: int, reason_code: str,
+        ) -> ServiceAccountApproval:
+    key_version, operator_proof = _operator_proof(
+        operator_key_version, operator_digest)
+    approval = _uuid_value(approval_id, "approval_id")
+    tenant = _uuid_value(tenant_id, "tenant_id")
+    account = _uuid_value(account_id, "service_account_id")
+    canonical_scopes = _scope_tuple(scopes)
+    account_expiry = _expiry(account_expires_at, "account_expires_at")
+    credential_expiry = _expiry(
+        credential_expires_at, "credential_expires_at")
+    policy_revision = _positive_revision(
+        expected_policy_revision, "expected_policy_revision")
+    reason = _reason(reason_code, SERVICE_ACCOUNT_ISSUE_REASONS)
+    facts = {
+        "account_expires_at": account_expiry.isoformat(),
+        "approval_id": str(approval), "approval_revision": 1,
+        "control_policy_revision": policy_revision,
+        "credential_expires_at": credential_expiry.isoformat(),
+        "reason_code": reason, "scopes": list(canonical_scopes),
+        "service_account_id": str(account), "state": "approved",
+        "tenant_id": str(tenant),
+    }
+    row = _approval_created(
+        conn,
+        "SELECT * FROM rag_control.control_approve_service_account_issue("
+        "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (key_version, operator_proof, approval, tenant, account,
+         list(canonical_scopes), account_expiry, credential_expiry,
+         policy_revision, reason,
+         _audit_digest("service_account_issue_approval_request", facts),
+         _audit_digest("service_account_issue_approval_result", facts)),
+    )
+    if row["control_policy_revision"] != policy_revision:
+        raise ControlPlaneRefused("service account approval result is invalid")
+    return ServiceAccountApproval(
+        approval, tenant, account, "issue", "approved", 1, reason,
+        canonical_scopes, account_expiry, credential_expiry, None,
+        policy_revision, _expiry(row["expires_at"], "expires_at"),
+        _expiry(row["created_at"], "created_at"),
+    )
+
+
+def approve_service_account_rotation(
+        conn, *, operator_key_version: int, operator_digest: bytes,
+        approval_id, tenant_id, account_id, expected_account_revision: int,
+        credential_expires_at: datetime, expected_policy_revision: int,
+        reason_code: str) -> ServiceAccountApproval:
+    key_version, operator_proof = _operator_proof(
+        operator_key_version, operator_digest)
+    approval = _uuid_value(approval_id, "approval_id")
+    tenant = _uuid_value(tenant_id, "tenant_id")
+    account = _uuid_value(account_id, "service_account_id")
+    account_revision = _positive_revision(
+        expected_account_revision, "expected_account_revision")
+    credential_expiry = _expiry(
+        credential_expires_at, "credential_expires_at")
+    policy_revision = _positive_revision(
+        expected_policy_revision, "expected_policy_revision")
+    reason = _reason(reason_code, SERVICE_ACCOUNT_ROTATE_REASONS)
+    facts = {
+        "approval_id": str(approval), "approval_revision": 1,
+        "control_policy_revision": policy_revision,
+        "credential_expires_at": credential_expiry.isoformat(),
+        "expected_account_revision": account_revision,
+        "reason_code": reason, "service_account_id": str(account),
+        "state": "approved", "tenant_id": str(tenant),
+    }
+    row = _approval_created(
+        conn,
+        "SELECT * FROM rag_control.control_approve_service_account_rotation("
+        "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (key_version, operator_proof, approval, tenant, account,
+         account_revision, credential_expiry, policy_revision, reason,
+         _audit_digest("service_account_rotate_approval_request", facts),
+         _audit_digest("service_account_rotate_approval_result", facts)),
+    )
+    if row["control_policy_revision"] != policy_revision:
+        raise ControlPlaneRefused("service account approval result is invalid")
+    return ServiceAccountApproval(
+        approval, tenant, account, "rotate", "approved", 1, reason,
+        None, None, credential_expiry, account_revision, policy_revision,
+        _expiry(row["expires_at"], "expires_at"),
+        _expiry(row["created_at"], "created_at"),
+    )
+
+
+def _approval_from_row(row) -> ServiceAccountApproval:
+    expected = {
+        "approval_id", "tenant_id", "service_account_id", "action", "state",
+        "approval_revision", "reason_code", "scopes", "account_expires_at",
+        "credential_expires_at", "expected_account_revision",
+        "control_policy_revision", "expires_at", "created_at",
+    }
+    if type(row) is not dict or set(row) != expected:
+        raise ControlPlaneRefused("service account approval result is invalid")
+    action = row["action"]
+    if action not in {"issue", "rotate"} or row["state"] != "approved":
+        raise ControlPlaneRefused("service account approval result is invalid")
+    approval = _uuid_value(row["approval_id"], "approval_id")
+    tenant = _uuid_value(row["tenant_id"], "tenant_id")
+    account = _uuid_value(row["service_account_id"], "service_account_id")
+    revision = _positive_revision(row["approval_revision"], "approval_revision")
+    policy = _positive_revision(
+        row["control_policy_revision"], "control_policy_revision")
+    reason_allowed = (SERVICE_ACCOUNT_ISSUE_REASONS if action == "issue"
+                      else SERVICE_ACCOUNT_ROTATE_REASONS)
+    reason = _reason(row["reason_code"], reason_allowed)
+    scopes_value = row["scopes"]
+    if action == "issue":
+        if type(scopes_value) is not list:
+            raise ControlPlaneRefused(
+                "service account approval result is invalid")
+        scopes = _scope_tuple(tuple(scopes_value))
+        account_expiry = _expiry(
+            row["account_expires_at"], "account_expires_at")
+        if row["expected_account_revision"] is not None:
+            raise ControlPlaneRefused(
+                "service account approval result is invalid")
+        account_revision = None
+    else:
+        if scopes_value is not None or row["account_expires_at"] is not None:
+            raise ControlPlaneRefused(
+                "service account approval result is invalid")
+        scopes = None
+        account_expiry = None
+        account_revision = _positive_revision(
+            row["expected_account_revision"], "expected_account_revision")
+    credential_expiry = _expiry(
+        row["credential_expires_at"], "credential_expires_at")
+    created = _expiry(row["created_at"], "created_at")
+    expires = _expiry(row["expires_at"], "expires_at")
+    measured_at = datetime.now(timezone.utc)
+    if (revision != 1 or expires <= created
+            or expires - created > timedelta(minutes=15)
+            or expires <= measured_at
+            or created > measured_at + timedelta(seconds=5)
+            or credential_expiry <= created
+            or (account_expiry is not None
+                and account_expiry < credential_expiry)):
+        raise ControlPlaneRefused("service account approval result is invalid")
+    return ServiceAccountApproval(
+        approval, tenant, account, action, "approved", revision, reason,
+        scopes, account_expiry, credential_expiry, account_revision, policy,
+        expires, created,
+    )
+
+
+def list_redeemable_service_account_approvals(
+        conn, tenant_id, *, limit: int = 100,
+        ) -> tuple[ServiceAccountApproval, ...]:
+    """Read the offline queue; no deployable role owns this grant yet."""
+    tenant = _uuid_value(tenant_id, "tenant_id")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ControlPlaneRefused("limit is invalid")
+    try:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                "SELECT * FROM rag_control."
+                "control_list_redeemable_service_account_approvals(%s, %s)",
+                (tenant, limit))
+            rows = cursor.fetchall()
+    except psycopg.Error:
+        raise ControlPlaneRefused("service account approvals refused") from None
+    if len(rows) > limit:
+        raise ControlPlaneRefused("service account approvals result is invalid")
+    approvals = tuple(_approval_from_row(row) for row in rows)
+    if (any(item.tenant_id != tenant for item in approvals)
+            or len({item.approval_id for item in approvals}) != len(approvals)
+            or list(approvals) != sorted(
+                approvals, key=lambda item: (
+                    item.created_at, item.approval_id.int))):
+        raise ControlPlaneRefused("service account approvals result is invalid")
+    return approvals
+
+
+def cancel_service_account_approval(
+        conn, *, operator_key_version: int, operator_digest: bytes,
+        approval_id, tenant_id, account_id,
+        expected_approval_revision: int, reason_code: str) -> int:
+    key_version, operator_proof = _operator_proof(
+        operator_key_version, operator_digest)
+    approval = _uuid_value(approval_id, "approval_id")
+    tenant = _uuid_value(tenant_id, "tenant_id")
+    account = _uuid_value(account_id, "service_account_id")
+    revision = _positive_revision(
+        expected_approval_revision, "expected_approval_revision")
+    reason = _reason(reason_code, (
+        "access_removed", "approval_cancelled", "security_response",
+        "tenant_suspension"))
+    return _mutation_revision(
+        conn,
+        "SELECT rag_control.control_cancel_service_account_approval("
+        "%s, %s, %s, %s, %s, %s, %s)",
+        (key_version, operator_proof, approval, tenant, account, revision,
+         reason),
+    )
+
+
+def _redemption_result(conn, query: str, params: tuple,
+                       account_id: uuid.UUID) -> ServiceAccountRedemption:
+    try:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+    except psycopg.Error as exc:
+        if exc.sqlstate in {"40001", "23505"}:
+            raise ControlPlaneConflict(
+                "service account redemption conflict") from None
+        if exc.sqlstate == "42501":
+            raise ControlPlaneDenied(
+                "service account redemption denied") from None
+        raise ControlPlaneRefused("service account redemption refused") from None
+    expected = {
+        "account_revision", "credential_version", "account_expires_at",
+        "credential_expires_at",
+    }
+    if len(rows) != 1 or type(rows[0]) is not dict or set(rows[0]) != expected:
+        raise ControlPlaneRefused("service account redemption result is invalid")
+    row = rows[0]
+    account_revision = _positive_revision(
+        row["account_revision"], "account_revision")
+    credential_version = _positive_revision(
+        row["credential_version"], "credential_version")
+    account_expiry = _expiry(row["account_expires_at"], "account_expires_at")
+    credential_expiry = _expiry(
+        row["credential_expires_at"], "credential_expires_at")
+    if (credential_version != account_revision
+            or credential_expiry > account_expiry):
+        raise ControlPlaneRefused("service account redemption result is invalid")
+    return ServiceAccountRedemption(
+        account_id, account_revision, credential_version,
+        account_expiry, credential_expiry)
+
+
+def redeem_service_account_approval(
+        conn, approval: ServiceAccountApproval, *,
+        tenant_actor_digest: bytes, org_policy_epoch: int,
+        credential_digest: bytes) -> ServiceAccountRedemption:
+    """Consume offline authority after a separately proven tenant gate.
+
+    The SQL function is deliberately revoked from every online role until a
+    cross-database actor assertion can bind that gate to this transaction.
+    """
+    if type(approval) is not ServiceAccountApproval:
+        raise ControlPlaneRefused("service account approval is invalid")
+    if (approval.action not in {"issue", "rotate"}
+            or approval.state != "approved"
+            or approval.approval_revision != 1):
+        raise ControlPlaneRefused("service account approval is invalid")
+    actor_digest = _credential_digest(tenant_actor_digest)
+    policy_epoch = _positive_revision(org_policy_epoch, "org_policy_epoch")
+    credential = _credential_digest(credential_digest)
+    next_revision = (1 if approval.action == "issue"
+                     else _positive_revision(
+                         approval.expected_account_revision,
+                         "expected_account_revision") + 1)
+    request_facts = {
+        "approval_id": str(approval.approval_id),
+        "approval_revision": approval.approval_revision,
+        "credential_digest": credential.hex(),
+        "org_policy_epoch": policy_epoch,
+        "service_account_id": str(approval.service_account_id),
+        "tenant_id": str(approval.tenant_id),
+    }
+    result_facts = {
+        **request_facts, "account_revision": next_revision,
+        "credential_version": next_revision, "state": "active",
+    }
+    query = {
+        "issue": (
+            "SELECT * FROM rag_control.control_redeem_service_account_issue("
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s)"),
+        "rotate": (
+            "SELECT * FROM rag_control.control_redeem_service_account_rotation("
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s)"),
+    }[approval.action]
+    return _redemption_result(
+        conn,
+        query,
+        (approval.approval_id, approval.tenant_id,
+         approval.service_account_id, approval.approval_revision,
+         actor_digest, policy_epoch, credential,
+         _audit_digest("service_account_redemption_request", request_facts),
+         _audit_digest("service_account_redemption_result", result_facts)),
+        approval.service_account_id,
+    )
 
 
 def issue_service_account(

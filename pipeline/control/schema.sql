@@ -169,6 +169,12 @@ CREATE TABLE IF NOT EXISTS rag_control.control_service_account_events (
     operator_id uuid NOT NULL
         REFERENCES rag_control.control_platform_operators(operator_id)
         ON DELETE RESTRICT,
+    actor_kind text NOT NULL DEFAULT 'platform_security' CHECK (
+        actor_kind IN ('platform_security', 'tenant_org_admin')),
+    tenant_actor_digest bytea CHECK (
+        tenant_actor_digest IS NULL
+        OR octet_length(tenant_actor_digest) = 32),
+    org_policy_epoch bigint CHECK (org_policy_epoch > 0),
     target_tenant_id uuid NOT NULL,
     service_account_id uuid NOT NULL,
     action text NOT NULL CHECK (action IN (
@@ -185,7 +191,160 @@ CREATE TABLE IF NOT EXISTS rag_control.control_service_account_events (
         CHECK (octet_length(resulting_fact_digest) = 32),
     FOREIGN KEY (target_tenant_id, service_account_id)
         REFERENCES rag_control.control_service_accounts(
-            tenant_id, service_account_id) ON DELETE RESTRICT
+            tenant_id, service_account_id) ON DELETE RESTRICT,
+    CHECK (
+        (actor_kind = 'platform_security'
+         AND tenant_actor_digest IS NULL AND org_policy_epoch IS NULL)
+        OR
+        (actor_kind = 'tenant_org_admin'
+         AND tenant_actor_digest IS NOT NULL AND org_policy_epoch IS NOT NULL))
+);
+
+ALTER TABLE rag_control.control_service_account_events
+    ADD COLUMN IF NOT EXISTS actor_kind text NOT NULL
+        DEFAULT 'platform_security';
+ALTER TABLE rag_control.control_service_account_events
+    ADD COLUMN IF NOT EXISTS tenant_actor_digest bytea;
+ALTER TABLE rag_control.control_service_account_events
+    ADD COLUMN IF NOT EXISTS org_policy_epoch bigint;
+ALTER TABLE rag_control.control_service_account_events
+    DROP CONSTRAINT IF EXISTS control_service_account_events_actor_kind_check;
+ALTER TABLE rag_control.control_service_account_events
+    ADD CONSTRAINT control_service_account_events_actor_kind_check CHECK (
+        actor_kind IN ('platform_security', 'tenant_org_admin'));
+ALTER TABLE rag_control.control_service_account_events
+    DROP CONSTRAINT IF EXISTS control_service_account_events_actor_digest_check;
+ALTER TABLE rag_control.control_service_account_events
+    ADD CONSTRAINT control_service_account_events_actor_digest_check CHECK (
+        tenant_actor_digest IS NULL
+        OR octet_length(tenant_actor_digest) = 32);
+ALTER TABLE rag_control.control_service_account_events
+    DROP CONSTRAINT IF EXISTS control_service_account_events_epoch_check;
+ALTER TABLE rag_control.control_service_account_events
+    ADD CONSTRAINT control_service_account_events_epoch_check CHECK (
+        org_policy_epoch IS NULL OR org_policy_epoch > 0);
+ALTER TABLE rag_control.control_service_account_events
+    DROP CONSTRAINT IF EXISTS control_service_account_events_actor_shape_check;
+ALTER TABLE rag_control.control_service_account_events
+    ADD CONSTRAINT control_service_account_events_actor_shape_check CHECK (
+        (actor_kind = 'platform_security'
+         AND tenant_actor_digest IS NULL AND org_policy_epoch IS NULL)
+        OR
+        (actor_kind = 'tenant_org_admin'
+         AND tenant_actor_digest IS NOT NULL AND org_policy_epoch IS NOT NULL));
+
+CREATE TABLE IF NOT EXISTS rag_control.control_service_account_approvals (
+    approval_id uuid PRIMARY KEY,
+    tenant_id uuid NOT NULL REFERENCES rag_control.control_tenants(tenant_id)
+        ON DELETE RESTRICT,
+    service_account_id uuid NOT NULL,
+    action text NOT NULL CHECK (action IN ('issue', 'rotate')),
+    state text NOT NULL CHECK (state IN (
+        'approved', 'redeemed', 'cancelled')),
+    approval_revision bigint NOT NULL DEFAULT 1 CHECK (approval_revision > 0),
+    platform_operator_id uuid NOT NULL
+        REFERENCES rag_control.control_platform_operators(operator_id)
+        ON DELETE RESTRICT,
+    reason_code text NOT NULL CHECK (reason_code IN (
+        'security_provisioning', 'incident_response',
+        'scheduled_rotation', 'suspected_compromise')),
+    scopes text[],
+    account_expires_at timestamptz,
+    credential_expires_at timestamptz NOT NULL,
+    expected_account_revision bigint CHECK (expected_account_revision > 0),
+    control_policy_revision bigint NOT NULL CHECK (control_policy_revision > 0),
+    expires_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    redeemed_at timestamptz,
+    request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+    resulting_fact_digest bytea NOT NULL
+        CHECK (octet_length(resulting_fact_digest) = 32),
+    UNIQUE (approval_id, tenant_id, service_account_id),
+    CHECK (credential_expires_at > created_at),
+    CHECK (expires_at > created_at
+           AND expires_at <= created_at + interval '15 minutes'),
+    CHECK (
+        (action = 'issue'
+         AND scopes IS NOT NULL AND cardinality(scopes) BETWEEN 1 AND 6
+         AND account_expires_at IS NOT NULL
+         AND expected_account_revision IS NULL)
+        OR
+        (action = 'rotate'
+         AND scopes IS NULL AND account_expires_at IS NULL
+         AND expected_account_revision IS NOT NULL)),
+    CHECK (
+        (state = 'approved' AND approval_revision = 1
+         AND redeemed_at IS NULL)
+        OR
+        (state = 'redeemed' AND approval_revision = 2
+         AND redeemed_at IS NOT NULL)
+        OR
+        (state = 'cancelled' AND approval_revision = 2
+         AND redeemed_at IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS control_one_pending_account_approval
+ON rag_control.control_service_account_approvals (service_account_id)
+WHERE state = 'approved';
+
+CREATE TABLE IF NOT EXISTS rag_control.control_service_account_approval_events (
+    sequence_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_id uuid NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    occurred_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    approval_id uuid NOT NULL,
+    target_tenant_id uuid NOT NULL,
+    service_account_id uuid NOT NULL,
+    action text NOT NULL CHECK (action IN (
+        'approval_created', 'approval_redeemed', 'approval_cancelled')),
+    reason_code text NOT NULL CHECK (reason_code IN (
+        'security_provisioning', 'incident_response',
+        'scheduled_rotation', 'suspected_compromise',
+        'approval_redeemed', 'approval_expired', 'approval_cancelled',
+        'service_account_revoked', 'security_response',
+        'tenant_suspension', 'access_removed')),
+    actor_kind text NOT NULL CHECK (actor_kind IN (
+        'platform_security', 'tenant_org_admin', 'system')),
+    platform_operator_id uuid
+        REFERENCES rag_control.control_platform_operators(operator_id)
+        ON DELETE RESTRICT,
+    tenant_actor_digest bytea
+        CHECK (tenant_actor_digest IS NULL
+               OR octet_length(tenant_actor_digest) = 32),
+    org_policy_epoch bigint CHECK (org_policy_epoch > 0),
+    prior_state text CHECK (prior_state IS NULL OR prior_state = 'approved'),
+    resulting_state text NOT NULL CHECK (resulting_state IN (
+        'approved', 'redeemed', 'cancelled')),
+    prior_revision bigint CHECK (prior_revision > 0),
+    approval_revision bigint NOT NULL CHECK (approval_revision > 0),
+    approval_created_at timestamptz NOT NULL,
+    approval_expires_at timestamptz NOT NULL,
+    request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+    resulting_fact_digest bytea NOT NULL
+        CHECK (octet_length(resulting_fact_digest) = 32),
+    FOREIGN KEY (approval_id, target_tenant_id, service_account_id)
+        REFERENCES rag_control.control_service_account_approvals(
+            approval_id, tenant_id, service_account_id) ON DELETE RESTRICT,
+    CHECK (
+        (action = 'approval_created'
+         AND prior_state IS NULL AND prior_revision IS NULL
+         AND resulting_state = 'approved' AND approval_revision = 1)
+        OR
+        (action IN ('approval_redeemed', 'approval_cancelled')
+         AND prior_state = 'approved' AND prior_revision = 1
+         AND resulting_state IN ('redeemed', 'cancelled')
+         AND approval_revision = 2)),
+    CHECK (
+        (actor_kind = 'platform_security'
+         AND platform_operator_id IS NOT NULL
+         AND tenant_actor_digest IS NULL AND org_policy_epoch IS NULL)
+        OR
+        (actor_kind = 'tenant_org_admin'
+         AND platform_operator_id IS NULL
+         AND tenant_actor_digest IS NOT NULL AND org_policy_epoch IS NOT NULL)
+        OR
+        (actor_kind = 'system'
+         AND platform_operator_id IS NULL
+         AND tenant_actor_digest IS NULL AND org_policy_epoch IS NULL))
 );
 
 CREATE TABLE IF NOT EXISTS rag_control.control_admin_events (
@@ -227,6 +386,49 @@ BEGIN
 END
 $events_immutable$;
 
+CREATE OR REPLACE FUNCTION
+rag_control.control_seal_service_account_approval_event()
+RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, rag_control AS $seal_approval_event$
+DECLARE
+    actor_digest text;
+    request_facts jsonb;
+    result_facts jsonb;
+BEGIN
+    actor_digest := CASE
+        WHEN NEW.tenant_actor_digest IS NULL THEN NULL
+        ELSE encode(NEW.tenant_actor_digest, 'hex')
+    END;
+    request_facts := jsonb_build_array(
+        'approval_event_request_v1', NEW.approval_id::text,
+        NEW.target_tenant_id::text, NEW.service_account_id::text,
+        NEW.action, NEW.reason_code, NEW.actor_kind,
+        NEW.platform_operator_id::text, actor_digest,
+        NEW.org_policy_epoch, NEW.prior_state, NEW.prior_revision);
+    result_facts := jsonb_build_array(
+        'approval_event_result_v1', NEW.approval_id::text,
+        NEW.target_tenant_id::text, NEW.service_account_id::text,
+        NEW.action, NEW.reason_code, NEW.actor_kind,
+        NEW.platform_operator_id::text, actor_digest,
+        NEW.org_policy_epoch, NEW.prior_state, NEW.resulting_state,
+        NEW.prior_revision, NEW.approval_revision,
+        extract(epoch FROM NEW.approval_created_at),
+        extract(epoch FROM NEW.approval_expires_at),
+        extract(epoch FROM NEW.occurred_at));
+    NEW.request_digest := sha256(convert_to(request_facts::text, 'UTF8'));
+    NEW.resulting_fact_digest := sha256(
+        convert_to(result_facts::text, 'UTF8'));
+    RETURN NEW;
+END
+$seal_approval_event$;
+
+DROP TRIGGER IF EXISTS control_service_account_approval_events_seal
+    ON rag_control.control_service_account_approval_events;
+CREATE TRIGGER control_service_account_approval_events_seal
+BEFORE INSERT ON rag_control.control_service_account_approval_events
+FOR EACH ROW EXECUTE FUNCTION
+    rag_control.control_seal_service_account_approval_event();
+
 DROP TRIGGER IF EXISTS control_events_immutable_write
     ON rag_control.control_admin_events;
 CREATE TRIGGER control_events_immutable_write
@@ -237,6 +439,12 @@ DROP TRIGGER IF EXISTS control_service_account_events_immutable_write
     ON rag_control.control_service_account_events;
 CREATE TRIGGER control_service_account_events_immutable_write
 BEFORE UPDATE OR DELETE ON rag_control.control_service_account_events
+FOR EACH ROW EXECUTE FUNCTION rag_control.control_events_immutable();
+
+DROP TRIGGER IF EXISTS control_service_account_approval_events_immutable_write
+    ON rag_control.control_service_account_approval_events;
+CREATE TRIGGER control_service_account_approval_events_immutable_write
+BEFORE UPDATE OR DELETE ON rag_control.control_service_account_approval_events
 FOR EACH ROW EXECUTE FUNCTION rag_control.control_events_immutable();
 
 CREATE OR REPLACE FUNCTION rag_control.control_tenant_facts(
@@ -421,6 +629,560 @@ EXCEPTION
 END
 $require_platform_security$;
 
+CREATE OR REPLACE FUNCTION rag_control.control_lock_service_account(
+    requested_account_id uuid)
+RETURNS void
+LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $lock_service_account$
+    SELECT pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(requested_account_id::text, 0))
+$lock_service_account$;
+
+CREATE OR REPLACE FUNCTION rag_control.control_expire_service_account_approval(
+    requested_account_id uuid)
+RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $expire_service_account_approval$
+BEGIN
+    WITH expired AS (
+        UPDATE rag_control.control_service_account_approvals
+        SET state = 'cancelled', approval_revision = 2
+        WHERE service_account_id = requested_account_id
+          AND state = 'approved'
+          AND expires_at <= statement_timestamp()
+        RETURNING *
+    )
+    INSERT INTO rag_control.control_service_account_approval_events (
+        approval_id, target_tenant_id, service_account_id, action,
+        reason_code, actor_kind, prior_state, resulting_state,
+        prior_revision, approval_revision, approval_created_at,
+        approval_expires_at, request_digest, resulting_fact_digest)
+    SELECT approval_id, tenant_id, service_account_id,
+           'approval_cancelled', 'approval_expired', 'system',
+           'approved', 'cancelled', 1, approval_revision, created_at,
+           expires_at, request_digest, resulting_fact_digest
+    FROM expired;
+END
+$expire_service_account_approval$;
+
+CREATE OR REPLACE FUNCTION rag_control.control_approve_service_account_issue(
+    requested_operator_key_version integer,
+    requested_operator_digest bytea,
+    requested_approval_id uuid,
+    requested_tenant_id uuid,
+    requested_account_id uuid,
+    requested_scopes text[],
+    requested_account_expires_at timestamptz,
+    requested_credential_expires_at timestamptz,
+    requested_control_policy_revision bigint,
+    requested_reason_code text,
+    requested_request_digest bytea,
+    requested_resulting_fact_digest bytea)
+RETURNS TABLE (
+    approval_revision bigint,
+    control_policy_revision bigint,
+    created_at timestamptz,
+    expires_at timestamptz)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $approve_service_account_issue$
+DECLARE
+    canonical_scopes text[];
+    resolved_operator_id uuid;
+    tenant_policy_revision bigint;
+BEGIN
+    resolved_operator_id := rag_control.control_require_platform_security(
+        requested_operator_key_version, requested_operator_digest);
+    SELECT array_agg(scope ORDER BY scope) INTO canonical_scopes
+    FROM (SELECT DISTINCT unnest(requested_scopes) AS scope) AS normalized;
+    SELECT tenant.policy_revision INTO tenant_policy_revision
+    FROM rag_control.control_tenants AS tenant
+    WHERE tenant.tenant_id = requested_tenant_id
+      AND tenant.lifecycle = 'active'
+    FOR SHARE;
+    PERFORM rag_control.control_lock_service_account(requested_account_id);
+    PERFORM rag_control.control_expire_service_account_approval(
+        requested_account_id);
+    IF canonical_scopes IS NULL
+       OR requested_scopes <> canonical_scopes
+       OR NOT requested_scopes <@ ARRAY[
+           'rag.query', 'documents.read', 'documents.write',
+           'documents.lifecycle', 'collections.manage',
+           'tables.extract']::text[]
+       OR tenant_policy_revision IS NULL
+       OR tenant_policy_revision <> requested_control_policy_revision
+       OR NOT EXISTS (
+           SELECT 1 FROM rag_control.control_tenant_facts(
+               requested_tenant_id))
+       OR requested_account_expires_at <= statement_timestamp()
+       OR requested_credential_expires_at <= statement_timestamp()
+       OR requested_account_expires_at < requested_credential_expires_at
+       OR requested_account_expires_at >
+          statement_timestamp() + interval '366 days'
+       OR requested_reason_code NOT IN (
+           'security_provisioning', 'incident_response')
+       OR octet_length(requested_request_digest) <> 32
+       OR octet_length(requested_resulting_fact_digest) <> 32
+       OR EXISTS (
+           SELECT 1 FROM rag_control.control_service_accounts
+           WHERE service_account_id = requested_account_id)
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '22023',
+            MESSAGE = 'service_account_approval_invalid';
+    END IF;
+    INSERT INTO rag_control.control_service_account_approvals (
+        approval_id, tenant_id, service_account_id, action, state,
+        platform_operator_id, reason_code, scopes, account_expires_at,
+        credential_expires_at, control_policy_revision, expires_at,
+        request_digest, resulting_fact_digest)
+    VALUES (
+        requested_approval_id, requested_tenant_id, requested_account_id,
+        'issue', 'approved', resolved_operator_id, requested_reason_code,
+        requested_scopes, requested_account_expires_at,
+        requested_credential_expires_at, tenant_policy_revision,
+        statement_timestamp() + interval '15 minutes',
+        requested_request_digest, requested_resulting_fact_digest);
+    INSERT INTO rag_control.control_service_account_approval_events (
+        approval_id, target_tenant_id, service_account_id, action,
+        reason_code, actor_kind, platform_operator_id, prior_state,
+        resulting_state, prior_revision, approval_revision,
+        approval_created_at, approval_expires_at, request_digest,
+        resulting_fact_digest)
+    VALUES (
+        requested_approval_id, requested_tenant_id, requested_account_id,
+        'approval_created', requested_reason_code, 'platform_security',
+        resolved_operator_id, NULL, 'approved', NULL, 1,
+        statement_timestamp(), statement_timestamp() + interval '15 minutes',
+        requested_request_digest, requested_resulting_fact_digest);
+    RETURN QUERY
+    SELECT approval.approval_revision, approval.control_policy_revision,
+           approval.created_at, approval.expires_at
+    FROM rag_control.control_service_account_approvals AS approval
+    WHERE approval.approval_id = requested_approval_id;
+END
+$approve_service_account_issue$;
+
+CREATE OR REPLACE FUNCTION rag_control.control_approve_service_account_rotation(
+    requested_operator_key_version integer,
+    requested_operator_digest bytea,
+    requested_approval_id uuid,
+    requested_tenant_id uuid,
+    requested_account_id uuid,
+    requested_expected_account_revision bigint,
+    requested_credential_expires_at timestamptz,
+    requested_control_policy_revision bigint,
+    requested_reason_code text,
+    requested_request_digest bytea,
+    requested_resulting_fact_digest bytea)
+RETURNS TABLE (
+    approval_revision bigint,
+    control_policy_revision bigint,
+    created_at timestamptz,
+    expires_at timestamptz)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $approve_service_account_rotation$
+DECLARE
+    account_expiry timestamptz;
+    account_revision bigint;
+    resolved_operator_id uuid;
+    tenant_policy_revision bigint;
+BEGIN
+    resolved_operator_id := rag_control.control_require_platform_security(
+        requested_operator_key_version, requested_operator_digest);
+    SELECT tenant.policy_revision INTO tenant_policy_revision
+    FROM rag_control.control_tenants AS tenant
+    WHERE tenant.tenant_id = requested_tenant_id
+      AND tenant.lifecycle = 'active'
+    FOR SHARE;
+    PERFORM rag_control.control_lock_service_account(requested_account_id);
+    PERFORM rag_control.control_expire_service_account_approval(
+        requested_account_id);
+    SELECT account.expires_at, account.revision
+    INTO account_expiry, account_revision
+    FROM rag_control.control_service_accounts AS account
+    WHERE account.service_account_id = requested_account_id
+      AND account.tenant_id = requested_tenant_id
+      AND account.state = 'active'
+    FOR UPDATE;
+    IF account_revision IS NULL
+       OR account_revision <> requested_expected_account_revision
+       OR tenant_policy_revision IS NULL
+       OR tenant_policy_revision <> requested_control_policy_revision
+       OR NOT EXISTS (
+           SELECT 1 FROM rag_control.control_tenant_facts(
+               requested_tenant_id))
+       OR requested_credential_expires_at <= statement_timestamp()
+       OR account_expiry < requested_credential_expires_at
+       OR requested_reason_code NOT IN (
+           'scheduled_rotation', 'suspected_compromise')
+       OR octet_length(requested_request_digest) <> 32
+       OR octet_length(requested_resulting_fact_digest) <> 32
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '40001',
+            MESSAGE = 'service_account_approval_conflict';
+    END IF;
+    INSERT INTO rag_control.control_service_account_approvals (
+        approval_id, tenant_id, service_account_id, action, state,
+        platform_operator_id, reason_code, credential_expires_at,
+        expected_account_revision, control_policy_revision, expires_at,
+        request_digest, resulting_fact_digest)
+    VALUES (
+        requested_approval_id, requested_tenant_id, requested_account_id,
+        'rotate', 'approved', resolved_operator_id, requested_reason_code,
+        requested_credential_expires_at,
+        requested_expected_account_revision, tenant_policy_revision,
+        statement_timestamp() + interval '15 minutes',
+        requested_request_digest, requested_resulting_fact_digest);
+    INSERT INTO rag_control.control_service_account_approval_events (
+        approval_id, target_tenant_id, service_account_id, action,
+        reason_code, actor_kind, platform_operator_id, prior_state,
+        resulting_state, prior_revision, approval_revision,
+        approval_created_at, approval_expires_at, request_digest,
+        resulting_fact_digest)
+    VALUES (
+        requested_approval_id, requested_tenant_id, requested_account_id,
+        'approval_created', requested_reason_code, 'platform_security',
+        resolved_operator_id, NULL, 'approved', NULL, 1,
+        statement_timestamp(), statement_timestamp() + interval '15 minutes',
+        requested_request_digest, requested_resulting_fact_digest);
+    RETURN QUERY
+    SELECT approval.approval_revision, approval.control_policy_revision,
+           approval.created_at, approval.expires_at
+    FROM rag_control.control_service_account_approvals AS approval
+    WHERE approval.approval_id = requested_approval_id;
+END
+$approve_service_account_rotation$;
+
+CREATE OR REPLACE FUNCTION rag_control.control_cancel_service_account_approval(
+    requested_operator_key_version integer,
+    requested_operator_digest bytea,
+    requested_approval_id uuid,
+    requested_tenant_id uuid,
+    requested_account_id uuid,
+    requested_expected_approval_revision bigint,
+    requested_reason_code text)
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $cancel_service_account_approval$
+DECLARE
+    cancelled rag_control.control_service_account_approvals%ROWTYPE;
+    resolved_operator_id uuid;
+BEGIN
+    resolved_operator_id := rag_control.control_require_platform_security(
+        requested_operator_key_version, requested_operator_digest);
+    PERFORM rag_control.control_lock_service_account(requested_account_id);
+    UPDATE rag_control.control_service_account_approvals
+    SET state = 'cancelled', approval_revision = 2
+    WHERE approval_id = requested_approval_id
+      AND tenant_id = requested_tenant_id
+      AND service_account_id = requested_account_id
+      AND state = 'approved'
+      AND approval_revision = requested_expected_approval_revision
+      AND requested_expected_approval_revision = 1
+      AND requested_reason_code IN (
+          'approval_cancelled', 'security_response',
+          'tenant_suspension', 'access_removed')
+    RETURNING * INTO cancelled;
+    IF cancelled.approval_id IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '40001',
+            MESSAGE = 'service_account_approval_conflict';
+    END IF;
+    INSERT INTO rag_control.control_service_account_approval_events (
+        approval_id, target_tenant_id, service_account_id, action,
+        reason_code, actor_kind, platform_operator_id, prior_state,
+        resulting_state, prior_revision, approval_revision,
+        approval_created_at, approval_expires_at, request_digest,
+        resulting_fact_digest)
+    VALUES (
+        cancelled.approval_id, cancelled.tenant_id,
+        cancelled.service_account_id, 'approval_cancelled',
+        requested_reason_code, 'platform_security', resolved_operator_id,
+        'approved', 'cancelled', 1, cancelled.approval_revision,
+        cancelled.created_at, cancelled.expires_at,
+        cancelled.request_digest, cancelled.resulting_fact_digest);
+    RETURN cancelled.approval_revision;
+END
+$cancel_service_account_approval$;
+
+CREATE OR REPLACE FUNCTION
+rag_control.control_list_redeemable_service_account_approvals(
+    requested_tenant_id uuid,
+    requested_limit integer)
+RETURNS TABLE (
+    approval_id uuid,
+    tenant_id uuid,
+    service_account_id uuid,
+    action text,
+    state text,
+    approval_revision bigint,
+    reason_code text,
+    scopes text[],
+    account_expires_at timestamptz,
+    credential_expires_at timestamptz,
+    expected_account_revision bigint,
+    control_policy_revision bigint,
+    expires_at timestamptz,
+    created_at timestamptz)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $list_service_account_approvals$
+    SELECT approval.approval_id, approval.tenant_id,
+           approval.service_account_id, approval.action, approval.state,
+           approval.approval_revision, approval.reason_code, approval.scopes,
+           approval.account_expires_at, approval.credential_expires_at,
+           approval.expected_account_revision,
+           approval.control_policy_revision, approval.expires_at,
+           approval.created_at
+    FROM rag_control.control_service_account_approvals AS approval
+    JOIN LATERAL rag_control.control_tenant_facts(
+        approval.tenant_id) AS facts ON true
+    LEFT JOIN rag_control.control_service_accounts AS account
+      ON account.service_account_id = approval.service_account_id
+    WHERE approval.tenant_id = requested_tenant_id
+      AND approval.state = 'approved'
+      AND approval.approval_revision = 1
+      AND statement_timestamp() < approval.expires_at
+      AND approval.control_policy_revision = facts.policy_revision
+      AND (
+          (approval.action = 'issue'
+           AND account.service_account_id IS NULL)
+          OR
+          (approval.action = 'rotate'
+           AND account.tenant_id = approval.tenant_id
+           AND account.state = 'active'
+           AND account.revision = approval.expected_account_revision
+           AND statement_timestamp() < account.expires_at
+           AND approval.credential_expires_at <= account.expires_at))
+      AND requested_limit BETWEEN 1 AND 100
+    ORDER BY approval.created_at, approval.approval_id
+    LIMIT requested_limit
+$list_service_account_approvals$;
+
+-- These redemption functions are an offline atomic authority in schema v4.
+-- PUBLIC is revoked below and no deployable role receives EXECUTE until the
+-- data-plane architect+admin proof can be cryptographically bound here.
+
+CREATE OR REPLACE FUNCTION rag_control.control_redeem_service_account_issue(
+    requested_approval_id uuid,
+    requested_tenant_id uuid,
+    requested_account_id uuid,
+    requested_expected_approval_revision bigint,
+    requested_tenant_actor_digest bytea,
+    requested_org_policy_epoch bigint,
+    requested_credential_digest bytea,
+    requested_request_digest bytea,
+    requested_resulting_fact_digest bytea)
+RETURNS TABLE (
+    account_revision bigint,
+    credential_version integer,
+    account_expires_at timestamptz,
+    credential_expires_at timestamptz)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $redeem_service_account_issue$
+DECLARE
+    approved rag_control.control_service_account_approvals%ROWTYPE;
+    tenant_policy_revision bigint;
+BEGIN
+    SELECT tenant.policy_revision INTO tenant_policy_revision
+    FROM rag_control.control_tenants AS tenant
+    WHERE tenant.tenant_id = requested_tenant_id
+      AND tenant.lifecycle = 'active'
+    FOR SHARE;
+    PERFORM rag_control.control_lock_service_account(requested_account_id);
+    SELECT approval.* INTO approved
+    FROM rag_control.control_service_account_approvals AS approval
+    WHERE approval.approval_id = requested_approval_id
+      AND approval.tenant_id = requested_tenant_id
+      AND approval.service_account_id = requested_account_id
+    FOR UPDATE;
+    IF approved.approval_id IS NULL
+       OR approved.action <> 'issue'
+       OR approved.state <> 'approved'
+       OR approved.approval_revision <> requested_expected_approval_revision
+       OR requested_expected_approval_revision <> 1
+       OR approved.expires_at <= statement_timestamp()
+       OR approved.control_policy_revision <> tenant_policy_revision
+       OR requested_org_policy_epoch < 1
+       OR octet_length(requested_tenant_actor_digest) <> 32
+       OR octet_length(requested_credential_digest) <> 32
+       OR octet_length(requested_request_digest) <> 32
+       OR octet_length(requested_resulting_fact_digest) <> 32
+       OR approved.account_expires_at <= statement_timestamp()
+       OR approved.credential_expires_at <= statement_timestamp()
+       OR approved.account_expires_at < approved.credential_expires_at
+       OR NOT EXISTS (
+           SELECT 1 FROM rag_control.control_tenant_facts(
+               requested_tenant_id))
+       OR EXISTS (
+           SELECT 1 FROM rag_control.control_service_accounts
+           WHERE service_account_id = requested_account_id)
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '40001',
+            MESSAGE = 'service_account_approval_conflict';
+    END IF;
+    INSERT INTO rag_control.control_service_accounts (
+        service_account_id, tenant_id, state, expires_at)
+    VALUES (requested_account_id, requested_tenant_id, 'active',
+            approved.account_expires_at);
+    INSERT INTO rag_control.control_service_account_scopes (
+        service_account_id, scope_code)
+    SELECT requested_account_id, scope FROM unnest(approved.scopes) AS scope;
+    INSERT INTO rag_control.control_service_account_credentials (
+        service_account_id, credential_version, digest, state,
+        not_before, expires_at)
+    VALUES (requested_account_id, 1, requested_credential_digest, 'active',
+            statement_timestamp(), approved.credential_expires_at);
+    UPDATE rag_control.control_service_account_approvals
+    SET state = 'redeemed', approval_revision = 2,
+        redeemed_at = statement_timestamp()
+    WHERE approval_id = requested_approval_id;
+    INSERT INTO rag_control.control_service_account_events (
+        operator_id, actor_kind, tenant_actor_digest, org_policy_epoch,
+        target_tenant_id, service_account_id, action, reason_code,
+        expected_revision, resulting_revision, request_digest,
+        resulting_fact_digest)
+    VALUES (approved.platform_operator_id, 'tenant_org_admin',
+            requested_tenant_actor_digest, requested_org_policy_epoch,
+            requested_tenant_id, requested_account_id, 'service_account_issue',
+            approved.reason_code, NULL, 1, requested_request_digest,
+            requested_resulting_fact_digest);
+    INSERT INTO rag_control.control_service_account_approval_events (
+        approval_id, target_tenant_id, service_account_id, action,
+        reason_code, actor_kind, tenant_actor_digest, org_policy_epoch,
+        prior_state, resulting_state, prior_revision, approval_revision,
+        approval_created_at, approval_expires_at, request_digest,
+        resulting_fact_digest)
+    VALUES (approved.approval_id, approved.tenant_id,
+            approved.service_account_id, 'approval_redeemed',
+            'approval_redeemed', 'tenant_org_admin',
+            requested_tenant_actor_digest, requested_org_policy_epoch,
+            'approved', 'redeemed', 1, 2, approved.created_at,
+            approved.expires_at, approved.request_digest,
+            approved.resulting_fact_digest);
+    RETURN QUERY SELECT 1::bigint, 1, approved.account_expires_at,
+                        approved.credential_expires_at;
+END
+$redeem_service_account_issue$;
+
+CREATE OR REPLACE FUNCTION rag_control.control_redeem_service_account_rotation(
+    requested_approval_id uuid,
+    requested_tenant_id uuid,
+    requested_account_id uuid,
+    requested_expected_approval_revision bigint,
+    requested_tenant_actor_digest bytea,
+    requested_org_policy_epoch bigint,
+    requested_credential_digest bytea,
+    requested_request_digest bytea,
+    requested_resulting_fact_digest bytea)
+RETURNS TABLE (
+    account_revision bigint,
+    credential_version integer,
+    account_expires_at timestamptz,
+    credential_expires_at timestamptz)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $redeem_service_account_rotation$
+DECLARE
+    account rag_control.control_service_accounts%ROWTYPE;
+    approved rag_control.control_service_account_approvals%ROWTYPE;
+    next_revision bigint;
+    tenant_policy_revision bigint;
+BEGIN
+    SELECT tenant.policy_revision INTO tenant_policy_revision
+    FROM rag_control.control_tenants AS tenant
+    WHERE tenant.tenant_id = requested_tenant_id
+      AND tenant.lifecycle = 'active'
+    FOR SHARE;
+    PERFORM rag_control.control_lock_service_account(requested_account_id);
+    SELECT approval.* INTO approved
+    FROM rag_control.control_service_account_approvals AS approval
+    WHERE approval.approval_id = requested_approval_id
+      AND approval.tenant_id = requested_tenant_id
+      AND approval.service_account_id = requested_account_id
+    FOR UPDATE;
+    SELECT service_account.* INTO account
+    FROM rag_control.control_service_accounts AS service_account
+    WHERE service_account.service_account_id = requested_account_id
+      AND service_account.tenant_id = requested_tenant_id
+      AND service_account.state = 'active'
+    FOR UPDATE;
+    IF approved.approval_id IS NULL
+       OR approved.action <> 'rotate'
+       OR approved.state <> 'approved'
+       OR approved.approval_revision <> requested_expected_approval_revision
+       OR requested_expected_approval_revision <> 1
+       OR approved.expires_at <= statement_timestamp()
+       OR approved.control_policy_revision <> tenant_policy_revision
+       OR account.service_account_id IS NULL
+       OR account.revision <> approved.expected_account_revision
+       OR account.expires_at <= statement_timestamp()
+       OR account.expires_at < approved.credential_expires_at
+       OR requested_org_policy_epoch < 1
+       OR octet_length(requested_tenant_actor_digest) <> 32
+       OR octet_length(requested_credential_digest) <> 32
+       OR octet_length(requested_request_digest) <> 32
+       OR octet_length(requested_resulting_fact_digest) <> 32
+       OR NOT EXISTS (
+           SELECT 1 FROM rag_control.control_tenant_facts(
+               requested_tenant_id))
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '40001',
+            MESSAGE = 'service_account_approval_conflict';
+    END IF;
+    next_revision := account.revision + 1;
+    UPDATE rag_control.control_service_account_credentials
+    SET state = 'retired'
+    WHERE service_account_id = requested_account_id AND state = 'active';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '40001',
+            MESSAGE = 'service_account_approval_conflict';
+    END IF;
+    INSERT INTO rag_control.control_service_account_credentials (
+        service_account_id, credential_version, digest, state,
+        not_before, expires_at)
+    VALUES (requested_account_id, next_revision, requested_credential_digest,
+            'active', statement_timestamp(), approved.credential_expires_at);
+    UPDATE rag_control.control_service_accounts
+    SET revision = next_revision
+    WHERE service_account_id = requested_account_id;
+    UPDATE rag_control.control_service_account_approvals
+    SET state = 'redeemed', approval_revision = 2,
+        redeemed_at = statement_timestamp()
+    WHERE approval_id = requested_approval_id;
+    INSERT INTO rag_control.control_service_account_events (
+        operator_id, actor_kind, tenant_actor_digest, org_policy_epoch,
+        target_tenant_id, service_account_id, action, reason_code,
+        expected_revision, resulting_revision, request_digest,
+        resulting_fact_digest)
+    VALUES (approved.platform_operator_id, 'tenant_org_admin',
+            requested_tenant_actor_digest, requested_org_policy_epoch,
+            requested_tenant_id, requested_account_id,
+            'service_account_rotate',
+            approved.reason_code, account.revision, next_revision,
+            requested_request_digest, requested_resulting_fact_digest);
+    INSERT INTO rag_control.control_service_account_approval_events (
+        approval_id, target_tenant_id, service_account_id, action,
+        reason_code, actor_kind, tenant_actor_digest, org_policy_epoch,
+        prior_state, resulting_state, prior_revision, approval_revision,
+        approval_created_at, approval_expires_at, request_digest,
+        resulting_fact_digest)
+    VALUES (approved.approval_id, approved.tenant_id,
+            approved.service_account_id, 'approval_redeemed',
+            'approval_redeemed', 'tenant_org_admin',
+            requested_tenant_actor_digest, requested_org_policy_epoch,
+            'approved', 'redeemed', 1, 2, approved.created_at,
+            approved.expires_at, approved.request_digest,
+            approved.resulting_fact_digest);
+    RETURN QUERY SELECT next_revision, next_revision::integer,
+                        account.expires_at, approved.credential_expires_at;
+END
+$redeem_service_account_rotation$;
+
 CREATE OR REPLACE FUNCTION rag_control.control_issue_service_account(
     requested_operator_key_version integer,
     requested_operator_digest bytea,
@@ -443,6 +1205,7 @@ DECLARE
 BEGIN
     resolved_operator_id := rag_control.control_require_platform_security(
         requested_operator_key_version, requested_operator_digest);
+    PERFORM rag_control.control_lock_service_account(requested_account_id);
     SELECT array_agg(scope ORDER BY scope) INTO canonical_scopes
     FROM (SELECT DISTINCT unnest(requested_scopes) AS scope) AS normalized;
     IF canonical_scopes IS NULL
@@ -515,6 +1278,7 @@ DECLARE
 BEGIN
     resolved_operator_id := rag_control.control_require_platform_security(
         requested_operator_key_version, requested_operator_digest);
+    PERFORM rag_control.control_lock_service_account(requested_account_id);
     SELECT revision, expires_at INTO account_revision, account_expiry
     FROM rag_control.control_service_accounts
     WHERE service_account_id = requested_account_id
@@ -583,6 +1347,7 @@ DECLARE
 BEGIN
     resolved_operator_id := rag_control.control_require_platform_security(
         requested_operator_key_version, requested_operator_digest);
+    PERFORM rag_control.control_lock_service_account(requested_account_id);
     SELECT revision INTO account_revision
     FROM rag_control.control_service_accounts
     WHERE service_account_id = requested_account_id
@@ -611,6 +1376,26 @@ BEGIN
     UPDATE rag_control.control_service_accounts
     SET state = 'revoked', revision = next_revision
     WHERE service_account_id = requested_account_id;
+    WITH cancelled AS (
+        UPDATE rag_control.control_service_account_approvals
+        SET state = 'cancelled', approval_revision = 2
+        WHERE tenant_id = requested_tenant_id
+          AND service_account_id = requested_account_id
+          AND state = 'approved'
+        RETURNING *
+    )
+    INSERT INTO rag_control.control_service_account_approval_events (
+        approval_id, target_tenant_id, service_account_id, action,
+        reason_code, actor_kind, platform_operator_id, prior_state,
+        resulting_state, prior_revision, approval_revision,
+        approval_created_at, approval_expires_at, request_digest,
+        resulting_fact_digest)
+    SELECT approval_id, tenant_id, service_account_id,
+           'approval_cancelled', 'service_account_revoked',
+           'platform_security', resolved_operator_id,
+           'approved', 'cancelled', 1, approval_revision, created_at,
+           expires_at, request_digest, resulting_fact_digest
+    FROM cancelled;
     INSERT INTO rag_control.control_service_account_events (
         operator_id, target_tenant_id, service_account_id, action,
         reason_code, expected_revision, resulting_revision, request_digest,
@@ -625,6 +1410,8 @@ END
 $revoke_service_account$;
 
 REVOKE ALL ON FUNCTION rag_control.control_events_immutable() FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    rag_control.control_seal_service_account_approval_event() FROM PUBLIC;
 REVOKE ALL ON FUNCTION rag_control.control_tenant_facts(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION rag_control.control_resolve_identity(integer, bytea)
     FROM PUBLIC;
@@ -634,6 +1421,30 @@ REVOKE ALL ON FUNCTION rag_control.control_resolve_service_account(
     uuid, integer, bytea) FROM PUBLIC;
 REVOKE ALL ON FUNCTION rag_control.control_require_platform_security(
     integer, bytea)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_control.control_lock_service_account(uuid)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_control.control_expire_service_account_approval(uuid)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_control.control_approve_service_account_issue(
+    integer, bytea, uuid, uuid, uuid, text[], timestamptz, timestamptz,
+    bigint, text, bytea, bytea)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_control.control_approve_service_account_rotation(
+    integer, bytea, uuid, uuid, uuid, bigint, timestamptz, bigint, text,
+    bytea, bytea)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_control.control_cancel_service_account_approval(
+    integer, bytea, uuid, uuid, uuid, bigint, text)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    rag_control.control_list_redeemable_service_account_approvals(uuid, integer)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_control.control_redeem_service_account_issue(
+    uuid, uuid, uuid, bigint, bytea, bigint, bytea, bytea, bytea)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_control.control_redeem_service_account_rotation(
+    uuid, uuid, uuid, bigint, bytea, bigint, bytea, bytea, bytea)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION rag_control.control_issue_service_account(
     integer, bytea, uuid, uuid, bytea, text[], timestamptz, timestamptz,
