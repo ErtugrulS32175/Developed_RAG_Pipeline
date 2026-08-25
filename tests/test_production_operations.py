@@ -2,13 +2,14 @@ import hashlib
 import inspect
 import json
 import subprocess
+from contextlib import contextmanager
 
 import pytest
 from fastapi.testclient import TestClient
 
 from pipeline.api import metrics
 from pipeline.index import db
-from pipeline.index import ingest, job_worker
+from pipeline.index import ingest, job_worker, purge_worker
 from scripts import bootstrap_org, db_snapshot, migrate_db, rollout_gate
 
 
@@ -111,7 +112,7 @@ def test_runtime_readiness_requires_both_the_receipt_and_restricted_role(
 
 
 def test_only_the_migration_entrypoint_invokes_schema_ddl():
-    runtime_modules = (ingest, job_worker, bootstrap_org)
+    runtime_modules = (ingest, job_worker, purge_worker, bootstrap_org)
     for module in runtime_modules:
         source = inspect.getsource(module)
         assert "db.init_schema(" not in source
@@ -155,11 +156,17 @@ def test_request_id_metrics_and_logs_are_content_free(monkeypatch, caplog):
 def _write_snapshot_pair(tmp_path, payload=b"snapshot"):
     archive = tmp_path / "database.dump"
     archive.write_bytes(payload)
+    schema_version, schema_sha256 = db.expected_schema_state()
     record = {
-        "snapshot_version": 1,
+        "snapshot_version": db_snapshot.SNAPSHOT_VERSION,
         "archive_name": archive.name,
         "size": len(payload),
         "sha256": hashlib.sha256(payload).hexdigest(),
+        "schema_version": schema_version,
+        "schema_sha256": schema_sha256,
+        "tenant_count": 2,
+        "purged_document_count": 1,
+        "retention_event_count": 4,
     }
     manifest = tmp_path / "database.dump.manifest.json"
     manifest.write_text(json.dumps(record), encoding="utf-8")
@@ -185,18 +192,90 @@ def test_snapshot_backup_keeps_the_dsn_out_of_argv_and_output(
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(db_snapshot.subprocess, "run", fake_run)
+    evidence = {field: value for field, value in {
+            "schema_version": db.expected_schema_state()[0],
+            "schema_sha256": db.expected_schema_state()[1],
+            "tenant_count": 2,
+            "purged_document_count": 1,
+            "retention_event_count": 4,
+        }.items()}
+
+    @contextmanager
+    def snapshot(_dsn):
+        yield "fixture-snapshot", evidence
+
+    monkeypatch.setattr(db_snapshot, "_backup_snapshot", snapshot)
     output = tmp_path / "created.dump"
 
     record = db_snapshot.backup(output)
 
     assert db_snapshot.verify(output) == record
     assert seen["argv"] == [
-        "pg_dump", "--format=custom", "--no-owner", "--no-acl"]
+        "pg_dump", "--format=custom", "--no-owner", "--no-acl",
+        "--snapshot", "fixture-snapshot"]
     assert seen["env"]["PGPASSWORD"] == secret
     assert "PG_DSN" not in seen["env"]
     assert "PG_RESTORE_DSN" not in seen["env"]
     public = json.dumps(record) + " ".join(seen["argv"])
     assert secret not in public and "db.internal" not in public
+
+
+def test_backup_evidence_and_pg_dump_share_one_exported_snapshot(monkeypatch):
+    events = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement):
+            events.append(("cursor", statement))
+
+        def fetchone(self):
+            return ("fixture-snapshot",)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement):
+            events.append(("connection", statement))
+
+        def cursor(self):
+            return Cursor()
+
+        def rollback(self):
+            events.append(("rollback", None))
+
+    evidence = {
+        "schema_version": db.expected_schema_state()[0],
+        "schema_sha256": db.expected_schema_state()[1],
+        "tenant_count": 2,
+        "purged_document_count": 1,
+        "retention_event_count": 4,
+    }
+    monkeypatch.setattr(
+        db_snapshot.psycopg, "connect", lambda _dsn: Connection())
+    monkeypatch.setattr(
+        db_snapshot, "_read_database_evidence",
+        lambda _conn: events.append(("evidence", None)) or evidence)
+
+    with db_snapshot._backup_snapshot("fixture-dsn") as measured:
+        assert measured == ("fixture-snapshot", evidence)
+        events.append(("dump", None))
+
+    assert events == [
+        ("connection", "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"),
+        ("cursor", "SELECT pg_export_snapshot()"),
+        ("evidence", None),
+        ("dump", None),
+        ("rollback", None),
+    ]
 
 
 def test_snapshot_verification_refuses_byte_drift(tmp_path):
@@ -214,6 +293,10 @@ def test_restore_requires_a_verified_archive_and_an_empty_database(
     monkeypatch.setenv(
         "PG_RESTORE_DSN", _disposable_dsn("fixture-password", "emptydb"))
     monkeypatch.setattr(db_snapshot, "_database_is_empty", lambda _dsn: True)
+    monkeypatch.setattr(
+        db_snapshot, "_database_evidence",
+        lambda _dsn: {field: record[field]
+                      for field in db_snapshot._EVIDENCE_FIELDS})
     seen = {}
 
     def fake_run(argv, **kwargs):
@@ -226,8 +309,15 @@ def test_restore_requires_a_verified_archive_and_an_empty_database(
     result = db_snapshot.restore(
         archive, manifest, confirmation="EMPTY_DATABASE")
 
-    assert result == {"snapshot_version": 1, "status": "restored",
-                      "sha256": record["sha256"]}
+    assert result == {
+        "snapshot_version": db_snapshot.SNAPSHOT_VERSION,
+        "status": "restored",
+        "sha256": record["sha256"],
+        "schema_sha256": record["schema_sha256"],
+        "tenant_count": 2,
+        "purged_document_count": 1,
+        "retention_event_count": 4,
+    }
     assert seen["input"] == b"snapshot"
     assert seen["argv"][-1] == "emptydb"
     assert "secret" not in " ".join(seen["argv"])
@@ -248,6 +338,46 @@ def test_restore_refuses_a_nonempty_destination_before_launch(
         db_snapshot.restore(
             archive, manifest, confirmation="EMPTY_DATABASE")
     assert launches == []
+
+
+def test_backup_refuses_a_database_without_the_exact_schema_receipt(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "PG_DSN", _disposable_dsn("fixture-password", "ragdb"))
+    @contextmanager
+    def refuse(_dsn):
+        raise db_snapshot.SnapshotError("database_schema_unverified")
+        yield
+
+    monkeypatch.setattr(db_snapshot, "_backup_snapshot", refuse)
+    launches = []
+    monkeypatch.setattr(
+        db_snapshot.subprocess, "run", lambda *a, **k: launches.append(True))
+
+    with pytest.raises(db_snapshot.SnapshotError,
+                       match="database_schema_unverified"):
+        db_snapshot.backup(tmp_path / "database.dump")
+    assert launches == []
+
+
+def test_restore_refuses_a_digest_valid_dump_with_wrong_database_evidence(
+        monkeypatch, tmp_path):
+    archive, manifest, record = _write_snapshot_pair(tmp_path)
+    monkeypatch.setenv(
+        "PG_RESTORE_DSN", _disposable_dsn("fixture-password", "emptydb"))
+    monkeypatch.setattr(db_snapshot, "_database_is_empty", lambda _dsn: True)
+    monkeypatch.setattr(
+        db_snapshot.subprocess, "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0))
+    restored = {field: record[field] for field in db_snapshot._EVIDENCE_FIELDS}
+    restored["retention_event_count"] += 1
+    monkeypatch.setattr(
+        db_snapshot, "_database_evidence", lambda _dsn: restored)
+
+    with pytest.raises(db_snapshot.SnapshotError,
+                       match="restore_evidence_mismatch"):
+        db_snapshot.restore(
+            archive, manifest, confirmation="EMPTY_DATABASE")
 
 
 def test_migration_cli_never_reflects_connection_exception_prose(

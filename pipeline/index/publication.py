@@ -127,6 +127,17 @@ class VersionSourceProof:
     size: int
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentSourcePurge:
+    """Closed storage result; no path, filename, or source bytes escape."""
+
+    tenant_id: str
+    document_id: str
+    version_count: int
+    removed_version_sources: int
+    removed_legacy_source: bool
+
+
 def _uuid_text(value, label: str) -> str:
     """Return one canonical UUID segment; never accept path-like text."""
     try:
@@ -292,6 +303,116 @@ def verify_version_source(object_root, tenant_id, document_id, version_id, *,
         expected_sha256=expected, max_bytes=max_bytes)
     return VersionSourceProof(
         tenant, document, version, expected, len(body))
+
+
+def purge_version_source(object_root, tenant_id, document_id, version_id):
+    """Idempotently remove one immutable source through held directories.
+
+    No content is read into memory.  The UUID-only hierarchy and fixed object
+    name are revalidated, the final child must be an ordinary no-follow file,
+    and the transport removes the identity it just reported.  A missing
+    version directory or source is already the desired terminal state.
+    """
+    tenant = _uuid_text(tenant_id, "tenant kimligi")
+    document = _uuid_text(document_id, "belge kimligi")
+    version = _uuid_text(version_id, "surum kimligi")
+    try:
+        directories = _open_source_parent(
+            object_root, tenant, document, version, create=False)
+    except VersionSourceMissing:
+        return False
+    primary = None
+    try:
+        version_directory = directories[-1]
+        entry = _object_transport.child_entry(
+            version_directory, _SOURCE_OBJECT_NAME)
+        removed = False
+        if entry is not None:
+            if entry.kind != "file" or entry.reparse_tag:
+                raise VersionSourceCorrupt(
+                    "silinecek kaynak siradan dosya degil")
+            _object_transport.remove_child_file(
+                version_directory, _SOURCE_OBJECT_NAME, entry.identity)
+            removed = True
+        # Empty version directories are lifecycle-owned residue.  Remove only
+        # this exact leaf; an unexpected child makes the kernel refuse rather
+        # than widening this into recursive deletion.
+        _object_transport.close_directory(version_directory)
+        directories.pop()
+        try:
+            _object_transport.remove_child_directory(
+                directories[-1], version)
+        except _object_transport.NotEmpty:
+            raise VersionSourceCorrupt(
+                "surum kaynak dizininde beklenmeyen kalinti var") from None
+        _object_transport.fsync_directory(directories[-1])
+        return removed
+    except (OSError, _object_transport.TransportError) as error:
+        primary = VersionSourceRefused("surum kaynagi kaldirilamadi")
+        raise primary from error
+    except BaseException as refused:
+        primary = refused
+        raise
+    finally:
+        try:
+            _close_directories(directories)
+        except VersionSourceRefused as cleanup:
+            if primary is None:
+                raise
+            primary.add_note(str(cleanup))
+
+
+def purge_legacy_source(object_root, tenant_id, canonical_filename):
+    """Idempotently remove the pre-v3 compatibility copy, if it exists."""
+    tenant = _uuid_text(tenant_id, "tenant kimligi")
+    canonical = _validated_canonical_name(canonical_filename)
+    try:
+        directories = _open_legacy_parent(object_root, tenant)
+    except VersionSourceMissing:
+        return False
+    primary = None
+    try:
+        entry = _object_transport.child_entry(directories[-1], canonical)
+        if entry is None:
+            return False
+        if entry.kind != "file" or entry.reparse_tag:
+            raise VersionSourceCorrupt("legacy kaynak siradan dosya degil")
+        _object_transport.remove_child_file(
+            directories[-1], canonical, entry.identity)
+        _object_transport.fsync_directory(directories[-1])
+        return True
+    except (OSError, _object_transport.TransportError) as error:
+        primary = VersionSourceRefused("legacy kaynak kaldirilamadi")
+        raise primary from error
+    except BaseException as refused:
+        primary = refused
+        raise
+    finally:
+        try:
+            _close_directories(directories)
+        except VersionSourceRefused as cleanup:
+            if primary is None:
+                raise
+            primary.add_note(str(cleanup))
+
+
+def purge_document_sources(object_root, tenant_id, document_id, version_ids,
+                           canonical_filename):
+    """Remove exactly the DB-authorized version set plus its legacy copy."""
+    tenant = _uuid_text(tenant_id, "tenant kimligi")
+    document = _uuid_text(document_id, "belge kimligi")
+    if type(version_ids) not in (tuple, list) or len(version_ids) > 10_000:
+        raise VersionSourceRefused("purge surum listesi gecersiz")
+    canonical = _validated_canonical_name(canonical_filename)
+    checked = tuple(_uuid_text(value, "surum kimligi") for value in version_ids)
+    if len(set(checked)) != len(checked):
+        raise VersionSourceRefused("purge surum listesi tekrarli")
+    removed = sum(
+        1 for version in checked
+        if purge_version_source(object_root, tenant, document, version))
+    legacy = purge_legacy_source(object_root, tenant, canonical)
+    return DocumentSourcePurge(
+        tenant, document, len(checked), removed, legacy)
 
 
 def publish_version_source(object_root, tenant_id, document_id, version_id,

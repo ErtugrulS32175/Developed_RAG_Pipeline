@@ -261,6 +261,37 @@ def open_child_file(directory: Directory, name: str) -> Handle:
     return Handle(fd)
 
 
+def remove_child_file(directory: Directory, name: str,
+                      expected_identity: str) -> None:
+    """Remove one ordinary child after binding its name to an open object.
+
+    POSIX has no unlink-by-file-descriptor primitive.  The directory itself is
+    held and the child is opened no-follow; its descriptor identity is checked
+    before unlink and its link count after unlink.  A hostile same-directory
+    name swap remains the platform residue documented at module level, but it
+    can never redirect this operation outside the held storage directory.
+    """
+    if directory.closed:
+        raise _api.TransportError("kapali dizin uzerinde islem")
+    if type(expected_identity) is not str or not expected_identity:
+        raise _api.TransportError("beklenen nesne kimligi gecersiz")
+    child = _api.validate_child_name(name)
+    handle = open_child_file(directory, child)
+    try:
+        before = os.fstat(handle.fd)
+        if _identity_text(before) != expected_identity:
+            raise _api.TransportError("silinecek nesne kimligi degisti")
+        try:
+            os.unlink(child, dir_fd=directory.fd)
+        except OSError:
+            raise _api.TransportError("dosya kaldirilamadi") from None
+        after = os.fstat(handle.fd)
+        if _identity_text(after) != expected_identity or after.st_nlink != 0:
+            raise _api.TransportError("silinecek nesne birakilamadi")
+    finally:
+        close_handle(handle)
+
+
 def rename_child(source: Directory, source_name: str, target: Directory,
                  target_name: str) -> None:
     """Move one ordinary file between two OPEN directories, NEVER

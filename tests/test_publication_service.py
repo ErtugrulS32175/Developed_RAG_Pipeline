@@ -180,6 +180,67 @@ def test_new_publications_never_call_the_legacy_flat_replace(wired,
         expected_sha256=SHA).size == len(BODY)
 
 
+def test_purge_removes_only_the_authorized_sources_and_is_idempotent(tmp_path):
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    second_version = "20000000-0000-4000-8000-000000000003"
+    publication.publish_version_source(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID, VERSION_ID, BODY,
+        expected_sha256=SHA)
+    publication.publish_version_source(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID, second_version, BODY,
+        expected_sha256=SHA)
+    legacy = upload_dir / "kurgu.pdf"
+    legacy.write_bytes(BODY)
+
+    first = publication.purge_document_sources(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID,
+        [VERSION_ID, second_version], "kurgu.pdf")
+
+    assert first.version_count == 2
+    assert first.removed_version_sources == 2
+    assert first.removed_legacy_source is True
+    assert not publication.version_source_path(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID, VERSION_ID).exists()
+    assert not publication.version_source_path(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID,
+        second_version).exists()
+    assert not legacy.exists()
+
+    second = publication.purge_document_sources(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID,
+        [VERSION_ID, second_version], "kurgu.pdf")
+    assert second.removed_version_sources == 0
+    assert second.removed_legacy_source is False
+
+
+def test_purge_refuses_an_unexpected_version_directory_child(tmp_path):
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    publication.publish_version_source(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID, VERSION_ID, BODY,
+        expected_sha256=SHA)
+    version_dir = publication.version_source_path(
+        upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID,
+        VERSION_ID).parent
+    residue = version_dir / "unexpected.bin"
+    residue.write_bytes(b"fixture-residue")
+
+    with pytest.raises(publication.VersionSourceCorrupt,
+                       match="beklenmeyen kalinti"):
+        publication.purge_version_source(
+            upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID, VERSION_ID)
+
+    # The source was removed through its proven handle, but the unknown child
+    # is never widened into recursive deletion.  A retry remains visibly
+    # blocked until an operator classifies that residue.
+    assert residue.read_bytes() == b"fixture-residue"
+    with pytest.raises(publication.VersionSourceCorrupt,
+                       match="beklenmeyen kalinti"):
+        publication.purge_version_source(
+            upload_dir, db.DEFAULT_TENANT_ID, DOCUMENT_ID, VERSION_ID)
+
+
 # --- the lock release reads its own answer ------------------------------
 
 class _LockConn:

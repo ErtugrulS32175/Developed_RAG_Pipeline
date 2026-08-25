@@ -36,7 +36,7 @@ load_dotenv()
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv(
     "PG_DSN", "postgresql://rag_runtime:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -131,6 +131,18 @@ class EvalDatasetStateRefused(RuntimeError):
 
 class OrgAuditQueryRefused(RuntimeError):
     """A governance event query request is malformed or unauthorized."""
+
+
+class RetentionPolicyConflict(RuntimeError):
+    """A tenant retention-policy write lost its optimistic revision fence."""
+
+
+class DocumentRetentionRefused(RuntimeError):
+    """A legal-hold or purge transition is not currently permitted."""
+
+
+class PurgeJobOwnershipLost(RuntimeError):
+    """A purge worker no longer owns the durable job it is completing."""
 
 
 def _context_secret() -> bytes:
@@ -587,7 +599,8 @@ def list_org_audit_events(conn, *, limit, before=None, actions=None,
     allowed_actions = {
         "monitor_view", "topology_read", "topology_change",
         "access_preview", "review_queue_view", "review_decision",
-        "events_view", "membership_change",
+        "events_view", "membership_change", "retention_policy_change",
+        "legal_hold_change", "purge_schedule", "purge_execute",
     }
     allowed_decisions = {"allowed", "denied"}
     allowed_reasons = {
@@ -1842,6 +1855,534 @@ def record_org_decision(conn, *, actor_id, subject_id, action,
     return str(event_id)
 
 
+_LEGAL_HOLD_REASONS = frozenset({
+    "litigation", "regulatory", "security_investigation",
+})
+_PURGE_FAILURE_CODES = frozenset({
+    "storage_refused", "storage_unavailable",
+})
+
+
+def _retention_uuid(value, field):
+    try:
+        return uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise DocumentRetentionRefused(field + " gecersiz") from exc
+
+
+def _retention_positive(value, field, *, maximum=None):
+    if (type(value) is not int or value < 1
+            or (maximum is not None and value > maximum)):
+        raise DocumentRetentionRefused(field + " gecersiz")
+    return value
+
+
+def _retention_counter(value, field):
+    if type(value) is not int or value < 0:
+        raise DocumentRetentionRefused(field + " gecersiz")
+    return value
+
+
+def _retention_request_id(value):
+    if type(value) is not str or not 8 <= len(value) <= 64:
+        raise DocumentRetentionRefused("request_id gecersiz")
+    return value
+
+
+def _lock_retention_architect(cur, actor_id, expected_policy_epoch=None):
+    actor = _retention_uuid(actor_id, "actor_id")
+    cur.execute(
+        "SELECT tenant.id, tenant.policy_epoch "
+        "FROM org_tenants tenant JOIN org_architects architect "
+        "ON architect.tenant_id = tenant.id "
+        "WHERE tenant.id = rag_effective_tenant() "
+        "AND architect.identity_id = %s AND architect.active = true "
+        "AND rag_effective_actor() = %s FOR UPDATE OF tenant",
+        (actor, actor))
+    tenant = cur.fetchone()
+    if tenant is None:
+        raise DocumentRetentionRefused("retention mimari yetkisi yok")
+    if (expected_policy_epoch is not None
+            and int(tenant["policy_epoch"]) != expected_policy_epoch):
+        raise OrgPolicyConflict("organizasyon politikasi degisti")
+    return actor, tenant
+
+
+def get_tenant_retention_policy(conn, *, actor_id):
+    """Return one architect-visible policy, including its implicit default."""
+    actor = _retention_uuid(actor_id, "actor_id")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT tenant.id AS tenant_id, tenant.policy_epoch, "
+            "COALESCE(policy.archive_retention_days, 365) "
+            "AS archive_retention_days, COALESCE(policy.revision, 1) revision, "
+            "policy.updated_at "
+            "FROM org_tenants tenant JOIN org_architects architect "
+            "ON architect.tenant_id = tenant.id "
+            "LEFT JOIN tenant_retention_policies policy "
+            "ON policy.tenant_id = tenant.id "
+            "WHERE tenant.id = rag_effective_tenant() "
+            "AND architect.identity_id = %s AND architect.active = true "
+            "AND rag_effective_actor() = %s",
+            (actor, actor))
+        row = cur.fetchone()
+    if row is None:
+        raise DocumentRetentionRefused("retention mimari yetkisi yok")
+    return dict(row)
+
+
+def update_tenant_retention_policy(
+        conn, *, actor_id, archive_retention_days, expected_revision,
+        expected_policy_epoch, request_id):
+    """CAS one tenant policy and append content-free governance evidence."""
+    days = _retention_positive(
+        archive_retention_days, "archive_retention_days", maximum=3650)
+    revision = _retention_positive(expected_revision, "expected_revision")
+    policy_epoch = _retention_positive(
+        expected_policy_epoch, "expected_policy_epoch")
+    request_id = _retention_request_id(request_id)
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            actor, tenant = _lock_retention_architect(
+                cur, actor_id, policy_epoch)
+            cur.execute(
+                "SELECT revision FROM tenant_retention_policies "
+                "WHERE tenant_id = %s FOR UPDATE", (tenant["id"],))
+            current = cur.fetchone()
+            current_revision = 1 if current is None else int(current["revision"])
+            if current_revision != revision:
+                raise RetentionPolicyConflict("retention politikasi degisti")
+            resulting_revision = revision + 1
+            cur.execute(
+                "INSERT INTO tenant_retention_policies "
+                "(tenant_id, archive_retention_days, revision, updated_by) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (tenant_id) DO UPDATE SET "
+                "archive_retention_days = EXCLUDED.archive_retention_days, "
+                "revision = EXCLUDED.revision, updated_by = EXCLUDED.updated_by, "
+                "updated_at = now() RETURNING tenant_id, "
+                "archive_retention_days, revision, updated_at",
+                (tenant["id"], days, resulting_revision, actor))
+            updated = dict(cur.fetchone())
+            cur.execute(
+                "UPDATE org_tenants SET policy_epoch = policy_epoch + 1 "
+                "WHERE id = %s RETURNING policy_epoch", (tenant["id"],))
+            updated["policy_epoch"] = int(cur.fetchone()["policy_epoch"])
+            cur.execute(
+                "INSERT INTO document_retention_events "
+                "(id, tenant_id, actor_id, event_type, request_id) VALUES "
+                "(%s, %s, %s, 'policy_changed', %s)",
+                (uuid.uuid4(), tenant["id"], actor, request_id))
+            cur.execute(
+                "INSERT INTO org_audit_events "
+                "(id, tenant_id, actor_id, action, reason_code, decision, "
+                "request_id) VALUES (%s, %s, %s, 'retention_policy_change', "
+                "'system_operation', 'allowed', %s)",
+                (uuid.uuid4(), tenant["id"], actor, request_id))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return updated
+
+
+def list_document_legal_holds(conn, *, actor_id, document_id):
+    actor = _retention_uuid(actor_id, "actor_id")
+    document = _retention_uuid(document_id, "document_id")
+    with conn.cursor(row_factory=dict_row) as cur:
+        _lock_retention_architect(cur, actor)
+        cur.execute(
+            "SELECT id, document_id, reason_code, state, revision, "
+            "created_at, released_at FROM document_legal_holds "
+            "WHERE document_id = %s ORDER BY created_at DESC, id DESC",
+            (document,))
+        rows = [dict(row) for row in cur.fetchall()]
+    conn.rollback()
+    return rows
+
+
+def create_document_legal_hold(
+        conn, *, actor_id, document_id, reason_code, expected_revision,
+        expected_policy_epoch, request_id):
+    actor = _retention_uuid(actor_id, "actor_id")
+    document = _retention_uuid(document_id, "document_id")
+    if reason_code not in _LEGAL_HOLD_REASONS:
+        raise DocumentRetentionRefused("legal hold nedeni gecersiz")
+    expected_revision = _retention_counter(
+        expected_revision, "expected_revision")
+    policy_epoch = _retention_positive(
+        expected_policy_epoch, "expected_policy_epoch")
+    request_id = _retention_request_id(request_id)
+    hold_id = uuid.uuid4()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            actor, tenant = _lock_retention_architect(
+                cur, actor, policy_epoch)
+            cur.execute(
+                "SELECT revision, purged_at FROM documents "
+                "WHERE id = %s FOR UPDATE", (document,))
+            target = cur.fetchone()
+            if target is None:
+                raise DocumentRetentionRefused("belge bulunamadi")
+            if target["purged_at"] is not None:
+                raise DocumentRetentionRefused("purged belge hold alamaz")
+            if int(target["revision"]) != expected_revision:
+                raise DocumentVersionConflict("belge revizyonu degisti")
+            cur.execute(
+                "INSERT INTO document_legal_holds "
+                "(id, tenant_id, document_id, reason_code, created_by) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "RETURNING id, document_id, reason_code, state, revision, "
+                "created_at, released_at",
+                (hold_id, tenant["id"], document, reason_code, actor))
+            hold = dict(cur.fetchone())
+            cur.execute(
+                "UPDATE document_purge_jobs SET state = 'cancelled', "
+                "completed_at = now() WHERE document_id = %s "
+                "AND state = 'pending'", (document,))
+            cur.execute(
+                "UPDATE org_tenants SET policy_epoch = policy_epoch + 1 "
+                "WHERE id = %s RETURNING policy_epoch", (tenant["id"],))
+            hold["policy_epoch"] = int(cur.fetchone()["policy_epoch"])
+            cur.execute(
+                "INSERT INTO document_retention_events "
+                "(id, tenant_id, document_id, actor_id, event_type, hold_id, "
+                "request_id) VALUES (%s, %s, %s, %s, 'hold_created', %s, %s)",
+                (uuid.uuid4(), tenant["id"], document, actor, hold_id,
+                 request_id))
+            cur.execute(
+                "INSERT INTO org_audit_events "
+                "(id, tenant_id, actor_id, subject_id, action, reason_code, "
+                "decision, request_id) VALUES (%s, %s, %s, NULL, "
+                "'legal_hold_change', 'system_operation', 'allowed', %s)",
+                (uuid.uuid4(), tenant["id"], actor, request_id))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return hold
+
+
+def release_document_legal_hold(
+        conn, *, actor_id, document_id, hold_id, expected_revision,
+        expected_policy_epoch, request_id):
+    actor = _retention_uuid(actor_id, "actor_id")
+    document = _retention_uuid(document_id, "document_id")
+    hold = _retention_uuid(hold_id, "hold_id")
+    expected_revision = _retention_positive(
+        expected_revision, "expected_revision")
+    policy_epoch = _retention_positive(
+        expected_policy_epoch, "expected_policy_epoch")
+    request_id = _retention_request_id(request_id)
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            actor, tenant = _lock_retention_architect(
+                cur, actor, policy_epoch)
+            cur.execute(
+                "SELECT state, revision FROM document_legal_holds "
+                "WHERE id = %s AND document_id = %s FOR UPDATE",
+                (hold, document))
+            current = cur.fetchone()
+            if current is None:
+                raise DocumentRetentionRefused("legal hold bulunamadi")
+            if current["state"] != "active":
+                raise DocumentRetentionRefused("legal hold aktif degil")
+            if int(current["revision"]) != expected_revision:
+                raise DocumentVersionConflict("legal hold revizyonu degisti")
+            cur.execute(
+                "UPDATE document_legal_holds SET state = 'released', "
+                "revision = revision + 1, released_by = %s, "
+                "released_at = now() WHERE id = %s RETURNING id, document_id, "
+                "reason_code, state, revision, created_at, released_at",
+                (actor, hold))
+            updated = dict(cur.fetchone())
+            cur.execute(
+                "UPDATE org_tenants SET policy_epoch = policy_epoch + 1 "
+                "WHERE id = %s RETURNING policy_epoch", (tenant["id"],))
+            updated["policy_epoch"] = int(cur.fetchone()["policy_epoch"])
+            cur.execute(
+                "INSERT INTO document_retention_events "
+                "(id, tenant_id, document_id, actor_id, event_type, hold_id, "
+                "request_id) VALUES (%s, %s, %s, %s, 'hold_released', %s, %s)",
+                (uuid.uuid4(), tenant["id"], document, actor, hold, request_id))
+            cur.execute(
+                "INSERT INTO org_audit_events "
+                "(id, tenant_id, actor_id, action, reason_code, decision, "
+                "request_id) VALUES (%s, %s, %s, 'legal_hold_change', "
+                "'system_operation', 'allowed', %s)",
+                (uuid.uuid4(), tenant["id"], actor, request_id))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return updated
+
+
+def schedule_document_purge(
+        conn, *, actor_id, document_id, expected_revision,
+        expected_policy_epoch, request_id):
+    """Schedule only a presently eligible archived document, never content."""
+    actor = _retention_uuid(actor_id, "actor_id")
+    document = _retention_uuid(document_id, "document_id")
+    expected_revision = _retention_counter(
+        expected_revision, "expected_revision")
+    policy_epoch = _retention_positive(
+        expected_policy_epoch, "expected_policy_epoch")
+    request_id = _retention_request_id(request_id)
+    job_id = uuid.uuid4()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            actor, tenant = _lock_retention_architect(
+                cur, actor, policy_epoch)
+            cur.execute(
+                "SELECT document.revision, document.archived_at, "
+                "document.purged_at, document.attempt_id, "
+                "COALESCE(policy.archive_retention_days, 365) retention_days, "
+                "COALESCE(policy.revision, 1) retention_revision "
+                "FROM documents document LEFT JOIN tenant_retention_policies "
+                "policy ON policy.tenant_id = document.tenant_id "
+                "WHERE document.id = %s FOR UPDATE OF document", (document,))
+            target = cur.fetchone()
+            if target is None:
+                raise DocumentRetentionRefused("belge bulunamadi")
+            if int(target["revision"]) != expected_revision:
+                raise DocumentVersionConflict("belge revizyonu degisti")
+            if target["purged_at"] is not None:
+                raise DocumentRetentionRefused("belge zaten purged")
+            if target["archived_at"] is None:
+                raise DocumentRetentionRefused("aktif belge purge edilemez")
+            if target["attempt_id"] is not None:
+                raise DocumentRetentionRefused("aktif ingest purge'u engelliyor")
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM ingest_jobs WHERE "
+                "document_id = %s AND status IN ('queued', 'running')) active, "
+                "EXISTS (SELECT 1 FROM document_legal_holds WHERE "
+                "document_id = %s AND state = 'active') held",
+                (document, document))
+            gates = cur.fetchone()
+            if gates["active"]:
+                raise DocumentRetentionRefused("aktif ingest purge'u engelliyor")
+            if gates["held"]:
+                raise DocumentRetentionRefused("legal hold purge'u engelliyor")
+            cur.execute(
+                "SELECT %(archived)s::timestamptz + "
+                "(%(days)s::text || ' days')::interval AS eligible_at, "
+                "now() AS database_now",
+                {"archived": target["archived_at"],
+                 "days": int(target["retention_days"])})
+            clock = cur.fetchone()
+            if clock["eligible_at"] > clock["database_now"]:
+                raise DocumentRetentionRefused("retention suresi dolmadi")
+            cur.execute(
+                "INSERT INTO document_purge_jobs "
+                "(id, tenant_id, document_id, scheduled_by, eligible_at, "
+                "policy_revision, policy_epoch, document_revision, request_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id, document_id, state, eligible_at, attempt_count, "
+                "policy_revision, policy_epoch, document_revision, created_at",
+                (job_id, tenant["id"], document, actor,
+                 clock["eligible_at"], int(target["retention_revision"]),
+                 int(tenant["policy_epoch"]), int(target["revision"]),
+                 request_id))
+            job = dict(cur.fetchone())
+            cur.execute(
+                "INSERT INTO document_retention_events "
+                "(id, tenant_id, document_id, actor_id, event_type, "
+                "purge_job_id, request_id) VALUES "
+                "(%s, %s, %s, %s, 'purge_scheduled', %s, %s)",
+                (uuid.uuid4(), tenant["id"], document, actor, job_id,
+                 request_id))
+            cur.execute(
+                "INSERT INTO org_audit_events "
+                "(id, tenant_id, actor_id, action, reason_code, decision, "
+                "request_id) VALUES (%s, %s, %s, 'purge_schedule', "
+                "'system_operation', 'allowed', %s)",
+                (uuid.uuid4(), tenant["id"], actor, request_id))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return job
+
+
+def list_document_purge_jobs(conn, *, actor_id, document_id):
+    actor = _retention_uuid(actor_id, "actor_id")
+    document = _retention_uuid(document_id, "document_id")
+    with conn.cursor(row_factory=dict_row) as cur:
+        _lock_retention_architect(cur, actor)
+        cur.execute(
+            "SELECT id, document_id, state, eligible_at, attempt_count, "
+            "policy_revision, policy_epoch, document_revision, failure_code, "
+            "created_at, started_at, completed_at "
+            "FROM document_purge_jobs WHERE document_id = %s "
+            "ORDER BY created_at DESC, id DESC", (document,))
+        rows = [dict(row) for row in cur.fetchall()]
+    conn.rollback()
+    return rows
+
+
+def claim_document_purge(conn, worker_id, *, max_attempts=5):
+    """Claim one due job while retaining its document lock until completion.
+
+    The caller MUST finish or fail on this same connection.  No commit occurs
+    here: a legal hold cannot interleave between the last hold check and the
+    irreversible storage deletion, and a crashed worker rolls the claim back
+    to pending automatically.
+    """
+    worker, _key = _canonical_label(worker_id, "worker_id")
+    max_attempts = _retention_positive(
+        max_attempts, "max_attempts", maximum=20)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT job.id FROM document_purge_jobs job "
+            "JOIN documents document ON document.tenant_id = job.tenant_id "
+            "AND document.id = job.document_id "
+            "WHERE rag_service_access() AND job.state = 'pending' "
+            "AND job.eligible_at <= now() AND job.attempt_count < %s "
+            "AND document.archived_at IS NOT NULL "
+            "AND document.purged_at IS NULL AND document.attempt_id IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM ingest_jobs active_job "
+            "WHERE active_job.tenant_id = job.tenant_id "
+            "AND active_job.document_id = job.document_id "
+            "AND active_job.status IN ('queued', 'running')) "
+            "AND NOT EXISTS (SELECT 1 FROM document_legal_holds hold "
+            "WHERE hold.tenant_id = job.tenant_id "
+            "AND hold.document_id = job.document_id AND hold.state = 'active') "
+            "ORDER BY job.eligible_at, job.created_at, job.id "
+            "FOR UPDATE OF job, document SKIP LOCKED LIMIT 1", (max_attempts,))
+        selected = cur.fetchone()
+        if selected is None:
+            conn.rollback()
+            return None
+        cur.execute(
+            "UPDATE document_purge_jobs SET state = 'running', "
+            "attempt_count = attempt_count + 1, worker_id = %s, "
+            "started_at = now(), completed_at = NULL, failure_code = NULL "
+            "WHERE id = %s RETURNING id, tenant_id, document_id, scheduled_by, "
+            "request_id, attempt_count", (worker, selected["id"]))
+        job = dict(cur.fetchone())
+        cur.execute(
+            "SELECT filename FROM documents WHERE id = %s",
+            (job["document_id"],))
+        job["filename"] = cur.fetchone()["filename"]
+        cur.execute(
+            "SELECT id FROM document_versions WHERE document_id = %s "
+            "ORDER BY version_number, id", (job["document_id"],))
+        job["version_ids"] = tuple(str(row["id"]) for row in cur.fetchall())
+    return job
+
+
+def complete_document_purge(conn, *, job_id, worker_id):
+    job = _retention_uuid(job_id, "job_id")
+    worker, _key = _canonical_label(worker_id, "worker_id")
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT job.tenant_id, job.document_id, job.scheduled_by, "
+                "job.request_id FROM document_purge_jobs job "
+                "WHERE job.id = %s AND job.state = 'running' "
+                "AND job.worker_id = %s FOR UPDATE", (job, worker))
+            current = cur.fetchone()
+            if current is None:
+                raise PurgeJobOwnershipLost("purge isi bu worker'a ait degil")
+            cur.execute(
+                "SELECT archived_at, purged_at, attempt_id FROM documents "
+                "WHERE id = %s FOR UPDATE", (current["document_id"],))
+            document = cur.fetchone()
+            if (document is None or document["archived_at"] is None
+                    or document["purged_at"] is not None
+                    or document["attempt_id"] is not None):
+                raise DocumentRetentionRefused("purge belge kapisi degisti")
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM document_legal_holds "
+                "WHERE document_id = %s AND state = 'active') held, "
+                "EXISTS (SELECT 1 FROM ingest_jobs WHERE document_id = %s "
+                "AND status IN ('queued', 'running')) active",
+                (current["document_id"], current["document_id"]))
+            gates = cur.fetchone()
+            if gates["held"] or gates["active"]:
+                raise DocumentRetentionRefused("purge kapisi yeniden kapandi")
+            cur.execute("DELETE FROM chunks WHERE document_id = %s",
+                        (current["document_id"],))
+            removed_chunks = cur.rowcount
+            cur.execute("DELETE FROM collection_documents WHERE document_id = %s",
+                        (current["document_id"],))
+            cur.execute("DELETE FROM document_tags WHERE document_id = %s",
+                        (current["document_id"],))
+            cur.execute(
+                "UPDATE documents SET filename = 'purged-' || id::text, "
+                "file_type = 'purged', status = 'purged', status_note = NULL, "
+                "content_sha256 = NULL, candidate_id = NULL, "
+                "candidate_state = NULL, active_content_sha = NULL, "
+                "active_version_id = NULL, active_generation = 0, "
+                "attempt_id = NULL, attempt_owner = NULL, "
+                "attempt_expires_at = NULL, purged_at = now(), "
+                "revision = revision + 1 WHERE id = %s "
+                "RETURNING purged_at, revision", (current["document_id"],))
+            tombstone = cur.fetchone()
+            cur.execute(
+                "UPDATE document_purge_jobs SET state = 'completed', "
+                "completed_at = now(), failure_code = NULL "
+                "WHERE id = %s AND worker_id = %s", (job, worker))
+            if cur.rowcount != 1:
+                raise PurgeJobOwnershipLost("purge isi tamamlanamadi")
+            cur.execute(
+                "INSERT INTO document_retention_events "
+                "(id, tenant_id, document_id, actor_id, event_type, "
+                "purge_job_id, request_id) VALUES "
+                "(%s, %s, %s, %s, 'purge_completed', %s, %s)",
+                (uuid.uuid4(), current["tenant_id"], current["document_id"],
+                 current["scheduled_by"], job, current["request_id"]))
+            cur.execute(
+                "INSERT INTO org_audit_events "
+                "(id, tenant_id, actor_id, action, reason_code, decision, "
+                "request_id) VALUES (%s, %s, %s, 'purge_execute', "
+                "'system_operation', 'allowed', %s)",
+                (uuid.uuid4(), current["tenant_id"], current["scheduled_by"],
+                 current["request_id"]))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return {"job_id": str(job), "document_id": str(current["document_id"]),
+            "state": "completed", "removed_chunks": removed_chunks,
+            "document_revision": int(tombstone["revision"]),
+            "purged_at": tombstone["purged_at"]}
+
+
+def fail_document_purge(conn, *, job_id, worker_id, failure_code):
+    job = _retention_uuid(job_id, "job_id")
+    worker, _key = _canonical_label(worker_id, "worker_id")
+    if failure_code not in _PURGE_FAILURE_CODES:
+        raise DocumentRetentionRefused("purge hata kodu gecersiz")
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT tenant_id, document_id, scheduled_by, request_id "
+                "FROM document_purge_jobs WHERE id = %s AND state = 'running' "
+                "AND worker_id = %s FOR UPDATE", (job, worker))
+            current = cur.fetchone()
+            if current is None:
+                raise PurgeJobOwnershipLost("purge isi bu worker'a ait degil")
+            cur.execute(
+                "UPDATE document_purge_jobs SET state = 'failed', "
+                "failure_code = %s, completed_at = now() WHERE id = %s",
+                (failure_code, job))
+            cur.execute(
+                "INSERT INTO document_retention_events "
+                "(id, tenant_id, document_id, actor_id, event_type, "
+                "purge_job_id, request_id) VALUES "
+                "(%s, %s, %s, %s, 'purge_failed', %s, %s)",
+                (uuid.uuid4(), current["tenant_id"], current["document_id"],
+                 current["scheduled_by"], job, current["request_id"]))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return {"job_id": str(job), "state": "failed",
+            "failure_code": failure_code}
+
+
 def upsert_document(conn, filename: str, file_type: str,
                     status: str = "processing",
                     content_sha256: str | None = None,
@@ -2428,7 +2969,7 @@ def get_document(conn, document_id: str) -> dict | None:
         cur.execute(
             "SELECT id, filename, file_type, uploaded_at, status, "
             "status_note, active_generation, content_sha256, candidate_id, "
-            "active_version_id, revision, archived_at "
+            "active_version_id, revision, archived_at, purged_at "
             "FROM documents WHERE id = %s", (document_id,))
         row = cur.fetchone()
     if row is None:
@@ -3382,12 +3923,16 @@ def set_document_archived(conn, document_id: str,
         raise ValueError("archived bir boolean olmali")
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
-            "SELECT id, archived_at, attempt_id FROM documents "
+            "SELECT id, archived_at, purged_at, attempt_id FROM documents "
             "WHERE id = %s FOR UPDATE", (document_id,))
         row = cur.fetchone()
         if row is None:
             conn.commit()
             return None
+        if row["purged_at"] is not None:
+            conn.rollback()
+            raise DocumentLifecycleConflict(
+                "purged belge yasam dongusune geri donemez")
         already = row["archived_at"] is not None
         if already == archived:
             # Release the FOR UPDATE transaction here as well.  Idempotent

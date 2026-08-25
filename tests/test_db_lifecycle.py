@@ -482,12 +482,13 @@ class LifecycleConn:
         self.commits += 1
 
 
-def _lifecycle_row(*, archived_at=None, attempt_id=None):
+def _lifecycle_row(*, archived_at=None, purged_at=None, attempt_id=None):
     import uuid
 
     return {
         "id": uuid.UUID("00000000-0000-0000-0000-0000000000ab"),
         "archived_at": archived_at,
+        "purged_at": purged_at,
         "attempt_id": attempt_id,
     }
 
@@ -506,7 +507,7 @@ def test_archive_locks_the_row_and_changes_only_lifecycle_metadata():
     lock_sql, lock_params = conn.cur.executed[0]
     active_job_sql, active_job_params = conn.cur.executed[1]
     update_sql, update_params = conn.cur.executed[2]
-    assert "SELECT id, archived_at, attempt_id" in lock_sql
+    assert "SELECT id, archived_at, purged_at, attempt_id" in lock_sql
     assert lock_sql.endswith("WHERE id = %s FOR UPDATE")
     assert lock_params == ("kurgu-id",)
     assert "FROM ingest_jobs" in active_job_sql

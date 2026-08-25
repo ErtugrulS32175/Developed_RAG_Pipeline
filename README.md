@@ -254,9 +254,14 @@ Schema receipts are monotonic: an older binary is refused before product DDL,
 and a database trigger prevents a schema-state downgrade even if a stale
 process reaches the receipt table.
 
-Backups use PostgreSQL custom format and a SHA-256 sidecar. Credentials reach
+Backups use PostgreSQL custom format and a closed SHA-256 sidecar. Version 2 of
+that sidecar also records the exact schema receipt plus tenant, purge-tombstone
+and retention-event counts. Those counts and `pg_dump` share one exported MVCC
+snapshot, so concurrent writes cannot make the manifest describe a different
+database instant. Restore is limited to an empty target and succeeds only when
+the restored database reproduces every closed evidence field. Credentials reach
 `pg_dump` and `pg_restore` through the process environment, never argv or JSON
-output. Restore is limited to an empty target and needs explicit confirmation:
+output:
 
 ```bash
 python -m scripts.db_snapshot backup --output backups/rag.dump
@@ -398,6 +403,25 @@ inventory and from both retrieval engines without deleting its chunks.
 `POST /documents/{document_id}/restore` makes the same stored generation
 retrievable again. Both operations are idempotent, require the same API key as
 the other document routes, and return 409 while an ingest lease is active.
+
+Irreversible deletion is deliberately a separate architect-only workflow.
+`GET`/`PUT /v1/org/admin/retention-policy` publishes and CAS-updates the tenant
+archive-retention period. Legal holds are created, listed and released under
+`/documents/{document_id}/legal-holds`; an active hold cancels a pending purge
+and prevents another one from being scheduled. Once an archived document has
+outlived the tenant period, `POST /documents/{document_id}/purge-jobs` creates a
+durable job. Run the content worker separately:
+
+```bash
+python -m pipeline.index.purge_worker
+```
+
+The worker rechecks holds and ingest activity while retaining the document row
+lock, removes only the database-authorized immutable source objects and chunks,
+then writes a terminal document tombstone. Version identities, lifecycle events,
+the job and closed governance audit events remain as deletion evidence; source
+bytes, chunk text, filename, content digests and collection/tag membership do
+not. A purged document cannot be restored or otherwise mutated.
 
 `GET /documents` lists active documents by default; use `archived=true` to list
 only archived ones. An archived document cannot start processing. Lifecycle

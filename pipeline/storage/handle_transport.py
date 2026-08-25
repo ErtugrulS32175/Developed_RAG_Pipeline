@@ -116,6 +116,7 @@ child_entry = _impl.child_entry
 open_child_directory = _impl.open_child_directory
 create_child_directory = _impl.create_child_directory
 remove_child_directory = _impl.remove_child_directory
+remove_child_file = _impl.remove_child_file
 create_child_file = _impl.create_child_file
 open_child_file = _impl.open_child_file
 rename_child = _impl.rename_child

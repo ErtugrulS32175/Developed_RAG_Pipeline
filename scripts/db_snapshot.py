@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -13,12 +14,20 @@ from urllib.parse import unquote, urlparse
 
 import psycopg
 
+from pipeline.index import db
 
-SNAPSHOT_VERSION = 1
+
+SNAPSHOT_VERSION = 2
 MAX_MANIFEST_BYTES = 16_384
 _MANIFEST_FIELDS = {
     "snapshot_version", "archive_name", "size", "sha256",
+    "schema_version", "schema_sha256", "tenant_count",
+    "purged_document_count", "retention_event_count",
 }
+_EVIDENCE_FIELDS = (
+    "schema_version", "schema_sha256", "tenant_count",
+    "purged_document_count", "retention_event_count",
+)
 
 
 class SnapshotError(RuntimeError):
@@ -77,6 +86,62 @@ def _manifest_path(archive: Path) -> Path:
     return archive.with_name(archive.name + ".manifest.json")
 
 
+def _read_database_evidence(conn) -> dict[str, object]:
+    """Read only closed restore evidence; never return names or content."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT schema_version, schema_sha256 FROM rag_schema_state "
+            "WHERE singleton = true")
+        schema = cur.fetchone()
+        if schema is None:
+            raise SnapshotError("database_schema_unverified")
+        cur.execute("SELECT count(*) FROM org_tenants")
+        tenant_count = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM documents WHERE purged_at IS NOT NULL")
+        purged_count = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM document_retention_events")
+        event_count = cur.fetchone()[0]
+    expected_version, expected_digest = db.expected_schema_state()
+    if schema != (expected_version, expected_digest):
+        raise SnapshotError("database_schema_unverified")
+    return {
+        "schema_version": int(schema[0]),
+        "schema_sha256": schema[1],
+        "tenant_count": int(tenant_count),
+        "purged_document_count": int(purged_count),
+        "retention_event_count": int(event_count),
+    }
+
+
+def _database_evidence(dsn: str) -> dict[str, object]:
+    try:
+        with psycopg.connect(dsn) as conn:
+            return _read_database_evidence(conn)
+    except psycopg.Error as error:
+        raise SnapshotError("database_schema_unverified") from error
+
+
+@contextmanager
+def _backup_snapshot(dsn: str):
+    """Hold one exported snapshot across evidence reads and pg_dump."""
+    try:
+        with psycopg.connect(dsn) as conn:
+            conn.execute(
+                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_export_snapshot()")
+                snapshot = cur.fetchone()[0]
+            if (type(snapshot) is not str or not 1 <= len(snapshot) <= 100
+                    or not snapshot.isascii()
+                    or any(char.isspace() for char in snapshot)):
+                raise SnapshotError("database_snapshot_invalid")
+            evidence = _read_database_evidence(conn)
+            yield snapshot, evidence
+            conn.rollback()
+    except psycopg.Error as error:
+        raise SnapshotError("database_schema_unverified") from error
+
+
 def _write_exclusive(path: Path, payload: bytes) -> None:
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -108,7 +173,14 @@ def verify(archive, manifest=None) -> dict[str, object]:
             or record["archive_name"] != archive.name
             or type(record["size"]) is not int
             or type(record["sha256"]) is not str
-            or len(record["sha256"]) != 64):
+            or len(record["sha256"]) != 64
+            or type(record["schema_version"]) is not int
+            or record["schema_version"] < 1
+            or type(record["schema_sha256"]) is not str
+            or len(record["schema_sha256"]) != 64
+            or any(type(record[field]) is not int or record[field] < 0
+                   for field in ("tenant_count", "purged_document_count",
+                                 "retention_event_count"))):
         raise SnapshotError("manifest_invalid")
     size, digest = _digest(archive)
     if size != record["size"] or digest != record["sha256"]:
@@ -121,7 +193,7 @@ def backup(output) -> dict[str, object]:
     manifest = _manifest_path(output)
     if output.exists() or manifest.exists() or not output.parent.is_dir():
         raise SnapshotError("output_not_available")
-    env, _database, _raw_dsn = _connection_env("PG_DSN")
+    env, _database, raw_dsn = _connection_env("PG_DSN")
     token = secrets.token_hex(12)
     archive_tmp = output.parent / f".{output.name}.{token}.tmp"
     manifest_tmp = output.parent / f".{manifest.name}.{token}.tmp"
@@ -130,14 +202,16 @@ def backup(output) -> dict[str, object]:
         flags |= os.O_NOFOLLOW
     fd = os.open(archive_tmp, flags, 0o600)
     try:
-        with os.fdopen(fd, "wb") as handle:
-            fd = -1
-            completed = subprocess.run(
-                ["pg_dump", "--format=custom", "--no-owner", "--no-acl"],
-                stdout=handle, stderr=subprocess.PIPE, env=env,
-                timeout=3600, check=False)
-            handle.flush()
-            os.fsync(handle.fileno())
+        with _backup_snapshot(raw_dsn) as (snapshot, evidence):
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                completed = subprocess.run(
+                    ["pg_dump", "--format=custom", "--no-owner", "--no-acl",
+                     "--snapshot", snapshot],
+                    stdout=handle, stderr=subprocess.PIPE, env=env,
+                    timeout=3600, check=False)
+                handle.flush()
+                os.fsync(handle.fileno())
         if completed.returncode != 0:
             raise SnapshotError("pg_dump_failed")
         size, digest = _digest(archive_tmp)
@@ -146,6 +220,7 @@ def backup(output) -> dict[str, object]:
             "archive_name": output.name,
             "size": size,
             "sha256": digest,
+            **evidence,
         }
         payload = (json.dumps(record, sort_keys=True, separators=(",", ":"))
                    + "\n").encode("utf-8")
@@ -199,8 +274,15 @@ def restore(archive, manifest=None, confirmation="") -> dict[str, object]:
         raise SnapshotError("restore_failed") from error
     if completed.returncode != 0:
         raise SnapshotError("pg_restore_failed")
+    restored = _database_evidence(raw_dsn)
+    if any(restored[field] != record[field] for field in _EVIDENCE_FIELDS):
+        raise SnapshotError("restore_evidence_mismatch")
     return {"snapshot_version": SNAPSHOT_VERSION, "status": "restored",
-            "sha256": record["sha256"]}
+            "sha256": record["sha256"],
+            "schema_sha256": record["schema_sha256"],
+            "tenant_count": record["tenant_count"],
+            "purged_document_count": record["purged_document_count"],
+            "retention_event_count": record["retention_event_count"]}
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -402,6 +402,12 @@ def require_org_architect(
             action = "events_view"
         elif path.startswith("/v1/org/admin/members/"):
             action = "membership_change"
+        elif path == "/v1/org/admin/retention-policy":
+            action = "retention_policy_change"
+        elif "/legal-holds" in path:
+            action = "legal_hold_change"
+        elif "/purge-jobs" in path:
+            action = "purge_schedule"
         else:
             action = ("topology_change" if request.method == "PUT"
                       else "topology_read")
@@ -610,6 +616,34 @@ class OrgMembershipUpdateRequest(BaseModel):
     position_id: UUID | None = None
 
 
+class RetentionPolicyUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=1, strict=True)
+    expected_policy_epoch: int = Field(ge=1, strict=True)
+    archive_retention_days: int = Field(ge=1, le=3650, strict=True)
+
+
+class LegalHoldCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_document_revision: int = Field(ge=0, strict=True)
+    expected_policy_epoch: int = Field(ge=1, strict=True)
+    reason_code: Literal[
+        "litigation", "regulatory", "security_investigation",
+    ]
+
+
+class LegalHoldReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=1, strict=True)
+    expected_policy_epoch: int = Field(ge=1, strict=True)
+
+
+class PurgeScheduleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_document_revision: int = Field(ge=0, strict=True)
+    expected_policy_epoch: int = Field(ge=1, strict=True)
+
+
 @app.get("/v1/org/me")
 def organization_me(principal=Depends(require_org_identity)):
     """Show only the caller's own level and content-free organization facts."""
@@ -663,7 +697,8 @@ def organization_audit_events(
         action: list[Literal[
             "monitor_view", "topology_read", "topology_change",
             "access_preview", "review_queue_view", "review_decision",
-            "events_view", "membership_change"
+            "events_view", "membership_change", "retention_policy_change",
+            "legal_hold_change", "purge_schedule", "purge_execute"
         ]] | None = Query(default=None),
         decision: list[Literal["allowed", "denied"]] | None = Query(
             default=None),
@@ -762,6 +797,118 @@ def update_organization_membership(
         "architecture_version": updated["architecture_version"],
         "policy_epoch": updated["policy_epoch"],
     }
+
+
+@app.get("/v1/org/admin/retention-policy")
+def organization_retention_policy(
+        principal=Depends(require_org_architect)):
+    try:
+        with db_conn() as conn:
+            return db.get_tenant_retention_policy(
+                conn, actor_id=principal.subject_id)
+    except db.DocumentRetentionRefused as error:
+        raise HTTPException(status_code=403, detail=str(error)) from None
+
+
+@app.put("/v1/org/admin/retention-policy")
+def update_organization_retention_policy(
+        body: RetentionPolicyUpdateRequest, request: Request,
+        principal=Depends(require_org_architect)):
+    try:
+        with db_conn() as conn:
+            return db.update_tenant_retention_policy(
+                conn, actor_id=principal.subject_id,
+                archive_retention_days=body.archive_retention_days,
+                expected_revision=body.expected_revision,
+                expected_policy_epoch=body.expected_policy_epoch,
+                request_id=request.state.request_id)
+    except (db.RetentionPolicyConflict,
+            db.OrgPolicyConflict) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except db.DocumentRetentionRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@app.get("/documents/{document_id}/legal-holds")
+def document_legal_holds(
+        document_id: UUID, principal=Depends(require_org_architect)):
+    try:
+        with db_conn() as conn:
+            return {"holds": db.list_document_legal_holds(
+                conn, actor_id=principal.subject_id,
+                document_id=document_id)}
+    except db.DocumentRetentionRefused as error:
+        raise HTTPException(status_code=403, detail=str(error)) from None
+
+
+@app.post("/documents/{document_id}/legal-holds", status_code=201)
+def create_document_legal_hold(
+        document_id: UUID, body: LegalHoldCreateRequest, request: Request,
+        principal=Depends(require_org_architect)):
+    try:
+        with db_conn() as conn:
+            return db.create_document_legal_hold(
+                conn, actor_id=principal.subject_id,
+                document_id=document_id,
+                reason_code=body.reason_code,
+                expected_revision=body.expected_document_revision,
+                expected_policy_epoch=body.expected_policy_epoch,
+                request_id=request.state.request_id)
+    except (db.DocumentVersionConflict,
+            db.OrgPolicyConflict) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except db.DocumentRetentionRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@app.post("/documents/{document_id}/legal-holds/{hold_id}/release")
+def release_document_legal_hold(
+        document_id: UUID, hold_id: UUID, body: LegalHoldReleaseRequest,
+        request: Request, principal=Depends(require_org_architect)):
+    try:
+        with db_conn() as conn:
+            return db.release_document_legal_hold(
+                conn, actor_id=principal.subject_id,
+                document_id=document_id, hold_id=hold_id,
+                expected_revision=body.expected_revision,
+                expected_policy_epoch=body.expected_policy_epoch,
+                request_id=request.state.request_id)
+    except (db.DocumentVersionConflict,
+            db.OrgPolicyConflict) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except db.DocumentRetentionRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@app.get("/documents/{document_id}/purge-jobs")
+def document_purge_jobs(
+        document_id: UUID, principal=Depends(require_org_architect)):
+    try:
+        with db_conn() as conn:
+            return {"jobs": db.list_document_purge_jobs(
+                conn, actor_id=principal.subject_id,
+                document_id=document_id)}
+    except db.DocumentRetentionRefused as error:
+        raise HTTPException(status_code=403, detail=str(error)) from None
+
+
+@app.post("/documents/{document_id}/purge-jobs", status_code=202)
+def schedule_document_purge(
+        document_id: UUID, body: PurgeScheduleRequest, request: Request,
+        principal=Depends(require_org_architect)):
+    try:
+        with db_conn() as conn:
+            return db.schedule_document_purge(
+                conn, actor_id=principal.subject_id,
+                document_id=document_id,
+                expected_revision=body.expected_document_revision,
+                expected_policy_epoch=body.expected_policy_epoch,
+                request_id=request.state.request_id)
+    except (db.DocumentVersionConflict,
+            db.OrgPolicyConflict) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except db.DocumentRetentionRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
 
 
 def _eval_version_metadata(row, *, version_id=None):

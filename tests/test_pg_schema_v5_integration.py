@@ -84,12 +84,12 @@ def test_v4_receipt_advances_to_current_and_repeated_init_is_idempotent(
     db.init_schema(conn)
     assert db.schema_is_current(conn)
     version, digest = db.expected_schema_state()
-    assert version == 9 and digest != V4_DIGEST
+    assert version == 10 and digest != V4_DIGEST
     with conn.cursor() as cur:
         cur.execute(
             "SELECT schema_version, schema_sha256 FROM rag_schema_history "
             "ORDER BY schema_version")
-        assert cur.fetchall() == [(4, V4_DIGEST), (9, digest)]
+        assert cur.fetchall() == [(4, V4_DIGEST), (10, digest)]
         for table in ("review_interactions", "review_feedback", "review_cases",
                       "review_case_events"):
             cur.execute("SELECT to_regclass(%s)", (table,))

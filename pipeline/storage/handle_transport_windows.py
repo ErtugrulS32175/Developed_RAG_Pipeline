@@ -457,6 +457,35 @@ def remove_child_directory(directory: Directory, name: str) -> None:
     _close(handle)
 
 
+def remove_child_file(directory: Directory, name: str,
+                      expected_identity: str) -> None:
+    """Remove the exact ordinary file through its own no-follow handle."""
+    _assert_open(directory)
+    if type(expected_identity) is not str or not expected_identity:
+        raise _api.TransportError("beklenen nesne kimligi gecersiz")
+    status, handle = _relative(
+        directory, name, _REMOVE_ACCESS, _FILE_OPEN,
+        _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_REPARSE_POINT
+        | _FILE_NON_DIRECTORY_FILE)
+    if status != 0:
+        raise _api.TransportError("dosya acilamadi")
+    try:
+        tag = _query(handle, _FileAttributeTagInfo, _FILE_ATTRIBUTE_TAG_INFO)
+        if (tag.FileAttributes & (ATTR_REPARSE | ATTR_DIRECTORY)
+                or tag.ReparseTag):
+            raise _api.TransportError("silinecek nesne siradan dosya degil")
+        if _identity_text(handle) != expected_identity:
+            raise _api.TransportError("silinecek nesne kimligi degisti")
+        removal = _dispose(handle)
+    except _api.TransportError as refused:
+        if not _close_quietly(handle):
+            refused.add_note("temizlik basarisiz: nesne kapatilamadi")
+        raise
+    if removal != 0:
+        raise _fail("dosya kaldirilamadi", handle)
+    _close(handle)
+
+
 def _dispose(handle) -> int:
     """Mark an object for removal THROUGH ITS HANDLE, POSIX semantics
     first so the name is gone the moment the call returns."""

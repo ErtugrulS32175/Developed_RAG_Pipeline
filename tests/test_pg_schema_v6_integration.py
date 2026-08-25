@@ -77,14 +77,14 @@ def test_v5_receipt_advances_to_current_with_forced_rls_and_is_idempotent(
     db.init_schema(conn)
 
     version, digest = db.expected_schema_state()
-    assert version == db.SCHEMA_VERSION == 9
+    assert version == db.SCHEMA_VERSION == 10
     assert digest != V5_DIGEST
     assert db.schema_is_current(conn)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT schema_version, schema_sha256 FROM rag_schema_history "
             "ORDER BY schema_version")
-        assert cur.fetchall() == [(5, V5_DIGEST), (9, digest)]
+        assert cur.fetchall() == [(5, V5_DIGEST), (10, digest)]
         for table in ("eval_datasets", "eval_dataset_versions", "eval_cases",
                       "eval_dataset_events"):
             cur.execute("SELECT to_regclass(%s)", (table,))

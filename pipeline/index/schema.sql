@@ -1880,3 +1880,266 @@ BEGIN
     END IF;
 END
 $runtime_private_tables$;
+
+-- Tenant retention is control-plane policy over data-plane content.  A
+-- document first becomes non-serving through archived_at; only after the
+-- tenant's closed waiting period may an architect schedule irreversible
+-- content removal.  The document/version identities and the events below are
+-- retained as content-free evidence, while chunks and source objects are the
+-- material that the purge worker destroys.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS purged_at timestamptz;
+
+CREATE TABLE IF NOT EXISTS tenant_retention_policies (
+    tenant_id              uuid PRIMARY KEY REFERENCES org_tenants(id)
+                           ON DELETE RESTRICT,
+    archive_retention_days integer NOT NULL DEFAULT 365 CHECK (
+                             archive_retention_days BETWEEN 1 AND 3650),
+    revision               bigint NOT NULL DEFAULT 1 CHECK (revision > 0),
+    updated_by             uuid NOT NULL REFERENCES org_identities(id)
+                           ON DELETE RESTRICT,
+    updated_at             timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS document_legal_holds (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    document_id uuid NOT NULL,
+    reason_code text NOT NULL CHECK (reason_code IN (
+                  'litigation', 'regulatory', 'security_investigation')),
+    state       text NOT NULL DEFAULT 'active' CHECK (
+                  state IN ('active', 'released')),
+    revision    bigint NOT NULL DEFAULT 1 CHECK (revision > 0),
+    created_by  uuid NOT NULL REFERENCES org_identities(id) ON DELETE RESTRICT,
+    released_by uuid REFERENCES org_identities(id) ON DELETE RESTRICT,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    released_at timestamptz,
+    UNIQUE (tenant_id, id),
+    FOREIGN KEY (tenant_id, document_id)
+        REFERENCES documents(tenant_id, id) ON DELETE RESTRICT,
+    CHECK ((state = 'active' AND released_by IS NULL AND released_at IS NULL)
+        OR (state = 'released' AND released_by IS NOT NULL
+            AND released_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS document_legal_holds_active_idx
+    ON document_legal_holds(tenant_id, document_id, created_at, id)
+    WHERE state = 'active';
+
+CREATE TABLE IF NOT EXISTS document_purge_jobs (
+    id             uuid PRIMARY KEY,
+    tenant_id      uuid NOT NULL,
+    document_id    uuid NOT NULL,
+    scheduled_by   uuid NOT NULL REFERENCES org_identities(id)
+                   ON DELETE RESTRICT,
+    state          text NOT NULL DEFAULT 'pending' CHECK (
+                     state IN ('pending', 'running', 'completed',
+                               'failed', 'cancelled')),
+    eligible_at    timestamptz NOT NULL,
+    policy_revision bigint NOT NULL CHECK (policy_revision > 0),
+    policy_epoch    bigint NOT NULL CHECK (policy_epoch > 0),
+    document_revision bigint NOT NULL CHECK (document_revision >= 0),
+    attempt_count  integer NOT NULL DEFAULT 0 CHECK (
+                     attempt_count BETWEEN 0 AND 20),
+    worker_id      text CHECK (worker_id IS NULL OR length(worker_id)
+                               BETWEEN 1 AND 200),
+    failure_code   text CHECK (failure_code IS NULL OR failure_code IN (
+                     'storage_refused', 'storage_unavailable')),
+    request_id     text NOT NULL CHECK (length(request_id) BETWEEN 8 AND 64),
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    started_at     timestamptz,
+    completed_at   timestamptz,
+    UNIQUE (tenant_id, id),
+    FOREIGN KEY (tenant_id, document_id)
+        REFERENCES documents(tenant_id, id) ON DELETE RESTRICT,
+    CHECK ((state = 'pending' AND worker_id IS NULL AND started_at IS NULL
+            AND completed_at IS NULL AND failure_code IS NULL)
+        OR (state = 'running' AND worker_id IS NOT NULL
+            AND started_at IS NOT NULL AND completed_at IS NULL
+            AND failure_code IS NULL)
+        OR (state = 'completed' AND worker_id IS NOT NULL
+            AND started_at IS NOT NULL AND completed_at IS NOT NULL
+            AND failure_code IS NULL)
+        OR (state = 'failed' AND worker_id IS NOT NULL
+            AND started_at IS NOT NULL AND completed_at IS NOT NULL
+            AND failure_code IS NOT NULL)
+        OR (state = 'cancelled' AND completed_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS document_purge_jobs_open_idx
+    ON document_purge_jobs(tenant_id, document_id)
+    WHERE state IN ('pending', 'running');
+CREATE INDEX IF NOT EXISTS document_purge_jobs_due_idx
+    ON document_purge_jobs(eligible_at, created_at, id)
+    WHERE state = 'pending';
+
+CREATE TABLE IF NOT EXISTS document_retention_events (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL REFERENCES org_tenants(id) ON DELETE RESTRICT,
+    document_id uuid,
+    actor_id    uuid NOT NULL REFERENCES org_identities(id) ON DELETE RESTRICT,
+    event_type  text NOT NULL CHECK (event_type IN (
+                  'policy_changed', 'hold_created', 'hold_released',
+                  'purge_scheduled', 'purge_completed', 'purge_failed')),
+    hold_id     uuid,
+    purge_job_id uuid,
+    request_id  text NOT NULL CHECK (length(request_id) BETWEEN 8 AND 64),
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (tenant_id, document_id)
+        REFERENCES documents(tenant_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, hold_id)
+        REFERENCES document_legal_holds(tenant_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, purge_job_id)
+        REFERENCES document_purge_jobs(tenant_id, id) ON DELETE RESTRICT,
+    CHECK ((event_type = 'policy_changed' AND document_id IS NULL
+            AND hold_id IS NULL AND purge_job_id IS NULL)
+        OR (event_type IN ('hold_created', 'hold_released')
+            AND document_id IS NOT NULL AND hold_id IS NOT NULL
+            AND purge_job_id IS NULL)
+        OR (event_type IN ('purge_scheduled', 'purge_completed',
+                           'purge_failed')
+            AND document_id IS NOT NULL AND hold_id IS NULL
+            AND purge_job_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS document_retention_events_tenant_time_idx
+    ON document_retention_events(tenant_id, created_at DESC, id DESC);
+
+DROP TRIGGER IF EXISTS document_retention_events_immutable
+    ON document_retention_events;
+CREATE TRIGGER document_retention_events_immutable
+BEFORE UPDATE OR DELETE ON document_retention_events
+FOR EACH ROW EXECUTE FUNCTION rag_reject_security_event_mutation();
+
+-- A purge tombstone is terminal.  The one permitted transition clears every
+-- mutable content pointer at the same time; later updates cannot silently
+-- resurrect a filename, digest, active build, status, or candidate.
+CREATE OR REPLACE FUNCTION rag_guard_document_purge_state()
+RETURNS trigger LANGUAGE plpgsql AS $purge_state$
+BEGIN
+    IF OLD.purged_at IS NOT NULL AND NEW IS DISTINCT FROM OLD THEN
+        RAISE EXCEPTION 'purged document is immutable' USING ERRCODE = '55000';
+    END IF;
+    IF OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL THEN
+        IF NEW.archived_at IS NULL
+           OR NEW.filename <> 'purged-' || NEW.id::text
+           OR NEW.file_type <> 'purged'
+           OR NEW.status <> 'purged'
+           OR NEW.content_sha256 IS NOT NULL
+           OR NEW.candidate_id IS NOT NULL
+           OR NEW.candidate_state IS NOT NULL
+           OR NEW.active_content_sha IS NOT NULL
+           OR NEW.active_version_id IS NOT NULL
+           OR NEW.attempt_id IS NOT NULL
+           OR NEW.attempt_owner IS NOT NULL
+           OR NEW.attempt_expires_at IS NOT NULL
+        THEN
+            RAISE EXCEPTION 'purge tombstone is incomplete'
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$purge_state$;
+DROP TRIGGER IF EXISTS documents_guard_purge_state ON documents;
+CREATE TRIGGER documents_guard_purge_state
+BEFORE UPDATE ON documents
+FOR EACH ROW EXECUTE FUNCTION rag_guard_document_purge_state();
+
+-- Re-declare the activation recorder with one additional terminal branch.
+-- Clearing an active version remains forbidden for every ordinary update;
+-- the purge tombstone is the sole exception and records its own retention
+-- event instead of pretending that content deletion was a version activation.
+CREATE OR REPLACE FUNCTION record_document_version_activation()
+RETURNS trigger LANGUAGE plpgsql AS $activated_version$
+DECLARE ready_count integer;
+DECLARE version_sha text;
+BEGIN
+    IF NEW.active_version_id IS NOT DISTINCT FROM OLD.active_version_id
+       AND NEW.active_generation IS NOT DISTINCT FROM OLD.active_generation
+    THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.purged_at IS NOT NULL AND OLD.purged_at IS NULL
+       AND NEW.active_version_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.active_version_id IS NULL THEN
+        RAISE EXCEPTION 'active version cannot be cleared'
+            USING ERRCODE = '55000';
+    END IF;
+    SELECT content_sha256 INTO STRICT version_sha
+    FROM document_versions
+    WHERE tenant_id = NEW.tenant_id AND document_id = NEW.id
+      AND id = NEW.active_version_id;
+    SELECT count(*) INTO ready_count FROM chunks
+    WHERE tenant_id = NEW.tenant_id AND document_id = NEW.id
+      AND version_id = NEW.active_version_id
+      AND generation = NEW.active_generation;
+    IF ready_count < 1 OR version_sha IS DISTINCT FROM NEW.active_content_sha
+    THEN
+        RAISE EXCEPTION 'active version build is not ready'
+            USING ERRCODE = '55000';
+    END IF;
+    IF OLD.attempt_id IS NOT NULL THEN
+        INSERT INTO document_version_builds
+            (tenant_id, document_id, version_id, generation, content_sha256,
+             attempt_id, chunk_count)
+        VALUES (NEW.tenant_id, NEW.id, NEW.active_version_id,
+                NEW.active_generation, NEW.active_content_sha,
+                OLD.attempt_id, ready_count)
+        ON CONFLICT DO NOTHING;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM document_version_builds b
+        WHERE b.tenant_id = NEW.tenant_id AND b.document_id = NEW.id
+          AND b.version_id = NEW.active_version_id
+          AND b.generation = NEW.active_generation
+          AND b.content_sha256 = NEW.active_content_sha
+          AND (OLD.attempt_id IS NULL OR b.attempt_id = OLD.attempt_id)
+          AND b.chunk_count = ready_count
+    ) THEN
+        RAISE EXCEPTION 'active version build receipt is missing'
+            USING ERRCODE = '55000';
+    END IF;
+    INSERT INTO document_version_events
+        (tenant_id, document_id, event_type, from_version_id, to_version_id,
+         expected_revision, resulting_revision)
+    VALUES (NEW.tenant_id, NEW.id, 'activated', OLD.active_version_id,
+            NEW.active_version_id, OLD.revision, NEW.revision);
+    RETURN NEW;
+END
+$activated_version$;
+
+ALTER TABLE tenant_retention_policies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_retention_policies FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON tenant_retention_policies;
+CREATE POLICY tenant_isolation ON tenant_retention_policies
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE document_legal_holds ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_legal_holds FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON document_legal_holds;
+CREATE POLICY tenant_isolation ON document_legal_holds
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE document_purge_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_purge_jobs FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON document_purge_jobs;
+CREATE POLICY tenant_isolation ON document_purge_jobs
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE document_retention_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_retention_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON document_retention_events;
+CREATE POLICY tenant_isolation ON document_retention_events
+    USING (rag_service_access() OR tenant_id = rag_effective_tenant())
+    WITH CHECK (rag_service_access() OR tenant_id = rag_effective_tenant());
+
+ALTER TABLE org_audit_events
+    DROP CONSTRAINT IF EXISTS org_audit_events_action_check;
+ALTER TABLE org_audit_events
+    ADD CONSTRAINT org_audit_events_action_check CHECK (action IN (
+        'monitor_view', 'topology_read', 'topology_change', 'access_preview',
+        'review_queue_view', 'review_decision', 'events_view',
+        'membership_change', 'retention_policy_change', 'legal_hold_change',
+        'purge_schedule', 'purge_execute'));
