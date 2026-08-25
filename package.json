@@ -1,0 +1,16 @@
+{
+  "name": "ragtest-contract-client",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "api:generate": "openapi-typescript contracts/openapi.json -o clients/typescript/src/schema.ts",
+    "typecheck": "tsc -p clients/typescript/tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "openapi-fetch": "0.17.0"
+  },
+  "devDependencies": {
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3"
+  }
+}

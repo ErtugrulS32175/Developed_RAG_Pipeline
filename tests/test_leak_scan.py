@@ -337,6 +337,21 @@ def test_an_unsupported_repo_file_is_reported_not_silently_skipped(
     assert report["files"] == 1
 
 
+def test_a_typescript_source_is_scanned_as_text(
+        tmp_path, monkeypatch, veri):
+    """Generated clients are part of the repository's leak surface."""
+    documents, full, _ = _corpora(veri)
+    start = CORPUS_SENTENCE.index("Zeta")
+    planted = CORPUS_SENTENCE[start:start + 20]
+    _repo(tmp_path, monkeypatch, {
+        "istemci.ts": f"// aciklama: {planted}\n",
+    })
+    report = scan(["istemci.ts"], documents, full, width=14)
+    assert report["files"] == 1
+    assert report["kapsam_disi"] == []
+    assert "istemci.ts" in report["document_hits"]
+
+
 def test_a_stem_shared_with_repo_vocabulary_is_triaged_not_dropped(
         tmp_path, monkeypatch, veri):
     """Round 17: a piece that also names a repo file used to be EXCLUDED

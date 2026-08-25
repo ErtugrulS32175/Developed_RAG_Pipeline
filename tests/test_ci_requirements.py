@@ -45,6 +45,19 @@ def test_the_omitted_package_is_actually_in_requirements():
 
 
 @pytest.mark.parametrize("ci_file", CI_FILES, ids=lambda p: p.name)
+def test_ci_checks_openapi_compatibility_and_the_generated_client(ci_file):
+    text = ci_file.read_text(encoding="utf-8")
+    for command in (
+            "npm ci",
+            "scripts/export_openapi.py --check contracts/openapi.json",
+            "scripts/check_openapi_compat.py contracts/openapi.v1.json",
+            "npm run api:generate",
+            "git diff --exit-code -- clients/typescript/src/schema.ts",
+            "npm run typecheck"):
+        assert command in text
+
+
+@pytest.mark.parametrize("ci_file", CI_FILES, ids=lambda p: p.name)
 def test_eval_governance_uses_real_postgresql_in_every_ci(ci_file):
     text = ci_file.read_text(encoding="utf-8")
     assert "pgvector/pgvector:pg17" in text

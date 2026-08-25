@@ -104,8 +104,8 @@ Status: `[~]` in progress.
   - [x] Collection, tag, and document-organization responses.
 - [x] Introduce one versioned, content-free error envelope and error-code
   vocabulary with an explicit compatibility transition from FastAPI `detail`.
-- [ ] Add an OpenAPI snapshot and backwards-compatibility CI gate.
-- [ ] Generate and compile a TypeScript client from the checked OpenAPI schema.
+- [x] Add an OpenAPI snapshot and backwards-compatibility CI gate.
+- [x] Generate and compile a TypeScript client from the checked OpenAPI schema.
 - [ ] Standardize cursor, pagination, idempotency, conflict, and deprecation
   contracts.
 - [ ] Split `pipeline/api/app.py` into domain routers without changing route

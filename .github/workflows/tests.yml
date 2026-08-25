@@ -41,6 +41,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
       - name: Install system libraries
         # OpenCV arrives through docling -> rapidocr and loads libGL at import
         # time, so without these the suite dies during collection -- not in the
@@ -62,5 +66,13 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
           pip install docling docling-core transformers 'psycopg[binary,pool]' pgvector fastembed python-dotenv requests openpyxl fastapi uvicorn python-multipart
           pip install pytest httpx jsonschema
+      - name: Verify OpenAPI compatibility and generated client
+        run: |
+          npm ci
+          python scripts/export_openapi.py --check contracts/openapi.json
+          python scripts/check_openapi_compat.py contracts/openapi.v1.json contracts/openapi.json
+          npm run api:generate
+          git diff --exit-code -- clients/typescript/src/schema.ts
+          npm run typecheck
       - name: Run tests
         run: python -m pytest tests/ -q

@@ -33,7 +33,7 @@ test:
     # OpenCV arrives through docling -> rapidocr and loads libGL at import time,
     # so without these the suite dies during collection -- not in the tests that
     # need OpenCV, but in every file that imports the pipeline.
-    - apt-get update && apt-get install -y libgl1 libglib2.0-0
+    - apt-get update && apt-get install -y libgl1 libglib2.0-0 nodejs npm
     # The packages are listed here rather than filtered out of requirements.txt.
     # A filter fails silently when it stops matching, and this one did:
     # `grep -v '^vllm$'` matched nothing on a Linux runner because the file was
@@ -49,4 +49,10 @@ test:
     - pip install docling docling-core transformers 'psycopg[binary,pool]' pgvector fastembed python-dotenv requests openpyxl fastapi uvicorn python-multipart
     - pip install pytest httpx jsonschema
   script:
+    - npm ci
+    - python scripts/export_openapi.py --check contracts/openapi.json
+    - python scripts/check_openapi_compat.py contracts/openapi.v1.json contracts/openapi.json
+    - npm run api:generate
+    - git diff --exit-code -- clients/typescript/src/schema.ts
+    - npm run typecheck
     - python -m pytest tests/ -q

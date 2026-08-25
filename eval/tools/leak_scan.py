@@ -55,7 +55,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-TEXT_SUFFIXES = {".txt", ".md", ".json", ".jsonl", ".csv", ".py", ".yml",
+TEXT_SUFFIXES = {".txt", ".md", ".json", ".jsonl", ".csv", ".py", ".ts", ".yml",
                  ".yaml", ".toml", ".cfg", ".sql", ".sh", ".ini", ".pem",
                  ".example", ".env", ""}
 # Image files cannot be text-scanned; they are COUNTED and declared, never

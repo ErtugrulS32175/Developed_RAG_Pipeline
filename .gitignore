@@ -5,8 +5,13 @@ data/
 output/
 uploads/
 contracts/
+!contracts/
+contracts/*
+!contracts/openapi.json
+!contracts/openapi.v1.json
 ROADMAP.md
 __pycache__/
+node_modules/
 *.pyc
 paddle_env/
 gemma_env/
