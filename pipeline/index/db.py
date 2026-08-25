@@ -36,7 +36,7 @@ load_dotenv()
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv(
     "PG_DSN", "postgresql://rag_runtime:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -93,6 +93,14 @@ class OrgIdentityConflict(RuntimeError):
     """An external identity cannot be bound safely to the requested tenant."""
 
 
+class OrgPolicyConflict(RuntimeError):
+    """A requested organization mutation lost a CAS policy epoch check."""
+
+
+class OrgMembershipStateRefused(RuntimeError):
+    """A membership lifecycle transition is closed by policy."""
+
+
 class EvidenceAccessRefused(RuntimeError):
     """A citation ticket cannot be minted or consumed under fresh policy."""
 
@@ -119,6 +127,10 @@ class EvalDatasetConflict(RuntimeError):
 
 class EvalDatasetStateRefused(RuntimeError):
     """An evaluation lifecycle transition is not currently valid."""
+
+
+class OrgAuditQueryRefused(RuntimeError):
+    """A governance event query request is malformed or unauthorized."""
 
 
 def _context_secret() -> bytes:
@@ -543,6 +555,96 @@ def visible_org_members(conn, viewer_id):
             "AND position.protected_from_monitoring = false "
             "ORDER BY scope.depth, target.display_label, target.identity_id",
             (viewer_id,))
+        return [dict(row) for row in cur.fetchall()]
+
+
+def list_org_audit_events(conn, *, limit, before=None, actions=None,
+                          decisions=None, reasons=None):
+    """Read one tenant's immutable governance events with closed filters."""
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise OrgAuditQueryRefused("governance olay liste limiti gecersiz")
+
+    if (before is not None and type(before) is not tuple
+            and type(before) is not list):
+        raise OrgAuditQueryRefused("governance cursor gecersiz")
+
+    if before is not None and len(before) != 2:
+        raise OrgAuditQueryRefused("governance cursor bozuk")
+    before_created_at, before_id = (None, None) if before is None else before
+    if (before_created_at is None) != (before_id is None):
+        raise OrgAuditQueryRefused("governance cursor eksik")
+    if before_created_at is not None and type(before_created_at) is not datetime:
+        raise OrgAuditQueryRefused("governance cursor zamani gecersiz")
+    if before_created_at is not None and before_created_at.tzinfo is None:
+        raise OrgAuditQueryRefused("governance cursor zamani gecersiz")
+    if before_id is not None:
+        try:
+            before_id = uuid.UUID(str(before_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise OrgAuditQueryRefused(
+                "governance cursor kimligi gecersiz") from exc
+
+    allowed_actions = {
+        "monitor_view", "topology_read", "topology_change",
+        "access_preview", "review_queue_view", "review_decision",
+        "events_view", "membership_change",
+    }
+    allowed_decisions = {"allowed", "denied"}
+    allowed_reasons = {
+        "management_duty", "security_review", "system_operation",
+        "policy_preview",
+    }
+
+    if actions is not None:
+        if type(actions) not in (list, tuple, set):
+            raise OrgAuditQueryRefused("governance eylem filtresi gecersiz")
+        for action in actions:
+            if type(action) is not str:
+                raise OrgAuditQueryRefused("governance eylem filtresi gecersiz")
+            if action not in allowed_actions:
+                raise OrgAuditQueryRefused("governance eylem filtresi gecersiz")
+
+    if decisions is not None:
+        if type(decisions) not in (list, tuple, set):
+            raise OrgAuditQueryRefused("governance karar filtresi gecersiz")
+        for decision in decisions:
+            if type(decision) is not str:
+                raise OrgAuditQueryRefused("governance karar filtresi gecersiz")
+            if decision not in allowed_decisions:
+                raise OrgAuditQueryRefused("governance karar filtresi gecersiz")
+
+    if reasons is not None:
+        if type(reasons) not in (list, tuple, set):
+            raise OrgAuditQueryRefused("governance neden filtresi gecersiz")
+        for reason in reasons:
+            if type(reason) is not str:
+                raise OrgAuditQueryRefused("governance neden filtresi gecersiz")
+            if reason not in allowed_reasons:
+                raise OrgAuditQueryRefused("governance neden filtresi gecersiz")
+
+    clauses = ["tenant_id = rag_effective_tenant()"]
+    args = []
+    if actions is not None and len(actions) > 0:
+        clauses.append("action = ANY(%s::text[])")
+        args.append(list(actions))
+    if decisions is not None and len(decisions) > 0:
+        clauses.append("decision = ANY(%s::text[])")
+        args.append(list(decisions))
+    if reasons is not None and len(reasons) > 0:
+        clauses.append("reason_code = ANY(%s::text[])")
+        args.append(list(reasons))
+    if before_created_at is not None:
+        clauses.append("(created_at, id) < (%s::timestamptz, %s::uuid)")
+        args.extend([before_created_at, before_id])
+
+    query = (
+        "SELECT id, actor_id, subject_id, action, reason_code, decision, "
+        "request_id, created_at FROM org_audit_events WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY created_at DESC, id DESC LIMIT %s")
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, (*args, limit + 1))
         return [dict(row) for row in cur.fetchall()]
 
 
@@ -1427,8 +1529,8 @@ def org_topology(conn):
             "WHERE tenant_id = rag_effective_tenant() ORDER BY title, id")
         positions = [dict(row) for row in cur.fetchall()]
         cur.execute(
-            "SELECT i.issuer, i.subject, m.position_id, m.display_label, "
-            "m.app_role, m.state FROM org_memberships m "
+            "SELECT i.id AS identity_id, i.issuer, i.subject, m.position_id, "
+            "m.display_label, m.app_role, m.state FROM org_memberships m "
             "JOIN org_identities i ON i.id = m.identity_id "
             "WHERE m.tenant_id = rag_effective_tenant() "
             "ORDER BY m.display_label, i.subject")
@@ -1559,6 +1661,169 @@ def replace_org_topology(conn, *, expected_version, name, positions, members,
             (uuid.uuid4(), actor_id, request_id))
     conn.commit()
     return dict(updated)
+
+
+def _coerce_uuid(value, *, label):
+    try:
+        return uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise OrgIdentityConflict(f"{label} kimligi gecersiz") from exc
+
+
+def _coerce_org_transition(current_state, next_state):
+    if next_state is None or current_state == next_state:
+        return True
+    allowed = {
+        ("pending", "active"),
+        ("active", "suspended"),
+        ("suspended", "active"),
+    }
+    if (current_state, next_state) not in allowed:
+        raise OrgMembershipStateRefused("uyelik durumu gecersiz")
+    return True
+
+
+def update_org_member(conn, *, actor_id, target_identity_id,
+                      expected_architecture_version, expected_policy_epoch,
+                      state=None, app_role=None, position_id=None,
+                      request_id=None):
+    """Mutate one active tenant member under optimistic concurrency fences."""
+    actor = _coerce_uuid(actor_id, label="islemci")
+    target_id = _coerce_uuid(target_identity_id, label="hedef")
+    if state is None and app_role is None and position_id is None:
+        raise OrgMembershipStateRefused("uyelik degisikligi belirtilmedi")
+
+    if (type(expected_architecture_version) is not int
+            or expected_architecture_version < 1
+            or type(expected_policy_epoch) is not int
+            or expected_policy_epoch < 1):
+        raise OrgPolicyConflict("organizasyon politikasi bilgisi gecersiz")
+
+    if state is not None and state not in {"active", "pending", "suspended"}:
+        raise OrgMembershipStateRefused("uyelik durumu gecersiz")
+    if app_role is not None and app_role not in {"reader", "editor", "admin"}:
+        raise OrgMembershipStateRefused("uyelik rolü gecersiz")
+    if position_id is not None:
+        position_id = _coerce_uuid(position_id, label="pozisyon")
+        if position_id.int == 0:
+            raise OrgMembershipStateRefused("pozisyon gecersiz")
+
+    if type(request_id) is not str or not 8 <= len(request_id) <= 64:
+        raise OrgIdentityConflict("talep kimligi eksik")
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT id, architecture_version, policy_epoch FROM org_tenants "
+            "WHERE id = rag_effective_tenant() FOR UPDATE")
+        tenant = cur.fetchone()
+        if tenant is None:
+            raise OrgIdentityConflict("organizasyon tenant'i bulunamadi")
+        tenant_id = tenant["id"]
+        if tenant["architecture_version"] != expected_architecture_version:
+            raise OrgVersionConflict("organizasyon mimarisi degisti")
+        if tenant["policy_epoch"] != expected_policy_epoch:
+            raise OrgPolicyConflict("organizasyon politikasi degisti")
+
+        cur.execute(
+            "SELECT 1 FROM org_architects architect "
+            "JOIN org_identities identity "
+            "ON identity.id = architect.identity_id "
+            "WHERE architect.tenant_id = %s AND architect.identity_id = %s "
+            "AND architect.active = true AND identity.state = 'active' "
+            "AND rag_effective_actor() = %s",
+            (tenant_id, actor, actor))
+        if cur.fetchone() is None:
+            raise OrgIdentityConflict("islemci mimari yetkisine sahip degil")
+
+        cur.execute(
+            "SELECT id, state FROM org_identities WHERE id = %s",
+            (target_id,))
+        identity = cur.fetchone()
+        if identity is None or identity["state"] != "active":
+            raise OrgIdentityConflict("hedef kimlik aktif degil")
+
+        cur.execute(
+            "SELECT tenant_id FROM org_identity_tenant_bindings "
+            "WHERE identity_id = %s",
+            (target_id,))
+        binding = cur.fetchone()
+        if binding is not None and binding["tenant_id"] != tenant_id:
+            raise OrgIdentityConflict("hedef kimlik baska tenant'a aktif")
+
+        cur.execute(
+            "SELECT identity_id, position_id, app_role, state, display_label "
+            "FROM org_memberships "
+            "WHERE tenant_id = %s AND identity_id = %s "
+            "FOR UPDATE",
+            (tenant_id, target_id))
+        membership = cur.fetchone()
+        if membership is None:
+            raise OrgIdentityConflict("hedef uyelik bulunamadi")
+
+        desired_state = membership["state"] if state is None else state
+        _coerce_org_transition(membership["state"], desired_state)
+
+        desired_role = membership["app_role"] if app_role is None else app_role
+        desired_position = (membership["position_id"]
+                           if position_id is None else position_id)
+
+        if desired_position is not None:
+            cur.execute(
+                "SELECT 1 FROM org_positions "
+                "WHERE tenant_id = %s AND id = %s",
+                (tenant_id, desired_position))
+            if cur.fetchone() is None:
+                raise OrgIdentityConflict("pozisyon bu tenant'ta bulunamadi")
+
+        if desired_state == "active" and desired_position is None:
+            raise OrgMembershipStateRefused(
+                "aktif uyelik icin pozisyon zorunlu")
+
+        if (desired_state == membership["state"]
+                and desired_role == membership["app_role"]
+                and desired_position == membership["position_id"]):
+            raise OrgMembershipStateRefused("uyelik degisikligi etkisiz")
+
+        try:
+            cur.execute(
+                "UPDATE org_memberships SET state = %s, app_role = %s, "
+                "position_id = %s WHERE tenant_id = %s AND identity_id = %s "
+                "RETURNING identity_id, display_label, app_role, position_id, "
+                "state",
+                (desired_state, desired_role, desired_position,
+                 tenant_id, target_id))
+            updated = cur.fetchone()
+        except psycopg.errors.UniqueViolation as error:
+            conn.rollback()
+            raise OrgIdentityConflict("pozisyon zaten aktif uyeye atanmis") from error
+
+        if updated is None:
+            raise OrgIdentityConflict("hedef uyelik bulunamadi")
+
+        cur.execute(
+            "UPDATE org_tenants SET architecture_version = "
+            "architecture_version + 1, policy_epoch = policy_epoch + 1 "
+            "WHERE id = %s "
+            "RETURNING architecture_version, policy_epoch",
+            (tenant_id,))
+        versions = cur.fetchone()
+        if versions is None:
+            raise OrgIdentityConflict("organizasyon tenant'i bulunamadi")
+
+        cur.execute(
+            "INSERT INTO org_audit_events "
+            "(id, tenant_id, actor_id, subject_id, action, reason_code, "
+            "decision, request_id) VALUES (%s, %s, %s, %s, "
+            "'membership_change', "
+            "'system_operation', 'allowed', %s)",
+            (uuid.uuid4(), tenant_id, actor, target_id, request_id))
+
+    conn.commit()
+    return {
+        **dict(updated),
+        "architecture_version": versions["architecture_version"],
+        "policy_epoch": versions["policy_epoch"],
+    }
 
 
 def record_org_decision(conn, *, actor_id, subject_id, action,

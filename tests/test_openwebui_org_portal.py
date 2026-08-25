@@ -46,8 +46,8 @@ def test_portal_keeps_secrets_server_side_and_renders_values_as_text(monkeypatch
 
 def test_portal_registers_only_session_authenticated_routes():
     source = PLUGIN.read_text(encoding="utf-8")
-    assert source.count("Depends(get_verified_user)") == 8
-    assert source.count("app.add_api_route(") == 8
+    assert source.count("Depends(get_verified_user)") == 9
+    assert source.count("app.add_api_route(") == 9
     assert "Authorization\": f\"Bearer {GATEWAY_KEY}" in source
     assert "X-OpenWebUI-User-Jwt" in source
 
@@ -65,3 +65,17 @@ def test_portal_review_queue_is_content_free_and_decisions_are_closed(
     assert 'set(payload) != allowed' in source
     assert '{"resolved", "dismissed"}' in source
     assert '{"detail": "gecersiz inceleme karari"}' in source
+
+
+def test_portal_exposes_audit_events_endpoint():
+    source = PLUGIN.read_text(encoding="utf-8")
+    assert "/ragtest-org/api/events" in source
+
+
+def test_audit_events_are_inside_the_architect_only_panel(monkeypatch):
+    html = _module(monkeypatch).PORTAL_HTML
+    admin_start = html.index('<section id="admin" hidden>')
+    events_start = html.index("<h2>Kurumsal olaylar</h2>")
+    admin_end = html.index("</section>", admin_start)
+    assert admin_start < events_start < admin_end
+    assert "if(me.architecture_admin)" in html

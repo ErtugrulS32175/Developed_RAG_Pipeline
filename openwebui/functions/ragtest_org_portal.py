@@ -99,14 +99,17 @@ textarea{width:100%;min-height:420px;font:13px ui-monospace;box-sizing:border-bo
 <section><h2>İnceleme kuyruğum</h2><p class="muted">Yalnız güncel hiyerarşide izleyebildiğiniz hesapların içeriksiz vakaları gösterilir.</p>
 <button id="reviews">Kuyruğu yenile</button> <span id="review-result"></span><ul id="cases"></ul></section>
 <section id="admin" hidden><h2>Mimari düzenleyici</h2><p>Değişiklik bütün topolojiyi atomik olarak değiştirir; eski sürümle kayıt 409 döner.</p>
-<textarea id="topology"></textarea><p><button id="save">Kaydet</button> <span id="result"></span></p></section>
+<textarea id="topology"></textarea><p><button id="save">Kaydet</button> <span id="result"></span></p>
+<h2>Kurumsal olaylar</h2><button id="events">Olayları getir</button> <span id="event-result"></span><ul id="events-list"></ul></section>
 <script>
 const j=async(url,opt={})=>{const r=await fetch(url,{...opt,headers:{'Content-Type':'application/json',...(opt.headers||{})}});const b=await r.json();if(!r.ok)throw Error(b.detail||'İstek reddedildi');return b};
 const text=(id,v)=>document.getElementById(id).textContent=v;
 async function load(){try{const own=await j('/ragtest-org/api/identity');text('subject',`OpenWebUI kimliği: ${own.openwebui_subject}`)}catch(e){text('subject',e.message)}try{const me=await j('/ragtest-org/api/me');const m=me.membership;text('me',m?`${m.display_label} — Seviye ${m.level}, ${m.title} (${m.kind})`:'İş hesabı yok; yalnız mimari yönetim yetkisi var.');if(me.architecture_admin){document.getElementById('admin').hidden=false;document.getElementById('topology').value=JSON.stringify(await j('/ragtest-org/api/topology'),null,2)}}catch(e){text('me',e.message)}}
 document.getElementById('visible').onclick=async()=>{const ul=document.getElementById('people');ul.replaceChildren();try{const b=await j('/ragtest-org/api/visible?reason_code=management_duty');for(const p of b.members){const li=document.createElement('li');li.textContent=`${p.display_label} — Seviye ${p.level}, ${p.title}`;ul.append(li)}}catch(e){const li=document.createElement('li');li.textContent=e.message;ul.append(li)}};
 async function reviews(){const ul=document.getElementById('cases');ul.replaceChildren();try{const b=await j('/ragtest-org/api/reviews?reason_code=management_duty');for(const c of b.cases){const li=document.createElement('li');const label=document.createElement('span');label.textContent=`${c.subject_label} — ${c.position_title}, ${c.trigger_code}`;li.append(label);for(const [caption,decision,resolution] of [['Düzeltildi','resolved','corrected'],['Sorun yok','dismissed','no_issue']]){const button=document.createElement('button');button.textContent=caption;button.onclick=async()=>{try{await j(`/ragtest-org/api/reviews/${c.case_id}/decision`,{method:'POST',body:JSON.stringify({expected_revision:c.revision,expected_policy_epoch:c.policy_epoch,decision:decision,resolution_code:resolution,reason_code:'management_duty'})});await reviews()}catch(e){text('review-result',e.message)}};li.append(' ',button)}ul.append(li)}}catch(e){const li=document.createElement('li');li.textContent=e.message;ul.append(li)}}
+async function events(){const ul=document.getElementById('events-list');ul.replaceChildren();try{const b=await j('/ragtest-org/api/events?limit=100');for(const e of b.events){const li=document.createElement('li');li.textContent=`${e.created_at} — ${e.action} — ${e.decision} — ${e.reason_code}`;ul.append(li)}}catch(e){const li=document.createElement('li');li.textContent=e.message;ul.append(li)}}
 document.getElementById('reviews').onclick=reviews;
+document.getElementById('events').onclick=events;
 document.getElementById('save').onclick=async()=>{try{const b=JSON.parse(document.getElementById('topology').value);const payload={expected_version:b.architecture_version,name:b.name,positions:b.positions,members:b.members};const v=await j('/ragtest-org/api/topology',{method:'PUT',body:JSON.stringify(payload)});text('result',`Kaydedildi: sürüm ${v.architecture_version}`);await load()}catch(e){text('result',e.message)}};load();
 </script></html>"""
 
@@ -169,6 +172,11 @@ class Event:
                 reason_code)
             return JSONResponse(body, status_code=status)
 
+        async def events(user=Depends(get_verified_user)):
+            status, body = await _proxy(
+                user, "GET", "/v1/org/admin/audit-events?limit=100")
+            return JSONResponse(body, status_code=status)
+
         async def review_decision(
                 case_id: str, payload: dict = Body(...),
                 user=Depends(get_verified_user)):
@@ -205,6 +213,8 @@ class Event:
         app.add_api_route(PORTAL_PATH + "/api/topology", topology_put,
                           methods=["PUT"], include_in_schema=False)
         app.add_api_route(PORTAL_PATH + "/api/reviews", reviews,
+                          methods=["GET"], include_in_schema=False)
+        app.add_api_route(PORTAL_PATH + "/api/events", events,
                           methods=["GET"], include_in_schema=False)
         app.add_api_route(PORTAL_PATH + "/api/reviews/{case_id}/decision",
                           review_decision, methods=["POST"],

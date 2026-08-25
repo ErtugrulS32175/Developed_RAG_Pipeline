@@ -397,8 +397,14 @@ def require_org_architect(
         principal=Depends(require_org_identity)):
     """Topology authority grants no document role by itself."""
     if not principal.org_architect:
-        action = ("topology_change" if request.method == "PUT"
-                  else "topology_read")
+        path = request.url.path
+        if path == "/v1/org/admin/audit-events":
+            action = "events_view"
+        elif path.startswith("/v1/org/admin/members/"):
+            action = "membership_change"
+        else:
+            action = ("topology_change" if request.method == "PUT"
+                      else "topology_read")
         with db_conn() as conn:
             db.record_org_decision(
                 conn,
@@ -595,6 +601,15 @@ class OrgTopologyRequest(BaseModel):
                                              max_length=5000)
 
 
+class OrgMembershipUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_architecture_version: int = Field(ge=1, strict=True)
+    expected_policy_epoch: int = Field(ge=1, strict=True)
+    state: Literal["active", "pending", "suspended"] | None = None
+    app_role: Literal["reader", "editor", "admin"] | None = None
+    position_id: UUID | None = None
+
+
 @app.get("/v1/org/me")
 def organization_me(principal=Depends(require_org_identity)):
     """Show only the caller's own level and content-free organization facts."""
@@ -639,6 +654,55 @@ def organization_topology(
     return topology
 
 
+@app.get("/v1/org/admin/audit-events")
+def organization_audit_events(
+        request: Request,
+        limit: int = Query(20, ge=1, le=100),
+        before_created_at: AwareDatetime | None = Query(default=None),
+        before_id: UUID | None = Query(default=None),
+        action: list[Literal[
+            "monitor_view", "topology_read", "topology_change",
+            "access_preview", "review_queue_view", "review_decision",
+            "events_view", "membership_change"
+        ]] | None = Query(default=None),
+        decision: list[Literal["allowed", "denied"]] | None = Query(
+            default=None),
+        reason_code: list[Literal["management_duty", "security_review",
+                                 "system_operation", "policy_preview"]]
+                      | None = Query(default=None),
+        principal=Depends(require_org_architect)):
+    """List immutable governance decisions with closed query filters."""
+    if (before_created_at is None) != (before_id is None):
+        raise HTTPException(status_code=422,
+                            detail="governance imlec parametreleri eksik")
+    before = (before_created_at, before_id) if before_id is not None else None
+    try:
+        with db_conn() as conn:
+            rows = db.list_org_audit_events(
+                conn, limit=limit, before=before, actions=action,
+                decisions=decision, reasons=reason_code)
+            db.record_org_decision(
+                conn, actor_id=principal.subject_id, subject_id=None,
+                action="events_view", reason_code="system_operation",
+                allowed=True, request_id=request.state.request_id)
+    except db.OrgAuditQueryRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    page = rows[:limit]
+    has_more = len(rows) > limit
+    next_cursor = None
+    if has_more and page:
+        next_cursor = {
+            "before_created_at": page[-1]["created_at"],
+            "before_id": str(page[-1]["id"]),
+        }
+    return {
+        "events": [_org_audit_event_summary(row) for row in page],
+        "limit": limit,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }
+
+
 @app.put("/v1/org/admin/topology")
 def replace_organization_topology(
         body: OrgTopologyRequest, request: Request,
@@ -661,6 +725,43 @@ def replace_organization_topology(
     except db.OrgIdentityConflict as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
     return version
+
+
+@app.put("/v1/org/admin/members/{identity_id}")
+def update_organization_membership(
+        identity_id: UUID, body: OrgMembershipUpdateRequest, request: Request,
+        principal=Depends(require_org_architect)):
+    if (body.state is None and body.app_role is None
+            and body.position_id is None):
+        raise HTTPException(status_code=422,
+                            detail="uyelik degisikligi belirtilmedi")
+    try:
+        with db_conn() as conn:
+            updated = db.update_org_member(
+                conn, actor_id=principal.subject_id,
+                target_identity_id=identity_id,
+                expected_architecture_version=body.expected_architecture_version,
+                expected_policy_epoch=body.expected_policy_epoch,
+                state=body.state, app_role=body.app_role,
+                position_id=body.position_id,
+                request_id=request.state.request_id)
+    except db.OrgVersionConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except db.OrgPolicyConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except (db.OrgIdentityConflict,
+            db.OrgMembershipStateRefused) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    return {
+        "identity_id": str(updated["identity_id"]),
+        "display_label": updated["display_label"],
+        "app_role": updated["app_role"],
+        "state": updated["state"],
+        "position_id": (None if updated["position_id"] is None
+                        else str(updated["position_id"])),
+        "architecture_version": updated["architecture_version"],
+        "policy_epoch": updated["policy_epoch"],
+    }
 
 
 def _eval_version_metadata(row, *, version_id=None):
@@ -1982,6 +2083,20 @@ def _document_summary(row):
 
 def _document_version_summary(row):
     return {field: row.get(field) for field in DOCUMENT_VERSION_LIST_FIELDS}
+
+
+def _org_audit_event_summary(row):
+    return {
+        "event_id": str(row["id"]),
+        "action": row["action"],
+        "reason_code": row["reason_code"],
+        "decision": row["decision"],
+        "request_id": row["request_id"],
+        "actor_id": str(row["actor_id"]),
+        "subject_id": (None if row["subject_id"] is None else str(
+            row["subject_id"])),
+        "created_at": row["created_at"],
+    }
 
 
 @app.get("/documents", dependencies=AUTH)

@@ -1,4 +1,5 @@
 """Organization hierarchy policy and HTTP authorization boundaries."""
+from datetime import datetime, timezone
 from contextlib import contextmanager
 import uuid
 
@@ -12,6 +13,7 @@ from scripts import bootstrap_org
 
 TENANT = uuid.UUID("81000000-0000-0000-0000-000000000001")
 ARCHITECT = uuid.UUID("81000000-0000-0000-0000-000000000002")
+MEMBER_IDENTITY = uuid.UUID("81000000-0000-0000-0000-000000000003")
 ROOT = uuid.UUID("81000000-0000-0000-0000-000000000010")
 MANAGER = uuid.UUID("81000000-0000-0000-0000-000000000011")
 LEAF = uuid.UUID("81000000-0000-0000-0000-000000000012")
@@ -173,7 +175,7 @@ def test_an_authenticated_topology_denial_writes_one_closed_audit_event(
 
 
 def test_topology_replace_is_closed_and_optimistically_versioned(org_api,
-                                                                  monkeypatch):
+                                                                   monkeypatch):
     client, _current = org_api
     captured = []
     monkeypatch.setattr(
@@ -200,6 +202,203 @@ def test_topology_replace_is_closed_and_optimistically_versioned(org_api,
     broken["positions"] = [{**body["positions"][0],
                             "can_monitor_descendants": True}]
     assert client.put("/v1/org/admin/topology", json=broken).status_code == 422
+
+
+def test_only_architect_can_read_audit_event_history(org_api, monkeypatch):
+    client, current = org_api
+    current["principal"] = auth.Principal(
+        TENANT, "admin", ARCHITECT, "openwebui", ROOT, False)
+    recorded = []
+    monkeypatch.setattr(api.db, "record_org_decision",
+                        lambda *_a, **fields: recorded.append(fields))
+    assert client.get("/v1/org/admin/audit-events").status_code == 403
+    assert recorded[0] == {
+        "actor_id": ARCHITECT,
+        "subject_id": None,
+        "action": "events_view",
+        "reason_code": "system_operation",
+        "allowed": False,
+        "request_id": recorded[0]["request_id"],
+    }
+
+
+def test_audit_events_returns_keyset_and_audits_events_view(org_api, monkeypatch):
+    client, _current = org_api
+    rows = [
+        {
+            "id": uuid.uuid4(),
+            "action": "events_view",
+            "reason_code": "system_operation",
+            "decision": "allowed",
+            "request_id": "req-a",
+            "actor_id": ARCHITECT,
+            "subject_id": None,
+            "created_at": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        },
+        {
+            "id": uuid.uuid4(),
+            "action": "topology_read",
+            "reason_code": "system_operation",
+            "decision": "allowed",
+            "request_id": "req-b",
+            "actor_id": ARCHITECT,
+            "subject_id": None,
+            "created_at": datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc),
+        },
+    ]
+    captured = {}
+    recorded = []
+
+    def list_events(_conn, **fields):
+        captured.update(fields)
+        return rows
+
+    monkeypatch.setattr(api.db, "list_org_audit_events", list_events)
+    monkeypatch.setattr(api.db, "record_org_decision",
+                        lambda *_a, **fields: recorded.append(fields))
+
+    response = client.get(
+        "/v1/org/admin/audit-events?limit=1&action=events_view"
+        "&decision=allowed&reason_code=system_operation")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["events"][0]["event_id"] == str(rows[0]["id"])
+    assert body["has_more"] is True
+    assert body["next_cursor"]["before_id"] == str(rows[0]["id"])
+    assert body["events"][0]["action"] == "events_view"
+    assert body["events"][0]["actor_id"] == str(ARCHITECT)
+    assert captured["actions"] == ["events_view"]
+    assert captured["decisions"] == ["allowed"]
+    assert captured["reasons"] == ["system_operation"]
+    assert recorded[0] == {
+        "actor_id": ARCHITECT,
+        "subject_id": None,
+        "action": "events_view",
+        "reason_code": "system_operation",
+        "allowed": True,
+        "request_id": recorded[0]["request_id"],
+    }
+
+
+def test_audit_events_rejects_invalid_cursor(org_api):
+    client, _current = org_api
+    response = client.get("/v1/org/admin/audit-events?before_created_at=2026-01-01T12:00:00")
+    assert response.status_code == 422
+
+
+def test_membership_update_denial_is_closed_and_uses_topology_audit(org_api,
+                                                                  monkeypatch):
+    client, current = org_api
+    current["principal"] = auth.Principal(
+        TENANT, "admin", ARCHITECT, "openwebui", ROOT, False)
+    recorded = []
+    monkeypatch.setattr(api.db, "record_org_decision",
+                        lambda *_a, **_k: recorded.append(_k))
+    response = client.put(
+        f"/v1/org/admin/members/{MEMBER_IDENTITY}",
+        json={"expected_architecture_version": 1,
+              "expected_policy_epoch": 1,
+              "state": "suspended"})
+    assert response.status_code == 403
+    assert recorded[0] == {
+        "actor_id": ARCHITECT,
+        "subject_id": None,
+        "action": "membership_change",
+        "reason_code": "system_operation",
+        "allowed": False,
+        "request_id": recorded[0]["request_id"],
+    }
+
+
+def test_membership_update_requires_mutation_fields(org_api):
+    client, _current = org_api
+    response = client.put(
+        f"/v1/org/admin/members/{MEMBER_IDENTITY}",
+        json={"expected_architecture_version": 1,
+              "expected_policy_epoch": 1})
+    assert response.status_code == 422
+
+
+def test_membership_update_calls_db_with_closed_request(org_api, monkeypatch):
+    client, _current = org_api
+    captured = []
+    expected = {
+        "identity_id": MEMBER_IDENTITY,
+        "display_label": "Leaf User",
+        "app_role": "editor",
+        "state": "suspended",
+        "position_id": LEAF,
+        "architecture_version": 3,
+        "policy_epoch": 4,
+    }
+
+    def mutate(conn, **fields):
+        captured.append(fields)
+        return expected
+
+    monkeypatch.setattr(api.db, "update_org_member", mutate)
+    body = {
+        "expected_architecture_version": 2,
+        "expected_policy_epoch": 1,
+        "state": "suspended",
+        "app_role": "editor",
+        "position_id": str(LEAF),
+    }
+    response = client.put(
+        f"/v1/org/admin/members/{MEMBER_IDENTITY}", json=body)
+    assert response.status_code == 200
+    assert response.json()["state"] == "suspended"
+    assert response.json()["position_id"] == str(LEAF)
+    assert captured[0] == {
+        "actor_id": ARCHITECT,
+        "target_identity_id": MEMBER_IDENTITY,
+        "expected_architecture_version": 2,
+        "expected_policy_epoch": 1,
+        "state": "suspended",
+        "app_role": "editor",
+        "position_id": LEAF,
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
+def test_membership_update_rejects_invalid_state_transition(org_api, monkeypatch):
+    client, _current = org_api
+    monkeypatch.setattr(
+        api.db, "update_org_member",
+        lambda _conn, **_kw: (_ for _ in ()).throw(
+            api.db.OrgMembershipStateRefused("uyelik durumu gecersiz")))
+    response = client.put(
+        f"/v1/org/admin/members/{MEMBER_IDENTITY}",
+        json={"expected_architecture_version": 1,
+              "expected_policy_epoch": 1,
+              "state": "pending"})
+    assert response.status_code == 422
+
+
+def test_membership_update_rejects_stale_arch_or_policy(org_api, monkeypatch):
+    client, _current = org_api
+    monkeypatch.setattr(
+        api.db, "update_org_member",
+        lambda _conn, **_kw: (_ for _ in ()).throw(
+            api.db.OrgVersionConflict("organizasyon mimarisi degisti")))
+    response = client.put(
+        f"/v1/org/admin/members/{MEMBER_IDENTITY}",
+        json={"expected_architecture_version": 99,
+              "expected_policy_epoch": 1,
+              "state": "active"})
+    assert response.status_code == 409
+
+    monkeypatch.setattr(
+        api.db, "update_org_member",
+        lambda _conn, **_kw: (_ for _ in ()).throw(
+            api.db.OrgPolicyConflict("organizasyon politikasi degisti")))
+    response = client.put(
+        f"/v1/org/admin/members/{MEMBER_IDENTITY}",
+        json={"expected_architecture_version": 1,
+              "expected_policy_epoch": 99,
+              "state": "active"})
+    assert response.status_code == 409
 
 
 def test_bootstrap_cli_prints_only_closed_ids(monkeypatch, capsys):

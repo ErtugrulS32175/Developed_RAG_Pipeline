@@ -966,9 +966,10 @@ CREATE TABLE IF NOT EXISTS org_audit_events (
     actor_id     uuid NOT NULL REFERENCES org_identities(id),
     subject_id   uuid REFERENCES org_identities(id),
     action       text NOT NULL CHECK (action IN (
-                   'monitor_view', 'topology_read', 'topology_change',
-                   'access_preview', 'review_queue_view',
-                   'review_decision')),
+                    'monitor_view', 'topology_read', 'topology_change',
+                    'access_preview', 'review_queue_view',
+                    'review_decision', 'events_view',
+                    'membership_change')),
     reason_code  text NOT NULL CHECK (reason_code IN (
                    'management_duty', 'security_review', 'system_operation',
                    'policy_preview')),
@@ -981,7 +982,8 @@ ALTER TABLE org_audit_events
 ALTER TABLE org_audit_events
     ADD CONSTRAINT org_audit_events_action_check CHECK (action IN (
         'monitor_view', 'topology_read', 'topology_change', 'access_preview',
-        'review_queue_view', 'review_decision'));
+        'review_queue_view', 'review_decision', 'events_view',
+        'membership_change'));
 
 ALTER TABLE org_audit_events
     DROP CONSTRAINT IF EXISTS org_audit_events_tenant_id_fkey;
@@ -996,9 +998,17 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM org_identity_tenant_bindings
         WHERE identity_id = NEW.actor_id AND tenant_id = NEW.tenant_id
-    ) OR (NEW.subject_id IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM org_identity_tenant_bindings
-        WHERE identity_id = NEW.subject_id AND tenant_id = NEW.tenant_id
+    ) OR (NEW.subject_id IS NOT NULL AND NOT (
+        EXISTS (
+            SELECT 1 FROM org_identity_tenant_bindings
+            WHERE identity_id = NEW.subject_id AND tenant_id = NEW.tenant_id
+        ) OR EXISTS (
+            SELECT 1 FROM org_memberships
+            WHERE identity_id = NEW.subject_id AND tenant_id = NEW.tenant_id
+        ) OR EXISTS (
+            SELECT 1 FROM org_architects
+            WHERE identity_id = NEW.subject_id AND tenant_id = NEW.tenant_id
+        )
     )) THEN
         RAISE EXCEPTION 'audit identity is outside tenant'
             USING ERRCODE = '23503';
@@ -1024,8 +1034,9 @@ DROP TRIGGER IF EXISTS org_audit_events_immutable ON org_audit_events;
 CREATE TRIGGER org_audit_events_immutable
 BEFORE UPDATE OR DELETE ON org_audit_events
 FOR EACH ROW EXECUTE FUNCTION rag_reject_security_event_mutation();
-CREATE INDEX IF NOT EXISTS org_audit_events_tenant_time_idx
-    ON org_audit_events(tenant_id, created_at DESC, id);
+DROP INDEX IF EXISTS org_audit_events_tenant_time_idx;
+CREATE INDEX IF NOT EXISTS org_audit_events_tenant_time_v2_idx
+    ON org_audit_events(tenant_id, created_at DESC, id DESC);
 
 CREATE OR REPLACE FUNCTION rag_rebuild_org_closure(target_tenant uuid)
 RETURNS void LANGUAGE plpgsql AS $closure$
