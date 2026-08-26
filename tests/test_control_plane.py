@@ -113,6 +113,23 @@ def test_runtime_role_has_only_lookup_function_authority():
     assert "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES" not in script
 
 
+def test_redeemer_role_is_a_separate_exact_function_capability():
+    script = (
+        ROOT / "scripts" / "init_control_redeemer_role.sh"
+    ).read_text(encoding="utf-8")
+    assert "rag_control_redeemer" in script
+    assert script.count("GRANT EXECUTE ON FUNCTION") == 4
+    assert "control_asserted_list_redeemable" in script
+    assert "control_asserted_get_redeemable" in script
+    assert "control_asserted_redeem_service_account_issue" in script
+    assert "control_asserted_redeem_service_account_rotation" in script
+    for forbidden in (
+            "control_tenant_facts", "control_resolve_identity",
+            "control_approve_service_account_issue",
+            "control_revoke_service_account"):
+        assert forbidden not in script
+
+
 def test_events_are_owner_immutable_and_public_exec_is_revoked():
     text = SCHEMA.read_text(encoding="utf-8")
     assert "BEFORE UPDATE OR DELETE ON rag_control.control_admin_events" in text

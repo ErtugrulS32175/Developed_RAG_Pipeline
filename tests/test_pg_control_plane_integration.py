@@ -172,6 +172,20 @@ def _install_lifecycle_roles(connection):
                 rag_control.control_revoke_service_account(
                     integer, bytea, uuid, uuid, bigint, text, bytea, bytea)
                 TO rag_control_admin;
+            GRANT EXECUTE ON FUNCTION
+                rag_control.control_asserted_list_redeemable_service_account_approvals(
+                    smallint, integer, uuid, bytea, bigint, integer, bigint,
+                    bigint, bytea, bytea),
+                rag_control.control_asserted_get_redeemable_service_account_approval(
+                    smallint, integer, uuid, bytea, bigint, uuid, bigint,
+                    uuid, bigint, bigint, bytea, bytea),
+                rag_control.control_asserted_redeem_service_account_issue(
+                    smallint, integer, uuid, bytea, bigint, uuid, bigint,
+                    uuid, bytea, bigint, bigint, bytea, bytea, bytea, bytea),
+                rag_control.control_asserted_redeem_service_account_rotation(
+                    smallint, integer, uuid, bytea, bigint, uuid, bigint,
+                    uuid, bytea, bigint, bigint, bytea, bytea, bytea, bytea)
+                TO rag_control_redeemer;
         """)
         for role, password in passwords.items():
             cursor.execute(sql.SQL(
@@ -188,13 +202,18 @@ def _install_lifecycle_roles(connection):
     return passwords
 
 
-def _connect_as_role(role, password):
-    import psycopg
+def _dsn_as_role(role, password):
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
     parameters = conninfo_to_dict(DSN)
     parameters.update(user=role, password=password)
-    return psycopg.connect(make_conninfo(**parameters))
+    return make_conninfo(**parameters)
+
+
+def _connect_as_role(role, password):
+    import psycopg
+
+    return psycopg.connect(_dsn_as_role(role, password))
 
 
 def _owner_as_role(role):
@@ -588,18 +607,121 @@ def test_role_readiness_rejects_later_function_privilege_drift(
         "rag_control_runtime", passwords["rag_control_runtime"])
     admin = _connect_as_role(
         "rag_control_admin", passwords["rag_control_admin"])
+    redeemer = _connect_as_role(
+        "rag_control_redeemer", passwords["rag_control_redeemer"])
     try:
         with pytest.raises(db.ControlPlaneRefused):
             db._configure_runtime_connection(runtime)
         with pytest.raises(db.ControlPlaneRefused):
             db._configure_admin_connection(admin)
+        with pytest.raises(db.ControlPlaneRefused):
+            db._configure_redeemer_connection(redeemer)
     finally:
         runtime.close()
         admin.close()
+        redeemer.close()
     with control_database.cursor() as cursor:
         cursor.execute(
             "DROP FUNCTION rag_control.control_rogue_probe()")
     control_database.commit()
+
+
+def test_warm_redeemer_pool_rechecks_privileges_on_every_checkout(
+        control_database, monkeypatch):
+    from psycopg_pool import PoolTimeout
+
+    passwords = _install_lifecycle_roles(control_database)
+    monkeypatch.setenv(
+        "PG_CONTROL_REDEMPTION_DSN",
+        _dsn_as_role(
+            "rag_control_redeemer", passwords["rag_control_redeemer"]))
+    monkeypatch.setenv("PG_CONTROL_REDEMPTION_POOL_MAX", "1")
+    db._redeemer_pool = None
+    pool = db.get_redeemer_pool()
+    try:
+        with pool.connection(timeout=2) as connection:
+            assert connection.execute(
+                "SELECT current_user").fetchone()[0] == "rag_control_redeemer"
+        with control_database.cursor() as cursor:
+            cursor.execute(
+                "CREATE OR REPLACE FUNCTION "
+                "rag_control.control_redeemer_drift_probe() "
+                "RETURNS integer LANGUAGE sql AS 'SELECT 1'")
+            cursor.execute(
+                "REVOKE ALL ON FUNCTION "
+                "rag_control.control_redeemer_drift_probe() FROM PUBLIC")
+            cursor.execute(
+                "GRANT EXECUTE ON FUNCTION "
+                "rag_control.control_redeemer_drift_probe() "
+                "TO rag_control_redeemer")
+        control_database.commit()
+        with pytest.raises(PoolTimeout):
+            with pool.connection(timeout=1):
+                pass
+    finally:
+        db.close_pool()
+        with control_database.cursor() as cursor:
+            cursor.execute(
+                "DROP FUNCTION IF EXISTS "
+                "rag_control.control_redeemer_drift_probe()")
+        control_database.commit()
+
+
+def test_redeemer_readiness_requires_exact_schema_state_receipt(
+        control_database):
+    passwords = _install_lifecycle_roles(control_database)
+    redeemer = _connect_as_role(
+        "rag_control_redeemer", passwords["rag_control_redeemer"])
+    version = None
+    digest = None
+    try:
+        db._configure_redeemer_connection(redeemer)
+        with control_database.cursor() as cursor:
+            cursor.execute(
+                "SELECT schema_version, schema_sha256 FROM "
+                "rag_control.control_schema_state WHERE singleton")
+            version, digest = cursor.fetchone()
+            cursor.execute(
+                "UPDATE rag_control.control_schema_state "
+                "SET schema_sha256 = %s WHERE singleton", ("0" * 64,))
+        control_database.commit()
+        with pytest.raises(db.ControlPlaneRefused, match="schema receipt"):
+            db._configure_redeemer_connection(redeemer)
+        redeemer.rollback()
+        with control_database.cursor() as cursor:
+            cursor.execute(
+                "UPDATE rag_control.control_schema_state "
+                "SET schema_sha256 = %s WHERE singleton", (digest,))
+        control_database.commit()
+        db._configure_redeemer_connection(redeemer)
+        with control_database.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM rag_control.control_schema_state "
+                "WHERE singleton")
+        control_database.commit()
+        with pytest.raises(db.ControlPlaneRefused, match="schema receipt"):
+            db._configure_redeemer_connection(redeemer)
+        redeemer.rollback()
+        with control_database.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO rag_control.control_schema_state "
+                "(singleton, schema_version, schema_sha256) "
+                "VALUES (true, %s, %s)", (version, digest))
+        control_database.commit()
+        db._configure_redeemer_connection(redeemer)
+    finally:
+        redeemer.close()
+        if version is not None and digest is not None:
+            with control_database.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO rag_control.control_schema_state "
+                    "(singleton, schema_version, schema_sha256) "
+                    "VALUES (true, %s, %s) "
+                    "ON CONFLICT (singleton) DO UPDATE SET "
+                    "schema_version = EXCLUDED.schema_version, "
+                    "schema_sha256 = EXCLUDED.schema_sha256",
+                    (version, digest))
+            control_database.commit()
 
 
 def test_service_account_approvals_create_no_credential_and_revoke_cancels(
@@ -763,7 +885,7 @@ def test_service_account_approvals_create_no_credential_and_revoke_cancels(
         ]
 
 
-def test_offline_authority_consumes_one_exact_approval_and_replay_fails(
+def test_redeemer_role_consumes_one_exact_approval_and_replay_fails(
         control_database, monkeypatch):
     monkeypatch.setenv("CONTROL_AUDIT_HMAC_SECRET", "a" * 32)
     monkeypatch.setenv("CONTROL_IDENTITY_HMAC_SECRET", "i" * 32)
@@ -804,13 +926,14 @@ def test_offline_authority_consumes_one_exact_approval_and_replay_fails(
     control_database.commit()
     admin = _connect_as_role(
         "rag_control_admin", passwords["rag_control_admin"])
-    untrusted = _connect_as_role(
+    redeemer = _connect_as_role(
         "rag_control_redeemer", passwords["rag_control_redeemer"])
     runtime = _connect_as_role(
         "rag_control_runtime", passwords["rag_control_runtime"])
     try:
         db._configure_admin_connection(admin)
         db._configure_runtime_connection(runtime)
+        db._configure_redeemer_connection(redeemer)
         with pytest.raises(db.ControlPlaneDenied):
             db.issue_service_account(
                 admin, operator_key_version=5, operator_digest=b"v" * 32,
@@ -833,20 +956,26 @@ def test_offline_authority_consumes_one_exact_approval_and_replay_fails(
             control_database, "approval_list", tenant, limit=100)
         with pytest.raises(db.ControlPlaneRefused):
             db.list_redeemable_service_account_approvals(
-                untrusted, list_proof)
-        untrusted.rollback()
+                runtime, list_proof)
+        runtime.rollback()
         denied_redeem_proof = _assertion(
             control_database, "approval_redeem_issue", tenant,
             approval=approval_id, account=account, credential=b"z" * 32)
         with pytest.raises(db.ControlPlaneDenied):
             db.redeem_service_account_approval(
-                untrusted, approval, assertion=denied_redeem_proof)
-        untrusted.rollback()
-        owner_list_proof = _assertion(
+                admin, approval, assertion=denied_redeem_proof)
+        admin.rollback()
+        redeemer_list_proof = _assertion(
             control_database, "approval_list", tenant, limit=100)
         assert db.list_redeemable_service_account_approvals(
-            control_database, owner_list_proof) == (approval,)
-        control_database.commit()
+            redeemer, redeemer_list_proof) == (approval,)
+        redeemer.commit()
+        get_proof = _assertion(
+            control_database, "approval_get", tenant,
+            approval=approval_id, account=account)
+        assert db.get_redeemable_service_account_approval(
+            redeemer, get_proof) == approval
+        redeemer.commit()
         with control_database.cursor() as cursor:
             cursor.execute(
                 "UPDATE rag_control.control_tenants SET policy_revision = 2 "
@@ -855,15 +984,15 @@ def test_offline_authority_consumes_one_exact_approval_and_replay_fails(
         stale_list_proof = _assertion(
             control_database, "approval_list", tenant, limit=100)
         assert db.list_redeemable_service_account_approvals(
-            control_database, stale_list_proof) == ()
-        control_database.commit()
+            redeemer, stale_list_proof) == ()
+        redeemer.commit()
         stale_redeem_proof = _assertion(
             control_database, "approval_redeem_issue", tenant,
             approval=approval_id, account=account, credential=b"b" * 32)
         with pytest.raises(db.ControlPlaneConflict):
             db.redeem_service_account_approval(
-                control_database, approval, assertion=stale_redeem_proof)
-        control_database.rollback()
+                redeemer, approval, assertion=stale_redeem_proof)
+        redeemer.rollback()
         with control_database.cursor() as cursor:
             cursor.execute(
                 "UPDATE rag_control.control_tenants SET policy_revision = 1 "
@@ -878,10 +1007,9 @@ def test_offline_authority_consumes_one_exact_approval_and_replay_fails(
         control_database.rollback()
 
         def attempt_redemption(item):
-            import psycopg
-
             credential, proof = item
-            candidate = psycopg.connect(DSN)
+            candidate = _connect_as_role(
+                "rag_control_redeemer", passwords["rag_control_redeemer"])
             try:
                 result = db.redeem_service_account_approval(
                     candidate, approval, assertion=proof)
@@ -906,11 +1034,11 @@ def test_offline_authority_consumes_one_exact_approval_and_replay_fails(
             approval=approval_id, account=account, credential=b"e" * 32)
         with pytest.raises(db.ControlPlaneConflict):
             db.redeem_service_account_approval(
-                control_database, approval, assertion=consumed_redeem_proof)
-        control_database.rollback()
+                redeemer, approval, assertion=consumed_redeem_proof)
+        redeemer.rollback()
     finally:
         runtime.close()
-        untrusted.close()
+        redeemer.close()
         admin.close()
     with control_database.cursor() as cursor:
         cursor.execute(
@@ -967,14 +1095,18 @@ def test_role_readiness_rejects_set_role_and_membership_power(
     passwords = _install_lifecycle_roles(control_database)
     assumed_runtime = _owner_as_role("rag_control_runtime")
     assumed_admin = _owner_as_role("rag_control_admin")
+    assumed_redeemer = _owner_as_role("rag_control_redeemer")
     try:
         with pytest.raises(db.ControlPlaneRefused):
             db._configure_runtime_connection(assumed_runtime)
         with pytest.raises(db.ControlPlaneRefused):
             db._configure_admin_connection(assumed_admin)
+        with pytest.raises(db.ControlPlaneRefused):
+            db._configure_redeemer_connection(assumed_redeemer)
     finally:
         assumed_runtime.close()
         assumed_admin.close()
+        assumed_redeemer.close()
 
     probe_role = "rag_control_escalation_probe"
     with control_database.cursor() as cursor:
@@ -990,14 +1122,19 @@ def test_role_readiness_rejects_set_role_and_membership_power(
         "rag_control_runtime", passwords["rag_control_runtime"])
     admin = _connect_as_role(
         "rag_control_admin", passwords["rag_control_admin"])
+    redeemer = _connect_as_role(
+        "rag_control_redeemer", passwords["rag_control_redeemer"])
     try:
         with pytest.raises(db.ControlPlaneRefused):
             db._configure_runtime_connection(runtime)
         with pytest.raises(db.ControlPlaneRefused):
             db._configure_admin_connection(admin)
+        with pytest.raises(db.ControlPlaneRefused):
+            db._configure_redeemer_connection(redeemer)
     finally:
         runtime.close()
         admin.close()
+        redeemer.close()
     with control_database.cursor() as cursor:
         for role in passwords:
             cursor.execute(sql.SQL("REVOKE {} FROM {}").format(
@@ -1015,12 +1152,16 @@ def test_role_readiness_rejects_database_create_power(control_database):
         "rag_control_runtime", passwords["rag_control_runtime"])
     admin = _connect_as_role(
         "rag_control_admin", passwords["rag_control_admin"])
+    redeemer = _connect_as_role(
+        "rag_control_redeemer", passwords["rag_control_redeemer"])
     try:
         db._configure_runtime_connection(runtime)
         db._configure_admin_connection(admin)
+        db._configure_redeemer_connection(redeemer)
     finally:
         runtime.close()
         admin.close()
+        redeemer.close()
 
     with control_database.cursor() as cursor:
         for role in passwords:
@@ -1033,14 +1174,19 @@ def test_role_readiness_rejects_database_create_power(control_database):
         "rag_control_runtime", passwords["rag_control_runtime"])
     admin = _connect_as_role(
         "rag_control_admin", passwords["rag_control_admin"])
+    redeemer = _connect_as_role(
+        "rag_control_redeemer", passwords["rag_control_redeemer"])
     try:
         with pytest.raises(db.ControlPlaneRefused):
             db._configure_runtime_connection(runtime)
         with pytest.raises(db.ControlPlaneRefused):
             db._configure_admin_connection(admin)
+        with pytest.raises(db.ControlPlaneRefused):
+            db._configure_redeemer_connection(redeemer)
     finally:
         runtime.close()
         admin.close()
+        redeemer.close()
     with control_database.cursor() as cursor:
         for role in passwords:
             cursor.execute(sql.SQL(

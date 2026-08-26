@@ -43,6 +43,7 @@ REVOKE ALL ON FUNCTION rag_control.control_guard_schema_monotonic()
 """
 _pool = None
 _admin_pool = None
+_redeemer_pool = None
 _ROLE_FACTS_SQL = """
 SELECT current_user AS role_name,
        session_user AS session_role,
@@ -176,6 +177,24 @@ SELECT current_user AS role_name,
                           'rag_control.control_cancel_service_account_approval('
                           'integer,bytea,uuid,uuid,uuid,bigint,text)'
                           ::regprocedure))
+                  OR (current_user = 'rag_control_redeemer'
+                      AND procedure.oid IN (
+                          'rag_control.control_asserted_list_redeemable_'
+                          'service_account_approvals(smallint,integer,uuid,'
+                          'bytea,bigint,integer,bigint,bigint,bytea,bytea)'
+                          ::regprocedure,
+                          'rag_control.control_asserted_get_redeemable_'
+                          'service_account_approval(smallint,integer,uuid,'
+                          'bytea,bigint,uuid,bigint,uuid,bigint,bigint,'
+                          'bytea,bytea)'::regprocedure,
+                          'rag_control.control_asserted_redeem_service_'
+                          'account_issue(smallint,integer,uuid,bytea,bigint,'
+                          'uuid,bigint,uuid,bytea,bigint,bigint,bytea,bytea,'
+                          'bytea,bytea)'::regprocedure,
+                          'rag_control.control_asserted_redeem_service_'
+                          'account_rotation(smallint,integer,uuid,bytea,'
+                          'bigint,uuid,bigint,uuid,bytea,bigint,bigint,'
+                          'bytea,bytea,bytea,bytea)'::regprocedure))
              )
        ) AS unexpected_function_execute
 FROM pg_catalog.pg_roles AS role
@@ -325,14 +344,33 @@ def get_admin_pool():
     return _admin_pool
 
 
+def get_redeemer_pool():
+    """Return only the proof-bound one-time credential delivery pool."""
+    global _redeemer_pool
+    if _redeemer_pool is None:
+        from psycopg_pool import ConnectionPool
+        _redeemer_pool = ConnectionPool(
+            _required_dsn("PG_CONTROL_REDEMPTION_DSN"),
+            min_size=0,
+            max_size=_redeemer_pool_max(),
+            check=_check_redeemer_connection,
+            configure=_configure_redeemer_connection,
+            open=True,
+        )
+    return _redeemer_pool
+
+
 def close_pool() -> None:
-    global _pool, _admin_pool
+    global _pool, _admin_pool, _redeemer_pool
     if _pool is not None:
         _pool.close()
         _pool = None
     if _admin_pool is not None:
         _admin_pool.close()
         _admin_pool = None
+    if _redeemer_pool is not None:
+        _redeemer_pool.close()
+        _redeemer_pool = None
 
 
 def _assert_control_role(conn, expected_role: str, expected: dict) -> None:
@@ -355,6 +393,44 @@ def _assert_control_role(conn, expected_role: str, expected: dict) -> None:
             or any(type(facts[name]) is not bool or facts[name] is not value
                    for name, value in expected.items())):
         raise ControlPlaneRefused("control database role refused")
+
+
+def _redeemer_pool_max() -> int:
+    value = os.getenv("PG_CONTROL_REDEMPTION_POOL_MAX", "2")
+    if (type(value) is not str or re.fullmatch(r"[1-9][0-9]?", value) is None
+            or int(value) > 16):
+        raise ControlPlaneRefused(
+            "PG_CONTROL_REDEMPTION_POOL_MAX is invalid")
+    return int(value)
+
+
+def _control_schema_digest() -> str:
+    schema_bytes = Path(__file__).with_name("schema.sql").read_bytes()
+    return hashlib.sha256(schema_bytes).hexdigest()
+
+
+def _assert_control_schema_receipt(conn) -> None:
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT schema_version, schema_sha256 "
+                "FROM rag_control.control_schema_state WHERE singleton")
+            rows = cursor.fetchall()
+        conn.rollback()
+    except (OSError, psycopg.Error):
+        try:
+            conn.rollback()
+        finally:
+            raise ControlPlaneRefused(
+                "control database schema receipt refused") from None
+    try:
+        expected = (CONTROL_SCHEMA_VERSION, _control_schema_digest())
+    except OSError:
+        raise ControlPlaneRefused(
+            "control database schema receipt refused") from None
+    if (len(rows) != 1 or type(rows[0]) not in (tuple, list)
+            or len(rows[0]) != 2 or tuple(rows[0]) != expected):
+        raise ControlPlaneRefused("control database schema receipt refused")
 
 
 def _configure_runtime_connection(conn) -> None:
@@ -393,6 +469,30 @@ def _configure_admin_connection(conn) -> None:
         "cancel_approval_execute": True,
         "redeem_issue_execute": False, "redeem_rotate_execute": False,
     })
+
+
+def _configure_redeemer_connection(conn) -> None:
+    _assert_control_role(conn, "rag_control_redeemer", {
+        "can_login": True, "elevated": False,
+        "schema_usage": True, "schema_create": False,
+        "database_create": False,
+        "role_membership_power": False,
+        "table_power": False, "sequence_power": False,
+        "schema_state_select": True,
+        "tenant_facts_execute": False, "identity_execute": False,
+        "operator_execute": False, "service_execute": False,
+        "issue_execute": False, "rotate_execute": False,
+        "revoke_execute": False, "unexpected_function_execute": False,
+        "approve_issue_execute": False, "approve_rotate_execute": False,
+        "list_approvals_execute": True, "get_approval_execute": True,
+        "cancel_approval_execute": False,
+        "redeem_issue_execute": True, "redeem_rotate_execute": True,
+    })
+    _assert_control_schema_receipt(conn)
+
+
+def _check_redeemer_connection(conn) -> None:
+    _configure_redeemer_connection(conn)
 
 
 def _identity_secret() -> bytes:

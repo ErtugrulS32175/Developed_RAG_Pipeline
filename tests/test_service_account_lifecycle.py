@@ -45,11 +45,18 @@ class _Cursor:
 
 
 class _Connection:
-    def __init__(self, rows=None, error=None):
+    def __init__(self, rows=None, error=None, following_rows=()):
         self.cursor_instance = _Cursor(rows, error)
+        self._cursor_instances = [
+            self.cursor_instance,
+            *(_Cursor(item) for item in following_rows),
+        ]
+        self._cursor_index = 0
 
     def cursor(self, **_kwargs):
-        return self.cursor_instance
+        index = min(self._cursor_index, len(self._cursor_instances) - 1)
+        self._cursor_index += 1
+        return self._cursor_instances[index]
 
     def rollback(self):
         return None
@@ -138,9 +145,10 @@ def test_admin_role_can_approve_cancel_and_revoke_but_never_redeem():
             "control_revoke_service_account"):
         assert f"GRANT EXECUTE ON FUNCTION rag_control.{name}" in script
     for name in (
-            "control_list_redeemable_service_account_approvals",
-            "control_redeem_service_account_issue",
-            "control_redeem_service_account_rotation"):
+            "control_asserted_list_redeemable_service_account_approvals",
+            "control_asserted_get_redeemable_service_account_approval",
+            "control_asserted_redeem_service_account_issue",
+            "control_asserted_redeem_service_account_rotation"):
         assert f"GRANT EXECUTE ON FUNCTION rag_control.{name}" not in script
     for forbidden in (
             "control_issue_service_account", "control_rotate_service_account"):
@@ -149,9 +157,41 @@ def test_admin_role_can_approve_cancel_and_revoke_but_never_redeem():
     assert "GRANT UPDATE" not in script
     assert "GRANT DELETE" not in script
     assert "control_resolve_identity" not in script
-    assert not (ROOT / "scripts" / "init_control_redeemer_role.sh").exists()
+
+
+def test_redeemer_role_has_only_the_four_asserted_authorities():
+    script = (
+        ROOT / "scripts" / "init_control_redeemer_role.sh"
+    ).read_text(encoding="utf-8")
+    assert ("NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT "
+            "NOREPLICATION") in script
+    assert "ALTER ROLE rag_control_redeemer LOGIN PASSWORD" in script
+    assert "\\getenv redeemer_password CONTROL_REDEEMER_PASSWORD" in script
+    assert "--set=redeemer_password" not in script
+    for sentence in (
+            "REVOKE ALL ON ALL TABLES IN SCHEMA rag_control",
+            "REVOKE ALL ON ALL SEQUENCES IN SCHEMA rag_control",
+            "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA rag_control",
+            "REVOKE CREATE ON DATABASE"):
+        assert sentence in script
+    for name in (
+            "control_asserted_list_redeemable_service_account_approvals",
+            "control_asserted_get_redeemable_service_account_approval",
+            "control_asserted_redeem_service_account_issue",
+            "control_asserted_redeem_service_account_rotation"):
+        assert f"rag_control.{name}" in script
+    for forbidden in (
+            "control_tenant_facts", "control_resolve_identity",
+            "control_resolve_platform_operator",
+            "control_resolve_service_account",
+            "control_approve_service_account_issue",
+            "control_cancel_service_account_approval",
+            "control_revoke_service_account"):
+        assert f"rag_control.{forbidden}" not in script
+    for forbidden in ("GRANT INSERT", "GRANT UPDATE", "GRANT DELETE"):
+        assert forbidden not in script
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "PG_CONTROL_REDEMPTION_DSN" not in env_example
+    assert "PG_CONTROL_REDEMPTION_DSN=" in env_example
 
 
 def test_admin_connection_never_falls_back_to_runtime_or_data(monkeypatch):
@@ -163,9 +203,32 @@ def test_admin_connection_never_falls_back_to_runtime_or_data(monkeypatch):
         db.get_admin_pool()
 
 
+def test_redeemer_connection_never_falls_back_to_other_roles(monkeypatch):
+    monkeypatch.delenv("PG_CONTROL_REDEMPTION_DSN", raising=False)
+    monkeypatch.setenv("PG_CONTROL_ADMIN_DSN", "must-not-be-used")
+    monkeypatch.setenv("PG_CONTROL_DSN", "must-not-be-used")
+    monkeypatch.setenv("PG_DSN", "must-not-be-used")
+    db._redeemer_pool = None
+    with pytest.raises(
+            db.ControlPlaneRefused, match="PG_CONTROL_REDEMPTION_DSN"):
+        db.get_redeemer_pool()
+
+
+@pytest.mark.parametrize("value", ("", "0", "17", "100", " 2", "2 ", "x"))
+def test_redeemer_pool_size_is_closed_and_bounded(monkeypatch, value):
+    monkeypatch.setenv("PG_CONTROL_REDEMPTION_POOL_MAX", value)
+    with pytest.raises(
+            db.ControlPlaneRefused,
+            match="PG_CONTROL_REDEMPTION_POOL_MAX"):
+        db._redeemer_pool_max()
+    monkeypatch.setenv("PG_CONTROL_REDEMPTION_POOL_MAX", "16")
+    assert db._redeemer_pool_max() == 16
+
+
 def _role_facts(role_name, *, kind):
     runtime = kind == "runtime"
     admin = kind == "admin"
+    redeemer = kind == "redeemer"
     return {
         "role_name": role_name,
         "session_role": role_name,
@@ -187,11 +250,11 @@ def _role_facts(role_name, *, kind):
         "revoke_execute": admin,
         "approve_issue_execute": admin,
         "approve_rotate_execute": admin,
-        "list_approvals_execute": False,
-        "get_approval_execute": False,
+        "list_approvals_execute": redeemer,
+        "get_approval_execute": redeemer,
         "cancel_approval_execute": admin,
-        "redeem_issue_execute": False,
-        "redeem_rotate_execute": False,
+        "redeem_issue_execute": redeemer,
+        "redeem_rotate_execute": redeemer,
         "unexpected_function_execute": False,
     }
 
@@ -201,6 +264,10 @@ def test_each_pool_proves_its_exact_role_and_privilege_shape():
         _role_facts("rag_control_runtime", kind="runtime")]))
     db._configure_admin_connection(_Connection([
         _role_facts("rag_control_admin", kind="admin")]))
+    receipt = [(db.CONTROL_SCHEMA_VERSION, db._control_schema_digest())]
+    db._configure_redeemer_connection(_Connection(
+        [_role_facts("rag_control_redeemer", kind="redeemer")],
+        following_rows=(receipt,)))
     for configure, row in (
             (db._configure_runtime_connection,
              _role_facts("rag_control_admin", kind="runtime")),
@@ -222,6 +289,15 @@ def test_each_pool_proves_its_exact_role_and_privilege_shape():
                 **_role_facts("rag_control_admin", kind="admin"),
                 "role_membership_power": True,
             }),
+            (db._configure_redeemer_connection, {
+                **_role_facts("rag_control_redeemer", kind="redeemer"),
+                "tenant_facts_execute": True,
+                "unexpected_function_execute": True,
+            }),
+            (db._configure_redeemer_connection, {
+                **_role_facts("rag_control_redeemer", kind="redeemer"),
+                "redeem_rotate_execute": False,
+            }),
             (db._configure_runtime_connection, {
                 **_role_facts("rag_control_runtime", kind="runtime"),
                 "database_create": True,
@@ -232,6 +308,19 @@ def test_each_pool_proves_its_exact_role_and_privilege_shape():
             })):
         with pytest.raises(db.ControlPlaneRefused):
             configure(_Connection([row]))
+
+
+@pytest.mark.parametrize("receipt", (
+    [],
+    [(db.CONTROL_SCHEMA_VERSION + 1, "0" * 64)],
+    [(db.CONTROL_SCHEMA_VERSION, "0" * 64)],
+))
+def test_redeemer_requires_the_exact_control_schema_receipt(receipt):
+    connection = _Connection(
+        [_role_facts("rag_control_redeemer", kind="redeemer")],
+        following_rows=(receipt,))
+    with pytest.raises(db.ControlPlaneRefused, match="schema receipt"):
+        db._configure_redeemer_connection(connection)
 
 
 def test_audit_key_is_independent_and_domain_separated(monkeypatch):

@@ -106,6 +106,7 @@ def test_enterprise_identity_decisions_are_closed_and_content_free():
         "CONTROL_IDENTITY_HMAC_SECRET",
         "PG_CONTROL_DSN",
         "PG_CONTROL_MIGRATION_DSN",
+        "PG_CONTROL_REDEMPTION_DSN",
     }
     values = {}
     for line in example.splitlines():

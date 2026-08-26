@@ -172,10 +172,10 @@ def test_each_operation_binds_every_mutable_business_dimension():
         assert "int4send(requested_limit)" in authority
 
 
-def test_the_online_http_surface_stays_closed_after_sql_authority_is_bound():
-    assert not (ROOT / "scripts" / "init_control_redeemer_role.sh").exists()
+def test_the_online_http_surface_stays_closed_after_redeemer_is_provisioned():
+    assert (ROOT / "scripts" / "init_control_redeemer_role.sh").is_file()
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "PG_CONTROL_REDEMPTION_DSN" not in env
+    assert "PG_CONTROL_REDEMPTION_DSN=" in env
     for route in (
             "/v1/org/admin/service-account-approvals",
             "service-account-approvals/{approval_id}/redeem"):
