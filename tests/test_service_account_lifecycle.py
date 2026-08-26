@@ -188,6 +188,7 @@ def _role_facts(role_name, *, kind):
         "approve_issue_execute": admin,
         "approve_rotate_execute": admin,
         "list_approvals_execute": False,
+        "get_approval_execute": False,
         "cancel_approval_execute": admin,
         "redeem_issue_execute": False,
         "redeem_rotate_execute": False,

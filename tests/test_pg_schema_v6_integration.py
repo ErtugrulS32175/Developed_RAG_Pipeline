@@ -20,6 +20,7 @@ def migration_database():
 
     schema = "ragtest_v6_" + uuid.uuid4().hex[:12]
     role = "ragtest_v6_role_" + uuid.uuid4().hex[:12]
+    runtime_role = "rag_runtime"
     password = "eval-migration-only"
     admin = psycopg.connect(DSN, autocommit=True)
     conn = None
@@ -29,8 +30,12 @@ def migration_database():
             cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public")
             cur.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(password)))
+            cur.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                sql.Identifier(runtime_role), sql.Literal(password)))
             cur.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
                 sql.Identifier(schema), sql.Identifier(role)))
+            cur.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                sql.Identifier(schema), sql.Identifier(runtime_role)))
         conn = psycopg.connect(DSN, user=role, password=password)
         with conn.cursor() as cur:
             cur.execute(sql.SQL("SET search_path TO {}, public").format(
@@ -44,6 +49,8 @@ def migration_database():
             with admin.cursor() as cur:
                 cur.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(
                     sql.Identifier(schema)))
+                cur.execute(sql.SQL("DROP ROLE {}").format(
+                    sql.Identifier(runtime_role)))
                 cur.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
         finally:
             admin.close()
@@ -77,14 +84,14 @@ def test_v5_receipt_advances_to_current_with_forced_rls_and_is_idempotent(
     db.init_schema(conn)
 
     version, digest = db.expected_schema_state()
-    assert version == db.SCHEMA_VERSION == 12
+    assert version == db.SCHEMA_VERSION == 13
     assert digest != V5_DIGEST
     assert db.schema_is_current(conn)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT schema_version, schema_sha256 FROM rag_schema_history "
             "ORDER BY schema_version")
-        assert cur.fetchall() == [(5, V5_DIGEST), (12, digest)]
+        assert cur.fetchall() == [(5, V5_DIGEST), (13, digest)]
         for table in ("eval_datasets", "eval_dataset_versions", "eval_cases",
                       "eval_dataset_events"):
             cur.execute("SELECT to_regclass(%s)", (table,))
@@ -119,6 +126,44 @@ def test_v5_receipt_advances_to_current_with_forced_rls_and_is_idempotent(
             ("eval_dataset_events", "eval_events_read"),
             ("eval_dataset_events", "eval_events_insert"),
         } <= policies
+
+        signatures = (
+            "rag_mint_service_account_approval_list_assertion("
+            "uuid,bigint,integer)",
+            "rag_mint_service_account_approval_get_assertion("
+            "uuid,bigint,uuid,bigint,uuid)",
+            "rag_mint_service_account_approval_redeem_issue_assertion("
+            "uuid,bigint,uuid,bigint,uuid,bytea)",
+            "rag_mint_service_account_approval_redeem_rotate_assertion("
+            "uuid,bigint,uuid,bigint,uuid,bytea)",
+        )
+        for signature in signatures:
+            cur.execute(
+                "SELECT has_function_privilege('rag_runtime', "
+                "format('%%I.' || %s, current_schema()), 'EXECUTE')",
+                (signature,))
+            assert cur.fetchone() == (True,)
+        cur.execute(
+            "SELECT has_function_privilege('rag_runtime', "
+            "format('%I.rag_mint_service_account_assertion("
+            "uuid,bigint,text,uuid,bigint,uuid,bytea,integer)', "
+            "current_schema()), 'EXECUTE')")
+        assert cur.fetchone() == (False,)
+        cur.execute("SELECT current_schema()")
+        migrated_schema = cur.fetchone()[0]
+
+    import psycopg
+    from psycopg import sql
+    runtime = psycopg.connect(
+        DSN, user="rag_runtime", password="eval-migration-only")
+    try:
+        with runtime.cursor() as cur:
+            cur.execute(sql.SQL("SET search_path TO {}, public").format(
+                sql.Identifier(migrated_schema)))
+        runtime.commit()
+        assert db.runtime_role_is_safe(runtime) is True
+    finally:
+        runtime.close()
 
     db.init_schema(conn)
     with conn.cursor() as cur:

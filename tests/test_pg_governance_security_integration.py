@@ -75,6 +75,18 @@ def governance_database():
                 "REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, "
                 "TRIGGER ON rag_schema_state, rag_schema_history FROM {}"
             ).format(sql.Identifier(request_role)))
+            for signature in (
+                    "rag_mint_service_account_approval_list_assertion("
+                    "uuid,bigint,integer)",
+                    "rag_mint_service_account_approval_get_assertion("
+                    "uuid,bigint,uuid,bigint,uuid)",
+                    "rag_mint_service_account_approval_redeem_issue_"
+                    "assertion(uuid,bigint,uuid,bigint,uuid,bytea)",
+                    "rag_mint_service_account_approval_redeem_rotate_"
+                    "assertion(uuid,bigint,uuid,bigint,uuid,bytea)"):
+                cur.execute(sql.SQL(
+                    "GRANT EXECUTE ON FUNCTION {} TO {}"
+                ).format(sql.SQL(signature), sql.Identifier(request_role)))
             cur.executemany(
                 "INSERT INTO org_tenants (id, name) VALUES (%s, %s)",
                 [(TENANT_A, "Tenant A"), (TENANT_B, "Tenant B")])

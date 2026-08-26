@@ -1146,9 +1146,17 @@ END
 $consume_service_account_assertion$;
 
 CREATE OR REPLACE FUNCTION
-rag_control.control_list_redeemable_service_account_approvals(
+rag_control.control_asserted_list_redeemable_service_account_approvals(
+    requested_assertion_version smallint,
+    requested_key_version integer,
     requested_tenant_id uuid,
-    requested_limit integer)
+    requested_tenant_actor_digest bytea,
+    requested_org_policy_epoch bigint,
+    requested_limit integer,
+    requested_issued_at bigint,
+    requested_expires_at bigint,
+    requested_nonce bytea,
+    requested_mac bytea)
 RETURNS TABLE (
     approval_id uuid,
     tenant_id uuid,
@@ -1164,10 +1172,17 @@ RETURNS TABLE (
     control_policy_revision bigint,
     expires_at timestamptz,
     created_at timestamptz)
-LANGUAGE sql STABLE SECURITY DEFINER
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, rag_control
-AS $list_service_account_approvals$
-    SELECT approval.approval_id, approval.tenant_id,
+AS $asserted_list_service_account_approvals$
+BEGIN
+    PERFORM rag_control.control_consume_service_account_assertion(
+        requested_assertion_version, 'approval_list', requested_key_version,
+        requested_tenant_id, requested_tenant_actor_digest,
+        requested_org_policy_epoch, NULL, NULL, NULL, NULL,
+        requested_limit, requested_issued_at, requested_expires_at,
+        requested_nonce, requested_mac);
+    RETURN QUERY SELECT approval.approval_id, approval.tenant_id,
            approval.service_account_id, approval.action, approval.state,
            approval.approval_revision, approval.reason_code, approval.scopes,
            approval.account_expires_at, approval.credential_expires_at,
@@ -1196,22 +1211,104 @@ AS $list_service_account_approvals$
            AND approval.credential_expires_at <= account.expires_at))
       AND requested_limit BETWEEN 1 AND 100
     ORDER BY approval.created_at, approval.approval_id
-    LIMIT requested_limit
-$list_service_account_approvals$;
+    LIMIT requested_limit;
+END
+$asserted_list_service_account_approvals$;
+
+CREATE OR REPLACE FUNCTION
+rag_control.control_asserted_get_redeemable_service_account_approval(
+    requested_assertion_version smallint,
+    requested_key_version integer,
+    requested_tenant_id uuid,
+    requested_tenant_actor_digest bytea,
+    requested_org_policy_epoch bigint,
+    requested_approval_id uuid,
+    requested_approval_revision bigint,
+    requested_service_account_id uuid,
+    requested_issued_at bigint,
+    requested_expires_at bigint,
+    requested_nonce bytea,
+    requested_mac bytea)
+RETURNS TABLE (
+    approval_id uuid,
+    tenant_id uuid,
+    service_account_id uuid,
+    action text,
+    state text,
+    approval_revision bigint,
+    reason_code text,
+    scopes text[],
+    account_expires_at timestamptz,
+    credential_expires_at timestamptz,
+    expected_account_revision bigint,
+    control_policy_revision bigint,
+    expires_at timestamptz,
+    created_at timestamptz)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $asserted_get_service_account_approval$
+BEGIN
+    PERFORM rag_control.control_consume_service_account_assertion(
+        requested_assertion_version, 'approval_get', requested_key_version,
+        requested_tenant_id, requested_tenant_actor_digest,
+        requested_org_policy_epoch, requested_approval_id,
+        requested_approval_revision, requested_service_account_id,
+        NULL, NULL, requested_issued_at, requested_expires_at,
+        requested_nonce, requested_mac);
+    RETURN QUERY SELECT approval.approval_id, approval.tenant_id,
+           approval.service_account_id, approval.action, approval.state,
+           approval.approval_revision, approval.reason_code, approval.scopes,
+           approval.account_expires_at, approval.credential_expires_at,
+           approval.expected_account_revision,
+           approval.control_policy_revision, approval.expires_at,
+           approval.created_at
+    FROM rag_control.control_service_account_approvals AS approval
+    JOIN LATERAL rag_control.control_tenant_facts(
+        approval.tenant_id) AS facts ON true
+    LEFT JOIN rag_control.control_service_accounts AS account
+      ON account.service_account_id = approval.service_account_id
+    WHERE approval.approval_id = requested_approval_id
+      AND approval.tenant_id = requested_tenant_id
+      AND approval.service_account_id = requested_service_account_id
+      AND approval.state = 'approved'
+      AND approval.approval_revision = requested_approval_revision
+      AND approval.approval_revision = 1
+      AND statement_timestamp() < approval.expires_at
+      AND approval.control_policy_revision = facts.policy_revision
+      AND (
+          (approval.action = 'issue'
+           AND account.service_account_id IS NULL)
+          OR
+          (approval.action = 'rotate'
+           AND account.tenant_id = approval.tenant_id
+           AND account.state = 'active'
+           AND account.revision = approval.expected_account_revision
+           AND statement_timestamp() < account.expires_at
+           AND approval.credential_expires_at <= account.expires_at))
+    FOR SHARE OF approval;
+END
+$asserted_get_service_account_approval$;
 
 -- These redemption functions remain an offline atomic authority until the
 -- asserted redeemer role is installed by a later migration.
 -- PUBLIC is revoked below and no deployable role receives EXECUTE until the
 -- data-plane architect+admin proof can be cryptographically bound here.
 
-CREATE OR REPLACE FUNCTION rag_control.control_redeem_service_account_issue(
-    requested_approval_id uuid,
+CREATE OR REPLACE FUNCTION
+rag_control.control_asserted_redeem_service_account_issue(
+    requested_assertion_version smallint,
+    requested_key_version integer,
     requested_tenant_id uuid,
-    requested_account_id uuid,
-    requested_expected_approval_revision bigint,
     requested_tenant_actor_digest bytea,
     requested_org_policy_epoch bigint,
+    requested_approval_id uuid,
+    requested_expected_approval_revision bigint,
+    requested_account_id uuid,
     requested_credential_digest bytea,
+    requested_issued_at bigint,
+    requested_expires_at bigint,
+    requested_nonce bytea,
+    requested_mac bytea,
     requested_request_digest bytea,
     requested_resulting_fact_digest bytea)
 RETURNS TABLE (
@@ -1226,6 +1323,14 @@ DECLARE
     approved rag_control.control_service_account_approvals%ROWTYPE;
     tenant_policy_revision bigint;
 BEGIN
+    PERFORM rag_control.control_consume_service_account_assertion(
+        requested_assertion_version, 'approval_redeem_issue',
+        requested_key_version, requested_tenant_id,
+        requested_tenant_actor_digest, requested_org_policy_epoch,
+        requested_approval_id, requested_expected_approval_revision,
+        requested_account_id, requested_credential_digest, NULL,
+        requested_issued_at, requested_expires_at, requested_nonce,
+        requested_mac);
     SELECT tenant.policy_revision INTO tenant_policy_revision
     FROM rag_control.control_tenants AS tenant
     WHERE tenant.tenant_id = requested_tenant_id
@@ -1307,14 +1412,21 @@ BEGIN
 END
 $redeem_service_account_issue$;
 
-CREATE OR REPLACE FUNCTION rag_control.control_redeem_service_account_rotation(
-    requested_approval_id uuid,
+CREATE OR REPLACE FUNCTION
+rag_control.control_asserted_redeem_service_account_rotation(
+    requested_assertion_version smallint,
+    requested_key_version integer,
     requested_tenant_id uuid,
-    requested_account_id uuid,
-    requested_expected_approval_revision bigint,
     requested_tenant_actor_digest bytea,
     requested_org_policy_epoch bigint,
+    requested_approval_id uuid,
+    requested_expected_approval_revision bigint,
+    requested_account_id uuid,
     requested_credential_digest bytea,
+    requested_issued_at bigint,
+    requested_expires_at bigint,
+    requested_nonce bytea,
+    requested_mac bytea,
     requested_request_digest bytea,
     requested_resulting_fact_digest bytea)
 RETURNS TABLE (
@@ -1331,6 +1443,14 @@ DECLARE
     next_revision bigint;
     tenant_policy_revision bigint;
 BEGIN
+    PERFORM rag_control.control_consume_service_account_assertion(
+        requested_assertion_version, 'approval_redeem_rotate',
+        requested_key_version, requested_tenant_id,
+        requested_tenant_actor_digest, requested_org_policy_epoch,
+        requested_approval_id, requested_expected_approval_revision,
+        requested_account_id, requested_credential_digest, NULL,
+        requested_issued_at, requested_expires_at, requested_nonce,
+        requested_mac);
     SELECT tenant.policy_revision INTO tenant_policy_revision
     FROM rag_control.control_tenants AS tenant
     WHERE tenant.tenant_id = requested_tenant_id
@@ -1647,6 +1767,17 @@ BEGIN
 END
 $revoke_service_account$;
 
+-- Version 6 removes every assertion-less tenant redemption authority.  The
+-- online role introduced with this schema can reach only the asserted outer
+-- functions below; an older application cannot retain a callable bypass.
+DROP FUNCTION IF EXISTS
+    rag_control.control_list_redeemable_service_account_approvals(
+        uuid, integer);
+DROP FUNCTION IF EXISTS rag_control.control_redeem_service_account_issue(
+    uuid, uuid, uuid, bigint, bytea, bigint, bytea, bytea, bytea);
+DROP FUNCTION IF EXISTS rag_control.control_redeem_service_account_rotation(
+    uuid, uuid, uuid, bigint, bytea, bigint, bytea, bytea, bytea);
+
 REVOKE ALL ON FUNCTION rag_control.control_events_immutable() FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     rag_control.control_seal_service_account_approval_event() FROM PUBLIC;
@@ -1685,14 +1816,21 @@ REVOKE ALL ON FUNCTION rag_control.control_cancel_service_account_approval(
     integer, bytea, uuid, uuid, uuid, bigint, text)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
-    rag_control.control_list_redeemable_service_account_approvals(uuid, integer)
-    FROM PUBLIC;
-REVOKE ALL ON FUNCTION rag_control.control_redeem_service_account_issue(
-    uuid, uuid, uuid, bigint, bytea, bigint, bytea, bytea, bytea)
-    FROM PUBLIC;
-REVOKE ALL ON FUNCTION rag_control.control_redeem_service_account_rotation(
-    uuid, uuid, uuid, bigint, bytea, bigint, bytea, bytea, bytea)
-    FROM PUBLIC;
+    rag_control.control_asserted_list_redeemable_service_account_approvals(
+        smallint, integer, uuid, bytea, bigint, integer, bigint, bigint,
+        bytea, bytea) FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    rag_control.control_asserted_get_redeemable_service_account_approval(
+        smallint, integer, uuid, bytea, bigint, uuid, bigint, uuid, bigint,
+        bigint, bytea, bytea) FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    rag_control.control_asserted_redeem_service_account_issue(
+        smallint, integer, uuid, bytea, bigint, uuid, bigint, uuid, bytea,
+        bigint, bigint, bytea, bytea, bytea, bytea) FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    rag_control.control_asserted_redeem_service_account_rotation(
+        smallint, integer, uuid, bytea, bigint, uuid, bigint, uuid, bytea,
+        bigint, bigint, bytea, bytea, bytea, bytea) FROM PUBLIC;
 REVOKE ALL ON FUNCTION rag_control.control_issue_service_account(
     integer, bytea, uuid, uuid, bytea, text[], timestamptz, timestamptz,
     text, bytea, bytea)

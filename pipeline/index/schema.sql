@@ -2101,12 +2101,132 @@ BEGIN
 END
 $harden_assertion_search_path$;
 
+-- Deployable callers never choose a purpose or its nullable field shape.
+-- These four wrappers are the complete tenant-human assertion surface; the
+-- generic mint remains private so a future caller cannot assemble a wider
+-- assertion from request-selected coordinates.
+CREATE OR REPLACE FUNCTION rag_mint_service_account_approval_list_assertion(
+    requested_actor_id uuid,
+    requested_expected_policy_epoch bigint,
+    requested_limit integer)
+RETURNS TABLE (
+    assertion_version smallint, purpose text, key_version integer,
+    tenant_id uuid, tenant_actor_digest bytea, org_policy_epoch bigint,
+    approval_id uuid, approval_revision bigint, service_account_id uuid,
+    credential_digest bytea, assertion_limit integer, issued_at bigint,
+    expires_at bigint, nonce bytea, mac bytea)
+LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path FROM CURRENT
+AS $mint_approval_list_assertion$
+    SELECT * FROM rag_mint_service_account_assertion(
+        requested_actor_id, requested_expected_policy_epoch,
+        'approval_list', NULL, NULL, NULL, NULL, requested_limit)
+$mint_approval_list_assertion$;
+
+CREATE OR REPLACE FUNCTION rag_mint_service_account_approval_get_assertion(
+    requested_actor_id uuid,
+    requested_expected_policy_epoch bigint,
+    requested_approval_id uuid,
+    requested_approval_revision bigint,
+    requested_service_account_id uuid)
+RETURNS TABLE (
+    assertion_version smallint, purpose text, key_version integer,
+    tenant_id uuid, tenant_actor_digest bytea, org_policy_epoch bigint,
+    approval_id uuid, approval_revision bigint, service_account_id uuid,
+    credential_digest bytea, assertion_limit integer, issued_at bigint,
+    expires_at bigint, nonce bytea, mac bytea)
+LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path FROM CURRENT
+AS $mint_approval_get_assertion$
+    SELECT * FROM rag_mint_service_account_assertion(
+        requested_actor_id, requested_expected_policy_epoch,
+        'approval_get', requested_approval_id,
+        requested_approval_revision, requested_service_account_id,
+        NULL, NULL)
+$mint_approval_get_assertion$;
+
+CREATE OR REPLACE FUNCTION
+rag_mint_service_account_approval_redeem_issue_assertion(
+    requested_actor_id uuid,
+    requested_expected_policy_epoch bigint,
+    requested_approval_id uuid,
+    requested_approval_revision bigint,
+    requested_service_account_id uuid,
+    requested_credential_digest bytea)
+RETURNS TABLE (
+    assertion_version smallint, purpose text, key_version integer,
+    tenant_id uuid, tenant_actor_digest bytea, org_policy_epoch bigint,
+    approval_id uuid, approval_revision bigint, service_account_id uuid,
+    credential_digest bytea, assertion_limit integer, issued_at bigint,
+    expires_at bigint, nonce bytea, mac bytea)
+LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path FROM CURRENT
+AS $mint_approval_redeem_issue_assertion$
+    SELECT * FROM rag_mint_service_account_assertion(
+        requested_actor_id, requested_expected_policy_epoch,
+        'approval_redeem_issue', requested_approval_id,
+        requested_approval_revision, requested_service_account_id,
+        requested_credential_digest, NULL)
+$mint_approval_redeem_issue_assertion$;
+
+CREATE OR REPLACE FUNCTION
+rag_mint_service_account_approval_redeem_rotate_assertion(
+    requested_actor_id uuid,
+    requested_expected_policy_epoch bigint,
+    requested_approval_id uuid,
+    requested_approval_revision bigint,
+    requested_service_account_id uuid,
+    requested_credential_digest bytea)
+RETURNS TABLE (
+    assertion_version smallint, purpose text, key_version integer,
+    tenant_id uuid, tenant_actor_digest bytea, org_policy_epoch bigint,
+    approval_id uuid, approval_revision bigint, service_account_id uuid,
+    credential_digest bytea, assertion_limit integer, issued_at bigint,
+    expires_at bigint, nonce bytea, mac bytea)
+LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path FROM CURRENT
+AS $mint_approval_redeem_rotate_assertion$
+    SELECT * FROM rag_mint_service_account_assertion(
+        requested_actor_id, requested_expected_policy_epoch,
+        'approval_redeem_rotate', requested_approval_id,
+        requested_approval_revision, requested_service_account_id,
+        requested_credential_digest, NULL)
+$mint_approval_redeem_rotate_assertion$;
+
+DO $harden_assertion_wrapper_search_paths$
+DECLARE
+    product_schema name := current_schema();
+    function_identity text;
+BEGIN
+    FOREACH function_identity IN ARRAY ARRAY[
+        'rag_mint_service_account_approval_list_assertion(uuid,bigint,integer)',
+        'rag_mint_service_account_approval_get_assertion(uuid,bigint,uuid,bigint,uuid)',
+        'rag_mint_service_account_approval_redeem_issue_assertion(uuid,bigint,uuid,bigint,uuid,bytea)',
+        'rag_mint_service_account_approval_redeem_rotate_assertion(uuid,bigint,uuid,bigint,uuid,bytea)'
+    ] LOOP
+        EXECUTE format(
+            'ALTER FUNCTION %I.%s SET search_path TO pg_catalog, %I, pg_temp',
+            product_schema, function_identity, product_schema);
+    END LOOP;
+END
+$harden_assertion_wrapper_search_paths$;
+
 REVOKE ALL ON FUNCTION rag_service_account_assertion_payload(
     text, integer, uuid, bytea, bigint, uuid, bigint, uuid, bytea, integer,
     bigint, bigint, bytea)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION rag_mint_service_account_assertion(
     uuid, bigint, text, uuid, bigint, uuid, bytea, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_mint_service_account_approval_list_assertion(
+    uuid, bigint, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION rag_mint_service_account_approval_get_assertion(
+    uuid, bigint, uuid, bigint, uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    rag_mint_service_account_approval_redeem_issue_assertion(
+        uuid, bigint, uuid, bigint, uuid, bytea) FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    rag_mint_service_account_approval_redeem_rotate_assertion(
+        uuid, bigint, uuid, bigint, uuid, bytea) FROM PUBLIC;
 REVOKE ALL ON FUNCTION rag_secure_bytea_equal_32(bytea, bytea) FROM PUBLIC;
 
 -- The runtime role receives broad product-table DML and relies on forced RLS,
@@ -2123,6 +2243,29 @@ BEGIN
             '%I.rag_service_account_assertion_keys, '
             '%I.org_identity_tenant_bindings FROM rag_runtime',
             product_schema, product_schema, product_schema);
+        EXECUTE format(
+            'REVOKE ALL ON FUNCTION %I.'
+            'rag_mint_service_account_assertion('
+            'uuid,bigint,text,uuid,bigint,uuid,bytea,integer) '
+            'FROM rag_runtime', product_schema);
+        EXECUTE format(
+            'GRANT EXECUTE ON FUNCTION %I.'
+            'rag_mint_service_account_approval_list_assertion('
+            'uuid,bigint,integer) TO rag_runtime', product_schema);
+        EXECUTE format(
+            'GRANT EXECUTE ON FUNCTION %I.'
+            'rag_mint_service_account_approval_get_assertion('
+            'uuid,bigint,uuid,bigint,uuid) TO rag_runtime', product_schema);
+        EXECUTE format(
+            'GRANT EXECUTE ON FUNCTION %I.'
+            'rag_mint_service_account_approval_redeem_issue_assertion('
+            'uuid,bigint,uuid,bigint,uuid,bytea) TO rag_runtime',
+            product_schema);
+        EXECUTE format(
+            'GRANT EXECUTE ON FUNCTION %I.'
+            'rag_mint_service_account_approval_redeem_rotate_assertion('
+            'uuid,bigint,uuid,bigint,uuid,bytea) TO rag_runtime',
+            product_schema);
         IF to_regclass(format('%I.rag_schema_state', product_schema))
                 IS NOT NULL THEN
             EXECUTE format(

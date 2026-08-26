@@ -90,7 +90,7 @@ def test_schema_is_fixed_and_closed_to_operational_facts_only():
     assert "CHECK (position('@' in connection_ref) = 0)" in text
     assert "ON DELETE CASCADE" not in text
     assert "SET search_path FROM CURRENT" not in text
-    assert text.count("SET search_path = pg_catalog, rag_control") == 20
+    assert text.count("SET search_path = pg_catalog, rag_control") == 21
 
 
 def test_runtime_role_has_only_lookup_function_authority():
@@ -123,7 +123,8 @@ def test_events_are_owner_immutable_and_public_exec_is_revoked():
     assert "control_service_account_approval_events_seal" in text
     assert "ERRCODE = '55000'" in text
     assert "MESSAGE = 'control_event_immutable'" in text
-    assert text.count("STABLE SECURITY DEFINER") == 6
+    assert text.count("STABLE SECURITY DEFINER") == 5
+    assert text.count("VOLATILE SECURITY DEFINER") >= 9
     assert "control_tenant_facts(uuid) FROM PUBLIC" in text
     assert "control_resolve_identity(integer, bytea)" in text
     assert "control_resolve_platform_operator(" in text
@@ -220,7 +221,7 @@ def test_invalid_digest_versions_and_shapes_fail_before_sql(version, digest):
 
 
 def test_control_schema_version_binds_the_shipped_bytes():
-    assert db.CONTROL_SCHEMA_VERSION == 5
+    assert db.CONTROL_SCHEMA_VERSION == 6
     digest = hashlib.sha256(SCHEMA.read_bytes()).hexdigest()
     assert len(digest) == 64
     assert db._SCHEMA_LOCK_NAME == "ragtest-control-schema-migration"

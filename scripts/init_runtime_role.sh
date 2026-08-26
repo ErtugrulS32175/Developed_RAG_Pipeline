@@ -29,6 +29,20 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 REVOKE ALL ON rag_context_secrets FROM rag_runtime;
 REVOKE ALL ON rag_service_account_assertion_keys FROM rag_runtime;
 REVOKE ALL ON org_identity_tenant_bindings FROM rag_runtime;
+REVOKE ALL ON FUNCTION rag_mint_service_account_assertion(
+    uuid, bigint, text, uuid, bigint, uuid, bytea, integer) FROM rag_runtime;
+GRANT EXECUTE ON FUNCTION
+    rag_mint_service_account_approval_list_assertion(uuid, bigint, integer)
+    TO rag_runtime;
+GRANT EXECUTE ON FUNCTION
+    rag_mint_service_account_approval_get_assertion(
+        uuid, bigint, uuid, bigint, uuid) TO rag_runtime;
+GRANT EXECUTE ON FUNCTION
+    rag_mint_service_account_approval_redeem_issue_assertion(
+        uuid, bigint, uuid, bigint, uuid, bytea) TO rag_runtime;
+GRANT EXECUTE ON FUNCTION
+    rag_mint_service_account_approval_redeem_rotate_assertion(
+        uuid, bigint, uuid, bigint, uuid, bytea) TO rag_runtime;
 SELECT 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER '
        'ON rag_schema_state FROM rag_runtime'
 WHERE to_regclass('rag_schema_state') IS NOT NULL

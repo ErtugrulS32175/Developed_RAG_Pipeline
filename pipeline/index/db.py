@@ -28,6 +28,10 @@ from pipeline.index.attempt_contract import (
     CandidateState,
     IngestAttempt,
 )
+from pipeline.service_account_assertions import (
+    ServiceAccountAssertion,
+    ServiceAccountAssertionRefused,
+)
 
 load_dotenv()
 
@@ -36,7 +40,7 @@ load_dotenv()
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv(
     "PG_DSN", "postgresql://rag_runtime:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -440,6 +444,22 @@ def runtime_role_is_safe(conn) -> bool:
                 "AND NOT has_function_privilege(current_user, "
                 "format('%I.rag_mint_service_account_assertion("
                 "uuid,bigint,text,uuid,bigint,uuid,bytea,integer)', "
+                "current_schema()), 'EXECUTE') "
+                "AND has_function_privilege(current_user, "
+                "format('%I.rag_mint_service_account_approval_list_"
+                "assertion(uuid,bigint,integer)', current_schema()), "
+                "'EXECUTE') "
+                "AND has_function_privilege(current_user, "
+                "format('%I.rag_mint_service_account_approval_get_"
+                "assertion(uuid,bigint,uuid,bigint,uuid)', "
+                "current_schema()), 'EXECUTE') "
+                "AND has_function_privilege(current_user, "
+                "format('%I.rag_mint_service_account_approval_redeem_issue_"
+                "assertion(uuid,bigint,uuid,bigint,uuid,bytea)', "
+                "current_schema()), 'EXECUTE') "
+                "AND has_function_privilege(current_user, "
+                "format('%I.rag_mint_service_account_approval_redeem_rotate_"
+                "assertion(uuid,bigint,uuid,bigint,uuid,bytea)', "
                 "current_schema()), 'EXECUTE') "
                 "AND NOT has_table_privilege(current_user, "
                 "format('%I.rag_schema_state', current_schema()), "
@@ -1951,6 +1971,110 @@ def lock_service_account_redeemer(conn, *, actor_id, expected_policy_epoch):
     if int(row["policy_epoch"]) != epoch:
         raise OrgPolicyConflict("organizasyon politikasi degisti")
     return {"tenant_id": row["tenant_id"], "policy_epoch": epoch}
+
+
+_ASSERTION_COLUMNS = {
+    "assertion_version", "purpose", "key_version", "tenant_id",
+    "tenant_actor_digest", "org_policy_epoch", "approval_id",
+    "approval_revision", "service_account_id", "credential_digest",
+    "assertion_limit", "issued_at", "expires_at", "nonce", "mac",
+}
+
+
+def _mint_service_account_assertion(conn, function_name, params):
+    placeholders = ",".join("%s" for _value in params)
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM {function_name}({placeholders})", params)
+            rows = list(cur.fetchall())
+    except psycopg.Error:
+        raise ServiceAccountRedemptionRefused(
+            "servis hesabi kaniti reddedildi") from None
+    if (len(rows) != 1 or type(rows[0]) is not dict
+            or set(rows[0]) != _ASSERTION_COLUMNS):
+        raise ServiceAccountRedemptionRefused(
+            "servis hesabi kaniti gecersiz")
+    row = rows[0]
+    try:
+        return ServiceAccountAssertion(
+            assertion_version=row["assertion_version"],
+            purpose=row["purpose"], key_version=row["key_version"],
+            tenant_id=row["tenant_id"],
+            tenant_actor_digest=bytes(row["tenant_actor_digest"]),
+            org_policy_epoch=row["org_policy_epoch"],
+            approval_id=row["approval_id"],
+            approval_revision=row["approval_revision"],
+            service_account_id=row["service_account_id"],
+            credential_digest=(
+                None if row["credential_digest"] is None
+                else bytes(row["credential_digest"])),
+            assertion_limit=row["assertion_limit"],
+            issued_at=row["issued_at"], expires_at=row["expires_at"],
+            nonce=bytes(row["nonce"]), mac=bytes(row["mac"]),
+        )
+    except (TypeError, ValueError, ServiceAccountAssertionRefused):
+        raise ServiceAccountRedemptionRefused(
+            "servis hesabi kaniti gecersiz") from None
+
+
+def mint_service_account_approval_list_assertion(
+        conn, *, actor_id, expected_policy_epoch, limit):
+    actor = _retention_uuid(actor_id, "actor_id")
+    epoch = _retention_positive(expected_policy_epoch,
+                                "expected_policy_epoch")
+    bounded_limit = _retention_positive(limit, "limit", maximum=100)
+    return _mint_service_account_assertion(
+        conn, "rag_mint_service_account_approval_list_assertion",
+        (actor, epoch, bounded_limit))
+
+
+def mint_service_account_approval_get_assertion(
+        conn, *, actor_id, expected_policy_epoch, approval_id,
+        approval_revision, service_account_id):
+    return _mint_service_account_assertion(
+        conn, "rag_mint_service_account_approval_get_assertion", (
+            _retention_uuid(actor_id, "actor_id"),
+            _retention_positive(expected_policy_epoch,
+                                "expected_policy_epoch"),
+            _retention_uuid(approval_id, "approval_id"),
+            _retention_positive(approval_revision, "approval_revision"),
+            _retention_uuid(service_account_id, "service_account_id"),
+        ))
+
+
+def _mint_service_account_redemption_assertion(
+        conn, *, action, actor_id, expected_policy_epoch, approval_id,
+        approval_revision, service_account_id, credential_digest):
+    if action not in {"issue", "rotate"}:
+        raise ServiceAccountRedemptionRefused(
+            "servis hesabi islemi gecersiz")
+    if (type(credential_digest) is not bytes
+            or len(credential_digest) != 32):
+        raise ServiceAccountRedemptionRefused(
+            "servis hesabi kimlik ozeti gecersiz")
+    return _mint_service_account_assertion(
+        conn,
+        "rag_mint_service_account_approval_redeem_"
+        + action + "_assertion", (
+            _retention_uuid(actor_id, "actor_id"),
+            _retention_positive(expected_policy_epoch,
+                                "expected_policy_epoch"),
+            _retention_uuid(approval_id, "approval_id"),
+            _retention_positive(approval_revision, "approval_revision"),
+            _retention_uuid(service_account_id, "service_account_id"),
+            credential_digest,
+        ))
+
+
+def mint_service_account_approval_redeem_issue_assertion(conn, **kwargs):
+    return _mint_service_account_redemption_assertion(
+        conn, action="issue", **kwargs)
+
+
+def mint_service_account_approval_redeem_rotate_assertion(conn, **kwargs):
+    return _mint_service_account_redemption_assertion(
+        conn, action="rotate", **kwargs)
 
 
 def get_tenant_retention_policy(conn, *, actor_id):

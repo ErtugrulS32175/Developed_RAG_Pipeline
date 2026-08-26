@@ -21,6 +21,8 @@ ACTOR_DIGEST = b"a" * 32
 ACTOR = uuid.UUID("20000000-0000-0000-0000-000000000002")
 APPROVAL = uuid.UUID("50000000-0000-0000-0000-000000000005")
 ACCOUNT = uuid.UUID("30000000-0000-0000-0000-000000000003")
+BUSINESS_APPROVAL = uuid.UUID("50000000-0000-0000-0000-000000000006")
+BUSINESS_ACCOUNT = uuid.UUID("30000000-0000-0000-0000-000000000004")
 APPROVAL_REVISION = 3
 CREDENTIAL_DIGEST = b"c" * 32
 NONCE = b"n" * 16
@@ -88,6 +90,38 @@ def proof_databases():
                 "(key_version, secret, state, not_before) "
                 "VALUES (7, %s, 'active', statement_timestamp() - "
                 "interval '1 minute')", (KEY,))
+            cursor.execute(
+                "INSERT INTO rag_control.control_regions "
+                "VALUES ('proof-region','active',1)")
+            cursor.execute(
+                "INSERT INTO rag_control.control_tenants "
+                "(tenant_id,lifecycle,deployment_profile,policy_revision) "
+                "VALUES (%s,'active','enterprise',9)", (TENANT,))
+            cursor.execute(
+                "INSERT INTO rag_control.control_tenant_routes "
+                "(tenant_id,route_kind,region_code,connection_ref,state) "
+                "VALUES (%s,'shared_rls','proof-region','proof:route',"
+                "'active')", (TENANT,))
+            cursor.execute(
+                "INSERT INTO rag_control.control_tenant_quotas VALUES "
+                "(%s,10,2,2,1000,10,1,1,1000,'declared',1)", (TENANT,))
+            cursor.execute(
+                "INSERT INTO rag_control.control_platform_operators "
+                "(role,state) VALUES ('platform_security','active') "
+                "RETURNING operator_id")
+            operator = cursor.fetchone()[0]
+            cursor.execute(
+                "INSERT INTO rag_control.control_service_account_approvals "
+                "(approval_id,tenant_id,service_account_id,action,state,"
+                "platform_operator_id,reason_code,scopes,account_expires_at,"
+                "credential_expires_at,control_policy_revision,expires_at,"
+                "request_digest,resulting_fact_digest) VALUES "
+                "(%s,%s,%s,'issue','approved',%s,'security_provisioning',"
+                "ARRAY['rag.query'],statement_timestamp()+interval '30 days',"
+                "statement_timestamp()+interval '7 days',9,"
+                "statement_timestamp()+interval '10 minutes',%s,%s)",
+                (BUSINESS_APPROVAL, TENANT, BUSINESS_ACCOUNT, operator,
+                 b"r" * 32, b"f" * 32))
         control.commit()
         yield data, control
     finally:
@@ -255,6 +289,87 @@ def test_data_database_mints_only_the_closed_tenant_authority(
     assert bytes(mac) == hmac.new(
         KEY, expected_payload, hashlib.sha256).digest()
     data.rollback()
+
+
+def test_purpose_specific_mints_drive_asserted_list_get_and_issue(
+        proof_databases, monkeypatch):
+    data, control = proof_databases
+    monkeypatch.setenv("CONTROL_AUDIT_HMAC_SECRET", "a" * 32)
+    monkeypatch.setenv("CONTROL_IDENTITY_HMAC_SECRET", "i" * 32)
+    monkeypatch.setenv("CONTROL_SERVICE_ACCOUNT_HMAC_SECRET", "s" * 32)
+    monkeypatch.setenv("OIDC_SESSION_SECRET", "o" * 32)
+    index_db.set_tenant_context(data, TENANT, actor_id=ACTOR)
+    data.commit()
+
+    listed_proof = index_db.mint_service_account_approval_list_assertion(
+        data, actor_id=ACTOR, expected_policy_epoch=9, limit=10)
+    data.commit()
+    approvals = control_db.list_redeemable_service_account_approvals(
+        control, listed_proof)
+    control.commit()
+    with pytest.raises(control_db.ControlPlaneConflict):
+        control_db.list_redeemable_service_account_approvals(
+            control, listed_proof)
+    control.rollback()
+    assert len(approvals) == 1
+    approval = approvals[0]
+    assert (approval.approval_id, approval.service_account_id) == (
+        BUSINESS_APPROVAL, BUSINESS_ACCOUNT)
+
+    index_db.set_tenant_context(data, TENANT, actor_id=ACTOR)
+    data.commit()
+    get_proof = index_db.mint_service_account_approval_get_assertion(
+        data, actor_id=ACTOR, expected_policy_epoch=9,
+        approval_id=BUSINESS_APPROVAL, approval_revision=1,
+        service_account_id=BUSINESS_ACCOUNT)
+    data.commit()
+    measured = control_db.get_redeemable_service_account_approval(
+        control, get_proof)
+    control.commit()
+    assert measured == approval
+
+    credential = b"z" * 32
+    index_db.set_tenant_context(data, TENANT, actor_id=ACTOR)
+    data.commit()
+    redeem_proof = (
+        index_db.mint_service_account_approval_redeem_issue_assertion(
+            data, actor_id=ACTOR, expected_policy_epoch=9,
+            approval_id=BUSINESS_APPROVAL, approval_revision=1,
+            service_account_id=BUSINESS_ACCOUNT,
+            credential_digest=credential))
+    data.commit()
+    result = control_db.redeem_service_account_approval(
+        control, approval, assertion=redeem_proof)
+    control.commit()
+    assert (result.service_account_id, result.account_revision,
+            result.credential_version) == (BUSINESS_ACCOUNT, 1, 1)
+    with pytest.raises(control_db.ControlPlaneConflict):
+        control_db.redeem_service_account_approval(
+            control, approval, assertion=redeem_proof)
+    control.rollback()
+    with control.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM rag_control."
+            "control_service_account_assertion_nonces "
+            "WHERE tenant_id = %s", (TENANT,))
+    control.commit()
+
+
+def test_old_assertionless_control_signatures_are_absent(proof_databases):
+    _data, control = proof_databases
+    signatures = (
+        "rag_control.control_list_redeemable_service_account_approvals("
+        "uuid,integer)",
+        "rag_control.control_redeem_service_account_issue("
+        "uuid,uuid,uuid,bigint,bytea,bigint,bytea,bytea,bytea)",
+        "rag_control.control_redeem_service_account_rotation("
+        "uuid,uuid,uuid,bigint,bytea,bigint,bytea,bytea,bytea)",
+    )
+    with control.cursor() as cursor:
+        for signature in signatures:
+            cursor.execute("SELECT to_regprocedure(%s)", (signature,))
+            assert cursor.fetchone()[0] is None
+    control.rollback()
 
 
 def test_service_context_cannot_mint_a_human_assertion(proof_databases):

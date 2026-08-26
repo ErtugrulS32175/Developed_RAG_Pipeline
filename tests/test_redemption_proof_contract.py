@@ -19,8 +19,8 @@ def _function(schema, name, terminator):
 
 
 def test_schema_versions_advance_for_the_proof_authorities():
-    assert index_db.SCHEMA_VERSION == 12
-    assert control_db.CONTROL_SCHEMA_VERSION == 5
+    assert index_db.SCHEMA_VERSION == 13
+    assert control_db.CONTROL_SCHEMA_VERSION == 6
 
 
 def test_the_two_databases_pin_one_binary_payload_layout():
@@ -172,7 +172,7 @@ def test_each_operation_binds_every_mutable_business_dimension():
         assert "int4send(requested_limit)" in authority
 
 
-def test_the_online_redemption_surface_stays_closed_in_this_foundation():
+def test_the_online_http_surface_stays_closed_after_sql_authority_is_bound():
     assert not (ROOT / "scripts" / "init_control_redeemer_role.sh").exists()
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "PG_CONTROL_REDEMPTION_DSN" not in env
@@ -181,3 +181,40 @@ def test_the_online_redemption_surface_stays_closed_in_this_foundation():
             "service-account-approvals/{approval_id}/redeem"):
         assert route not in (ROOT / "pipeline" / "api" / "app.py").read_text(
             encoding="utf-8")
+
+
+def test_deployable_data_mints_are_purpose_specific_and_generic_is_private():
+    runtime_script = (ROOT / "scripts" / "init_runtime_role.sh").read_text(
+        encoding="utf-8")
+    signatures = (
+        "rag_mint_service_account_approval_list_assertion",
+        "rag_mint_service_account_approval_get_assertion",
+        "rag_mint_service_account_approval_redeem_issue_assertion",
+        "rag_mint_service_account_approval_redeem_rotate_assertion",
+    )
+    flattened = DATA_SCHEMA.replace("\n", " ")
+    for name in signatures:
+        assert f"FUNCTION {name}(" in flattened
+        assert f"{name}(" in runtime_script
+    assert "GRANT EXECUTE ON FUNCTION rag_mint_service_account_assertion" not in (
+        runtime_script)
+
+
+def test_control_exposes_only_asserted_redemption_signatures():
+    for name in (
+            "control_asserted_list_redeemable_service_account_approvals",
+            "control_asserted_get_redeemable_service_account_approval",
+            "control_asserted_redeem_service_account_issue",
+            "control_asserted_redeem_service_account_rotation"):
+        body = CONTROL_SCHEMA.split(f"rag_control.{name}(", 1)[1].split(
+            "CREATE OR REPLACE FUNCTION", 1)[0]
+        assert "control_consume_service_account_assertion" in body
+        assert "VOLATILE SECURITY DEFINER" in body
+    flattened = " ".join(CONTROL_SCHEMA.split())
+    for signature in (
+            "control_list_redeemable_service_account_approvals( uuid, integer)",
+            "control_redeem_service_account_issue( uuid, uuid, uuid, bigint, "
+            "bytea, bigint, bytea, bytea, bytea)",
+            "control_redeem_service_account_rotation( uuid, uuid, uuid, bigint, "
+            "bytea, bigint, bytea, bytea, bytea)"):
+        assert "DROP FUNCTION IF EXISTS rag_control." + signature in flattened

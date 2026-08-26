@@ -7,6 +7,7 @@ import pytest
 
 from pipeline.control import db
 from pipeline.index import db as index_db
+from pipeline.service_account_assertions import ServiceAccountAssertion
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +89,19 @@ def _audit(monkeypatch):
     monkeypatch.setenv("CONTROL_IDENTITY_HMAC_SECRET", "i" * 32)
     monkeypatch.setenv("CONTROL_SERVICE_ACCOUNT_HMAC_SECRET", "s" * 32)
     monkeypatch.setenv("OIDC_SESSION_SECRET", "o" * 32)
+
+
+def _proof(purpose="approval_list", *, limit=100, action="issue"):
+    issued = 2_000_000_000
+    shaped = purpose != "approval_list"
+    redeem = purpose.startswith("approval_redeem_")
+    return ServiceAccountAssertion(
+        1, purpose, 7, TENANT, b"t" * 32, 4,
+        APPROVAL if shaped else None, 1 if shaped else None,
+        ACCOUNT if shaped else None, b"c" * 32 if redeem else None,
+        limit if purpose == "approval_list" else None,
+        issued, issued + 30, b"n" * 16, b"m" * 32,
+    )
 
 
 def test_approval_schema_is_closed_content_free_and_short_lived():
@@ -230,11 +244,13 @@ def test_listing_returns_only_tenant_safe_approval_metadata():
     }
     connection = _Connection([first, second])
     rows = db.list_redeemable_service_account_approvals(
-        connection, TENANT, limit=2)
+        connection, _proof(limit=2))
     assert [row.action for row in rows] == ["issue", "rotate"]
     assert all(row.tenant_id == TENANT and row.state == "approved"
                for row in rows)
-    assert connection.cursor_instance.params == (TENANT, 2)
+    assert connection.cursor_instance.params[2] == TENANT
+    assert connection.cursor_instance.params[5] == 2
+    assert len(connection.cursor_instance.params) == 10
 
 
 def test_listing_rejects_open_or_impossible_rows():
@@ -249,7 +265,7 @@ def test_listing_rejects_open_or_impossible_rows():
         row = {**_listed(), **change}
         with pytest.raises(db.ControlPlaneRefused):
             db.list_redeemable_service_account_approvals(
-                _Connection([row]), TENANT)
+                _Connection([row]), _proof())
 
 
 @pytest.mark.parametrize("created,expires", [
@@ -264,7 +280,7 @@ def test_listing_rejects_expired_or_future_created_rows(created, expires):
     }
     with pytest.raises(db.ControlPlaneRefused):
         db.list_redeemable_service_account_approvals(
-            _Connection([row]), TENANT)
+            _Connection([row]), _proof())
 
 
 @pytest.mark.parametrize("shape,limit", [
@@ -288,7 +304,7 @@ def test_listing_rejects_duplicate_excess_or_out_of_order_rows(shape, limit):
         ]
     with pytest.raises(db.ControlPlaneRefused) as refused:
         db.list_redeemable_service_account_approvals(
-            _Connection(rows), TENANT, limit=limit)
+            _Connection(rows), _proof(limit=limit))
     assert str(refused.value) == "service account approvals result is invalid"
 
 
@@ -296,8 +312,19 @@ def test_listing_hides_database_error_details():
     connection = _Connection(
         [], db.psycopg.OperationalError("SENTINEL database detail"))
     with pytest.raises(db.ControlPlaneRefused) as refused:
-        db.list_redeemable_service_account_approvals(connection, TENANT)
+        db.list_redeemable_service_account_approvals(connection, _proof())
     assert str(refused.value) == "service account approvals refused"
+    assert "SENTINEL" not in str(refused.value)
+    assert refused.value.__cause__ is None
+
+
+def test_listing_maps_a_replayed_assertion_to_the_closed_conflict_family():
+    connection = _Connection(
+        [], db.psycopg.errors.SerializationFailure(
+            "SENTINEL replay detail"))
+    with pytest.raises(db.ControlPlaneConflict) as refused:
+        db.list_redeemable_service_account_approvals(connection, _proof())
+    assert str(refused.value) == "service account approval conflict"
     assert "SENTINEL" not in str(refused.value)
     assert refused.value.__cause__ is None
 
@@ -333,15 +360,15 @@ def test_redeem_wrapper_selects_only_the_closed_action(monkeypatch):
         row["account_expires_at"], row["credential_expires_at"], None, 7,
         now + timedelta(minutes=15), now)
     result = db.redeem_service_account_approval(
-        connection, approval, tenant_actor_digest=b"t" * 32,
-        org_policy_epoch=4, credential_digest=b"c" * 32)
+        connection, approval,
+        assertion=_proof("approval_redeem_issue"))
     assert result.service_account_id == ACCOUNT
     assert result.credential_version == 1
-    assert "control_redeem_service_account_issue" in (
+    assert "control_asserted_redeem_service_account_issue" in (
         connection.cursor_instance.query)
-    assert b"c" * 32 == connection.cursor_instance.params[6]
+    assert b"c" * 32 == connection.cursor_instance.params[8]
     assert all(type(value) is bytes and len(value) == 32
-               for value in connection.cursor_instance.params[7:])
+               for value in connection.cursor_instance.params[-2:])
 
 
 @pytest.mark.parametrize("error,expected,message", [
@@ -364,8 +391,7 @@ def test_redemption_hides_database_error_details(
     with pytest.raises(expected) as refused:
         db.redeem_service_account_approval(
             _Connection([], error), approval,
-            tenant_actor_digest=b"t" * 32, org_policy_epoch=4,
-            credential_digest=b"c" * 32)
+            assertion=_proof("approval_redeem_issue"))
     assert str(refused.value) == message
     assert "SENTINEL" not in str(refused.value)
     assert refused.value.__cause__ is None
@@ -384,7 +410,7 @@ def test_cancel_wrapper_is_platform_proof_and_revision_bound(monkeypatch):
 
 
 def test_control_schema_version_advances_for_the_approval_authority():
-    assert db.CONTROL_SCHEMA_VERSION == 5
+    assert db.CONTROL_SCHEMA_VERSION == 6
 
 
 def test_tenant_redemption_gate_locks_both_authority_rows():

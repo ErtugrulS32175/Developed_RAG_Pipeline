@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
+import hmac
 import os
 from pathlib import Path
 import uuid
@@ -9,11 +10,32 @@ import uuid
 import pytest
 
 from pipeline.control import db
+from pipeline.service_account_assertions import ServiceAccountAssertion
 
 
 DSN = os.getenv("RAGTEST_CONTROL_PG_DSN", "").strip()
 pytestmark = pytest.mark.skipif(
     not DSN, reason="RAGTEST_CONTROL_PG_DSN is absent")
+ASSERTION_KEY = b"k" * 32
+
+
+def _assertion(connection, purpose, tenant, *, approval=None, account=None,
+               credential=None, limit=None):
+    issued = int(datetime.now(timezone.utc).timestamp())
+    nonce = uuid.uuid4().bytes
+    revision = None if approval is None else 1
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT rag_control.control_service_account_assertion_payload("
+            "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (purpose, 17, tenant, b"t" * 32, 9, approval, revision,
+             account, credential, limit, issued, issued + 30, nonce))
+        payload = bytes(cursor.fetchone()[0])
+    return ServiceAccountAssertion(
+        1, purpose, 17, tenant, b"t" * 32, 9,
+        approval, revision, account, credential, limit,
+        issued, issued + 30, nonce,
+        hmac.new(ASSERTION_KEY, payload, hashlib.sha256).digest())
 
 
 @pytest.fixture(scope="module")
@@ -27,6 +49,14 @@ def control_database():
             cursor.execute("DROP SCHEMA IF EXISTS rag_control CASCADE")
         connection = psycopg.connect(DSN)
         db.init_schema(connection)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO rag_control."
+                "control_service_account_assertion_keys "
+                "(key_version,secret,state,not_before) VALUES "
+                "(17,%s,'active',statement_timestamp()-interval '1 minute')",
+                (ASSERTION_KEY,))
+        connection.commit()
         yield connection
     finally:
         if connection is not None:
@@ -630,8 +660,11 @@ def test_service_account_approvals_create_no_credential_and_revoke_cancels(
             reason_code="security_provisioning")
         admin.commit()
         assert issue.approval_revision == 1
+        issue_list_proof = _assertion(
+            control_database, "approval_list", tenant, limit=100)
         assert db.list_redeemable_service_account_approvals(
-            control_database, tenant) == (issue,)
+            control_database, issue_list_proof) == (issue,)
+        control_database.commit()
         with control_database.cursor() as cursor:
             cursor.execute(
                 "SELECT count(*) FROM rag_control.control_service_accounts "
@@ -643,8 +676,11 @@ def test_service_account_approvals_create_no_credential_and_revoke_cancels(
             account_id=issue_account, expected_approval_revision=1,
             reason_code="approval_cancelled") == 2
         admin.commit()
+        cancelled_list_proof = _assertion(
+            control_database, "approval_list", tenant, limit=100)
         assert db.list_redeemable_service_account_approvals(
-            control_database, tenant) == ()
+            control_database, cancelled_list_proof) == ()
+        control_database.commit()
 
         assert db.issue_service_account(
             control_database, operator_key_version=3,
@@ -793,41 +829,62 @@ def test_offline_authority_consumes_one_exact_approval_and_replay_fails(
             expected_policy_revision=1,
             reason_code="security_provisioning")
         admin.commit()
+        list_proof = _assertion(
+            control_database, "approval_list", tenant, limit=100)
         with pytest.raises(db.ControlPlaneRefused):
-            db.list_redeemable_service_account_approvals(untrusted, tenant)
+            db.list_redeemable_service_account_approvals(
+                untrusted, list_proof)
         untrusted.rollback()
+        denied_redeem_proof = _assertion(
+            control_database, "approval_redeem_issue", tenant,
+            approval=approval_id, account=account, credential=b"z" * 32)
         with pytest.raises(db.ControlPlaneDenied):
             db.redeem_service_account_approval(
-                untrusted, approval, tenant_actor_digest=b"u" * 32,
-                org_policy_epoch=1, credential_digest=b"z" * 32)
+                untrusted, approval, assertion=denied_redeem_proof)
         untrusted.rollback()
+        owner_list_proof = _assertion(
+            control_database, "approval_list", tenant, limit=100)
         assert db.list_redeemable_service_account_approvals(
-            control_database, tenant) == (approval,)
+            control_database, owner_list_proof) == (approval,)
+        control_database.commit()
         with control_database.cursor() as cursor:
             cursor.execute(
                 "UPDATE rag_control.control_tenants SET policy_revision = 2 "
                 "WHERE tenant_id = %s", (tenant,))
         control_database.commit()
+        stale_list_proof = _assertion(
+            control_database, "approval_list", tenant, limit=100)
         assert db.list_redeemable_service_account_approvals(
-            control_database, tenant) == ()
+            control_database, stale_list_proof) == ()
+        control_database.commit()
+        stale_redeem_proof = _assertion(
+            control_database, "approval_redeem_issue", tenant,
+            approval=approval_id, account=account, credential=b"b" * 32)
         with pytest.raises(db.ControlPlaneConflict):
             db.redeem_service_account_approval(
-                control_database, approval, tenant_actor_digest=b"t" * 32,
-                org_policy_epoch=9, credential_digest=b"b" * 32)
+                control_database, approval, assertion=stale_redeem_proof)
         control_database.rollback()
         with control_database.cursor() as cursor:
             cursor.execute(
                 "UPDATE rag_control.control_tenants SET policy_revision = 1 "
                 "WHERE tenant_id = %s", (tenant,))
         control_database.commit()
-        def attempt_redemption(credential):
+        attempts_with_proofs = tuple(
+            (credential, _assertion(
+                control_database, "approval_redeem_issue", tenant,
+                approval=approval_id, account=account,
+                credential=credential))
+            for credential in (b"c" * 32, b"d" * 32))
+        control_database.rollback()
+
+        def attempt_redemption(item):
             import psycopg
 
+            credential, proof = item
             candidate = psycopg.connect(DSN)
             try:
                 result = db.redeem_service_account_approval(
-                    candidate, approval, tenant_actor_digest=b"t" * 32,
-                    org_policy_epoch=9, credential_digest=credential)
+                    candidate, approval, assertion=proof)
                 candidate.commit()
                 return "redeemed", credential, result.account_revision
             except db.ControlPlaneConflict:
@@ -837,17 +894,19 @@ def test_offline_authority_consumes_one_exact_approval_and_replay_fails(
                 candidate.close()
 
         with ThreadPoolExecutor(max_workers=2) as workers:
-            attempts = list(workers.map(
-                attempt_redemption, (b"c" * 32, b"d" * 32)))
+            attempts = list(workers.map(attempt_redemption,
+                                        attempts_with_proofs))
         assert sorted(item[0] for item in attempts) == ["conflict", "redeemed"]
         winner = next(item for item in attempts if item[0] == "redeemed")
         assert winner[2] == 1
         assert db.resolve_service_account(runtime, account, 1, winner[1])
         runtime.rollback()
+        consumed_redeem_proof = _assertion(
+            control_database, "approval_redeem_issue", tenant,
+            approval=approval_id, account=account, credential=b"e" * 32)
         with pytest.raises(db.ControlPlaneConflict):
             db.redeem_service_account_approval(
-                control_database, approval, tenant_actor_digest=b"t" * 32,
-                org_policy_epoch=9, credential_digest=b"e" * 32)
+                control_database, approval, assertion=consumed_redeem_proof)
         control_database.rollback()
     finally:
         runtime.close()
@@ -1022,9 +1081,9 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
             "DROP FUNCTION rag_control."
             "control_consume_service_account_assertion(smallint,text,integer,"
             "uuid,bytea,bigint,uuid,bigint,uuid,bytea,integer,bigint,bigint,"
-            "bytea,bytea)")
+            "bytea,bytea) CASCADE")
         cursor.execute(
-            "DROP FUNCTION rag_control."
+            "DROP FUNCTION IF EXISTS rag_control."
             "control_service_account_assertion_payload(text,integer,uuid,"
             "bytea,bigint,uuid,bigint,uuid,bytea,integer,bigint,bigint,"
             "bytea)")
@@ -1036,17 +1095,28 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
         cursor.execute(
             "DROP TABLE rag_control.control_service_account_assertion_keys")
         cursor.execute(
-            "DROP FUNCTION rag_control.control_redeem_service_account_issue("
-            "uuid,uuid,uuid,bigint,bytea,bigint,bytea,bytea,bytea)")
+            "DROP FUNCTION IF EXISTS rag_control."
+            "control_asserted_redeem_service_account_issue("
+            "smallint,integer,uuid,bytea,bigint,uuid,bigint,uuid,bytea,"
+            "bigint,bigint,bytea,bytea,bytea,bytea)")
         cursor.execute(
-            "DROP FUNCTION rag_control.control_redeem_service_account_rotation("
-            "uuid,uuid,uuid,bigint,bytea,bigint,bytea,bytea,bytea)")
+            "DROP FUNCTION IF EXISTS rag_control."
+            "control_asserted_redeem_service_account_rotation("
+            "smallint,integer,uuid,bytea,bigint,uuid,bigint,uuid,bytea,"
+            "bigint,bigint,bytea,bytea,bytea,bytea)")
         cursor.execute(
             "DROP FUNCTION rag_control.control_cancel_service_account_approval("
             "integer,bytea,uuid,uuid,uuid,bigint,text)")
         cursor.execute(
-            "DROP FUNCTION rag_control."
-            "control_list_redeemable_service_account_approvals(uuid,integer)")
+            "DROP FUNCTION IF EXISTS rag_control."
+            "control_asserted_list_redeemable_service_account_approvals("
+            "smallint,integer,uuid,bytea,bigint,integer,bigint,bigint,"
+            "bytea,bytea)")
+        cursor.execute(
+            "DROP FUNCTION IF EXISTS rag_control."
+            "control_asserted_get_redeemable_service_account_approval("
+            "smallint,integer,uuid,bytea,bigint,uuid,bigint,uuid,bigint,"
+            "bigint,bytea,bytea)")
         cursor.execute(
             "DROP FUNCTION rag_control.control_approve_service_account_issue("
             "integer,bytea,uuid,uuid,uuid,text[],timestamptz,timestamptz,"
@@ -1084,7 +1154,7 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
             "rag_control.control_schema_state")
         cursor.execute(
             "DELETE FROM rag_control.control_schema_history "
-            "WHERE schema_version = 5")
+            "WHERE schema_version = 6")
         cursor.execute(
             "UPDATE rag_control.control_schema_state SET schema_version = 3, "
             "schema_sha256 = repeat('3', 64)")
@@ -1104,13 +1174,13 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
         cursor.execute(
             "SELECT schema_version, schema_sha256 FROM "
             "rag_control.control_schema_state")
-        assert cursor.fetchone() == (5, expected_digest)
+        assert cursor.fetchone() == (6, expected_digest)
         cursor.execute(
             "SELECT array_agg(schema_version ORDER BY schema_version), "
-            "max(schema_sha256) FILTER (WHERE schema_version = 5) "
+            "max(schema_sha256) FILTER (WHERE schema_version = 6) "
             "FROM rag_control.control_schema_history")
         history, v5_digest = cursor.fetchone()
-        assert history[-2:] == [3, 5]
+        assert history[-2:] == [3, 6]
         assert v5_digest == expected_digest
         cursor.execute(
             "SELECT count(*) FROM information_schema.tables "
@@ -1137,11 +1207,18 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
             "uuid,uuid,bigint,timestamptz,bigint,text,bytea,bytea)",
             "control_cancel_service_account_approval(integer,bytea,uuid,uuid,"
             "uuid,bigint,text)",
-            "control_list_redeemable_service_account_approvals(uuid,integer)",
-            "control_redeem_service_account_issue(uuid,uuid,uuid,bigint,"
-            "bytea,bigint,bytea,bytea,bytea)",
-            "control_redeem_service_account_rotation(uuid,uuid,uuid,bigint,"
-            "bytea,bigint,bytea,bytea,bytea)",
+            "control_asserted_list_redeemable_service_account_approvals("
+            "smallint,integer,uuid,bytea,bigint,integer,bigint,bigint,"
+            "bytea,bytea)",
+            "control_asserted_get_redeemable_service_account_approval("
+            "smallint,integer,uuid,bytea,bigint,uuid,bigint,uuid,bigint,"
+            "bigint,bytea,bytea)",
+            "control_asserted_redeem_service_account_issue(smallint,integer,"
+            "uuid,bytea,bigint,uuid,bigint,uuid,bytea,bigint,bigint,bytea,"
+            "bytea,bytea,bytea)",
+            "control_asserted_redeem_service_account_rotation(smallint,integer,"
+            "uuid,bytea,bigint,uuid,bigint,uuid,bytea,bigint,bigint,bytea,"
+            "bytea,bytea,bytea)",
             "control_seal_service_account_approval_event()",
             "control_service_account_assertion_payload(text,integer,uuid,"
             "bytea,bigint,uuid,bigint,uuid,bytea,integer,bigint,bigint,"

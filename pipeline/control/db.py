@@ -16,8 +16,10 @@ from typing import Mapping
 import psycopg
 from psycopg.rows import dict_row
 
+from pipeline.service_account_assertions import ServiceAccountAssertion
 
-CONTROL_SCHEMA_VERSION = 5
+
+CONTROL_SCHEMA_VERSION = 6
 _SCHEMA_LOCK_NAME = "ragtest-control-schema-migration"
 _SCHEMA_MONOTONIC_GUARD_DDL = """
 CREATE OR REPLACE FUNCTION rag_control.control_guard_schema_monotonic()
@@ -121,19 +123,26 @@ SELECT current_user AS role_name,
            'integer,bytea,uuid,uuid,uuid,bigint,timestamptz,bigint,text,'
            'bytea,bytea)', 'EXECUTE') AS approve_rotate_execute,
        has_function_privilege(current_user,
-           'rag_control.control_list_redeemable_service_account_approvals('
-           'uuid,integer)', 'EXECUTE') AS list_approvals_execute,
+           'rag_control.control_asserted_list_redeemable_service_account_'
+           'approvals(smallint,integer,uuid,bytea,bigint,integer,bigint,'
+           'bigint,bytea,bytea)', 'EXECUTE') AS list_approvals_execute,
+       has_function_privilege(current_user,
+           'rag_control.control_asserted_get_redeemable_service_account_'
+           'approval(smallint,integer,uuid,bytea,bigint,uuid,bigint,uuid,'
+           'bigint,bigint,bytea,bytea)', 'EXECUTE') AS get_approval_execute,
        has_function_privilege(current_user,
            'rag_control.control_cancel_service_account_approval('
            'integer,bytea,uuid,uuid,uuid,bigint,text)', 'EXECUTE')
            AS cancel_approval_execute,
        has_function_privilege(current_user,
-           'rag_control.control_redeem_service_account_issue('
-           'uuid,uuid,uuid,bigint,bytea,bigint,bytea,bytea,bytea)', 'EXECUTE')
+           'rag_control.control_asserted_redeem_service_account_issue('
+           'smallint,integer,uuid,bytea,bigint,uuid,bigint,uuid,bytea,'
+           'bigint,bigint,bytea,bytea,bytea,bytea)', 'EXECUTE')
            AS redeem_issue_execute,
        has_function_privilege(current_user,
-           'rag_control.control_redeem_service_account_rotation('
-           'uuid,uuid,uuid,bigint,bytea,bigint,bytea,bytea,bytea)', 'EXECUTE')
+           'rag_control.control_asserted_redeem_service_account_rotation('
+           'smallint,integer,uuid,bytea,bigint,uuid,bigint,uuid,bytea,'
+           'bigint,bigint,bytea,bytea,bytea,bytea)', 'EXECUTE')
            AS redeem_rotate_execute,
        EXISTS (
            SELECT 1
@@ -361,7 +370,7 @@ def _configure_runtime_connection(conn) -> None:
         "issue_execute": False, "rotate_execute": False,
         "revoke_execute": False, "unexpected_function_execute": False,
         "approve_issue_execute": False, "approve_rotate_execute": False,
-        "list_approvals_execute": False,
+        "list_approvals_execute": False, "get_approval_execute": False,
         "cancel_approval_execute": False,
         "redeem_issue_execute": False, "redeem_rotate_execute": False,
     })
@@ -380,7 +389,8 @@ def _configure_admin_connection(conn) -> None:
         "issue_execute": False, "rotate_execute": False,
         "revoke_execute": True, "unexpected_function_execute": False,
         "approve_issue_execute": True, "approve_rotate_execute": True,
-        "list_approvals_execute": False, "cancel_approval_execute": True,
+        "list_approvals_execute": False, "get_approval_execute": False,
+        "cancel_approval_execute": True,
         "redeem_issue_execute": False, "redeem_rotate_execute": False,
     })
 
@@ -890,20 +900,33 @@ def _approval_from_row(row) -> ServiceAccountApproval:
     )
 
 
+def _require_assertion(assertion, purpose):
+    if (type(assertion) is not ServiceAccountAssertion
+            or assertion.purpose != purpose):
+        raise ControlPlaneRefused("service account assertion is invalid")
+    return assertion
+
+
 def list_redeemable_service_account_approvals(
-        conn, tenant_id, *, limit: int = 100,
-        ) -> tuple[ServiceAccountApproval, ...]:
-    """Read the offline queue; no deployable role owns this grant yet."""
-    tenant = _uuid_value(tenant_id, "tenant_id")
-    if type(limit) is not int or not 1 <= limit <= 100:
-        raise ControlPlaneRefused("limit is invalid")
+        conn, assertion) -> tuple[ServiceAccountApproval, ...]:
+    proof = _require_assertion(assertion, "approval_list")
+    tenant = proof.tenant_id
+    limit = proof.assertion_limit
     try:
         with conn.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 "SELECT * FROM rag_control."
-                "control_list_redeemable_service_account_approvals(%s, %s)",
-                (tenant, limit))
+                "control_asserted_list_redeemable_service_account_approvals("
+                "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (
+                    proof.assertion_version, proof.key_version,
+                    proof.tenant_id, proof.tenant_actor_digest,
+                    proof.org_policy_epoch, proof.assertion_limit,
+                    proof.issued_at, proof.expires_at, proof.nonce,
+                    proof.mac))
             rows = cursor.fetchall()
+    except psycopg.errors.SerializationFailure:
+        raise ControlPlaneConflict(
+            "service account approval conflict") from None
     except psycopg.Error:
         raise ControlPlaneRefused("service account approvals refused") from None
     if len(rows) > limit:
@@ -916,6 +939,44 @@ def list_redeemable_service_account_approvals(
                     item.created_at, item.approval_id.int))):
         raise ControlPlaneRefused("service account approvals result is invalid")
     return approvals
+
+
+def get_redeemable_service_account_approval(
+        conn, assertion) -> ServiceAccountApproval | None:
+    proof = _require_assertion(assertion, "approval_get")
+    try:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                "SELECT * FROM rag_control."
+                "control_asserted_get_redeemable_service_account_approval("
+                "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (
+                    proof.assertion_version, proof.key_version,
+                    proof.tenant_id, proof.tenant_actor_digest,
+                    proof.org_policy_epoch, proof.approval_id,
+                    proof.approval_revision, proof.service_account_id,
+                    proof.issued_at, proof.expires_at, proof.nonce,
+                    proof.mac))
+            rows = list(cursor.fetchall())
+    except psycopg.errors.SerializationFailure:
+        raise ControlPlaneConflict(
+            "service account approval conflict") from None
+    except psycopg.errors.InsufficientPrivilege:
+        raise ControlPlaneDenied("service account approval denied") from None
+    except psycopg.Error:
+        raise ControlPlaneRefused("service account approval refused") from None
+    if len(rows) > 1:
+        raise ControlPlaneRefused(
+            "service account approval result is invalid")
+    if not rows:
+        return None
+    approval = _approval_from_row(rows[0])
+    if (approval.tenant_id != proof.tenant_id
+            or approval.approval_id != proof.approval_id
+            or approval.approval_revision != proof.approval_revision
+            or approval.service_account_id != proof.service_account_id):
+        raise ControlPlaneRefused(
+            "service account approval result is invalid")
+    return approval
 
 
 def cancel_service_account_approval(
@@ -979,22 +1040,25 @@ def _redemption_result(conn, query: str, params: tuple,
 
 def redeem_service_account_approval(
         conn, approval: ServiceAccountApproval, *,
-        tenant_actor_digest: bytes, org_policy_epoch: int,
-        credential_digest: bytes) -> ServiceAccountRedemption:
-    """Consume offline authority after a separately proven tenant gate.
-
-    The SQL function is deliberately revoked from every online role until a
-    cross-database actor assertion can bind that gate to this transaction.
-    """
+        assertion: ServiceAccountAssertion) -> ServiceAccountRedemption:
+    """Consume one approval through its purpose-bound database assertion."""
     if type(approval) is not ServiceAccountApproval:
         raise ControlPlaneRefused("service account approval is invalid")
+    if approval.action not in {"issue", "rotate"}:
+        raise ControlPlaneRefused("service account approval is invalid")
+    proof = _require_assertion(
+        assertion, "approval_redeem_" + approval.action)
     if (approval.action not in {"issue", "rotate"}
             or approval.state != "approved"
-            or approval.approval_revision != 1):
+            or approval.approval_revision != 1
+            or proof.tenant_id != approval.tenant_id
+            or proof.approval_id != approval.approval_id
+            or proof.approval_revision != approval.approval_revision
+            or proof.service_account_id != approval.service_account_id):
         raise ControlPlaneRefused("service account approval is invalid")
-    actor_digest = _credential_digest(tenant_actor_digest)
-    policy_epoch = _positive_revision(org_policy_epoch, "org_policy_epoch")
-    credential = _credential_digest(credential_digest)
+    actor_digest = proof.tenant_actor_digest
+    policy_epoch = proof.org_policy_epoch
+    credential = proof.credential_digest
     next_revision = (1 if approval.action == "issue"
                      else _positive_revision(
                          approval.expected_account_revision,
@@ -1013,18 +1077,21 @@ def redeem_service_account_approval(
     }
     query = {
         "issue": (
-            "SELECT * FROM rag_control.control_redeem_service_account_issue("
-            "%s, %s, %s, %s, %s, %s, %s, %s, %s)"),
+            "SELECT * FROM rag_control."
+            "control_asserted_redeem_service_account_issue("
+            "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"),
         "rotate": (
-            "SELECT * FROM rag_control.control_redeem_service_account_rotation("
-            "%s, %s, %s, %s, %s, %s, %s, %s, %s)"),
+            "SELECT * FROM rag_control."
+            "control_asserted_redeem_service_account_rotation("
+            "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"),
     }[approval.action]
     return _redemption_result(
         conn,
         query,
-        (approval.approval_id, approval.tenant_id,
-         approval.service_account_id, approval.approval_revision,
-         actor_digest, policy_epoch, credential,
+        (proof.assertion_version, proof.key_version, proof.tenant_id,
+         actor_digest, policy_epoch, proof.approval_id,
+         proof.approval_revision, proof.service_account_id, credential,
+         proof.issued_at, proof.expires_at, proof.nonce, proof.mac,
          _audit_digest("service_account_redemption_request", request_facts),
          _audit_digest("service_account_redemption_result", result_facts)),
         approval.service_account_id,
