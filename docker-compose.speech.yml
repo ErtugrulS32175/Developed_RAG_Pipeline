@@ -1,0 +1,20 @@
+# Opt-in overlay: local speech dictation for OpenWebUI's microphone button.
+# It adds AUDIO_STT_* variables to the open-webui service and nothing else;
+# without this file on the command line the base compose behaves as before.
+#
+#   export SPEECH_API_KEY=...                      # at least 32 random characters
+#   python -m services.speech_service              # on the host, port 8012
+#   docker compose -f docker-compose.yml -f docker-compose.speech.yml up -d open-webui
+#
+# OpenWebUI reaches the host service through the host.docker.internal mapping
+# the base file already declares. The key is a service identity between the
+# two processes only, never a user or tenant identity.
+services:
+  open-webui:
+    environment:
+      AUDIO_STT_ENGINE: openai
+      AUDIO_STT_OPENAI_API_BASE_URL: http://host.docker.internal:8012/v1
+      AUDIO_STT_OPENAI_API_KEY: ${SPEECH_API_KEY:?set SPEECH_API_KEY}
+      AUDIO_STT_MODEL: large-v3
+      AUDIO_STT_OPENAI_API_REQUEST_FORMAT: multipart
+      AUDIO_STT_SUPPORTED_CONTENT_TYPES: audio/wav,audio/x-wav,audio/webm,audio/ogg,audio/mp4,audio/mpeg,audio/x-m4a,audio/flac

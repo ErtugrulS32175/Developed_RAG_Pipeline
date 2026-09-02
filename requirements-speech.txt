@@ -1,0 +1,7 @@
+# Local speech service only (services/speech_service.py). Kept out of
+# requirements.txt on purpose: it pulls CTranslate2 and PyAV, which nothing
+# else in the pipeline imports, and it runs in its own environment.
+faster-whisper
+fastapi
+uvicorn
+python-multipart

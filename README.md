@@ -245,6 +245,68 @@ ceiling and returns it only if its current length and digest still match the
 registration. The current OpenWebUI table reply displays the opaque reference;
 a browser Action for the binary hand-off remains a separate UI integration.
 
+### Local speech dictation in OpenWebUI
+
+An opt-in, local speech-to-text path for OpenWebUI's microphone button. It is
+a separate process, `services/speech_service.py`, that loads one
+faster-whisper model once and speaks the OpenAI transcription shape:
+
+```bash
+pip install -r requirements-speech.txt   # its own environment, not requirements.txt
+export SPEECH_API_KEY=...                # at least 32 random characters
+python -m services.speech_service        # 0.0.0.0:8012, one process, one worker
+docker compose -f docker-compose.yml -f docker-compose.speech.yml up -d open-webui
+```
+
+The override only adds `AUDIO_STT_*` variables to the `open-webui` service;
+without `-f docker-compose.speech.yml` on the command line nothing changes.
+OpenWebUI then posts each recording as multipart to
+`POST /v1/audio/transcriptions` with the bearer key, and the service answers
+`{"text": "..."}` and nothing else.
+
+The profile is closed and pinned by tests: model `large-v3`, device `cuda`,
+compute type `float16`, `language="tr"`, `vad_filter=True`. A request naming
+another `model` or `language` is refused. There is no `turbo`, `int8` or CPU
+fallback: a GPU that cannot hold the model leaves `/readyz` answering 503
+rather than a smaller model. `GET /healthz` says only that the process is
+alive; `GET /readyz` reports the profile above once the model has loaded. Both
+are unauthenticated monitoring endpoints, like `/health` and `/ready` on the
+main API. The transcription endpoint requires
+`Authorization: Bearer $SPEECH_API_KEY`, compared timing-safely. That key is a
+service identity between OpenWebUI and this process, not a user or tenant
+identity, so this path records no transcript, audit entry or ownership: the
+audio and the text exist only for the duration of the request. The service
+never opens PostgreSQL, never writes to the RAG index, calls no external model
+API and never logs a filename, the audio or the transcript; log lines carry
+closed event codes and numbers only.
+
+First local dictation profile, pinned in `tests/test_speech_service.py` until
+the E5 quota policy takes these values over: uploads of at most 25 MiB, at
+most 120 seconds of audio (measured by decoding before the model runs, so a
+small but very long compressed file is refused early), a 90-second
+transcription timeout, one transcription at a time with at most two callers
+waiting up to 20 seconds each; a further caller gets a closed `speech_busy`
+503 at once. Accepted formats are WAV, WebM, MP3, MP4/M4A, OGG and FLAC, by
+extension and audio content type; the user's filename is never used as a path.
+Uploads are written in 64 KiB chunks to a task-specific temporary file that is
+removed by exact path on success, failure, timeout and cancellation. To serve
+a model you downloaded beforehand, point `HF_HUB_CACHE` at that cache and set
+`HF_HUB_OFFLINE=1`; the model identity stays `large-v3`.
+
+On a single 8 GB card the model shares the GPU with nothing. The compose GPU
+profile reserves about 20% of the card for `bge-m3` embeddings and 15% for the
+reranker; loading `large-v3` in float16 alone held about 3.9 GB on an RTX 4070
+Laptop (8 GB) in the first local run, and decoding real speech needs more on
+top, so the local order of operations is manual:
+
+1. Do not run the embed and reranker containers while transcribing.
+2. Stop the speech service when dictation is done.
+3. Start the embed and reranker containers for the next ingest/index run.
+
+Automatic GPU orchestration is a later E5/E6 package. Persistent recordings,
+transcription jobs, transcript revisions and RAG indexing of transcripts are
+the E4/E6 packages and are deliberately not scaffolded here.
+
 ### Production operations
 
 Apply migrations before sending traffic to a new application version:
@@ -569,5 +631,5 @@ removes nothing.
 
 PaddleOCR-VL and HunyuanOCR for tables, PaddleOCR PP-OCRv5 for OCR, Docling for
 PDF parsing, bge-m3 for embeddings, BM25 for sparse retrieval, PostgreSQL with
-pgvector as the store, a reranker, and an LLM served with vLLM. All open source,
-all on-premise.
+pgvector as the store, a reranker, an LLM served with vLLM, and faster-whisper
+`large-v3` for local dictation. All open source, all on-premise.
