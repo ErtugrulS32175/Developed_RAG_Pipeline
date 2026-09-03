@@ -40,7 +40,7 @@ load_dotenv()
 # instead of silently connecting with a committed secret.
 PG_DSN = os.getenv(
     "PG_DSN", "postgresql://rag_runtime:CHANGE_ME@localhost:5433/ragdb")
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 # Stable across schema versions: old and new application revisions must
 # serialize against each other during a rolling deploy.
 _SCHEMA_LOCK_NAME = "ragtest-schema-migration"
@@ -417,10 +417,28 @@ def schema_is_current(conn) -> bool:
                 "SELECT schema_version, schema_sha256 FROM rag_schema_state "
                 "WHERE singleton = true")
             row = cur.fetchone()
+            cur.execute(
+                "SELECT ext.extnamespace = 'public'::regnamespace "
+                "AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep "
+                "WHERE dep.refobjid = ext.oid "
+                "AND dep.refclassid = 'pg_catalog.pg_extension'::regclass "
+                "AND dep.classid = 'pg_catalog.pg_proc'::regclass "
+                "AND dep.objid = to_regprocedure("
+                "'public.hmac(bytea,bytea,text)') AND dep.deptype = 'e') "
+                "AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep "
+                "WHERE dep.refobjid = ext.oid "
+                "AND dep.refclassid = 'pg_catalog.pg_extension'::regclass "
+                "AND dep.classid = 'pg_catalog.pg_proc'::regclass "
+                "AND dep.objid = to_regprocedure("
+                "'public.gen_random_bytes(integer)') AND dep.deptype = 'e') "
+                "FROM pg_catalog.pg_extension AS ext "
+                "WHERE ext.extname = 'pgcrypto'")
+            crypto = cur.fetchone()
     except Exception:
         conn.rollback()
         return False
-    return row is not None and tuple(row) == expected
+    return (row is not None and tuple(row) == expected
+            and crypto is not None and tuple(crypto) == (True,))
 
 
 def runtime_role_is_safe(conn) -> bool:
@@ -439,6 +457,10 @@ def runtime_role_is_safe(conn) -> bool:
                 "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
                 "AND NOT has_table_privilege(current_user, "
                 "format('%I.rag_service_account_assertion_keys', "
+                "current_schema()), "
+                "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
+                "AND NOT has_table_privilege(current_user, "
+                "format('%I.rag_service_account_assertion_rotations', "
                 "current_schema()), "
                 "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
                 "AND NOT has_function_privilege(current_user, "

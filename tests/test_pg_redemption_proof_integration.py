@@ -1,5 +1,6 @@
 """Real two-database proof for the service-account assertion foundation."""
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -11,6 +12,7 @@ import pytest
 
 from pipeline.control import db as control_db
 from pipeline.index import db as index_db
+from pipeline.service_account_assertions import ServiceAccountAssertion
 
 
 DSN = os.getenv("RAGTEST_CONTROL_PG_DSN", "").strip()
@@ -638,16 +640,22 @@ def test_key_and_nonce_tables_are_not_public_authorities(proof_databases):
             "SELECT has_table_privilege('public', "
             "'rag_service_account_assertion_keys', "
             "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'), "
+            "has_table_privilege('public', "
+            "'rag_service_account_assertion_rotations', "
+            "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'), "
             "has_function_privilege('public', "
             "'rag_mint_service_account_assertion(uuid,bigint,text,uuid,"
             "bigint,uuid,bytea,integer)',"
             "'EXECUTE')")
-        assert cursor.fetchone() == (False, False)
+        assert cursor.fetchone() == (False, False, False)
     data.rollback()
     with control.cursor() as cursor:
         cursor.execute(
             "SELECT has_table_privilege('public', "
             "'rag_control.control_service_account_assertion_keys', "
+            "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'), "
+            "has_table_privilege('public', "
+            "'rag_control.control_service_account_assertion_rotations', "
             "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'), "
             "has_table_privilege('public', "
             "'rag_control.control_service_account_assertion_nonces', "
@@ -657,7 +665,7 @@ def test_key_and_nonce_tables_are_not_public_authorities(proof_databases):
             "uuid,bytea,bigint,uuid,bigint,uuid,bytea,integer,bigint,bigint,"
             "bytea,bytea)', "
             "'EXECUTE')")
-        assert cursor.fetchone() == (False, False, False)
+        assert cursor.fetchone() == (False, False, False, False)
     control.rollback()
 
 
@@ -671,6 +679,21 @@ def test_key_state_machine_has_one_active_and_bounded_verify_only_key(
 
     data, control = proof_databases
     connection = data if side == "data" else control
+    rotation_table = table.replace("assertion_keys", "assertion_rotations")
+
+    def bind_rotation(rotation):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {rotation_table} "
+                "(rotation_id,previous_key_version,target_key_version,"
+                "target_key_fingerprint,verify_started_at,verify_until,phase) "
+                "VALUES (%s,7,8,%s,statement_timestamp(),"
+                "statement_timestamp()+interval '300 seconds','staged')",
+                (rotation, b"f" * 32))
+            cursor.execute(
+                f"UPDATE {table} SET rotation_id=%s WHERE key_version=7",
+                (rotation,))
+
     with pytest.raises(psycopg.errors.UniqueViolation):
         with connection.cursor() as cursor:
             cursor.execute(
@@ -678,11 +701,429 @@ def test_key_state_machine_has_one_active_and_bounded_verify_only_key(
                 "(key_version,secret,state,not_before) "
                 "VALUES (8,%s,'active',statement_timestamp())", (KEY,))
     connection.rollback()
+    rotation = uuid.uuid4()
+    bind_rotation(rotation)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO {table} "
+            "(key_version,secret,state,not_before,verify_started_at,"
+            "verify_until,rotation_id) VALUES (8,%s,'verify_only',"
+            "statement_timestamp()-interval '1 minute',"
+            "statement_timestamp(),"
+            "statement_timestamp()+interval '300 seconds',%s)",
+            (KEY, rotation))
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {table} "
+                "(key_version,secret,state,not_before,verify_started_at,"
+                "verify_until,rotation_id) VALUES (9,%s,'verify_only',"
+                "statement_timestamp()-interval '1 minute',"
+                "statement_timestamp(),"
+                "statement_timestamp()+interval '1 second',%s)",
+                (KEY, rotation))
+    connection.rollback()
+    rotation = uuid.uuid4()
+    bind_rotation(rotation)
     with pytest.raises(psycopg.errors.CheckViolation):
         with connection.cursor() as cursor:
             cursor.execute(
                 f"INSERT INTO {table} "
-                "(key_version,secret,state,not_before,verify_until) "
-                "VALUES (8,%s,'verify_only',statement_timestamp(),NULL)",
-                (KEY,))
+                "(key_version,secret,state,not_before,verify_started_at,"
+                "verify_until,rotation_id) VALUES (8,%s,'verify_only',"
+                "statement_timestamp()-interval '1 minute',"
+                "statement_timestamp(),"
+                "statement_timestamp()+interval '301 seconds',%s)",
+                (KEY, rotation))
     connection.rollback()
+    rotation = uuid.uuid4()
+    bind_rotation(rotation)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO {table} "
+            "(key_version,secret,state,not_before,rotation_id) "
+            "VALUES (8,%s,'staged',statement_timestamp(),%s)",
+            (KEY, rotation))
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {table} "
+                "(key_version,secret,state,not_before,rotation_id) "
+                "VALUES (9,%s,'staged',statement_timestamp(),%s)",
+                (KEY, rotation))
+    connection.rollback()
+    rotation = uuid.uuid4()
+    bind_rotation(rotation)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {table} "
+                "(key_version,secret,state,not_before,verify_until,rotation_id) "
+                "VALUES (8,%s,'verify_only',statement_timestamp(),NULL,%s)",
+                (KEY, rotation))
+    connection.rollback()
+
+
+@pytest.mark.parametrize(("side", "key_table", "rotation_table"), [
+    ("data", "rag_service_account_assertion_keys",
+     "rag_service_account_assertion_rotations"),
+    ("control", "rag_control.control_service_account_assertion_keys",
+     "rag_control.control_service_account_assertion_rotations"),
+])
+def test_rotation_ledger_requires_both_bound_keys_and_only_one_live_row(
+        proof_databases, side, key_table, rotation_table):
+    import psycopg
+
+    data, control = proof_databases
+    connection = data if side == "data" else control
+    orphan = uuid.uuid4()
+    with pytest.raises(psycopg.errors.CheckViolation,
+                       match="rotation_keys_unbound"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {rotation_table} "
+                "(rotation_id,previous_key_version,target_key_version,"
+                "target_key_fingerprint,verify_started_at,verify_until,phase) "
+                "VALUES (%s,7,8,%s,statement_timestamp(),"
+                "statement_timestamp()+interval '300 seconds','staged')",
+                (orphan, b"f" * 32))
+        connection.commit()
+    connection.rollback()
+
+
+@pytest.mark.parametrize(("side", "key_table", "rotation_table"), [
+    ("data", "rag_service_account_assertion_keys",
+     "rag_service_account_assertion_rotations"),
+    ("control", "rag_control.control_service_account_assertion_keys",
+     "rag_control.control_service_account_assertion_rotations"),
+])
+def test_bound_rotation_resists_later_key_detach_delete_and_window_extension(
+        proof_databases, side, key_table, rotation_table):
+    import psycopg
+
+    data, control = proof_databases
+    connection = data if side == "data" else control
+    rotation = uuid.uuid4()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO {rotation_table} "
+            "(rotation_id,previous_key_version,target_key_version,"
+            "target_key_fingerprint,verify_started_at,verify_until,phase) "
+            "VALUES (%s,7,18,%s,statement_timestamp(),"
+            "statement_timestamp()+interval '300 seconds','staged')",
+            (rotation, b"f" * 32))
+        cursor.execute(
+            f"UPDATE {key_table} SET rotation_id=%s WHERE key_version=7",
+            (rotation,))
+        cursor.execute(
+            f"INSERT INTO {key_table} "
+            "(key_version,secret,state,not_before,rotation_id) "
+            "VALUES (18,%s,'staged',statement_timestamp(),%s)",
+            (KEY, rotation))
+    connection.commit()
+    with pytest.raises(psycopg.errors.CheckViolation,
+                       match="rotation_keys_unbound"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {key_table} SET rotation_id=NULL "
+                "WHERE key_version=7")
+        connection.commit()
+    connection.rollback()
+    with pytest.raises(psycopg.errors.CheckViolation,
+                       match="rotation_keys_unbound"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"DELETE FROM {key_table} WHERE key_version=18")
+        connection.commit()
+    connection.rollback()
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState,
+                       match="transition_refused"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {rotation_table} SET verify_until="
+                "verify_until+interval '1 second' WHERE rotation_id=%s",
+                (rotation,))
+    connection.rollback()
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState,
+                       match="tombstone_immutable"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"DELETE FROM {rotation_table} WHERE rotation_id=%s",
+                (rotation,))
+    connection.rollback()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"UPDATE {rotation_table} SET phase='aborted' "
+            "WHERE rotation_id=%s", (rotation,))
+    connection.commit()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"UPDATE {key_table} SET rotation_id=NULL WHERE key_version=7")
+        cursor.execute(f"DELETE FROM {key_table} WHERE key_version=18")
+    connection.commit()
+
+    first = uuid.uuid4()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO {rotation_table} "
+            "(rotation_id,previous_key_version,target_key_version,"
+            "target_key_fingerprint,verify_started_at,verify_until,phase) "
+            "VALUES (%s,7,8,%s,statement_timestamp(),"
+            "statement_timestamp()+interval '300 seconds','staged')",
+            (first, b"f" * 32))
+        cursor.execute(
+            f"UPDATE {key_table} SET rotation_id=%s WHERE key_version=7",
+            (first,))
+        cursor.execute(
+            f"INSERT INTO {key_table} "
+            "(key_version,secret,state,not_before,rotation_id) "
+            "VALUES (8,%s,'staged',statement_timestamp(),%s)", (KEY, first))
+        cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {rotation_table} "
+                "(rotation_id,previous_key_version,target_key_version,"
+                "target_key_fingerprint,verify_started_at,verify_until,phase) "
+                "VALUES (%s,7,9,%s,statement_timestamp(),"
+                "statement_timestamp()+interval '300 seconds','staged')",
+                (uuid.uuid4(), b"g" * 32))
+    connection.rollback()
+
+
+@pytest.mark.parametrize(("side", "key_table", "rotation_table"), [
+    ("data", "rag_service_account_assertion_keys",
+     "rag_service_account_assertion_rotations"),
+    ("control", "rag_control.control_service_account_assertion_keys",
+     "rag_control.control_service_account_assertion_rotations"),
+])
+def test_rotation_membership_rechecks_both_sides_and_rejects_foreign_keys(
+        proof_databases, side, key_table, rotation_table):
+    import psycopg
+
+    data, control = proof_databases
+    connection = data if side == "data" else control
+    live_rotation = uuid.uuid4()
+    aborted_rotation = uuid.uuid4()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO {rotation_table} "
+            "(rotation_id,previous_key_version,target_key_version,"
+            "target_key_fingerprint,verify_started_at,verify_until,phase) "
+            "VALUES (%s,7,410,%s,statement_timestamp(),"
+            "statement_timestamp()+interval '300 seconds','staged')",
+            (live_rotation, b"l" * 32))
+        cursor.execute(
+            f"UPDATE {key_table} SET rotation_id=%s WHERE key_version=7",
+            (live_rotation,))
+        cursor.execute(
+            f"INSERT INTO {key_table} "
+            "(key_version,secret,state,not_before,rotation_id) "
+            "VALUES (410,%s,'staged',statement_timestamp(),%s)",
+            (KEY, live_rotation))
+        cursor.execute(
+            f"INSERT INTO {rotation_table} "
+            "(rotation_id,previous_key_version,target_key_version,"
+            "target_key_fingerprint,verify_started_at,verify_until,phase) "
+            "VALUES (%s,7,411,%s,statement_timestamp(),"
+            "statement_timestamp()+interval '300 seconds','aborted')",
+            (aborted_rotation, b"a" * 32))
+    connection.commit()
+
+    # The destination accepts version 7 as one of its declared members.  The
+    # update must still fail because its OLD rotation would become unbound.
+    with pytest.raises(psycopg.errors.CheckViolation,
+                       match="rotation_keys_unbound"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {key_table} SET rotation_id=%s WHERE key_version=7",
+                (aborted_rotation,))
+        connection.commit()
+    connection.rollback()
+
+    # An aborted tombstone may have zero, one, or two declared members, never
+    # an unrelated key that would falsify its immutable membership record.
+    with pytest.raises(psycopg.errors.CheckViolation,
+                       match="rotation_keys_unbound"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {key_table} "
+                "(key_version,secret,state,not_before,rotation_id) "
+                "VALUES (412,%s,'retired',statement_timestamp(),%s)",
+                (KEY, aborted_rotation))
+        connection.commit()
+    connection.rollback()
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"UPDATE {rotation_table} SET phase='aborted' "
+            "WHERE rotation_id=%s", (live_rotation,))
+        cursor.execute(
+            f"UPDATE {key_table} SET rotation_id=NULL WHERE key_version=7")
+        cursor.execute(f"DELETE FROM {key_table} WHERE key_version=410")
+    connection.commit()
+
+    retired_rotation = uuid.uuid4()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO {rotation_table} "
+            "(rotation_id,previous_key_version,target_key_version,"
+            "target_key_fingerprint,verify_started_at,verify_until,phase,"
+            "completed_at,retired_at) VALUES (%s,7,413,%s,"
+            "statement_timestamp(),statement_timestamp()+interval '300 seconds',"
+            "'retired',statement_timestamp(),statement_timestamp())",
+            (retired_rotation, b"r" * 32))
+        cursor.execute(
+            f"INSERT INTO {key_table} "
+            "(key_version,secret,state,not_before,rotation_id) "
+            "VALUES (413,%s,'retired',statement_timestamp(),%s)",
+            (KEY, retired_rotation))
+    connection.commit()
+    with pytest.raises(psycopg.errors.CheckViolation,
+                       match="rotation_keys_unbound"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {key_table} "
+                "(key_version,secret,state,not_before,rotation_id) "
+                "VALUES (414,%s,'retired',statement_timestamp(),%s)",
+                (KEY, retired_rotation))
+        connection.commit()
+    connection.rollback()
+
+
+def test_control_refuses_a_verify_only_key_before_its_window_begins(
+        proof_databases):
+    _data, control = proof_databases
+    rotation = uuid.uuid4()
+    nonce = uuid.uuid4().bytes
+    issued = int(datetime.now(timezone.utc).timestamp())
+    values = (
+        "approval_list", 8, TENANT, ACTOR_DIGEST, 9,
+        None, None, None, None, 10, issued, issued + 30, nonce)
+    payload = _shape_payload(
+        control,
+        "rag_control.control_service_account_assertion_payload", values)
+    proof = ServiceAccountAssertion(
+        1, "approval_list", 8, TENANT, ACTOR_DIGEST, 9,
+        None, None, None, None, 10, issued, issued + 30, nonce,
+        hmac.new(KEY, payload, hashlib.sha256).digest())
+    with control.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO rag_control."
+            "control_service_account_assertion_rotations "
+            "(rotation_id,previous_key_version,target_key_version,"
+            "target_key_fingerprint,verify_started_at,verify_until,phase) "
+            "VALUES (%s,7,8,%s,statement_timestamp()+interval '60 seconds',"
+            "statement_timestamp()+interval '120 seconds','admitted')",
+            (rotation, b"f" * 32))
+        cursor.execute(
+            "UPDATE rag_control.control_service_account_assertion_keys "
+            "SET rotation_id=%s WHERE key_version=7", (rotation,))
+        cursor.execute(
+            "INSERT INTO rag_control.control_service_account_assertion_keys "
+            "(key_version,secret,state,not_before,verify_started_at,"
+            "verify_until,rotation_id) VALUES (8,%s,'verify_only',"
+            "statement_timestamp(),statement_timestamp()+interval '60 seconds',"
+            "statement_timestamp()+interval '120 seconds',%s)",
+            (KEY, rotation))
+    control.commit()
+    try:
+        with pytest.raises(control_db.ControlPlaneRefused):
+            control_db.list_redeemable_service_account_approvals(control, proof)
+        control.rollback()
+        with control.cursor() as cursor:
+            cursor.execute(
+                "SELECT count(*) FROM rag_control."
+                "control_service_account_assertion_nonces WHERE nonce=%s",
+                (nonce,))
+            assert cursor.fetchone()[0] == 0
+        control.rollback()
+    finally:
+        with control.cursor() as cursor:
+            cursor.execute(
+                "UPDATE rag_control."
+                "control_service_account_assertion_rotations "
+                "SET phase='aborted' WHERE rotation_id=%s", (rotation,))
+            cursor.execute(
+                "DELETE FROM rag_control.control_service_account_assertion_keys "
+                "WHERE key_version=8")
+            cursor.execute(
+                "UPDATE rag_control.control_service_account_assertion_keys "
+                "SET rotation_id=NULL WHERE key_version=7")
+        control.commit()
+
+def test_control_prunes_only_a_bounded_expired_nonce_batch_after_valid_mac(
+        proof_databases):
+    data, control = proof_databases
+    with control.cursor() as cursor:
+        cursor.executemany(
+            "INSERT INTO rag_control.control_service_account_assertion_nonces "
+            "(key_version,purpose,nonce,tenant_id,expires_at) "
+            "VALUES (7,'approval_list',%s,%s,"
+            "statement_timestamp()-interval '1 second')",
+            [(number.to_bytes(16, "big"), TENANT) for number in range(130)],
+        )
+    control.commit()
+    index_db.set_tenant_context(data, TENANT, actor_id=ACTOR)
+    data.commit()
+    proof = index_db.mint_service_account_approval_list_assertion(
+        data, actor_id=ACTOR, expected_policy_epoch=9, limit=10)
+    data.commit()
+    invalid = replace(proof, mac=b"x" * 32)
+    with pytest.raises(control_db.ControlPlaneRefused):
+        control_db.list_redeemable_service_account_approvals(control, invalid)
+    control.rollback()
+    with control.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM rag_control."
+            "control_service_account_assertion_nonces "
+            "WHERE expires_at <= statement_timestamp()")
+        assert cursor.fetchone()[0] == 130
+    control.rollback()
+    control_db.list_redeemable_service_account_approvals(control, proof)
+    control.commit()
+    with control.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM rag_control."
+            "control_service_account_assertion_nonces "
+            "WHERE expires_at <= statement_timestamp()")
+        assert cursor.fetchone()[0] == 2
+    control.rollback()
+    second = index_db.mint_service_account_approval_list_assertion(
+        data, actor_id=ACTOR, expected_policy_epoch=9, limit=10)
+    data.commit()
+    control_db.list_redeemable_service_account_approvals(control, second)
+    control.commit()
+    with control.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM rag_control."
+            "control_service_account_assertion_nonces "
+            "WHERE expires_at <= statement_timestamp()")
+        assert cursor.fetchone()[0] == 0
+    control.rollback()
+
+
+def test_schema_readiness_refuses_pgcrypto_namespace_drift(proof_databases):
+    data, control = proof_databases
+    for connection, ready in (
+            (data, index_db.schema_is_current),
+            (control, lambda conn: control_db._assert_control_schema_receipt(
+                conn) is None)):
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE SCHEMA assertion_extension_drift")
+            cursor.execute(
+                "ALTER EXTENSION pgcrypto SET SCHEMA assertion_extension_drift")
+        connection.commit()
+        try:
+            if connection is data:
+                assert ready(connection) is False
+            else:
+                with pytest.raises(control_db.ControlPlaneRefused,
+                                   match="pgcrypto"):
+                    ready(connection)
+        finally:
+            connection.rollback()
+            with connection.cursor() as cursor:
+                cursor.execute("ALTER EXTENSION pgcrypto SET SCHEMA public")
+                cursor.execute("DROP SCHEMA assertion_extension_drift")
+            connection.commit()

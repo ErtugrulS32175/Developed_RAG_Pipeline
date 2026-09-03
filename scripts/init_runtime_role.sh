@@ -28,6 +28,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO rag_runtime;
 REVOKE ALL ON rag_context_secrets FROM rag_runtime;
 REVOKE ALL ON rag_service_account_assertion_keys FROM rag_runtime;
+REVOKE ALL ON rag_service_account_assertion_rotations FROM rag_runtime;
 REVOKE ALL ON org_identity_tenant_bindings FROM rag_runtime;
 REVOKE ALL ON FUNCTION rag_mint_service_account_assertion(
     uuid, bigint, text, uuid, bigint, uuid, bytea, integer) FROM rag_runtime;

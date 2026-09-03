@@ -410,7 +410,7 @@ def test_cancel_wrapper_is_platform_proof_and_revision_bound(monkeypatch):
 
 
 def test_control_schema_version_advances_for_the_approval_authority():
-    assert db.CONTROL_SCHEMA_VERSION == 6
+    assert db.CONTROL_SCHEMA_VERSION == 7
 
 
 def test_tenant_redemption_gate_locks_both_authority_rows():

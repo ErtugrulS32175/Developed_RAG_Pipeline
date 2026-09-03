@@ -124,6 +124,14 @@ Status: `[~]` in progress.
 - [x] Verify OIDC authorization-code/PKCE sessions through issuer, audience,
   client, expiry, and rotating JWKS keys.
 - [ ] Add service-account issuance, rotation, revocation, and audit evidence.
+  - [x] Add content-free issuance/rotation/revocation approval authority,
+    immutable audit facts, replay-safe assertion proofs, and a dedicated
+    least-privilege redemption role/pool.
+  - [x] Bind assertion keys to a cross-database rotation ledger with bounded
+    overlap and nonce cleanup. The ledger records chained rotations, and
+    forward upgrades revoke the ledger from the runtime role in-schema.
+  - [ ] Add the retry-safe offline cross-database rotation coordinator.
+  - [ ] Add the one-time, no-store HTTP secret delivery boundary.
 - [ ] Add controlled provisioning/SCIM and IdP group-to-role policy.
 - [ ] Separate platform administration from customer-tenant administration.
 - [x] Add tenant routing, deployment profile, feature, region, and quota facts
@@ -374,3 +382,61 @@ SLOs; the rollback window has closed.
 - Current browser sessions are process-local and intentionally bounded. A
   shared highly available session backend is a deployment/resilience concern
   for E7; multi-replica rollout is not claimed by this E2 slice.
+
+### 2026-08-26 - E2 assertion-key lifecycle checkpoint (paused)
+
+- Published the content-free service-account assertion authority and a
+  separate `rag_control_redeemer` role/pool at commit `911d6e8`; its CI run
+  completed successfully before this package began.
+- The uncommitted lifecycle package raises the data schema to 14 and the
+  control schema to 7. It adds a bounded rotation ledger, immutable version
+  tombstones, one active/staged/verify-only key, a 300-second maximum overlap,
+  bounded expired-nonce pruning, and fail-closed `pgcrypto` namespace/member
+  receipts in both databases.
+- Deferred triggers validate both OLD and NEW rotation identities after key
+  rebinds. Every phase rejects foreign members: live/completed rows require
+  exactly previous+target, while retired and aborted tombstones carry their
+  own versions and permit only the declared zero-to-two member subset (the
+  retired rule was relaxed on 2026-09-03; see the entry below).
+- Current evidence: 75 real-PostgreSQL integration tests and 99 focused
+  lifecycle/contract tests pass; leak scan hard counters are all zero; an
+  independent threat review reports no remaining commit blocker.
+- The first full suite reached 3280 passed / 200 skipped with one stale fake
+  cursor fixture. That fixture was corrected and gained a negative pgcrypto
+  drift test. The clean rerun was intentionally interrupted at 28 percent at
+  the operator's request; it had reported no failures but is not a completed
+  verdict and must not be reused.
+- Resume gate: start the disposable PostgreSQL container, rerun the full suite
+  from the preserved working tree, repeat hygiene and leak checks, then commit,
+  push, and require matching green CI before starting the rotation coordinator.
+
+### 2026-09-03 - E2 assertion-key lifecycle resumed and published
+
+- The preserved package was applied byte-exact to a disposable worktree and
+  reviewed by a single reviewer against a disposable `pgvector/pgvector:pg17`
+  database. Two defects were measured and fixed at minimum scope.
+- Measured: after one rotation completed and retired, no second rotation could
+  be recorded in either database in any form, because a retired tombstone
+  required its target to stay bound while the next rotation needed that same
+  key as its previous member. The retired rule now matches the aborted rule:
+  a tombstone carries its own versions and admits only a subset of them. A
+  two-sided real-PostgreSQL test drives v1->v2 to retirement, proves the
+  successor is refused while the predecessor is merely completed, then
+  records v2->v3, and re-checks foreign-member and tombstone-edit refusals.
+- Measured: the in-schema privilege re-assertion revoked the key and secret
+  tables from `rag_runtime` but not the new rotation ledger, so a forward
+  upgrade after bootstrap left the ledger with default-privilege DML for the
+  runtime role and readiness fail-closed. The ledger joined that revocation;
+  a real-PostgreSQL test reproduces the post-bootstrap default privileges and
+  proves the revocation and the readiness check.
+- Evidence on the final source: 78 real-PostgreSQL integration tests and 149
+  focused lifecycle/contract tests pass; the full suite with real PostgreSQL
+  reports 3477 passed / 8 skipped; leak scan hard counters are all zero with
+  an unchanged soft-triage set; compile, static, diff and byte-hygiene checks
+  are clean.
+- Recorded for the coordinator package rather than fixed here: CHECK
+  violations on the key tables echo the failing row, so operator tooling must
+  keep treating database error detail as content; the completed-phase and
+  expired-overlap redemption paths and concurrent rotation have no dedicated
+  real-PostgreSQL test yet; `target_key_fingerprint` is recorded but not yet
+  compared against the target key.

@@ -19,7 +19,7 @@ from psycopg.rows import dict_row
 from pipeline.service_account_assertions import ServiceAccountAssertion
 
 
-CONTROL_SCHEMA_VERSION = 6
+CONTROL_SCHEMA_VERSION = 7
 _SCHEMA_LOCK_NAME = "ragtest-control-schema-migration"
 _SCHEMA_MONOTONIC_GUARD_DDL = """
 CREATE OR REPLACE FUNCTION rag_control.control_guard_schema_monotonic()
@@ -416,6 +416,23 @@ def _assert_control_schema_receipt(conn) -> None:
                 "SELECT schema_version, schema_sha256 "
                 "FROM rag_control.control_schema_state WHERE singleton")
             rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT ext.extnamespace = 'public'::regnamespace "
+                "AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep "
+                "WHERE dep.refobjid = ext.oid "
+                "AND dep.refclassid = 'pg_catalog.pg_extension'::regclass "
+                "AND dep.classid = 'pg_catalog.pg_proc'::regclass "
+                "AND dep.objid = to_regprocedure("
+                "'public.hmac(bytea,bytea,text)') AND dep.deptype = 'e') "
+                "AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend AS dep "
+                "WHERE dep.refobjid = ext.oid "
+                "AND dep.refclassid = 'pg_catalog.pg_extension'::regclass "
+                "AND dep.classid = 'pg_catalog.pg_proc'::regclass "
+                "AND dep.objid = to_regprocedure("
+                "'public.gen_random_bytes(integer)') AND dep.deptype = 'e') "
+                "FROM pg_catalog.pg_extension AS ext "
+                "WHERE ext.extname = 'pgcrypto'")
+            crypto_rows = cursor.fetchall()
         conn.rollback()
     except (OSError, psycopg.Error):
         try:
@@ -431,6 +448,9 @@ def _assert_control_schema_receipt(conn) -> None:
     if (len(rows) != 1 or type(rows[0]) not in (tuple, list)
             or len(rows[0]) != 2 or tuple(rows[0]) != expected):
         raise ControlPlaneRefused("control database schema receipt refused")
+    if (len(crypto_rows) != 1 or type(crypto_rows[0]) not in (tuple, list)
+            or tuple(crypto_rows[0]) != (True,)):
+        raise ControlPlaneRefused("control database pgcrypto refused")
 
 
 def _configure_runtime_connection(conn) -> None:

@@ -60,7 +60,7 @@ def test_retention_models_are_strict_and_closed():
 def test_schema_carries_closed_retention_evidence_and_rls():
     schema = db.Path(db.__file__).with_name("schema.sql").read_text(
         encoding="utf-8")
-    assert db.SCHEMA_VERSION == 13
+    assert db.SCHEMA_VERSION == 14
     for table in (
             "tenant_retention_policies", "document_legal_holds",
             "document_purge_jobs", "document_retention_events"):

@@ -84,7 +84,8 @@ def test_schema_version_cannot_be_reused_for_different_bytes():
 @pytest.mark.parametrize("row, expected", [
     (None, False),
     ((0, "0" * 64), False),
-    (db.expected_schema_state(), True),
+    ([db.expected_schema_state(), (True,)], True),
+    ([db.expected_schema_state(), (False,)], False),
 ])
 def test_readiness_requires_the_exact_schema_version_and_digest(row, expected):
     assert db.schema_is_current(_Connection(row)) is expected

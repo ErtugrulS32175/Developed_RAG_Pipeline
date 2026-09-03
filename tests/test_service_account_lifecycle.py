@@ -19,9 +19,11 @@ ACCOUNT = uuid.UUID("30000000-0000-0000-0000-000000000003")
 
 
 class _Cursor:
-    def __init__(self, rows=None, error=None):
+    def __init__(self, rows=None, error=None, result_sets=()):
         self.rows = [] if rows is None else rows
         self.error = error
+        self.result_sets = tuple(result_sets)
+        self.result_index = 0
         self.query = None
         self.params = None
 
@@ -36,6 +38,10 @@ class _Cursor:
         self.params = params
         if self.error is not None:
             raise self.error
+        if self.result_sets:
+            index = min(self.result_index, len(self.result_sets) - 1)
+            self.rows = self.result_sets[index]
+            self.result_index += 1
 
     def fetchone(self):
         return self.rows[0] if self.rows else None
@@ -49,7 +55,8 @@ class _Connection:
         self.cursor_instance = _Cursor(rows, error)
         self._cursor_instances = [
             self.cursor_instance,
-            *(_Cursor(item) for item in following_rows),
+            *(item if isinstance(item, _Cursor) else _Cursor(item)
+              for item in following_rows),
         ]
         self._cursor_index = 0
 
@@ -267,7 +274,7 @@ def test_each_pool_proves_its_exact_role_and_privilege_shape():
     receipt = [(db.CONTROL_SCHEMA_VERSION, db._control_schema_digest())]
     db._configure_redeemer_connection(_Connection(
         [_role_facts("rag_control_redeemer", kind="redeemer")],
-        following_rows=(receipt,)))
+        following_rows=(_Cursor(result_sets=(receipt, [(True,)])),)))
     for configure, row in (
             (db._configure_runtime_connection,
              _role_facts("rag_control_admin", kind="runtime")),
@@ -320,6 +327,15 @@ def test_redeemer_requires_the_exact_control_schema_receipt(receipt):
         [_role_facts("rag_control_redeemer", kind="redeemer")],
         following_rows=(receipt,))
     with pytest.raises(db.ControlPlaneRefused, match="schema receipt"):
+        db._configure_redeemer_connection(connection)
+
+
+def test_redeemer_requires_the_extension_members_in_the_public_schema():
+    receipt = [(db.CONTROL_SCHEMA_VERSION, db._control_schema_digest())]
+    connection = _Connection(
+        [_role_facts("rag_control_redeemer", kind="redeemer")],
+        following_rows=(_Cursor(result_sets=(receipt, [(False,)])),))
+    with pytest.raises(db.ControlPlaneRefused, match="pgcrypto refused"):
         db._configure_redeemer_connection(connection)
 
 

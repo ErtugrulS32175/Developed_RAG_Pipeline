@@ -1300,7 +1300,7 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
             "rag_control.control_schema_state")
         cursor.execute(
             "DELETE FROM rag_control.control_schema_history "
-            "WHERE schema_version = 6")
+            "WHERE schema_version = 7")
         cursor.execute(
             "UPDATE rag_control.control_schema_state SET schema_version = 3, "
             "schema_sha256 = repeat('3', 64)")
@@ -1320,13 +1320,13 @@ def test_v3_shaped_control_schema_upgrades_through_init_schema(
         cursor.execute(
             "SELECT schema_version, schema_sha256 FROM "
             "rag_control.control_schema_state")
-        assert cursor.fetchone() == (6, expected_digest)
+        assert cursor.fetchone() == (7, expected_digest)
         cursor.execute(
             "SELECT array_agg(schema_version ORDER BY schema_version), "
-            "max(schema_sha256) FILTER (WHERE schema_version = 6) "
+            "max(schema_sha256) FILTER (WHERE schema_version = 7) "
             "FROM rag_control.control_schema_history")
         history, v5_digest = cursor.fetchone()
-        assert history[-2:] == [3, 6]
+        assert history[-2:] == [3, 7]
         assert v5_digest == expected_digest
         cursor.execute(
             "SELECT count(*) FROM information_schema.tables "

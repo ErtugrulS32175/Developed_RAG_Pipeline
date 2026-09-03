@@ -69,6 +69,7 @@ def governance_database():
             cur.execute(sql.SQL(
                 "REVOKE ALL ON rag_context_secrets, "
                 "rag_service_account_assertion_keys, "
+                "rag_service_account_assertion_rotations, "
                 "org_identity_tenant_bindings FROM {}").format(
                     sql.Identifier(request_role)))
             cur.execute(sql.SQL(
@@ -234,12 +235,39 @@ def test_runtime_readiness_refuses_an_accidental_mint_grant(
     assert db.runtime_role_is_safe(requester) is True
 
 
+def test_runtime_readiness_refuses_rotation_ledger_access(
+        governance_database):
+    from psycopg import sql
+
+    owner, requester = governance_database
+    role = sql.Identifier(requester.info.user)
+    with owner.cursor() as cur:
+        cur.execute("SELECT current_schema()")
+        schema = cur.fetchone()[0]
+    owner.rollback()
+    table = sql.Identifier(
+        schema, "rag_service_account_assertion_rotations")
+    assert db.runtime_role_is_safe(requester) is True
+    with owner.cursor() as cur:
+        cur.execute(sql.SQL("GRANT SELECT ON {} TO {}").format(table, role))
+    owner.commit()
+    assert db.runtime_role_is_safe(requester) is False
+    with owner.cursor() as cur:
+        cur.execute(sql.SQL("REVOKE SELECT ON {} FROM {}").format(table, role))
+    owner.commit()
+    assert db.runtime_role_is_safe(requester) is True
+
+
 def test_a_runtime_role_cannot_rewrite_control_plane_authority(
         governance_database):
     _owner, requester = governance_database
     with pytest.raises(Exception, match="permission denied"):
         with requester.cursor() as cur:
             cur.execute("SELECT * FROM org_identity_tenant_bindings")
+    requester.rollback()
+    with pytest.raises(Exception, match="permission denied"):
+        with requester.cursor() as cur:
+            cur.execute("SELECT * FROM rag_service_account_assertion_rotations")
     requester.rollback()
     with pytest.raises(Exception, match="permission denied"):
         with requester.cursor() as cur:

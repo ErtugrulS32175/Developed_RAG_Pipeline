@@ -19,8 +19,8 @@ def _function(schema, name, terminator):
 
 
 def test_schema_versions_advance_for_the_proof_authorities():
-    assert index_db.SCHEMA_VERSION == 13
-    assert control_db.CONTROL_SCHEMA_VERSION == 6
+    assert index_db.SCHEMA_VERSION == 14
+    assert control_db.CONTROL_SCHEMA_VERSION == 7
 
 
 def test_the_two_databases_pin_one_binary_payload_layout():
@@ -83,6 +83,15 @@ def test_key_material_is_private_and_separate_from_existing_domains():
     assert "(state = 'verify_only') = (verify_until IS NOT NULL)" in (
         CONTROL_SCHEMA)
     assert "control_one_active_assertion_key" in CONTROL_SCHEMA
+    for schema, prefix in (
+            (DATA_SCHEMA, "rag"), (CONTROL_SCHEMA, "control")):
+        assert f"{prefix}_one_staged_assertion_key" in schema
+        assert f"{prefix}_one_verify_only_assertion_key" in schema
+        assert "verify_started_at timestamptz" in schema
+        assert "interval '300 seconds'" in schema
+        assert "target_key_fingerprint bytea NOT NULL" in schema
+        assert "previous_key_version <> target_key_version" in schema
+        assert "'staged', 'admitted', 'activated', 'completed'" in schema
     assert "REVOKE ALL ON rag_service_account_assertion_keys FROM PUBLIC" in (
         DATA_SCHEMA)
     assert ("REVOKE ALL ON "
@@ -148,13 +157,49 @@ def test_control_verifies_before_consuming_one_global_nonce():
         "FUNCTION rag_control.control_consume_service_account_assertion(",
         "$consume_service_account_assertion$;")
     verify = consume.index("control_secure_bytea_equal")
+    prune = consume.index(
+        "DELETE FROM rag_control.control_service_account_assertion_nonces")
     insert = consume.index(
         "INSERT INTO rag_control.control_service_account_assertion_nonces")
-    assert verify < insert
+    assert verify < prune < insert
+    assert "LIMIT 128" in consume
+    assert "FOR UPDATE SKIP LOCKED" in consume
+    assert "control_assertion_nonces_expiry" in CONTROL_SCHEMA
     assert "ON CONFLICT (key_version, nonce) DO NOTHING" in consume
     assert "requested_expires_at <= now_epoch" in consume
     assert "requested_issued_at > now_epoch + 5" in consume
     assert "key.state IN ('active', 'verify_only')" in consume
+
+
+def test_both_migrations_bind_pgcrypto_to_the_exact_public_extension_members():
+    for schema in (DATA_SCHEMA, CONTROL_SCHEMA):
+        prelude = schema.split("CREATE TABLE", 1)[0]
+        assert "ext.extnamespace" not in prelude
+        assert "extension_namespace <> 'public'::pg_catalog.regnamespace" in (
+            prelude)
+        assert "public.hmac(bytea,bytea,text)" in prelude
+        assert "public.gen_random_bytes(integer)" in prelude
+        assert "dependency.deptype = 'e'" in prelude
+        assert ("dependency.refclassid =\n"
+                "                  'pg_catalog.pg_extension'::regclass"
+                in prelude)
+        assert "MESSAGE = 'pgcrypto_namespace_refused'" in prelude
+
+
+def test_rotation_ledgers_are_private_bound_and_single_live_authorities():
+    for schema, prefix in (
+            (DATA_SCHEMA, "rag"), (CONTROL_SCHEMA, "control")):
+        assert f"{prefix}_one_live_assertion_rotation" in schema
+        assert f"{prefix}_assertion_key_rotation_fk" in schema
+        assert "DEFERRABLE INITIALLY DEFERRED" in schema
+        assert "assertion_rotation_keys_unbound" in schema
+        assert "AFTER INSERT OR UPDATE OR DELETE" in schema
+        assert "assertion_rotation_tombstone_immutable" in schema
+        assert "assertion_rotation_transition_refused" in schema
+    runtime_script = (ROOT / "scripts" / "init_runtime_role.sh").read_text(
+        encoding="utf-8")
+    assert "REVOKE ALL ON rag_service_account_assertion_rotations" in (
+        runtime_script)
 
 
 def test_each_operation_binds_every_mutable_business_dimension():

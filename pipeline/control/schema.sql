@@ -1,4 +1,37 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+DO $assert_pgcrypto_namespace$
+DECLARE
+    extension_oid oid;
+    extension_namespace oid;
+BEGIN
+    SELECT oid, extnamespace INTO extension_oid, extension_namespace
+    FROM pg_catalog.pg_extension WHERE extname = 'pgcrypto';
+    IF extension_oid IS NULL
+       OR extension_namespace <> 'public'::pg_catalog.regnamespace
+       OR NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend AS dependency
+            WHERE dependency.refobjid = extension_oid
+              AND dependency.refclassid =
+                  'pg_catalog.pg_extension'::regclass
+              AND dependency.classid = 'pg_catalog.pg_proc'::regclass
+              AND dependency.objid = pg_catalog.to_regprocedure(
+                  'public.hmac(bytea,bytea,text)')
+              AND dependency.deptype = 'e')
+       OR NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_depend AS dependency
+            WHERE dependency.refobjid = extension_oid
+              AND dependency.refclassid =
+                  'pg_catalog.pg_extension'::regclass
+              AND dependency.classid = 'pg_catalog.pg_proc'::regclass
+              AND dependency.objid = pg_catalog.to_regprocedure(
+                  'public.gen_random_bytes(integer)')
+              AND dependency.deptype = 'e')
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '55000',
+            MESSAGE = 'pgcrypto_namespace_refused';
+    END IF;
+END
+$assert_pgcrypto_namespace$;
 CREATE SCHEMA IF NOT EXISTS rag_control;
 
 CREATE TABLE IF NOT EXISTS rag_control.control_schema_history (
@@ -288,7 +321,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS control_one_pending_account_approval
 ON rag_control.control_service_account_approvals (service_account_id)
 WHERE state = 'approved';
 
--- The control process never receives these bytes.  Migration ownership loads
+-- The online control processes never receive these bytes. Migration ownership
+-- loads
 -- the same versioned key material into the tenant and control databases; only
 -- SECURITY DEFINER proof functions may read it.  This is deliberately a
 -- separate domain from identity, audit, service-token and RLS-context keys.
@@ -299,14 +333,270 @@ rag_control.control_service_account_assertion_keys (
     state text NOT NULL CHECK (state IN (
         'staged', 'active', 'verify_only', 'retired')),
     not_before timestamptz NOT NULL,
+    verify_started_at timestamptz,
     verify_until timestamptz,
+    rotation_id uuid,
     created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
     CHECK (verify_until IS NULL OR verify_until > not_before),
     CHECK ((state = 'verify_only') = (verify_until IS NOT NULL))
 );
+ALTER TABLE rag_control.control_service_account_assertion_keys
+    ADD COLUMN IF NOT EXISTS verify_started_at timestamptz;
+ALTER TABLE rag_control.control_service_account_assertion_keys
+    ADD COLUMN IF NOT EXISTS rotation_id uuid;
+DO $assertion_key_constraints$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM rag_control.control_service_account_assertion_keys
+        WHERE state = 'verify_only' AND verify_started_at IS NULL)
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '55000',
+            MESSAGE = 'assertion_key_overlap_unknown';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conrelid =
+              'rag_control.control_service_account_assertion_keys'::regclass
+          AND conname = 'control_assertion_key_state_shape')
+    THEN
+        ALTER TABLE rag_control.control_service_account_assertion_keys
+            ADD CONSTRAINT control_assertion_key_state_shape CHECK (
+                (state = 'verify_only'
+                 AND verify_started_at IS NOT NULL
+                 AND verify_until IS NOT NULL
+                 AND rotation_id IS NOT NULL)
+                OR
+                (state <> 'verify_only'
+                 AND verify_started_at IS NULL
+                 AND verify_until IS NULL
+                 AND (state <> 'staged' OR rotation_id IS NOT NULL)))
+                NOT VALID;
+        ALTER TABLE rag_control.control_service_account_assertion_keys
+            VALIDATE CONSTRAINT control_assertion_key_state_shape;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conrelid =
+              'rag_control.control_service_account_assertion_keys'::regclass
+          AND conname = 'control_assertion_key_overlap_bounded')
+    THEN
+        ALTER TABLE rag_control.control_service_account_assertion_keys
+            ADD CONSTRAINT control_assertion_key_overlap_bounded CHECK (
+                verify_until IS NULL OR (
+                    verify_until > verify_started_at
+                    AND verify_until <= verify_started_at
+                        + interval '300 seconds')) NOT VALID;
+        ALTER TABLE rag_control.control_service_account_assertion_keys
+            VALIDATE CONSTRAINT control_assertion_key_overlap_bounded;
+    END IF;
+END
+$assertion_key_constraints$;
 CREATE UNIQUE INDEX IF NOT EXISTS control_one_active_assertion_key
     ON rag_control.control_service_account_assertion_keys ((state))
     WHERE state = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS control_one_staged_assertion_key
+    ON rag_control.control_service_account_assertion_keys ((state))
+    WHERE state = 'staged';
+CREATE UNIQUE INDEX IF NOT EXISTS control_one_verify_only_assertion_key
+    ON rag_control.control_service_account_assertion_keys ((state))
+    WHERE state = 'verify_only';
+
+CREATE TABLE IF NOT EXISTS
+rag_control.control_service_account_assertion_rotations (
+    rotation_id uuid PRIMARY KEY,
+    previous_key_version integer NOT NULL CHECK (previous_key_version > 0),
+    target_key_version integer NOT NULL UNIQUE CHECK (target_key_version > 0),
+    target_key_fingerprint bytea NOT NULL
+        CHECK (octet_length(target_key_fingerprint) = 32),
+    verify_started_at timestamptz NOT NULL,
+    verify_until timestamptz NOT NULL,
+    phase text NOT NULL CHECK (phase IN (
+        'staged', 'admitted', 'activated', 'completed', 'aborted', 'retired')),
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    completed_at timestamptz,
+    retired_at timestamptz,
+    CHECK (previous_key_version <> target_key_version),
+    CHECK (verify_until > verify_started_at),
+    CHECK (verify_until <= verify_started_at + interval '300 seconds'),
+    CHECK ((phase IN ('completed', 'retired')) = (completed_at IS NOT NULL)),
+    CHECK ((phase = 'retired') = (retired_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS control_one_live_assertion_rotation
+    ON rag_control.control_service_account_assertion_rotations ((true))
+    WHERE phase IN ('staged', 'admitted', 'activated');
+DO $assertion_rotation_fk$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conrelid =
+              'rag_control.control_service_account_assertion_keys'::regclass
+          AND conname = 'control_assertion_key_rotation_fk')
+    THEN
+        ALTER TABLE rag_control.control_service_account_assertion_keys
+            ADD CONSTRAINT control_assertion_key_rotation_fk
+            FOREIGN KEY (rotation_id) REFERENCES
+                rag_control.control_service_account_assertion_rotations(
+                    rotation_id) ON DELETE RESTRICT;
+    END IF;
+END
+$assertion_rotation_fk$;
+
+CREATE OR REPLACE FUNCTION
+rag_control.control_assertion_rotation_keys_bound()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $assertion_rotation_keys_bound$
+DECLARE
+    previous_bound boolean;
+    target_bound boolean;
+    bound_count integer;
+    members_allowed boolean;
+BEGIN
+    SELECT bool_or(key_version = NEW.previous_key_version),
+           bool_or(key_version = NEW.target_key_version), count(*),
+           bool_and(key_version IN (
+               NEW.previous_key_version, NEW.target_key_version))
+    INTO previous_bound, target_bound, bound_count, members_allowed
+    FROM rag_control.control_service_account_assertion_keys
+    WHERE rotation_id = NEW.rotation_id;
+    -- A retired tombstone, like an aborted one, carries its own versions
+    -- and may keep zero, one or both members: its target has to be free
+    -- to become the previous member of the NEXT rotation, or the ledger
+    -- could record exactly one rotation per database.
+    IF (bound_count > 0 AND members_allowed IS DISTINCT FROM true)
+       OR bound_count > 2
+       OR (NEW.phase NOT IN ('aborted', 'retired')
+           AND (previous_bound IS DISTINCT FROM true OR bound_count <> 2))
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '23514',
+            MESSAGE = 'assertion_rotation_keys_unbound';
+    END IF;
+    RETURN NULL;
+END
+$assertion_rotation_keys_bound$;
+DROP TRIGGER IF EXISTS control_assertion_rotation_keys_bound
+    ON rag_control.control_service_account_assertion_rotations;
+CREATE CONSTRAINT TRIGGER control_assertion_rotation_keys_bound
+AFTER INSERT OR UPDATE ON
+    rag_control.control_service_account_assertion_rotations
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION
+    rag_control.control_assertion_rotation_keys_bound();
+REVOKE ALL ON FUNCTION
+    rag_control.control_assertion_rotation_keys_bound() FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION
+rag_control.control_assertion_key_rotation_bound()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, rag_control
+AS $assertion_key_rotation_bound$
+DECLARE
+    bound_rotation_ids uuid[];
+    bound_rotation_id uuid;
+    checked_rotation_id uuid;
+    rotation_phase text;
+    previous_bound boolean;
+    target_bound boolean;
+    bound_count integer;
+    members_allowed boolean;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        bound_rotation_ids := ARRAY[NEW.rotation_id];
+    ELSIF TG_OP = 'DELETE' THEN
+        bound_rotation_ids := ARRAY[OLD.rotation_id];
+    ELSE
+        bound_rotation_ids := ARRAY[OLD.rotation_id, NEW.rotation_id];
+    END IF;
+    FOREACH bound_rotation_id IN ARRAY bound_rotation_ids LOOP
+        IF bound_rotation_id IS NULL
+           OR bound_rotation_id IS NOT DISTINCT FROM checked_rotation_id
+        THEN
+            CONTINUE;
+        END IF;
+        SELECT rotation.phase,
+               bool_or(key.key_version = rotation.previous_key_version),
+               bool_or(key.key_version = rotation.target_key_version),
+               count(key.key_version),
+               bool_and(key.key_version IN (
+                   rotation.previous_key_version,
+                   rotation.target_key_version))
+        INTO rotation_phase, previous_bound, target_bound, bound_count,
+             members_allowed
+        FROM rag_control.control_service_account_assertion_rotations AS rotation
+        LEFT JOIN rag_control.control_service_account_assertion_keys AS key
+          ON key.rotation_id = rotation.rotation_id
+        WHERE rotation.rotation_id = bound_rotation_id
+        GROUP BY rotation.phase, rotation.previous_key_version,
+                 rotation.target_key_version;
+        IF rotation_phase IS NULL
+           OR (bound_count > 0 AND members_allowed IS DISTINCT FROM true)
+           OR bound_count > 2
+           OR (rotation_phase NOT IN ('aborted', 'retired')
+               AND (previous_bound IS DISTINCT FROM true OR bound_count <> 2))
+        THEN
+            RAISE EXCEPTION USING ERRCODE = '23514',
+                MESSAGE = 'assertion_rotation_keys_unbound';
+        END IF;
+        checked_rotation_id := bound_rotation_id;
+    END LOOP;
+    RETURN NULL;
+END
+$assertion_key_rotation_bound$;
+DROP TRIGGER IF EXISTS control_assertion_key_rotation_bound
+    ON rag_control.control_service_account_assertion_keys;
+CREATE CONSTRAINT TRIGGER control_assertion_key_rotation_bound
+AFTER INSERT OR UPDATE OR DELETE ON
+    rag_control.control_service_account_assertion_keys
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION
+    rag_control.control_assertion_key_rotation_bound();
+REVOKE ALL ON FUNCTION
+    rag_control.control_assertion_key_rotation_bound() FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION
+rag_control.control_assertion_rotation_lifecycle_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $assertion_rotation_lifecycle_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING ERRCODE = '55000',
+            MESSAGE = 'assertion_rotation_tombstone_immutable';
+    END IF;
+    IF NEW.rotation_id IS DISTINCT FROM OLD.rotation_id
+       OR NEW.previous_key_version IS DISTINCT FROM OLD.previous_key_version
+       OR NEW.target_key_version IS DISTINCT FROM OLD.target_key_version
+       OR NEW.target_key_fingerprint IS DISTINCT FROM OLD.target_key_fingerprint
+       OR NEW.verify_started_at IS DISTINCT FROM OLD.verify_started_at
+       OR NEW.verify_until IS DISTINCT FROM OLD.verify_until
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR (OLD.phase, NEW.phase) NOT IN (
+            ('staged', 'admitted'), ('staged', 'activated'),
+            ('staged', 'aborted'), ('admitted', 'completed'),
+            ('admitted', 'aborted'), ('activated', 'completed'),
+            ('completed', 'retired'))
+       OR (OLD.phase = 'completed'
+           AND NEW.completed_at IS DISTINCT FROM OLD.completed_at)
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '55000',
+            MESSAGE = 'assertion_rotation_transition_refused';
+    END IF;
+    RETURN NEW;
+END
+$assertion_rotation_lifecycle_guard$;
+DROP TRIGGER IF EXISTS control_assertion_rotation_lifecycle_guard
+    ON rag_control.control_service_account_assertion_rotations;
+CREATE TRIGGER control_assertion_rotation_lifecycle_guard
+BEFORE UPDATE OR DELETE ON
+    rag_control.control_service_account_assertion_rotations
+FOR EACH ROW EXECUTE FUNCTION
+    rag_control.control_assertion_rotation_lifecycle_guard();
+REVOKE ALL ON FUNCTION
+    rag_control.control_assertion_rotation_lifecycle_guard() FROM PUBLIC;
 
 CREATE TABLE IF NOT EXISTS
 rag_control.control_service_account_assertion_nonces (
@@ -327,8 +617,13 @@ rag_control.control_service_account_assertion_nonces (
                        'approval_redeem_rotate')
             AND approval_id IS NOT NULL))
 );
+CREATE INDEX IF NOT EXISTS control_assertion_nonces_expiry
+    ON rag_control.control_service_account_assertion_nonces
+       (expires_at, key_version, nonce);
 
 REVOKE ALL ON rag_control.control_service_account_assertion_keys FROM PUBLIC;
+REVOKE ALL ON rag_control.control_service_account_assertion_rotations
+    FROM PUBLIC;
 REVOKE ALL ON rag_control.control_service_account_assertion_nonces FROM PUBLIC;
 
 CREATE TABLE IF NOT EXISTS rag_control.control_service_account_approval_events (
@@ -1117,6 +1412,8 @@ BEGIN
     WHERE key.key_version = requested_key_version
       AND key.state IN ('active', 'verify_only')
       AND key.not_before <= statement_timestamp()
+      AND (key.verify_started_at IS NULL
+           OR key.verify_started_at <= statement_timestamp())
       AND (key.verify_until IS NULL
            OR key.verify_until > statement_timestamp())
     FOR SHARE;
@@ -1130,6 +1427,14 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '42501',
             MESSAGE = 'service_account_assertion_invalid';
     END IF;
+    DELETE FROM rag_control.control_service_account_assertion_nonces AS nonce
+    WHERE (nonce.key_version, nonce.nonce) IN (
+        SELECT expired.key_version, expired.nonce
+        FROM rag_control.control_service_account_assertion_nonces AS expired
+        WHERE expired.expires_at <= statement_timestamp()
+        ORDER BY expired.expires_at, expired.key_version, expired.nonce
+        LIMIT 128
+        FOR UPDATE SKIP LOCKED);
     INSERT INTO rag_control.control_service_account_assertion_nonces (
         key_version, purpose, nonce, tenant_id, approval_id, expires_at)
     VALUES (requested_key_version, requested_purpose, requested_nonce,
