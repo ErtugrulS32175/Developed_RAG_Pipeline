@@ -955,6 +955,38 @@ def test_the_speech_override_adds_only_stt_variables_to_open_webui():
     assert "\t" not in override
 
 
+def test_the_request_body_documents_exactly_the_multipart_fields(
+        monkeypatch, tmp_path):
+    """The two Form parameters exist for this document: OpenWebUI sends
+    `model` (and sometimes `language`) beside `file`, and the contract
+    says so. Validation reads the raw form, so this pin is what keeps the
+    parameters from being dead weight."""
+    spec = make_app(monkeypatch, tmp_path).openapi()
+    body = spec["paths"][URL]["post"]["requestBody"]
+    assert body["required"] is True
+    ref = body["content"]["multipart/form-data"]["schema"]["$ref"]
+    schema = spec["components"]["schemas"][ref.rsplit("/", 1)[1]]
+    assert set(schema["properties"]) == {"file", "model", "language"}
+    assert schema["required"] == ["file"]
+    # OpenAPI 3.1: a binary part is a string with a content media type
+    assert schema["properties"]["file"]["type"] == "string"
+    assert (schema["properties"]["file"]["contentMediaType"]
+            == "application/octet-stream")
+    for optional in ("model", "language"):
+        assert {"type": "string"} in schema["properties"][optional]["anyOf"]
+
+
+def test_the_env_example_declares_the_speech_key_without_a_value():
+    values = {}
+    for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    assert values["SPEECH_API_KEY"] == ""
+    compose = (ROOT / "docker-compose.speech.yml").read_text(encoding="utf-8")
+    assert "${SPEECH_API_KEY:?" in compose
+
+
 def test_the_speech_requirements_stay_out_of_the_main_tree():
     speech_requirements = (ROOT / "requirements-speech.txt").read_text(
         encoding="utf-8")
