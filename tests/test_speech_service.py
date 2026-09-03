@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 import dataclasses
 import importlib.util
 import inspect
+import json
 import logging
 import os
 import socket
@@ -27,6 +28,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from services import speech_service as speech
+from services import speech_terminology as terminology
 
 ROOT = Path(__file__).resolve().parent.parent
 KEY = "test-speech-key-" + "x" * 24
@@ -95,6 +97,8 @@ class FakeModel:
         self.fail = fail
         self.calls = []
         self.generators = []
+        self.hf_tokenizer = SimpleNamespace(
+            encode=lambda text: SimpleNamespace(ids=text.split()))
 
     def transcribe(self, audio, **kwargs):
         self.calls.append((audio, kwargs))
@@ -137,6 +141,9 @@ def fake_probe(seconds=1.0, error=None):
 def make_app(monkeypatch, tmp_path, *, factory=None, probe=None,
              limits=None):
     monkeypatch.setenv("SPEECH_API_KEY", KEY)
+    monkeypatch.delenv("SPEECH_HOTWORD_PROFILE", raising=False)
+    monkeypatch.delenv("SPEECH_TERMINOLOGY_FILE", raising=False)
+    monkeypatch.delenv("SPEECH_TERMINOLOGY_CONTEXT", raising=False)
     settings = speech.load_settings(os.environ)
     return speech.create_app(
         settings,
@@ -251,6 +258,133 @@ def test_transcribe_receives_exactly_language_tr_and_vad_filter(
     assert Path(audio).parent == tmp_path
     assert audio.endswith(speech.UPLOAD_SUFFIX)
     assert "ozel-ad" not in audio       # the user's name is never a path
+
+
+def test_the_capital_markets_profile_is_closed_and_deployment_owned(
+        monkeypatch, tmp_path):
+    registry = terminology.load_registry(
+        speech.DEFAULT_TERMINOLOGY_REGISTRY)
+    pack = registry.select("default", lambda text: len(text.split()))
+    terms = pack.text.split(", ")
+    assert pack.phrase_count == 11
+    assert speech.BUILTIN_TERMINOLOGY_PROFILES == {"capital_markets_tr"}
+    assert {"Borsa İstanbul", "THYAO", "GARAN", "lot"} <= set(terms)
+
+    monkeypatch.setenv("SPEECH_API_KEY", KEY)
+    monkeypatch.setenv("SPEECH_HOTWORD_PROFILE", "capital_markets_tr")
+    settings = speech.load_settings(os.environ)
+    model = FakeModel()
+    app = speech.create_app(
+        settings,
+        model_factory=Factory(model),
+        probe=fake_probe(),
+        upload_dir=tmp_path,
+    )
+    with TestClient(app) as client:
+        assert upload(
+            client,
+            fields={
+                "hotwords": "kullanici bu profili degistiremez",
+                "context": "request-context-is-not-an-authority",
+            },
+        ).status_code == 200
+    (_audio, kwargs), = model.calls
+    assert kwargs == {
+        "language": "tr",
+        "vad_filter": True,
+        "hotwords": pack.text,
+        "condition_on_previous_text": False,
+    }
+
+
+def test_an_unknown_hotword_profile_is_refused_at_startup(monkeypatch):
+    monkeypatch.setenv("SPEECH_API_KEY", KEY)
+    monkeypatch.setenv("SPEECH_HOTWORD_PROFILE", "kullanici-metni")
+    with pytest.raises(speech.SpeechConfigError):
+        speech.load_settings(os.environ)
+
+
+def _private_registry(tmp_path, *, profile="private_tr"):
+    path = tmp_path / "private-registry.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "profile_id": profile,
+        "revision": "rev_1",
+        "language": "tr",
+        "terms": [{
+            "canonical": "Gizli Kurum Terimi",
+            "aliases": ["GKT"],
+            "contexts": ["default", "equities"],
+            "priority": 100,
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_a_private_registry_is_loaded_once_and_selected_by_deployment_context(
+        monkeypatch, tmp_path, caplog):
+    path = _private_registry(tmp_path)
+    monkeypatch.setenv("SPEECH_API_KEY", KEY)
+    monkeypatch.setenv("SPEECH_HOTWORD_PROFILE", "private_tr")
+    monkeypatch.setenv("SPEECH_TERMINOLOGY_FILE", str(path))
+    monkeypatch.setenv("SPEECH_TERMINOLOGY_CONTEXT", "equities")
+    settings = speech.load_settings(os.environ)
+    assert str(path) not in repr(settings)
+    factory = Factory()
+    app = speech.create_app(settings, model_factory=factory,
+                            probe=fake_probe(), upload_dir=tmp_path)
+    with caplog.at_level(logging.INFO, logger="speech_service"):
+        with TestClient(app) as client:
+            assert upload(client).status_code == 200
+            assert upload(client).status_code == 200
+    assert factory.calls == 1
+    assert [call[1]["hotwords"] for call in factory.model.calls] == [
+        "Gizli Kurum Terimi, GKT", "Gizli Kurum Terimi, GKT"]
+    assert "Gizli Kurum Terimi" not in caplog.text
+    assert str(path) not in caplog.text
+
+
+def test_bad_private_registry_or_context_fails_before_model_load(
+        monkeypatch, tmp_path):
+    path = _private_registry(tmp_path)
+    monkeypatch.setenv("SPEECH_API_KEY", KEY)
+    monkeypatch.setenv("SPEECH_HOTWORD_PROFILE", "wrong_profile")
+    monkeypatch.setenv("SPEECH_TERMINOLOGY_FILE", str(path))
+    factory = Factory()
+    with pytest.raises(speech.SpeechConfigError):
+        speech.create_app(speech.load_settings(os.environ),
+                          model_factory=factory)
+    assert factory.calls == 0
+
+    monkeypatch.setenv("SPEECH_HOTWORD_PROFILE", "private_tr")
+    monkeypatch.setenv("SPEECH_TERMINOLOGY_CONTEXT", "caller_context")
+    with pytest.raises(speech.SpeechConfigError):
+        speech.create_app(speech.load_settings(os.environ),
+                          model_factory=factory)
+    assert factory.calls == 0
+
+
+def test_a_profile_with_no_model_tokenizer_never_becomes_ready(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("SPEECH_API_KEY", KEY)
+    monkeypatch.setenv("SPEECH_HOTWORD_PROFILE", "capital_markets_tr")
+    model = FakeModel()
+    model.hf_tokenizer = None
+    app = speech.create_app(
+        speech.load_settings(os.environ), model_factory=Factory(model),
+        probe=fake_probe(), upload_dir=tmp_path)
+    with TestClient(app) as client:
+        assert client.get("/readyz").status_code == 503
+        response = upload(client)
+    _closed_error(response, "service_unavailable")
+    assert model.calls == []
+
+def test_terminology_settings_without_a_profile_are_refused(monkeypatch):
+    monkeypatch.setenv("SPEECH_API_KEY", KEY)
+    monkeypatch.delenv("SPEECH_HOTWORD_PROFILE", raising=False)
+    monkeypatch.setenv("SPEECH_TERMINOLOGY_FILE", "private.json")
+    with pytest.raises(speech.SpeechConfigError):
+        speech.load_settings(os.environ)
 
 
 def test_a_successful_response_carries_only_text(monkeypatch, tmp_path):

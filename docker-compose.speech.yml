@@ -8,7 +8,8 @@
 #
 # OpenWebUI reaches the host service through the host.docker.internal mapping
 # the base file already declares. The key is a service identity between the
-# two processes only, never a user or tenant identity.
+# two processes only, never a user or tenant identity. Terminology
+# configuration belongs to the separately launched host process, not here.
 services:
   open-webui:
     environment:

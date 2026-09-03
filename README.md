@@ -254,6 +254,9 @@ faster-whisper model once and speaks the OpenAI transcription shape:
 ```bash
 pip install -r requirements-speech.txt   # its own environment, not requirements.txt
 export SPEECH_API_KEY=...                # at least 32 random characters
+export SPEECH_HOTWORD_PROFILE=capital_markets_tr  # optional, deployment-owned
+export SPEECH_TERMINOLOGY_FILE=/run/secrets/capital-markets-tr.json  # optional
+export SPEECH_TERMINOLOGY_CONTEXT=equities                           # optional
 python -m services.speech_service        # 0.0.0.0:8012, one process, one worker
 docker compose -f docker-compose.yml -f docker-compose.speech.yml up -d open-webui
 ```
@@ -306,6 +309,36 @@ top, so the local order of operations is manual:
 Automatic GPU orchestration is a later E5/E6 package. Persistent recordings,
 transcription jobs, transcript revisions and RAG indexing of transcripts are
 the E4/E6 packages and are deliberately not scaffolded here.
+
+`SPEECH_HOTWORD_PROFILE=capital_markets_tr` enables a deployment-owned,
+versioned terminology registry. The checked-in registry is only the measured
+eleven-phrase seed; a licensed or organization-owned full registry can be kept
+outside Git and selected with `SPEECH_TERMINOLOGY_FILE`. Validate such a file
+without printing its terms or path with:
+
+```bash
+python -m services.speech_terminology /run/secrets/capital-markets-tr.json
+```
+
+The registry stores the whole catalog in memory, but the loaded large-v3
+tokenizer deterministically projects only the highest-priority phrases for the
+closed `SPEECH_TERMINOLOGY_CONTEXT` into a maximum 96-token/16-phrase hotword
+pack. Requests cannot provide or override the profile, context, terms or token
+budget. With a pack enabled, decoding also disables previous-window
+conditioning because that was the smallest measured setting which kept the
+real two-speaker Turkish benchmark complete without a fabricated closing line.
+Leaving the profile empty preserves the general dictation behaviour exactly.
+
+Registry files are strict UTF-8 JSON: root fields are `schema_version` (1),
+`profile_id`, `revision`, `language` (`tr`) and `terms`. Each term contains only
+`canonical`, `aliases`, `contexts` and `priority`; definitions and source prose
+do not belong there. The loader refuses unknown fields, links, invalid or
+control-bearing text, normalization collisions, overlong values and unbounded
+files. Keep the private registry on a read-only deployment mount. The current
+OpenWebUI microphone relay authenticates the service, not the human or tenant,
+so this version deliberately supports only deployment contexts. Tenant-specific
+overlays require a later signed identity bridge and server-side tenant lookup;
+browser-supplied tenant/profile fields are not an authority.
 
 ### Production operations
 

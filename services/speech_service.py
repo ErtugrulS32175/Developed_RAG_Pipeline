@@ -41,6 +41,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -57,6 +58,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from services import speech_terminology as terminology
+
 log = logging.getLogger("speech_service")
 
 # --- the closed profile ------------------------------------------------------
@@ -66,6 +69,12 @@ DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 LANGUAGE = "tr"
 VAD_FILTER = True
+
+DEFAULT_TERMINOLOGY_REGISTRY = (
+    Path(__file__).resolve().parent / "terminology" /
+    "capital_markets_tr.json"
+)
+BUILTIN_TERMINOLOGY_PROFILES = frozenset({"capital_markets_tr"})
 
 DEFAULT_BIND_HOST = "0.0.0.0"
 DEFAULT_PORT = 8012
@@ -200,10 +209,16 @@ class Settings:
     api_key: str
     host: str = DEFAULT_BIND_HOST
     port: int = DEFAULT_PORT
+    hotword_profile: str | None = None
+    terminology_file: str | None = dataclasses.field(default=None, repr=False)
+    terminology_context: str | None = None
 
     def __repr__(self):
         # the key is the one thing a repr must never carry into a log
-        return f"Settings(host={self.host!r}, port={self.port})"
+        return (f"Settings(host={self.host!r}, port={self.port}, "
+                f"hotword_profile={self.hotword_profile!r}, "
+                f"terminology_file_set={self.terminology_file is not None}, "
+                f"terminology_context={self.terminology_context!r})")
 
 
 def load_settings(environ=os.environ) -> Settings:
@@ -219,7 +234,25 @@ def load_settings(environ=os.environ) -> Settings:
         raise SpeechConfigError("SPEECH_PORT must be an integer") from None
     if not 1 <= port <= 65535:
         raise SpeechConfigError("SPEECH_PORT must be between 1 and 65535")
-    return Settings(api_key=key, host=host, port=port)
+    hotword_profile = environ.get("SPEECH_HOTWORD_PROFILE", "").strip() or None
+    terminology_file = (
+        environ.get("SPEECH_TERMINOLOGY_FILE", "").strip() or None)
+    terminology_context = (
+        environ.get("SPEECH_TERMINOLOGY_CONTEXT", "").strip() or None)
+    if hotword_profile is None and (
+            terminology_file is not None or terminology_context is not None):
+        raise SpeechConfigError(
+            "terminology configuration requires SPEECH_HOTWORD_PROFILE")
+    if hotword_profile is not None and not re.fullmatch(
+            r"[a-z0-9][a-z0-9_-]{0,63}", hotword_profile):
+        raise SpeechConfigError("SPEECH_HOTWORD_PROFILE is not supported")
+    if (hotword_profile is not None and terminology_file is None
+            and hotword_profile not in BUILTIN_TERMINOLOGY_PROFILES):
+        raise SpeechConfigError("SPEECH_HOTWORD_PROFILE is not supported")
+    return Settings(api_key=key, host=host, port=port,
+                    hotword_profile=hotword_profile,
+                    terminology_file=terminology_file,
+                    terminology_context=terminology_context)
 
 
 def key_matches(presented: str, expected: str) -> bool:
@@ -307,6 +340,21 @@ def _remove_exact(path: str) -> None:
                     type(exc).__name__)
 
 
+def _count_hotword_tokens(model, text: str) -> int:
+    """Use the exact tokenizer owned by the loaded Whisper model."""
+    tokenizer = getattr(model, "hf_tokenizer", None)
+    encode = getattr(tokenizer, "encode", None)
+    if not callable(encode):
+        raise terminology.TerminologyConfigError(
+            "speech model tokenizer is unavailable")
+    encoded = encode(text)
+    ids = getattr(encoded, "ids", None)
+    if not isinstance(ids, (list, tuple)):
+        raise terminology.TerminologyConfigError(
+            "speech model tokenizer returned an invalid encoding")
+    return len(ids)
+
+
 class SpeechEngine:
     """One model, one worker thread, one slot.
 
@@ -318,11 +366,15 @@ class SpeechEngine:
     before submission cleans up itself.
     """
 
-    def __init__(self, model_factory, probe, limits: Limits):
+    def __init__(self, model_factory, probe, limits: Limits, *,
+                 registry=None, terminology_context=None):
         self._factory = model_factory
         self._probe = probe
         self._limits = limits
         self._model = None
+        self._registry = registry
+        self._terminology_context = terminology_context
+        self._hotwords = None
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="speech-gpu")
         self._slot = asyncio.Semaphore(1)
@@ -340,8 +392,22 @@ class SpeechEngine:
         started = time.monotonic()
         try:
             self._model = self._factory()
+            if self._registry is not None:
+                pack = self._registry.select(
+                    self._terminology_context,
+                    lambda text: _count_hotword_tokens(self._model, text),
+                )
+                self._hotwords = pack.text
+                log.info(
+                    "speech.terminology_ready profile=%s revision=%s "
+                    "digest=%s registry_terms=%d selected_phrases=%d "
+                    "selected_tokens=%d",
+                    self._registry.profile_id, self._registry.revision,
+                    self._registry.sha256, len(self._registry.terms),
+                    pack.phrase_count, pack.token_count)
         except Exception as exc:
             self._model = None
+            self._hotwords = None
             log.error("speech.model_load_failed error_type=%s",
                       type(exc).__name__)
             return False
@@ -388,8 +454,16 @@ class SpeechEngine:
         try:
             seconds = self._probe(path, self._limits.max_audio_seconds)
             started = time.monotonic()
-            segments, _info = model.transcribe(
-                path, language=LANGUAGE, vad_filter=VAD_FILTER)
+            transcribe_options = {
+                "language": LANGUAGE,
+                "vad_filter": VAD_FILTER,
+            }
+            if self._hotwords is not None:
+                transcribe_options.update(
+                    hotwords=self._hotwords,
+                    condition_on_previous_text=False,
+                )
+            segments, _info = model.transcribe(path, **transcribe_options)
             # drained completely and in order; joined as the model spoke,
             # with nothing added, translated or normalised
             text = "".join(segment.text for segment in segments).strip()
@@ -580,10 +654,38 @@ async def _stage(upload: UploadFile, limits: Limits, upload_dir: Path) -> str:
     return path
 
 
+def _registry_for(settings: Settings):
+    if settings.hotword_profile is None:
+        return None, None
+    source = (Path(settings.terminology_file)
+              if settings.terminology_file is not None
+              else DEFAULT_TERMINOLOGY_REGISTRY)
+    try:
+        registry = terminology.load_registry(source)
+    except terminology.TerminologyConfigError as exc:
+        raise SpeechConfigError(str(exc)) from None
+    if registry.profile_id != settings.hotword_profile:
+        raise SpeechConfigError(
+            "SPEECH_HOTWORD_PROFILE does not match the terminology registry")
+    context = settings.terminology_context or terminology.DEFAULT_CONTEXT
+    try:
+        registry.require_context(context)
+    except terminology.TerminologyConfigError as exc:
+        raise SpeechConfigError(str(exc)) from None
+    return registry, context
+
+
 def create_app(settings: Settings, *, model_factory=production_model_factory,
                probe=probe_audio_seconds, limits: Limits = DEFAULT_LIMITS,
                upload_dir=None) -> FastAPI:
-    engine = SpeechEngine(model_factory, probe, limits)
+    registry, terminology_context = _registry_for(settings)
+    engine = SpeechEngine(
+        model_factory,
+        probe,
+        limits,
+        registry=registry,
+        terminology_context=terminology_context,
+    )
     staging_dir = Path(upload_dir) if upload_dir else Path(tempfile.gettempdir())
 
     @asynccontextmanager
@@ -678,10 +780,10 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     try:
         settings = load_settings(os.environ)
+        app = create_app(settings)
     except SpeechConfigError as exc:
         print(f"speech_service: config_error: {exc}", file=sys.stderr)
         return 2
-    app = create_app(settings)
     import uvicorn
     # one process, one worker: the model is loaded exactly once and the
     # GPU is never asked to hold two copies

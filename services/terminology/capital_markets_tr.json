@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "profile_id": "capital_markets_tr",
+  "revision": "seed_1",
+  "language": "tr",
+  "terms": [
+    {"canonical": "Borsa İstanbul", "aliases": [], "contexts": ["default", "equities"], "priority": 110},
+    {"canonical": "yatırım hesabı", "aliases": [], "contexts": ["default", "equities"], "priority": 100},
+    {"canonical": "hisse senedi", "aliases": [], "contexts": ["default", "equities"], "priority": 90},
+    {"canonical": "Türk Hava Yolları", "aliases": ["THYAO"], "contexts": ["default", "equities"], "priority": 80},
+    {"canonical": "Garanti BBVA", "aliases": ["Garanti Bankası", "GARAN"], "contexts": ["default", "equities"], "priority": 70},
+    {"canonical": "lot", "aliases": [], "contexts": ["default", "equities"], "priority": 60},
+    {"canonical": "satış emri", "aliases": [], "contexts": ["default", "equities"], "priority": 50},
+    {"canonical": "alış emri", "aliases": [], "contexts": ["default", "equities"], "priority": 40}
+  ]
+}
